@@ -16,13 +16,14 @@ mlsweep_run sweeps/my_sweep.py [options]
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, and `ABBREV`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `ABBREV`, and `GPUS_PER_RUN`:
 
 ```python
 COMMAND = ["python", "train.py"]
 OPTIONS = { ... }
 
 # Optional
+GPUS_PER_RUN = 1   # GPUs to allocate per run (default: 1)
 EXTRA_FLAGS = ["--seed", "42"]
 ABBREV = {"local_batch_size": "bs"}
 
@@ -129,6 +130,22 @@ For the common pattern of passing a flag name with each value:
 ```
 
 The shorthand generates `{v: ["--optimizer.lr", str(v)] for v in values}`.
+
+### `GPUS_PER_RUN`
+
+An optional positive integer specifying how many GPUs to allocate per run. Defaults to `1`.
+
+```python
+GPUS_PER_RUN = 4
+```
+
+When set, the runner divides the available GPUs into non-overlapping groups of `GPUS_PER_RUN` and assigns one group per concurrent run. `CUDA_VISIBLE_DEVICES` is set to all GPUs in the group (e.g. `0,1,2,3`).
+
+The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_PER_RUN=4` and `-g 8`, you get 2 parallel slots (2 concurrent runs). `-g 0` uses all visible GPUs, divided into as many slots as fit.
+
+GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
+
+See [Multi-GPU Runs (torchrun)](#multi-gpu-runs-torchrun) below for a complete example.
 
 ### `EXTRA_FLAGS`
 
@@ -310,7 +327,7 @@ The following environment variables are set for each run:
 | `EXP_EXPERIMENT` | The experiment name. |
 | `EXP_TAGS` | Comma-separated `key=value` pairs for this run's combo (e.g. `lr=0.001,bs=32`). |
 | `EXP_SERVER` | HTTP URL of the experiment tracking server, if `--exp-server` is active. |
-| `CUDA_VISIBLE_DEVICES` | Set to the assigned GPU index for local runs. |
+| `CUDA_VISIBLE_DEVICES` | Comma-separated GPU indices for this run (e.g. `0` or `0,1,2,3` with `GPUS_PER_RUN=4`). |
 | `HIP_VISIBLE_DEVICES` | Same as above (for AMD ROCm compatibility). |
 
 Your training script can use these to integrate with the experiment tracker or write outputs to the right place.
@@ -422,6 +439,33 @@ Produces:
 - `sweep_optadam_bs32`, `sweep_optadam_bs64` (2 runs)
 - `sweep_optmuon.lrs0.1_bs32`, `sweep_optmuon.lrs0.1_bs64`, ... (6 runs)
 
+### Multi-GPU Runs (torchrun)
+
+Use `GPUS_PER_RUN` together with `torchrun` (or any other multi-process launcher) in `COMMAND` to run each sweep variation across multiple GPUs:
+
+```python
+#!/usr/bin/env mlsweep_run
+
+COMMAND = ["torchrun", "--nproc_per_node", "4", "train.py"]
+GPUS_PER_RUN = 4  # allocate 4 GPUs per run
+
+OPTIONS = {
+    ".learning_rate": {
+        "values": [1e-4, 3e-4, 1e-3],
+        "flags": "--optimizer.lr",
+        "name": "lr",
+    },
+}
+```
+
+Run with 8 GPUs to get 2 parallel 4-GPU jobs:
+
+```bash
+mlsweep_run sweeps/torchrun_sweep.py -g 8
+```
+
+The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second. GPU groups are chosen to maximise NVLink connectivity.
+
 ## Troubleshooting
 
 - **`COMMAND is required`** — Add `COMMAND = ["python", "train.py"]` to the sweep file.
@@ -429,6 +473,8 @@ Produces:
 - **`has both 'values' and subdimensions`** — A dim can be either a value dim (`values` list) or a branch dim (dot-prefixed subdim keys), not both.
 - **Monotonic/singular skipping not working** — These only work in sequential mode (`-g 1 -j 1`). In parallel mode results are recorded but skipping is not applied dynamically.
 - **Remote jobs not connecting** — Ensure passwordless SSH key-based authentication is configured for each worker. Test with `ssh -o BatchMode=yes <worker> nvidia-smi`.
+- **`need at least GPUS_PER_RUN GPUs`** — The requested GPU count (`-g N`) is less than `GPUS_PER_RUN`. Either increase `-g` or reduce `GPUS_PER_RUN`.
+- **Remote worker skipped with `need N per run`** — A remote worker has fewer GPUs than `GPUS_PER_RUN`. That worker is skipped; other workers with enough GPUs are still used.
 
 ## See Also
 
