@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlsweep"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+mlsweep_run    = "mlsweep.run_sweep:main"
+mlsweep_server = "mlsweep.server:main"
+mlsweep_viz    = "mlsweep.visualize:main"
+
+[tool.setuptools.packages.find]
+where = [""]
+include = ["mlsweep*"]
