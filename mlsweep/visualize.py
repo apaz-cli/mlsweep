@@ -367,6 +367,9 @@ select:focus { outline: none; border-color: #4c9be8; }
 
 input[type=number] { padding: 4px 6px; border: 1px solid var(--border-input);
                       border-radius: 4px; background: var(--btn-bg); color: var(--text); }
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button { opacity: 1; }
+[data-theme=dark] input[type=number] { color-scheme: dark; }
 
 .radio-row { display: flex; flex-wrap: wrap; gap: 3px; }
 .radio-row input[type=radio] { display: none; }
@@ -444,7 +447,7 @@ input[type=number] { padding: 4px 6px; border: 1px solid var(--border-input);
   <div class="section">
     <div class="section-title">Poll interval (sec)</div>
     <div class="row">
-      <input type="number" id="poll-interval" min="1" max="300" value="2" style="width:60px">
+      <input type="number" id="poll-interval" min="0.5" max="300" step="0.5" value="2" style="width:60px">
     </div>
   </div>
 
@@ -1309,8 +1312,8 @@ fetch("/config.json").then(r => r.json()).then(cfg => {
 }).catch(() => {});  // ignore errors — default CONFIG is fine
 
 document.getElementById("poll-interval").addEventListener("change", e => {
-  const val = parseInt(e.target.value, 10);
-  if (val >= 1 && val <= 300) {
+  const val = parseFloat(e.target.value);
+  if (val >= 0.5 && val <= 300) {
     CONFIG.poll_interval = val;
     if (_pollTimer) {
       clearInterval(_pollTimer);
