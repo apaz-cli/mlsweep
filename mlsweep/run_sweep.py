@@ -420,7 +420,7 @@ def should_skip(combo, failed, succeeded, options):
 
 def _visible_devices():
     """Get list of visible GPU device indices."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "") or os.environ.get("HIP_VISIBLE_DEVICES", "")
     if cvd:
         devs = []
         for p in cvd.split(","):
@@ -436,28 +436,55 @@ def _visible_devices():
                            capture_output=True, text=True, check=True)
         return [int(x) for x in r.stdout.strip().splitlines() if x.strip()]
     except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
-        return [0]
+        pass
+    try:
+        r = subprocess.run(["amd-smi", "topology", "--json"],
+                           capture_output=True, text=True, check=True)
+        data = json.loads(r.stdout)
+        return [entry["gpu"] for entry in data if "gpu" in entry]
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError):
+        pass
+    return []
 
 
 def _discover_remote_gpus(workers):
     """SSH to each worker, count GPUs. Returns [(worker, gpu_id), ...]."""
     slots = []
     for w in workers:
+        ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", w]
         try:
             result = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", w,
-                 "nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                ssh_prefix + ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {result.stderr.strip()}")
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line:
+                        slots.append((w, int(line)))
                 continue
-            for line in result.stdout.strip().splitlines():
-                line = line.strip()
-                if line:
-                    slots.append((w, int(line)))
         except (subprocess.TimeoutExpired, ValueError) as e:
             sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
             continue
+
+        # nvidia-smi unavailable — try amd-smi
+        try:
+            result = subprocess.run(
+                ssh_prefix + ["amd-smi", "topology", "--json"],
+                capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout)
+                    for entry in data:
+                        if "gpu" in entry:
+                            slots.append((w, entry["gpu"]))
+                    continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except subprocess.TimeoutExpired as e:
+            sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
+            continue
+
+        sweep_print(f"  {_RED}WARN{_RESET}  {w}: no GPU management tool found (tried nvidia-smi, amd-smi)")
     return slots
 
 
@@ -500,24 +527,66 @@ def _parse_topo_output(text):
     return scores
 
 
+def _amd_topo_score(link_type, num_hops):
+    """Convert an amd-smi topology link type to a numeric score (higher = better)."""
+    if link_type == "XGMI":
+        # AMD Infinity Fabric / xGMI: high-speed GPU interconnect analogous to NVLink
+        return max(100 - (num_hops - 1) * 10, 50)
+    if link_type in ("PCIE", "PCIX"):
+        return max(50 - (num_hops - 1) * 10, 10)
+    return 10
+
+
+def _parse_amd_topo_output(text):
+    """Parse `amd-smi topology --json` stdout. Returns {(gpu_a, gpu_b): score}."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    scores = {}
+    for gpu_entry in data:
+        gpu_a = gpu_entry.get("gpu")
+        if gpu_a is None:
+            continue
+        for link in gpu_entry.get("links", []):
+            gpu_b = link.get("gpu")
+            link_type = link.get("link_type", "")
+            num_hops = link.get("num_hops", 1)
+            if gpu_b is None or gpu_a == gpu_b or link_type == "SELF":
+                continue
+            scores[(gpu_a, gpu_b)] = _amd_topo_score(link_type, num_hops)
+    return scores
+
+
 def _gpu_topology(worker=None):
-    """Query GPU interconnect topology via `nvidia-smi topo -m`.
+    """Query GPU interconnect topology via nvidia-smi or amd-smi.
 
     Returns {(gpu_a, gpu_b): score} where higher score means better connectivity
-    (NVLink >> PCIe switch >> PCIe host bridge >> NUMA >> cross-NUMA).
-    Falls back to {} if the query fails or nvidia-smi is unavailable.
+    (NVLink/XGMI >> PCIe switch >> PCIe host bridge >> NUMA >> cross-NUMA).
+    Falls back to {} if all queries fail.
     worker: None for local; SSH target string for remote.
     """
-    cmd = ["nvidia-smi", "topo", "-m"]
-    if worker:
-        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", worker] + cmd
+    ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", worker] if worker else []
+
+    # Try nvidia-smi first
+    cmd = ssh_prefix + ["nvidia-smi", "topo", "-m"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return {}
+        if r.returncode == 0:
+            return _parse_topo_output(r.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return {}
-    return _parse_topo_output(r.stdout)
+        pass
+
+    # Fall back to amd-smi (AMD GPUs)
+    cmd = ssh_prefix + ["amd-smi", "topology", "--json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return _parse_amd_topo_output(r.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    return {}
 
 
 def _best_gpu_groups(devices, group_size, n_groups, worker=None):
@@ -1082,6 +1151,10 @@ def _setup_gpu_slots(args, gpus_per_run, exp_server=None):
         # Local mode
         visible = _visible_devices()
         if not visible:
+            if args.gpus is not None or os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES"):
+                sweep_print(f"{_RED}Error: GPUs requested but no GPU management tool found "
+                            f"(tried nvidia-smi, amd-smi){_RESET}")
+                sys.exit(1)
             visible = [0]
         if args.gpus is None:
             num_gpus = gpus_per_run   # default: one slot
