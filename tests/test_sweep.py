@@ -1,12 +1,11 @@
 #!/usr/bin/env mlsweep_run
 
-"""Sweep config for tests/fake_train.py.
+"""Sweep config for tests/_fake_train.py.
 
-Generates 4 combinations (2 lr values × 2 batch sizes) and runs
-each for 5 simulated training steps.
+Launches runs for all combinations of learning rates and batch sizes.
 """
 
-COMMAND = "./fake_train.py"
+COMMAND = "tests/train.py"
 
 OPTIONS = {
     ".lr": {

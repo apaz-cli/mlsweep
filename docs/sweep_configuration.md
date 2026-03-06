@@ -16,7 +16,7 @@ mlsweep_run sweeps/my_sweep.py [options]
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `ABBREV`, and `GPUS_PER_RUN`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `ABBREV`, `GPUS_PER_RUN`, and `RUN_FROM`:
 
 ```python
 COMMAND = ["python", "train.py"]
@@ -24,6 +24,7 @@ OPTIONS = { ... }
 
 # Optional
 GPUS_PER_RUN = 1   # GPUs to allocate per run (default: 1)
+RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
 EXTRA_FLAGS = ["--seed", "42"]
 ABBREV = {"local_batch_size": "bs"}
 
@@ -146,6 +147,16 @@ The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_P
 GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
 
 See [Multi-GPU Runs (torchrun)](#multi-gpu-runs-torchrun) below for a complete example.
+
+### `RUN_FROM`
+
+An optional string specifying the working directory passed to each local run's subprocess. Defaults to the git root of the directory where `mlsweep_run` is invoked.
+
+```python
+RUN_FROM = "/home/user/myproject"
+```
+
+This is useful when the sweep file lives outside the project root, or when the training command uses paths relative to a specific directory. Ignored for remote runs (which `cd` to `--remote-dir` on the worker instead).
 
 ### `EXTRA_FLAGS`
 
@@ -278,12 +289,12 @@ The shebang line to use is:
 | Option | Description |
 |--------|-------------|
 | `--sweep <name>` | Name of the sweep (loads `sweeps/<name>.py`). Required in named mode. |
-| `--output_dir <dir>` | Directory where run outputs will be stored. Default: `./outputs/sweeps`. |
+| `--output_dir <dir>` | Directory where run outputs will be stored. Default: `<git-root>/outputs/sweeps`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>`. |
 | `-g [N]`, `--gpus [N]` | GPUs to use. `-g` alone = all visible GPUs. `-g N` = N GPUs. Default: 1. |
 | `-j N`, `--jobs-per-gpu N` | Concurrent jobs per GPU. Default: 1. Total workers = GPUs × jobs-per-GPU. |
 | `--workers <targets>` | SSH targets for remote dispatch. Comma-separated or `@file` (one host per line). |
-| `--remote-dir <path>` | Repo path on remote workers. Default: same as local working directory. |
+| `--remote-dir <path>` | Repo path on remote workers. Default: git root of the local working directory. |
 | `--exp-server <host:port>` | Experiment tracking server. Auto-detected in remote mode (local machine IP:53800). |
 | `--sync-artifacts` | After each remote job, rsync run outputs back to the local machine. |
 | `--resume` | Skip runs already recorded as completed in `sweep_status.json`. |
@@ -479,4 +490,4 @@ The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISI
 ## See Also
 
 - `mlsweep/run_sweep.py` — full implementation and inline documentation.
-- `tests/sweep.py` — minimal example sweep for the bundled test training script.
+- `tests/test_sweep.py` — minimal example sweep for the bundled test training script.

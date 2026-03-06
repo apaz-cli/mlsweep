@@ -3,6 +3,7 @@
 """Run experiment sweeps. See docs/sweep_configuration.md for format and usage."""
 
 import argparse
+import importlib.metadata
 import importlib.util
 import itertools
 import json
@@ -15,12 +16,20 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections import Counter
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+from mlsweep._utils import _git_root, _val_sort_key
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+_PROJECT_ROOT = _git_root(os.getcwd()) or os.getcwd()
 
 # ANSI colors
 _GREEN = "\033[32m"
@@ -38,7 +47,7 @@ _METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic"}
 _log_file = None
 
 
-def _parse_flag_list(f, ctx):
+def _parse_flag_list(f: str | list[str] | None, ctx: str) -> list[str]:
     """Normalize a flags field to a list of CLI strings (branch/fixed dims only)."""
     if f is None:
         return []
@@ -49,7 +58,7 @@ def _parse_flag_list(f, ctx):
     raise ValueError(f"{ctx}: flags must be str or list, got {type(f).__name__}")
 
 
-def sweep_print(msg, end="\n"):
+def sweep_print(msg: str, end: str = "\n") -> None:
     """Print to stdout (colored) and log file (plain)."""
     print(msg, end=end, flush=True)
     if _log_file is not None:
@@ -57,7 +66,7 @@ def sweep_print(msg, end="\n"):
         _log_file.flush()
 
 
-def fmt_time(s):
+def fmt_time(s: float) -> str:
     if s < 60:
         return f"{s:.0f}s"
     if s < 3600:
@@ -68,7 +77,7 @@ def fmt_time(s):
 # ── Sweep loading ──────────────────────────────────────────────────────────
 
 
-def _load_module(path):
+def _load_module(path: str | Path) -> types.ModuleType:
     path = Path(path)
     if str(path.parent) not in sys.path:
         sys.path.insert(0, str(path.parent))
@@ -80,7 +89,7 @@ def _load_module(path):
     return mod
 
 
-def load_sweep_file(path):
+def load_sweep_file(path: str | Path) -> dict[str, Any]:
     """Load a single sweep .py file, returning a sweep-info dict."""
     mod = _load_module(path)
     command = getattr(mod, "COMMAND", None)
@@ -93,6 +102,9 @@ def load_sweep_file(path):
     gpus_per_run = getattr(mod, "GPUS_PER_RUN", 1)
     if not isinstance(gpus_per_run, int) or gpus_per_run < 1:
         raise ValueError(f"{path}: GPUS_PER_RUN must be a positive integer, got {gpus_per_run!r}")
+    run_from = getattr(mod, "RUN_FROM", None)
+    if run_from is not None and not isinstance(run_from, str):
+        raise ValueError(f"{path}: RUN_FROM must be a str, got {type(run_from).__name__}")
     return {
         "name": Path(path).stem,
         "options": mod.OPTIONS,
@@ -101,10 +113,11 @@ def load_sweep_file(path):
         "extra_flags": getattr(mod, "EXTRA_FLAGS", []),
         "abbrev": getattr(mod, "ABBREV", None),
         "gpus_per_run": gpus_per_run,
+        "run_from": run_from,
     }
 
 
-def load_sweeps():
+def load_sweeps() -> dict[str, dict[str, Any]]:
     """Import all sweep files from sweeps/ directory."""
     return {
         f.stem: load_sweep_file(f)
@@ -112,7 +125,7 @@ def load_sweeps():
     }
 
 
-def validate_options(options, _ancestor_keys=None):
+def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | None = None) -> None:
     """Validate and normalize OPTIONS dict.
 
     Each key in options must start with '.' to identify it as a dimension.
@@ -160,7 +173,7 @@ def validate_options(options, _ancestor_keys=None):
             values = opt["values"]
             flags = opt.get("flags")
             if flags is None:
-                flags_dict = {v: [] for v in values}
+                flags_dict: dict[Any, list[str]] = {v: [] for v in values}
             elif isinstance(flags, str):
                 flags_dict = {v: [flags, str(v)] for v in values}
             elif isinstance(flags, dict):
@@ -207,7 +220,7 @@ def validate_options(options, _ancestor_keys=None):
 # ── Variation generation ───────────────────────────────────────────────────
 
 
-def _make_part(nm, val):
+def _make_part(nm: str | None, val: Any) -> str | None:
     """Build a name part string from dim name and value, or None if no name/value."""
     if nm is None:
         return None
@@ -216,7 +229,7 @@ def _make_part(nm, val):
     return f"{nm}{val}"
 
 
-def _flatten_tokens(tokens):
+def _flatten_tokens(tokens: list[Any]) -> list[str]:
     """Flatten a name_tokens list to a plain list of strings."""
     parts = []
     for tok in tokens:
@@ -227,14 +240,14 @@ def _flatten_tokens(tokens):
     return parts
 
 
-def _build_level_tokens(all_keys, vals, options, contributing_keys=(), child_tokens=()):
+def _build_level_tokens(all_keys: list[str], vals: Any, options: dict[str, Any], contributing_keys: Any = (), child_tokens: Any = ()) -> list[Any]:
     """Build name tokens for one level of the expansion tree.
 
     contributing_keys: keys whose selected branch has child sub-dims (child_tokens
                        are attributed to them, dotted onto this level's name part).
     child_tokens:      name tokens from the recursive child expansion.
     """
-    tokens = []
+    tokens: list[Any] = []
     for key, val in zip(all_keys, vals):
         nm = options[key].get("name", key[1:])
         part = _make_part(nm, val)
@@ -249,7 +262,7 @@ def _build_level_tokens(all_keys, vals, options, contributing_keys=(), child_tok
     return tokens
 
 
-def _expand_tree(options, combo_so_far, effective_so_far):
+def _expand_tree(options: dict[str, Any], combo_so_far: dict[str, Any], effective_so_far: dict[str, Any]) -> Generator[tuple[dict[str, Any], dict[str, Any], list[Any]], None, None]:
     """Recursively expand an options tree, yielding (combo, effective_options, name_tokens).
 
     options: dict with dot-prefixed dimension keys (e.g. {".treatment": {...}}).
@@ -311,7 +324,7 @@ def _expand_tree(options, combo_so_far, effective_so_far):
                 yield combo, effective, _build_level_tokens(all_keys, vals, options)
 
 
-def generate_variations(sweep_name, options, exclude_fn=None, extra_flags=()):
+def generate_variations(sweep_name: str, options: dict[str, Any], exclude_fn: Callable[[dict[str, Any]], bool] | None = None, extra_flags: Sequence[str] = ()) -> list[dict[str, Any]]:
     """Generate all config variations using tree expansion.
 
     Singular dims vary slowest (diagonal order — advances all singular dims
@@ -347,12 +360,12 @@ def generate_variations(sweep_name, options, exclude_fn=None, extra_flags=()):
     return variations
 
 
-def _treatment_key(combo, options):
+def _treatment_key(combo: dict[str, Any], options: dict[str, Any]) -> tuple[Any, ...]:
     """Non-singular dims identify a treatment. Both combo and options use stripped keys (no dot)."""
     return tuple(combo[k] for k in sorted(options) if not options[k].get("singular"))
 
 
-def count_expected(options):
+def count_expected(options: dict[str, Any]) -> int:
     """Expected runs, computed recursively over the options tree.
 
     Singular dims contribute 1 (we only need one working value).
@@ -377,7 +390,7 @@ def count_expected(options):
 # ── Skip logic ─────────────────────────────────────────────────────────────
 
 
-def should_skip(combo, failed, succeeded, options):
+def should_skip(combo: dict[str, Any], failed: list[dict[str, Any]], succeeded: list[dict[str, Any]], options: dict[str, Any]) -> bool:
     """Check monotonic (skip worse on failure) and singular (skip others on success).
 
     Both combo and options use stripped keys (no dot prefix).
@@ -418,11 +431,11 @@ def should_skip(combo, failed, succeeded, options):
 
 
 
-def _visible_devices():
+def _visible_devices() -> list[int]:
     """Get list of visible GPU device indices."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "") or os.environ.get("HIP_VISIBLE_DEVICES", "")
     if cvd:
-        devs = []
+        devs: list[int] = []
         for p in cvd.split(","):
             p = p.strip()
             if "-" in p:
@@ -447,7 +460,7 @@ def _visible_devices():
     return []
 
 
-def _discover_remote_gpus(workers):
+def _discover_remote_gpus(workers: list[str]) -> list[tuple[str, int]]:
     """SSH to each worker, count GPUs. Returns [(worker, gpu_id), ...]."""
     slots = []
     for w in workers:
@@ -488,7 +501,7 @@ def _discover_remote_gpus(workers):
     return slots
 
 
-def _topo_score(conn_type):
+def _topo_score(conn_type: str) -> int:
     """Convert an nvidia-smi topology connection type to a numeric score (higher = better)."""
     if conn_type.startswith("NV"):
         try:
@@ -498,7 +511,7 @@ def _topo_score(conn_type):
     return {"PIX": 50, "PXB": 40, "PHB": 30, "NODE": 20, "SYS": 10}.get(conn_type, 0)
 
 
-def _parse_topo_output(text):
+def _parse_topo_output(text: str) -> dict[tuple[int, int], int]:
     """Parse `nvidia-smi topo -m` stdout. Returns {(gpu_a, gpu_b): score}."""
     lines = [l for l in text.splitlines() if l.strip()]
     # Header line starts with whitespace (tab) before GPU0
@@ -527,7 +540,7 @@ def _parse_topo_output(text):
     return scores
 
 
-def _amd_topo_score(link_type, num_hops):
+def _amd_topo_score(link_type: str, num_hops: int) -> int:
     """Convert an amd-smi topology link type to a numeric score (higher = better)."""
     if link_type == "XGMI":
         # AMD Infinity Fabric / xGMI: high-speed GPU interconnect analogous to NVLink
@@ -537,7 +550,7 @@ def _amd_topo_score(link_type, num_hops):
     return 10
 
 
-def _parse_amd_topo_output(text):
+def _parse_amd_topo_output(text: str) -> dict[tuple[int, int], int]:
     """Parse `amd-smi topology --json` stdout. Returns {(gpu_a, gpu_b): score}."""
     try:
         data = json.loads(text)
@@ -558,7 +571,7 @@ def _parse_amd_topo_output(text):
     return scores
 
 
-def _gpu_topology(worker=None):
+def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
     """Query GPU interconnect topology via nvidia-smi or amd-smi.
 
     Returns {(gpu_a, gpu_b): score} where higher score means better connectivity
@@ -589,7 +602,7 @@ def _gpu_topology(worker=None):
     return {}
 
 
-def _best_gpu_groups(devices, group_size, n_groups, worker=None):
+def _best_gpu_groups(devices: list[int], group_size: int, n_groups: int, worker: str | None = None) -> list[list[int]]:
     """Select n_groups non-overlapping groups of group_size GPUs from devices,
     preferring groups with the best NVLink/PCIe interconnect.
 
@@ -603,7 +616,7 @@ def _best_gpu_groups(devices, group_size, n_groups, worker=None):
 
     topo = _gpu_topology(worker)
 
-    def pair_score(a, b):
+    def pair_score(a: int, b: int) -> int:
         return topo.get((a, b), 0) + topo.get((b, a), 0)
 
     available = list(devices)
@@ -636,7 +649,7 @@ def _best_gpu_groups(devices, group_size, n_groups, worker=None):
     return groups
 
 
-def _parse_workers(workers_arg):
+def _parse_workers(workers_arg: str) -> list[str]:
     """Parse --workers argument: comma-separated list or @file."""
     if workers_arg.startswith("@"):
         path = workers_arg[1:]
@@ -645,7 +658,7 @@ def _parse_workers(workers_arg):
     return [w.strip() for w in workers_arg.split(",") if w.strip()]
 
 
-def _get_default_exp_server():
+def _get_default_exp_server() -> str:
     """Get default exp server address (this machine's hostname + default port)."""
     try:
         # Get the first non-loopback IP
@@ -658,7 +671,8 @@ def _get_default_exp_server():
         return f"{socket.gethostname()}:53800"
 
 
-def _run_env_dict(device, run_dir, name, experiment, tag_str, exp_server):
+def _run_env_dict(device: str, run_dir: str, name: str, experiment: str,
+                  tag_str: str, exp_server: str | None) -> dict[str, str]:
     """Common env vars for a training run, as a plain dict."""
     env = {
         "CUDA_VISIBLE_DEVICES": device,
@@ -674,8 +688,11 @@ def _run_env_dict(device, run_dir, name, experiment, tag_str, exp_server):
     return env
 
 
-def _run_one(command, var, output_dir, experiment, extra, gpu, log,
-             worker=None, remote_dir=None, exp_server=None, sync_artifacts=False):
+def _run_one(command: list[str], var: dict[str, Any], output_dir: str, experiment: str,
+             extra: list[str], gpu: list[int], log: str,
+             worker: str | None = None, remote_dir: str | None = None,
+             exp_server: str | None = None, sync_artifacts: bool = False,
+             run_from: str | None = None) -> tuple[dict, bool, float, str]:
     """Execute one training run. Returns (var, success, elapsed, log_file).
 
     When worker is None, runs locally.
@@ -699,9 +716,11 @@ def _run_one(command, var, output_dir, experiment, extra, gpu, log,
 
             with open(log, "w", buffering=1) as f:
                 subprocess.run(cmd, env=env, stdout=f,
-                               stderr=subprocess.STDOUT, check=True)
+                               stderr=subprocess.STDOUT, check=True,
+                               cwd=run_from or _PROJECT_ROOT)
         else:
             # === REMOTE execution via SSH ===
+            assert remote_dir is not None, "remote_dir required for SSH dispatch"
             remote_run_dir = os.path.join(remote_dir, "outputs", "sweeps", experiment, name)
             remote_log = os.path.join(remote_run_dir, "training.log")
 
@@ -738,7 +757,7 @@ def _run_one(command, var, output_dir, experiment, extra, gpu, log,
         return var, False, time.time() - t0, log
 
 
-def _singular_desc(combo, options, abbrev=None):
+def _singular_desc(combo: dict[str, Any], options: dict[str, Any], abbrev: dict[str, str] | None = None) -> str:
     """Short description of singular dim values, e.g. 'bs=64, ac=full'.
 
     Both combo and options use stripped keys (no dot prefix).
@@ -754,7 +773,7 @@ def _singular_desc(combo, options, abbrev=None):
 # ── Manifest & status helpers ──────────────────────────────────────────────────
 
 
-def _manifest_axes_from_variations(variations):
+def _manifest_axes_from_variations(variations: list[dict[str, Any]]) -> tuple[dict[str, list[Any]], dict[str, dict[str, Any]]]:
     """Extract axes and sub_axes from a list of variations.
 
     Returns (axes, sub_axes_fmt) where:
@@ -772,17 +791,10 @@ def _manifest_axes_from_variations(variations):
             axis_values.setdefault(k, set()).add(v)
             names_with.setdefault(k, set()).add(var["name"])
 
-    def val_sort_key(v):
-        if isinstance(v, bool):
-            return (0, str(v))
-        if isinstance(v, (int, float)):
-            return (1, v)
-        return (2, str(v))
-
-    axes = {k: sorted(vs, key=val_sort_key) for k, vs in axis_values.items()}
+    axes = {k: sorted(vs, key=_val_sort_key) for k, vs in axis_values.items()}
 
     # Detect sub-axes: axes that only appear when a parent has a specific value
-    sub_axes_fmt: dict = {}
+    sub_axes_fmt: dict[str, dict[str, Any]] = {}
     for axis in axes:
         if names_with.get(axis) == all_names:
             continue  # universal axis
@@ -806,7 +818,7 @@ def _manifest_axes_from_variations(variations):
     return axes, sub_axes_fmt
 
 
-def _write_manifest(exp_dir: str, experiment: str, variations: list) -> None:
+def _write_manifest(exp_dir: str, experiment: str, variations: list[dict[str, Any]], note: str | None = None) -> None:
     """Write the initial sweep_manifest.json before any jobs are dispatched."""
     axes, sub_axes = _manifest_axes_from_variations(variations)
     manifest = {
@@ -816,6 +828,8 @@ def _write_manifest(exp_dir: str, experiment: str, variations: list) -> None:
         "runs": [],         # populated as jobs are dispatched
         "metricNames": [],  # populated dynamically by server
     }
+    if note:
+        manifest["note"] = note
     path = os.path.join(exp_dir, "sweep_manifest.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -827,7 +841,7 @@ _manifest_lock = threading.Lock()
 _status_lock = threading.Lock()
 
 
-def _append_manifest_run(exp_dir: str, var: dict) -> None:
+def _append_manifest_run(exp_dir: str, var: dict[str, Any]) -> None:
     """Append a dispatched run entry to sweep_manifest.json (thread-safe)."""
     path = os.path.join(exp_dir, "sweep_manifest.json")
     with _manifest_lock:
@@ -843,18 +857,18 @@ def _append_manifest_run(exp_dir: str, var: dict) -> None:
         os.replace(tmp, path)
 
 
-def _load_sweep_status(exp_dir: str) -> dict:
+def _load_sweep_status(exp_dir: str) -> dict[str, Any]:
     """Load sweep_status.json if present. Returns {} if missing or corrupt."""
     path = os.path.join(exp_dir, "sweep_status.json")
     try:
         with open(path) as f:
-            return json.load(f)
+            return json.load(f)  # type: ignore[no-any-return]
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _update_sweep_status(exp_dir: str, run_name: str, status: str,
-                          elapsed: float, combo: dict) -> None:
+                          elapsed: float, combo: dict[str, Any]) -> None:
     """Append/update a run's entry in sweep_status.json (thread-safe)."""
     path = os.path.join(exp_dir, "sweep_status.json")
     with _status_lock:
@@ -877,9 +891,12 @@ def _update_sweep_status(exp_dir: str, run_name: str, status: str,
 # ── Sweep execution ────────────────────────────────────────────────────────
 
 
-def run_sweep(variations, command, output_dir, experiment, expected, extra,
-              gpu_slots, jobs_per_gpu, remote_dir=None, exp_server=None,
-              sync_artifacts=False, exp_dir=None, abbrev=None):
+def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: str, experiment: str,
+              expected: int, extra: list[str],
+              gpu_slots: list[tuple[str | None, list[int]]], jobs_per_gpu: int,
+              remote_dir: str | None = None, exp_server: str | None = None,
+              sync_artifacts: bool = False, exp_dir: str | None = None,
+              abbrev: dict[str, str] | None = None, run_from: str | None = None) -> tuple[list[tuple[Any, ...]], int, float]:
     """Execute all variations. Single code path for sequential and parallel.
 
     gpu_slots: list of (worker, gpu_group) tuples. worker=None means local; gpu_group is a list of GPU ids.
@@ -896,8 +913,9 @@ def run_sweep(variations, command, output_dir, experiment, expected, extra,
     )
 
     # Shared state (protected by lock)
-    results = []          # (var, success, elapsed, log_file)
-    failed, succeeded = [], []
+    results: list[tuple[Any, ...]] = []    # (var, success, elapsed, log_file)
+    failed: list[dict[str, Any]] = []
+    succeeded: list[dict[str, Any]] = []
     resolved = set()      # treatment keys with at least one success
     lock = threading.Lock()
     t0 = time.time()
@@ -905,14 +923,14 @@ def run_sweep(variations, command, output_dir, experiment, expected, extra,
 
     # GPU pool: each slot appears jobs_per_gpu times
     # Slots are (worker, gpu_id) tuples — worker=None for local
-    gpu_q = queue.Queue()
+    gpu_q: queue.Queue[tuple[str | None, list[int]]] = queue.Queue()
     for worker, gpu_id in gpu_slots:
         for _ in range(jobs_per_gpu):
             gpu_q.put((worker, gpu_id))
 
     skipped_count = 0
 
-    def _job_worker(var):
+    def _job_worker(var: dict[str, Any]) -> None:
         nonlocal skipped_count
         worker, gpu = gpu_q.get()
         opts = var["effective_options"]
@@ -954,8 +972,9 @@ def run_sweep(variations, command, output_dir, experiment, expected, extra,
             _, ok, elapsed, log = _run_one(
                 command, var, output_dir, experiment, extra, gpu, log,
                 worker=worker, remote_dir=remote_dir, exp_server=exp_server,
-                sync_artifacts=sync_artifacts)
-        except Exception:
+                sync_artifacts=sync_artifacts, run_from=run_from)
+        except Exception as e:
+            sweep_print(f"{_RED}ERROR{_RESET}  {var['name']}: unexpected exception: {e}")
             ok, elapsed, log = False, time.time() - job_t0, "?"
         finally:
             gpu_q.put((worker, gpu))
@@ -987,16 +1006,16 @@ def run_sweep(variations, command, output_dir, experiment, expected, extra,
 
         return
 
-    def _drain_completed():
+    def _drain_completed() -> None:
         """Process any already-completed futures to update state before skip checks."""
         for f in [f for f in futures if f.done()]:
             f.result()
             del futures[f]
 
-    inflight = {}  # treatment_key -> most recent future for that treatment
+    inflight: dict[tuple, Any] = {}  # treatment_key -> most recent future for that treatment
 
     with ThreadPoolExecutor(max_workers=num_slots) as pool:
-        futures = {}
+        futures: dict[Any, Any] = {}
         remaining = list(variations)
         while remaining:
             deferred = []
@@ -1046,7 +1065,7 @@ def run_sweep(variations, command, output_dir, experiment, expected, extra,
 # ── Summary ────────────────────────────────────────────────────────────────
 
 
-def print_summary(results, skipped, elapsed, abbrev=None):
+def print_summary(results: list[tuple[Any, ...]], skipped: int, elapsed: float, abbrev: dict[str, str] | None = None) -> bool:
     """Print per-treatment summary."""
     has_singular = any(
         o.get("singular")
@@ -1055,7 +1074,7 @@ def print_summary(results, skipped, elapsed, abbrev=None):
     )
 
     # Group by treatment
-    treatments = {}
+    treatments: dict[tuple[Any, ...], list[tuple[Any, ...]]] = {}
     for var, ok, el, log in results:
         tk = _treatment_key(var["combo"], var["effective_options"])
         treatments.setdefault(tk, []).append((var, ok, el, log))
@@ -1102,7 +1121,7 @@ def print_summary(results, skipped, elapsed, abbrev=None):
 # ── Main ───────────────────────────────────────────────────────────────────
 
 
-def _setup_gpu_slots(args, gpus_per_run, exp_server=None):
+def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None) -> tuple[list[tuple[str | None, list[int]]], str | None]:
     """Resolve and return (gpu_slots, exp_server).
 
     Remote mode: discovers GPUs via SSH, groups them topology-aware per worker.
@@ -1119,14 +1138,14 @@ def _setup_gpu_slots(args, gpus_per_run, exp_server=None):
         if exp_server is None:
             exp_server = _get_default_exp_server()
         # Group raw [(worker, gpu_id)] by worker
-        worker_gpu_map = {}
+        worker_gpu_map: dict[str, list[int]] = {}
         for w, g in gpu_slots:
             worker_gpu_map.setdefault(w, []).append(g)
         # Optional per-worker GPU cap (--gpus)
         if args.gpus is not None and args.gpus > 0:
             worker_gpu_map = {w: gpus[:args.gpus] for w, gpus in worker_gpu_map.items()}
         # Topology-aware slot building per worker
-        gpu_slots = []
+        grouped_slots: list[tuple[str | None, list[int]]] = []
         for w in sorted(worker_gpu_map):
             worker_gpus = worker_gpu_map[w]
             n_slots = len(worker_gpus) // gpus_per_run
@@ -1135,18 +1154,18 @@ def _setup_gpu_slots(args, gpus_per_run, exp_server=None):
                             f"need {gpus_per_run} per run — skipping")
                 continue
             groups = _best_gpu_groups(worker_gpus, gpus_per_run, n_slots, worker=w)
-            gpu_slots.extend((w, grp) for grp in groups)
-        if not gpu_slots:
+            grouped_slots.extend((w, grp) for grp in groups)
+        if not grouped_slots:
             sweep_print(f"{_RED}Error: no workers with enough GPUs for GPUS_PER_RUN={gpus_per_run}{_RESET}")
             sys.exit(1)
         # Show discovered topology
-        worker_slot_counts = Counter(w for w, _ in gpu_slots)
-        for w, cnt in sorted(worker_slot_counts.items()):
+        worker_slot_counts = Counter(wk for wk, _ in grouped_slots)
+        for wk, cnt in sorted(worker_slot_counts.items()):
             total_gpus = cnt * gpus_per_run
             slot_word = "slot" if cnt == 1 else "slots"
-            sweep_print(f"  {_GREEN}OK{_RESET}    {w}: {cnt} {slot_word} ({total_gpus} GPUs)")
+            sweep_print(f"  {_GREEN}OK{_RESET}    {wk}: {cnt} {slot_word} ({total_gpus} GPUs)")
         sweep_print(f"Exp server: {exp_server}")
-        return gpu_slots, exp_server
+        return grouped_slots, exp_server
     else:
         # Local mode
         visible = _visible_devices()
@@ -1179,7 +1198,7 @@ def _setup_gpu_slots(args, gpus_per_run, exp_server=None):
         return [(None, grp) for grp in groups], exp_server
 
 
-def main():
+def main() -> None:
     global _log_file
 
     # Shebang mode: first arg is a .py sweep file
@@ -1188,23 +1207,35 @@ def main():
     extra_flags = []
     abbrev = None
     gpus_per_run = 1
+    run_from = None
     if argv and argv[0].endswith(".py") and os.path.isfile(argv[0]):
         info = load_sweep_file(argv[0])
         sweep_name, options, command, exclude_fn, extra_flags, abbrev = (
             info["name"], info["options"], info["command"],
             info["exclude"], info["extra_flags"], info.get("abbrev"))
         gpus_per_run = info.get("gpus_per_run", 1)
+        run_from = info.get("run_from")
         validate_options(options)
         argv = argv[1:]
 
     parser = argparse.ArgumentParser(
         description="Run experiment sweeps",
-        epilog="Extra args after -- are passed to every training run.")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Extra args after -- are passed to every training run.\n\n"
+            "Environment variables:\n"
+            "  CUDA_VISIBLE_DEVICES  Nvidia GPU indices available for scheduling\n"
+            "                        (used when --gpus is not set)\n"
+            "  HIP_VISIBLE_DEVICES   AMD GPU indices available for scheduling\n"
+            "                        (used when --gpus is not set)\n"
+            "  MLSWEEP_TOKEN         Bearer token forwarded to each training process\n"
+            "                        for exp-server auth (see --exp-server)\n"
+        ))
     if sweep_name is None:
         sweeps = load_sweeps()
         parser.add_argument("--sweep", required=True, choices=sorted(sweeps),
                             help="Sweep name")
-    parser.add_argument("--output_dir", default=os.path.join(os.getcwd(), "outputs", "sweeps"),
+    parser.add_argument("--output_dir", default=os.path.join(_PROJECT_ROOT, "outputs", "sweeps"),
                         help="Output directory")
     parser.add_argument("--experiment", default=None,
                         help="Experiment name (default: <sweep>_<timestamp>)")
@@ -1224,12 +1255,20 @@ def main():
                         help="Skip runs already recorded as completed in sweep_status.json")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without execution")
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate sweep config, print all combinations, and exit (no jobs launched)")
+    parser.add_argument("--note", default=None,
+                        help="Human-readable note stored in sweep_manifest.json")
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
 
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
         extra = extra[1:]
 
     if sweep_name is None:
+        assert sweeps is not None
         info = sweeps[args.sweep]
         sweep_name, options, command = args.sweep, info["options"], info["command"]
         exclude_fn  = info.get("exclude")
@@ -1238,8 +1277,31 @@ def main():
         gpus_per_run = info.get("gpus_per_run", 1)
         validate_options(options)
 
+    assert options is not None and command is not None
+    # --validate: check config, print all combinations, exit (no jobs, no files)
+    if args.validate:
+        all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
+        expected = count_expected(options)
+        excluded = expected - len(all_variations)
+        # Collect top-level dimension names (strip leading dot)
+        dim_names = [k[1:] for k in options]
+        sweep_print(f"Sweep: {sweep_name}")
+        sweep_print(f"Dimensions: {', '.join(dim_names) if dim_names else '(none)'}")
+        for key in options:
+            dim_name = key[1:]
+            values = options[key].get("_values", [])
+            if values != [None]:
+                sweep_print(f"  {dim_name}: {values}")
+        sweep_print(f"\nTotal combinations: {len(all_variations)}")
+        if excluded:
+            sweep_print(f"Excluded by EXCLUDE filter: {excluded}")
+        sweep_print(f"\nRuns:")
+        for var in all_variations:
+            sweep_print(f"  {var['name']}: {var['combo']}")
+        sys.exit(0)
+
     # GPU setup: build list of (worker, gpu_id) slots
-    remote_dir = args.remote_dir or os.getcwd()
+    remote_dir = args.remote_dir or _PROJECT_ROOT
     exp_server = args.exp_server
     gpu_slots, exp_server = _setup_gpu_slots(args, gpus_per_run, exp_server)
 
@@ -1315,7 +1377,7 @@ def main():
         return
 
     # Write sweep_manifest.json before dispatching any jobs
-    _write_manifest(exp_dir, experiment, variations)
+    _write_manifest(exp_dir, experiment, variations, note=args.note)
 
     run_desc = f"{expected} runs, {n} possible" if expected < n else f"{n} runs"
     sweep_print(f"\n{'=' * 80}")
@@ -1326,7 +1388,7 @@ def main():
         variations, command, output_dir, experiment, expected, extra,
         gpu_slots, args.jobs_per_gpu, remote_dir=remote_dir,
         exp_server=exp_server, sync_artifacts=args.sync_artifacts,
-        exp_dir=exp_dir, abbrev=abbrev)
+        exp_dir=exp_dir, abbrev=abbrev, run_from=run_from)
 
     has_failures = print_summary(results, skipped, elapsed, abbrev=abbrev)
     sweep_print(f"\nOutput: {output_dir}")

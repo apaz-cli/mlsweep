@@ -3,7 +3,7 @@
 """File-based experiment logger.
 
 Writes run_meta.json and metrics.jsonl co-located with training output.
-If server is configured, also POSTs to exp_server.py for live visualization.
+If server is configured, also POSTs to mlsweep_server for live visualization.
 
 Local-first design: metrics are always written to local disk first. Server
 POSTs are best-effort. On reconnect after an outage, missed records are
@@ -13,15 +13,17 @@ Constructor parameters:
     log_dir     Directory for this run's files (created if absent).
     experiment  Experiment name (groups runs together).
     run_name    Unique name for this run.
-    tags        Dict of varied dimension values (str/int/float/bool).
     hparams     Full hyperparameter config dict (optional).
     server      http://host:port for exp_server.py (or set EXP_SERVER env var).
     tag         Optional prefix applied to every logged metric key.
 
 Env vars:
-    EXP_SERVER    http://host:port  (overridden by server= constructor arg)
-    EXP_TAGS      comma-separated key=value pairs merged into tags
-    MLSWEEP_TOKEN bearer token for server auth (overridden by token= constructor arg)
+    MLSWEEP_RUN_DIR   log directory for this run (used when log_dir= is unset)
+    MLSWEEP_RUN_NAME  unique run name (used when run_name= is unset)
+    EXP_EXPERIMENT    experiment name (used when experiment= is unset)
+    EXP_SERVER        http://host:port for the tracking server (used when server= is unset)
+    EXP_TAGS          comma-separated key=value pairs merged into the run's tags
+    MLSWEEP_TOKEN     bearer token for server auth (used when token= is unset)
 """
 
 import json
@@ -29,11 +31,15 @@ import logging
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any
+
+from mlsweep._utils import _git_root
 
 _logger = logging.getLogger(__name__)
 
@@ -42,16 +48,6 @@ def _git_head(path: str) -> str | None:
     """Return HEAD commit hash for the git repo containing path, or None."""
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
-
-
-def _git_root(path: str) -> str | None:
-    """Return the root directory of the git repo containing path, or None."""
-    try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=path,
                            capture_output=True, text=True, timeout=5)
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
@@ -94,16 +90,60 @@ class MLSweepLogger:
 
     def __init__(
         self,
-        log_dir: str,
+        log_dir: str | os.PathLike | None = None,
         *,
-        experiment: str,
-        run_name: str,
-        tags: dict[str, str | int | float | bool] | None = None,
-        hparams: dict | None = None,
+        experiment: str | None = None,
+        run_name: str | None = None,
+        hparams: dict[str, Any] | None = None,
         server: str | None = None,
         token: str | None = None,
-        tag: str | None = None,
-    ):
+        tag: str = "",
+    ) -> None:
+        """Create a new run logger.
+
+        All positional and keyword arguments fall back to environment variables
+        set by ``mlsweep_run``, so a sweep-integrated training script needs only::
+
+            logger = MLSweepLogger()
+
+        Args:
+            log_dir:    Directory for this run's files (created if absent).
+                        Defaults to ``MLSWEEP_RUN_DIR``.
+            experiment: Experiment name used to group runs together.
+                        Defaults to ``EXP_EXPERIMENT``.
+            run_name:   Unique name for this run.
+                        Defaults to ``MLSWEEP_RUN_NAME``.
+            hparams:    Full hyperparameter config dict (optional, for reference).
+            server:     ``http://host:port`` for mlsweep_server. Falls back to
+                        the ``EXP_SERVER`` environment variable.
+            token:      Bearer token for server auth. Falls back to the
+                        ``MLSWEEP_TOKEN`` environment variable.
+            tag:        Optional prefix applied to every logged metric key,
+                        e.g. ``"train"`` produces keys like ``"train/loss"``.
+
+        Raises:
+            RuntimeError: If any of ``log_dir``, ``experiment``, or ``run_name``
+                          is unset and its corresponding environment variable is missing.
+        """
+        log_dir = log_dir or os.getenv("MLSWEEP_RUN_DIR")
+        experiment = experiment or os.getenv("EXP_EXPERIMENT")
+        run_name = run_name or os.getenv("MLSWEEP_RUN_NAME")
+
+        if log_dir is None:
+            # Standalone mode — derive defaults, write under project root
+            if experiment is None:
+                experiment = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+            if run_name is None:
+                run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+            project_root = _git_root(os.getcwd()) or os.getcwd()
+            log_dir = os.path.join(project_root, "outputs", experiment, run_name)
+        else:
+            # Sweep mode — all three must be present
+            if not experiment:
+                raise RuntimeError("EXP_EXPERIMENT is not set.")
+            if not run_name:
+                raise RuntimeError("MLSWEEP_RUN_NAME is not set.")
+
         self.tag = tag
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
@@ -113,13 +153,13 @@ class MLSweepLogger:
         self.server = server or os.getenv("EXP_SERVER")
         self.token = token or os.getenv("MLSWEEP_TOKEN")
 
-        # Merge EXP_TAGS env var into tags dict
-        resolved_tags: dict[str, Any] = dict(tags or {})
+        # Parse EXP_TAGS env var (comma-separated key=value pairs)
+        resolved_tags: dict[str, Any] = {}
         for pair in os.getenv("EXP_TAGS", "").split(","):
             pair = pair.strip()
             if "=" in pair:
                 k, v = pair.split("=", 1)
-                resolved_tags.setdefault(k.strip(), v.strip())
+                resolved_tags[k.strip()] = v.strip()
 
         # Server connectivity state
         self._server_ok = self.server is not None
@@ -360,10 +400,15 @@ class MLSweepLogger:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        """Enqueue a metrics record. Never blocks the training loop."""
+        """Enqueue a metrics record. Never blocks the training loop.
+
+        Args:
+            metrics: Mapping of metric name to scalar value.
+            step:    Global training step (x-axis for plots).
+        """
         record: dict[str, Any] = {"step": step, "t": time.time()}
         for k, v in metrics.items():
-            key = k if self.tag is None else f"{self.tag}/{k}"
+            key = f"{self.tag}/{k}" if self.tag else k
             record[key] = v
         self._queue.put(record)
 
@@ -407,3 +452,4 @@ class MLSweepLogger:
                     "status": "completed",
                 },
             )
+

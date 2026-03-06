@@ -10,7 +10,7 @@ Storage layout:
         metrics.jsonl   — one JSON line per log() call, append-only
 
 Usage:
-    python exp_server.py --exp-dir outputs/sweeps --port 53800 --host 0.0.0.0
+    mlsweep_server --exp-dir outputs/sweeps --port 53800 --host 0.0.0.0
 
 API (write):
     POST /run/start    — register a new run, write run_meta.json
@@ -25,10 +25,15 @@ API (read):
     GET  /manifest.json?name=...                 — sweep manifest (axes, runs, metricNames)
     GET  /metric_since.json?name=...&metric=...&since_step=N  — incremental metric data
     GET  /run_status.json?name=...               — per-run status dict (O(1), no disk)
+
+Environment variables:
+    MLSWEEP_TOKEN   Fallback for --token (bearer token required on all POST requests)
 """
 
 import argparse
+import importlib.metadata
 import json
+from typing import IO, Any
 import os
 import socketserver
 import threading
@@ -37,6 +42,8 @@ import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+
+from mlsweep._utils import _detect_sub_axes, _parse_tag_value, _val_sort_key
 
 
 _verbose: bool = False
@@ -52,7 +59,7 @@ def _vlog(msg: str) -> None:
 # run_key = f"{experiment}/{run_name}"
 _experiments: dict[str, list[str]] = {}   # experiment → [run_name, ...]
 _run_dirs: dict[str, str] = {}             # run_key → absolute path
-_open_files: dict[str, object] = {}        # run_key → open append file handle
+_open_files: dict[str, IO[str]] = {}       # run_key → open append file handle
 
 # Per-run status: "pending" | "running" | "completed" | "failed" | "interrupted"
 _run_status: dict[str, str] = {}           # run_key → status string
@@ -81,9 +88,9 @@ def _is_interrupted(meta: dict) -> bool:
     hb = meta.get("last_heartbeat")
     now = time.time()
     if hb is not None:
-        return (now - hb) > _HEARTBEAT_STALE
+        return bool((now - hb) > _HEARTBEAT_STALE)
     # No heartbeat field: use start_time grace period
-    return meta.get("start_time", now) < (now - _STARTUP_GRACE)
+    return bool(meta.get("start_time", now) < (now - _STARTUP_GRACE))
 
 
 def _scan_disk(root_dir: str) -> None:
@@ -131,7 +138,7 @@ def _scan_disk(root_dir: str) -> None:
     print(f"Scanned {_root_dir}: {n_runs} runs across {n_exp} experiments", flush=True)
 
 
-def _get_or_open_file(experiment: str, run_name: str):
+def _get_or_open_file(experiment: str, run_name: str) -> IO[str] | None:
     """Return the open (line-buffered) append file handle for a run, opening if needed."""
     key = _run_key(experiment, run_name)
     with _files_lock:
@@ -150,7 +157,8 @@ def _get_or_open_file(experiment: str, run_name: str):
 # ── HTTP handler ───────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    _token: str | None = None  # set by main() if --token is provided
+    _token: str | None = None           # set by main() if --token is provided
+    _request_timeout: float = 30.0      # set by main() via --request-timeout
 
     def _check_token(self) -> bool:
         """Return True if the request is authorized (or no token configured)."""
@@ -159,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         return auth == f"Bearer {self._token}"
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         if not self._check_token():
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Bearer realm="exp-server"')
@@ -175,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         try:
             self._handle_get()
         except Exception:
@@ -189,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
-        return json.loads(raw)
+        return json.loads(raw)  # type: ignore[no-any-return]
 
     def _send(self, code: int, content_type: str, body: bytes,
               cache: str = "no-store") -> None:
@@ -253,13 +261,13 @@ class Handler(BaseHTTPRequestHandler):
 
             key = _run_key(experiment, run_name)
             with _lock:
-                run_dir = _run_dirs.get(key)
-            if run_dir is None:
+                end_run_dir: str | None = _run_dirs.get(key)
+            if end_run_dir is None:
                 self.send_response(404)
                 self.end_headers()
                 return
 
-            meta_path = os.path.join(run_dir, "run_meta.json")
+            meta_path = os.path.join(end_run_dir, "run_meta.json")
             try:
                 with open(meta_path) as f:
                     meta = json.load(f)
@@ -322,15 +330,15 @@ class Handler(BaseHTTPRequestHandler):
 
             key = _run_key(experiment, run_name)
             with _lock:
-                run_dir = _run_dirs.get(key)
-            if run_dir is None:
+                replay_run_dir: str | None = _run_dirs.get(key)
+            if replay_run_dir is None:
                 # Run not registered yet — auto-register from first replay
                 # (handles the case where /run/start was lost during outage)
                 self.send_response(404)
                 self.end_headers()
                 return
 
-            metrics_path = os.path.join(run_dir, "metrics.jsonl")
+            metrics_path = os.path.join(replay_run_dir, "metrics.jsonl")
 
             # Read existing steps to deduplicate
             existing_steps: set[int] = set()
@@ -386,10 +394,8 @@ class Handler(BaseHTTPRequestHandler):
                 best = 0.0
                 with _lock:
                     runs = list(_experiments.get(exp, []))
-                for rn in runs:
-                    key = _run_key(exp, rn)
-                    with _lock:
-                        rd = _run_dirs.get(key)
+                    run_dirs_snap = [_run_dirs.get(_run_key(exp, rn)) for rn in runs]
+                for rd in run_dirs_snap:
                     if rd:
                         try:
                             with open(os.path.join(rd, "run_meta.json")) as f:
@@ -446,15 +452,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
-            data = _load_manifest(name)
-            if data is None:
+            manifest: dict | None = _load_manifest(name)
+            if manifest is None:
                 self._send_json({"error": "manifest not found"}, code=404)
                 return
             # Populate metricNames dynamically if empty
-            if not data.get("metricNames"):
-                data["metricNames"] = _discover_metric_names(name)
+            if not manifest.get("metricNames"):
+                manifest["metricNames"] = _discover_metric_names(name)
             # Manifest is immutable once written; cache indefinitely
-            self._send_json(data, cache="public, max-age=31536000")
+            self._send_json(manifest, cache="public, max-age=31536000")
 
         elif parsed.path == "/metric_since.json":
             name = qs.get("name", [None])[0]
@@ -488,55 +494,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt: str, *args: object) -> None:
         if _verbose:
             print(f"  -> {fmt % args}", flush=True)
 
 
 # ── Data builders ──────────────────────────────────────────────────────────────
 
-def _parse_tag_value(s: str):
-    """Convert a tag value string to a typed Python value."""
-    if s == "True":
-        return True
-    if s == "False":
-        return False
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
-
-
-def _detect_sub_axes(runs: list[dict], axes: dict) -> dict:
-    """Detect axes that only appear when a parent axis has a specific value.
-
-    Shared utility used by both _build_experiment_meta (backward compat) and
-    sweep_manifest population.
-    """
-    all_names = {r["hash"] for r in runs}
-    names_with = {ax: {r["hash"] for r in runs if ax in r["combo"]} for ax in axes}
-    sub_axes: dict = {}
-    for axis in axes:
-        if names_with[axis] == all_names:
-            continue  # universal axis — not a sub-axis
-        for parent_axis in axes:
-            if parent_axis == axis:
-                continue
-            for parent_val in axes[parent_axis]:
-                names_with_parent = {
-                    r["hash"] for r in runs if r["combo"].get(parent_axis) == parent_val
-                }
-                if names_with_parent == names_with[axis]:
-                    sub_axes[axis] = {"parentAxis": parent_axis, "parentValue": parent_val}
-                    break
-            if axis in sub_axes:
-                break
-    return sub_axes
 
 
 def _build_experiment_meta(experiment_name: str) -> dict:
@@ -546,7 +510,6 @@ def _build_experiment_meta(experiment_name: str) -> dict:
 
     axis_values: dict[str, set] = {}
     runs = []
-    metric_names: set[str] = set()
 
     for run_name in run_names:
         key = _run_key(experiment_name, run_name)
@@ -565,36 +528,16 @@ def _build_experiment_meta(experiment_name: str) -> dict:
         combo = {k: _parse_tag_value(str(v)) for k, v in tags.items()}
         for k, v in combo.items():
             axis_values.setdefault(k, set()).add(v)
-
         runs.append({"name": run_name, "hash": run_name, "combo": combo})
 
-        metrics_path = os.path.join(run_dir, "metrics.jsonl")
-        try:
-            with open(metrics_path) as f:
-                first_line = f.readline()
-            if first_line.strip():
-                rec = json.loads(first_line)
-                for k in rec:
-                    if k not in ("step", "t"):
-                        metric_names.add(k)
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    def val_sort_key(v):
-        if isinstance(v, bool):
-            return (0, str(v))
-        if isinstance(v, (int, float)):
-            return (1, v)
-        return (2, str(v))
-
-    axes = {k: sorted(vs, key=val_sort_key) for k, vs in axis_values.items()}
+    axes = {k: sorted(vs, key=_val_sort_key) for k, vs in axis_values.items()}
     sub_axes = _detect_sub_axes(runs, axes)
 
     return {
         "experiment": experiment_name,
         "axes": axes,
         "runs": runs,
-        "metricNames": sorted(metric_names),
+        "metricNames": _discover_metric_names(experiment_name),
         "subAxes": sub_axes,
     }
 
@@ -643,15 +586,13 @@ def _load_manifest(experiment_name: str) -> dict | None:
     manifest_path = os.path.join(_root_dir, experiment_name, "sweep_manifest.json")
     try:
         with open(manifest_path) as f:
-            return json.load(f)
+            return json.load(f)  # type: ignore[no-any-return]
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def _discover_metric_names(experiment_name: str) -> list[str]:
     """Discover metric names from first available metrics.jsonl in an experiment."""
-    with _lock:
-        run_names = list(_experiments.get(experiment_name, []))
     with _lock:
         run_names = list(_experiments.get(experiment_name, []))
 
@@ -778,7 +719,7 @@ class ThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -803,6 +744,9 @@ def main():
     parser.add_argument(
         "--verbose", action="store_true",
         help="Log every request received and response sent")
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
     args = parser.parse_args()
 
     global _verbose

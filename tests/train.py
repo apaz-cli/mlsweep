@@ -6,9 +6,9 @@ metrics via MLSweepLogger. Reads run dir/name/experiment from the env
 vars set by mlsweep_run; falls back to sensible defaults for standalone use.
 """
 
+import os
 import argparse
 import math
-import os
 import sys
 import time
 
@@ -22,19 +22,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
-    experiment = os.environ.get("EXP_EXPERIMENT", "test")
-    run_name = os.environ.get("MLSWEEP_RUN_NAME", "fake_train")
-    log_dir = os.environ.get(
-        "MLSWEEP_RUN_DIR",
-        os.path.join("/tmp/mlsweep_test", experiment, run_name),
-    )
-
-    logger = MLSweepLogger(
-        log_dir,
-        experiment=experiment,
-        run_name=run_name,
-        tags={"lr": args.lr, "batch_size": args.batch_size},
-    )
+    logger = MLSweepLogger(hparams=vars(args))
 
     print(f"[fake_train] lr={args.lr}  batch_size={args.batch_size}")
 

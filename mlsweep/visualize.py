@@ -3,20 +3,26 @@
 """
 Sweep experiment visualizer.
 
-Loads training metrics from JSONL files (or exp_server.py) and serves an
+Loads training metrics from JSONL files (or mlsweep_server) and serves an
 interactive browser UI for exploring loss curves across experimental axes.
 
 Usage:
-    python visualize_experiment.py                                  # newest experiment
-    python visualize_experiment.py debug_smoke_...                  # specific experiment
-    python visualize_experiment.py --open-browser
-    python visualize_experiment.py --port 43801
-    python visualize_experiment.py --server http://host:53800        # remote server
-    python visualize_experiment.py --dir ./outputs/sweeps            # local files
+    mlsweep_viz                                                     # newest experiment
+    mlsweep_viz debug_smoke_...                                     # specific experiment
+    mlsweep_viz --open-browser
+    mlsweep_viz --port 43801
+    mlsweep_viz --server http://host:53800                          # remote server
+    mlsweep_viz --dir ./outputs/sweeps                              # local files
+
+Environment variables:
+    EXP_SERVER      Fallback for --server (http://host:port for mlsweep_server)
+    MLSWEEP_TOKEN   Fallback for --token (bearer auth token for mlsweep_server)
 """
 
 import argparse
 import base64
+import importlib.metadata
+from typing import Any
 import json
 import math
 import os
@@ -30,35 +36,27 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from mlsweep._utils import _detect_sub_axes, _parse_tag_value, _val_sort_key
+
 # Default exp source: check EXP_SERVER env var, fall back to local sweeps dir.
 
 # ── Data loading (dual-mode: HTTP server OR direct file reads) ─────────────────
 
-def _parse_tag_value(s):
-    """Convert a tag value string back to a typed Python value."""
-    if s == "True":  return True
-    if s == "False": return False
-    try:    return int(s)
-    except ValueError: pass
-    try:    return float(s)
-    except ValueError: pass
-    return s
 
-
-def _http_get_json(base_url, path):
+def _http_get_json(base_url: str, path: str) -> dict:
     """GET JSON from an HTTP server. Returns parsed dict."""
     url = base_url.rstrip("/") + path
     with urllib.request.urlopen(url, timeout=30) as resp:
-        return json.loads(resp.read())
+        return json.loads(resp.read())  # type: ignore[no-any-return]
 
 
-def list_experiments(source):
+def list_experiments(source: str) -> list[str]:
     """Return all experiment names, sorted newest-first.
 
     source: http://host:port  OR  local/path/to/sweeps
     """
     if source.startswith("http"):
-        return _http_get_json(source, "/experiments")["experiments"]
+        return _http_get_json(source, "/experiments")["experiments"]  # type: ignore[no-any-return]
 
     # File mode: walk subdirs, find experiment names from run_meta.json files
     root = Path(source)
@@ -77,7 +75,7 @@ def list_experiments(source):
     return sorted(latest, key=lambda e: latest[e], reverse=True)
 
 
-def load_experiment_meta(experiment_name, source):
+def load_experiment_meta(experiment_name: str, source: str) -> dict:
     """Return axes, run combos, and metric names — no metric data loaded.
 
     Returns {"experiment", "axes", "runs", "metricNames", "subAxes"}.
@@ -89,9 +87,9 @@ def load_experiment_meta(experiment_name, source):
 
     # File mode: walk source/experiment_name/*/run_meta.json
     root = Path(source) / experiment_name
-    axis_values: dict = {}
-    runs = []
-    metric_names: set = set()
+    axis_values: dict[str, set] = {}
+    runs: list[dict[str, Any]] = []
+    metric_names: set[str] = set()
 
     for meta_path in sorted(root.glob("*/run_meta.json")):
         try:
@@ -122,37 +120,14 @@ def load_experiment_meta(experiment_name, source):
         except (OSError, json.JSONDecodeError):
             pass
 
-    def val_sort_key(v):
-        if isinstance(v, bool):         return (0, str(v))
-        if isinstance(v, (int, float)): return (1, v)
-        return                                  (2, str(v))
-
-    axes = {k: sorted(vs, key=val_sort_key) for k, vs in axis_values.items()}
-
-    # Detect sub-axes
-    all_hashes = {r["hash"] for r in runs}
-    hashes_with = {ax: {r["hash"] for r in runs if ax in r["combo"]} for ax in axes}
-    sub_axes: dict = {}
-    for axis in axes:
-        if hashes_with[axis] == all_hashes:
-            continue
-        for parent_axis in axes:
-            if parent_axis == axis:
-                continue
-            for parent_val in axes[parent_axis]:
-                hashes_with_parent = {r["hash"] for r in runs
-                                      if r["combo"].get(parent_axis) == parent_val}
-                if hashes_with_parent == hashes_with[axis]:
-                    sub_axes[axis] = {"parentAxis": parent_axis, "parentValue": parent_val}
-                    break
-            if axis in sub_axes:
-                break
+    axes = {k: sorted(vs, key=_val_sort_key) for k, vs in axis_values.items()}
+    sub_axes = _detect_sub_axes(runs, axes)
 
     return {"experiment": experiment_name, "axes": axes, "runs": runs,
             "metricNames": sorted(metric_names), "subAxes": sub_axes}
 
 
-def load_manifest(experiment_name, source):
+def load_manifest(experiment_name: str, source: str) -> dict | None:
     """Return the sweep manifest dict, or None if not found."""
     if source.startswith("http"):
         try:
@@ -167,7 +142,7 @@ def load_manifest(experiment_name, source):
     p = Path(source) / experiment_name / "sweep_manifest.json"
     try:
         with open(p) as f:
-            data = json.load(f)
+            data: dict = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -193,7 +168,7 @@ def load_manifest(experiment_name, source):
     return data
 
 
-def load_metric_since(experiment_name, metric_name, since_step, source):
+def load_metric_since(experiment_name: str, metric_name: str, since_step: int, source: str) -> dict[str, dict[str, list[Any]]]:
     """Return {run_name: {steps, values}} for steps strictly greater than since_step."""
     if source.startswith("http"):
         path = (f"/metric_since.json?name={urllib.parse.quote(experiment_name)}"
@@ -229,7 +204,7 @@ def load_metric_since(experiment_name, metric_name, since_step, source):
     return result
 
 
-def load_run_status(experiment_name, source):
+def load_run_status(experiment_name: str, source: str) -> dict[str, str]:
     """Return {run_name: status_string} for all known runs."""
     if source.startswith("http"):
         path = f"/run_status.json?name={urllib.parse.quote(experiment_name)}"
@@ -247,7 +222,7 @@ def load_run_status(experiment_name, source):
     return result
 
 
-def load_metric_data(experiment_name, metric_name, source):
+def load_metric_data(experiment_name: str, metric_name: str, source: str) -> dict[str, dict[str, list[Any]]]:
     """Load one metric's values for all runs in an experiment.
 
     Returns {run_name: {"steps": [...], "values": [...]}} — keyed by run_name
@@ -422,6 +397,9 @@ input[type=number]::-webkit-outer-spin-button { opacity: 1; }
 #theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer;
                 color: var(--text-dim); padding: 0; line-height: 1; flex-shrink: 0; }
 #theme-toggle:hover { color: var(--text); }
+
+#sweep-note { font-size: 11px; color: var(--text-muted); font-style: italic;
+              margin-top: 4px; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -429,6 +407,7 @@ input[type=number]::-webkit-outer-spin-button { opacity: 1; }
   <div>
     <h1>Sweep Visualizer</h1>
     <div class="exp-name loading" id="exp-name">Fetching data…</div>
+    <div id="sweep-note" style="display:none"></div>
   </div>
 
   <div class="section">
@@ -1083,6 +1062,14 @@ function init(data) {
   METRIC_CACHE = {};
   colorBy      = Object.keys(DATA.axes)[0];
 
+  const noteEl = document.getElementById("sweep-note");
+  if (DATA.note) {
+    noteEl.textContent = DATA.note;
+    noteEl.style.display = "";
+  } else {
+    noteEl.style.display = "none";
+  }
+
   filters = Object.fromEntries(
     Object.entries(DATA.axes).map(([axis, vals]) => [axis, new Set(vals)])
   );
@@ -1356,13 +1343,13 @@ _META_CACHE_TTL = 30.0  # seconds for live experiment discovery
 
 class Handler(BaseHTTPRequestHandler):
     # experiment name → (timestamp, json_bytes); 30s TTL for live runs
-    _meta_cache: dict = {}
-    _default    = None
-    exp_source  = None
+    _meta_cache: dict[str, tuple[float, bytes]] = {}
+    _default: str | None = None
+    exp_source: str = ""
     poll_interval: int = 2
     token: str | None = None
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         qs     = urllib.parse.parse_qs(parsed.query)
 
@@ -1410,13 +1397,13 @@ class Handler(BaseHTTPRequestHandler):
             name = qs.get("name", [None])[0]
             if not name:
                 self.send_response(400); self.end_headers(); return
-            data = load_manifest(name, self.exp_source)
-            if data is None:
+            manifest_data = load_manifest(name, self.exp_source)
+            if manifest_data is None:
                 self.send_response(404); self.end_headers(); return
-            body = json.dumps(data).encode()
+            body = json.dumps(manifest_data).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "public, max-age=31536000")
             self.end_headers()
             self.wfile.write(body)
@@ -1450,25 +1437,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def _send(self, code, content_type, body):
+    def _send(self, code: int, content_type: str, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", len(body))
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
+    def log_message(self, fmt: str, *args: object) -> None:
         pass  # suppress request logs
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("experiment", nargs="?",
                         help="Experiment name to pre-load (default: newest)")
     parser.add_argument("--server", default=None, metavar="URL",
-                        help="http://host:port for exp_server.py "
+                        help="http://host:port for mlsweep_server "
                              "(also read from EXP_SERVER env var)")
     parser.add_argument("--dir", default=None, metavar="PATH",
                         help="Local path to sweeps directory (default: ./outputs/sweeps)")
@@ -1479,8 +1466,11 @@ def main():
         help="Live-update poll interval in seconds (default: 10)")
     parser.add_argument(
         "--token", default=None, metavar="SECRET",
-        help="Bearer token to include in requests to exp_server "
+        help="Bearer token to include in requests to mlsweep_server "
              "(also read from MLSWEEP_TOKEN env var)")
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
     args = parser.parse_args()
 
     exp_source = (
