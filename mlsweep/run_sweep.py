@@ -3,6 +3,7 @@
 """Run experiment sweeps. See docs/sweep_configuration.md for format and usage."""
 
 import argparse
+import functools
 import importlib.metadata
 import importlib.util
 import itertools
@@ -460,23 +461,24 @@ def _visible_devices() -> list[int]:
     return []
 
 
-def _discover_remote_gpus(workers: list[str]) -> list[tuple[str, int]]:
-    """SSH to each worker, count GPUs. Returns [(worker, gpu_id), ...]."""
+def _discover_remote_gpus(workers: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
+    """SSH to each worker, count GPUs. Returns [(worker, remote_dir, gpu_id), ...]."""
     slots = []
-    for w in workers:
+    for w, remote_dir in workers:
         ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", w]
+
         try:
             result = subprocess.run(
                 ssh_prefix + ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line:
-                        slots.append((w, int(line)))
-                continue
-        except (subprocess.TimeoutExpired, ValueError) as e:
+        except subprocess.TimeoutExpired as e:
             sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
+            continue
+        if result.returncode == 0:
+            slots.extend(
+                (w, remote_dir, int(line.strip()))
+                for line in result.stdout.splitlines() if line.strip()
+            )
             continue
 
         # nvidia-smi unavailable — try amd-smi
@@ -484,18 +486,16 @@ def _discover_remote_gpus(workers: list[str]) -> list[tuple[str, int]]:
             result = subprocess.run(
                 ssh_prefix + ["amd-smi", "topology", "--json"],
                 capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                try:
-                    data = json.loads(result.stdout)
-                    for entry in data:
-                        if "gpu" in entry:
-                            slots.append((w, entry["gpu"]))
-                    continue
-                except (json.JSONDecodeError, ValueError):
-                    pass
         except subprocess.TimeoutExpired as e:
             sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
             continue
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                slots.extend((w, remote_dir, e["gpu"]) for e in data if "gpu" in e)
+                continue
+            except (json.JSONDecodeError, ValueError):
+                pass
 
         sweep_print(f"  {_RED}WARN{_RESET}  {w}: no GPU management tool found (tried nvidia-smi, amd-smi)")
     return slots
@@ -571,6 +571,7 @@ def _parse_amd_topo_output(text: str) -> dict[tuple[int, int], int]:
     return scores
 
 
+@functools.lru_cache(maxsize=None)
 def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
     """Query GPU interconnect topology via nvidia-smi or amd-smi.
 
@@ -649,19 +650,53 @@ def _best_gpu_groups(devices: list[int], group_size: int, n_groups: int, worker:
     return groups
 
 
-def _parse_workers(workers_arg: str) -> list[str]:
-    """Parse --workers argument: comma-separated list or @file."""
-    if workers_arg.startswith("@"):
-        path = workers_arg[1:]
-        with open(path) as f:
-            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    return [w.strip() for w in workers_arg.split(",") if w.strip()]
+def _parse_workers(path: str) -> list[tuple[str, str, int | None, int | None]]:
+    """Parse workers file. Each line: <ssh_target> <remote_dir> [-g N] [-j N].
+
+    Returns [(worker, remote_dir, gpus, jobs_per_gpu)] where gpus and jobs_per_gpu are
+    None if not specified.
+    """
+    result = []
+    with open(path) as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(
+                    f"{path}:{lineno}: expected '<host> <remote_dir> [-g N] [-j N]', got {line!r}"
+                )
+            host, remote_dir = parts[0], parts[1]
+            gpus: int | None = None
+            jobs: int | None = None
+            i = 2
+            while i < len(parts):
+                if parts[i] in ("-g", "-j") and i + 1 < len(parts):
+                    try:
+                        val = int(parts[i + 1])
+                    except ValueError:
+                        raise ValueError(
+                            f"{path}:{lineno}: {parts[i]} requires an integer, got {parts[i + 1]!r}"
+                        )
+                    if parts[i] == "-g":
+                        gpus = val
+                    else:
+                        jobs = val
+                    i += 2
+                else:
+                    raise ValueError(
+                        f"{path}:{lineno}: unexpected token {parts[i]!r}; "
+                        f"expected '<host> <remote_dir> [-g N] [-j N]'"
+                    )
+            result.append((host, remote_dir, gpus, jobs))
+    return result
 
 
 def _get_default_exp_server() -> str:
     """Get default exp server address (this machine's hostname + default port)."""
     try:
-        # Get the first non-loopback IP
+        # Get the first non-loopback IP (doesn't actually send a request)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
@@ -714,14 +749,25 @@ def _run_one(command: list[str], var: dict[str, Any], output_dir: str, experimen
             run_vars = _run_env_dict(device, run_dir, name, experiment, tag_str, exp_server)
             env = {**os.environ, **run_vars}
 
+            effective_cwd = (
+                os.path.join(_PROJECT_ROOT, run_from)
+                if run_from and not os.path.isabs(run_from)
+                else run_from or _PROJECT_ROOT
+            )
             with open(log, "w", buffering=1) as f:
                 subprocess.run(cmd, env=env, stdout=f,
                                stderr=subprocess.STDOUT, check=True,
-                               cwd=run_from or _PROJECT_ROOT)
+                               cwd=effective_cwd)
         else:
             # === REMOTE execution via SSH ===
             assert remote_dir is not None, "remote_dir required for SSH dispatch"
-            remote_run_dir = os.path.join(remote_dir, "outputs", "sweeps", experiment, name)
+            rel = os.path.relpath(output_dir, _PROJECT_ROOT)
+            remote_output_dir = (
+                os.path.join(remote_dir, rel)
+                if not rel.startswith("..")
+                else os.path.join(remote_dir, "outputs", "sweeps")
+            )
+            remote_run_dir = os.path.join(remote_output_dir, experiment, name)
             remote_log = os.path.join(remote_run_dir, "training.log")
 
             run_vars = _run_env_dict(device, remote_run_dir, name, experiment, tag_str, exp_server)
@@ -893,19 +939,20 @@ def _update_sweep_status(exp_dir: str, run_name: str, status: str,
 
 def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: str, experiment: str,
               expected: int, extra: list[str],
-              gpu_slots: list[tuple[str | None, list[int]]], jobs_per_gpu: int,
-              remote_dir: str | None = None, exp_server: str | None = None,
+              gpu_slots: list[tuple[str | None, list[int], str | None, int]],
+              exp_server: str | None = None,
               sync_artifacts: bool = False, exp_dir: str | None = None,
               abbrev: dict[str, str] | None = None, run_from: str | None = None) -> tuple[list[tuple[Any, ...]], int, float]:
     """Execute all variations. Single code path for sequential and parallel.
 
-    gpu_slots: list of (worker, gpu_group) tuples. worker=None means local; gpu_group is a list of GPU ids.
+    gpu_slots: list of (worker, gpu_group, remote_dir, jobs_per_slot) tuples.
+               worker=None and remote_dir=None means local.
     expected:  expected number of resolved treatments (from count_expected).
     command:   list[str] from the sweep file's COMMAND.
     exp_dir:   experiment output directory (for manifest/status updates).
     abbrev:    optional abbreviation dict for singular dim display.
     """
-    num_slots = len(gpu_slots) * jobs_per_gpu
+    num_slots = sum(jpg for _, _, _, jpg in gpu_slots)
     has_singular = any(
         o.get("singular")
         for var in variations
@@ -921,24 +968,24 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
     t0 = time.time()
     pad = max((len(v["name"]) for v in variations), default=0)
 
-    # GPU pool: each slot appears jobs_per_gpu times
-    # Slots are (worker, gpu_id) tuples — worker=None for local
-    gpu_q: queue.Queue[tuple[str | None, list[int]]] = queue.Queue()
-    for worker, gpu_id in gpu_slots:
-        for _ in range(jobs_per_gpu):
-            gpu_q.put((worker, gpu_id))
+    # GPU pool: each slot appears jobs_per_slot times
+    # Slots are (worker, gpu_group, remote_dir) — worker=None and remote_dir=None for local
+    gpu_q: queue.Queue[tuple[str | None, list[int], str | None]] = queue.Queue()
+    for worker, gpu_group, remote_dir, jobs_per_slot in gpu_slots:
+        for _ in range(jobs_per_slot):
+            gpu_q.put((worker, gpu_group, remote_dir))
 
     skipped_count = 0
 
     def _job_worker(var: dict[str, Any]) -> None:
         nonlocal skipped_count
-        worker, gpu = gpu_q.get()
+        worker, gpu, remote_dir = gpu_q.get()
         opts = var["effective_options"]
 
         # Pre-flight: re-check skip in case treatment was resolved while queued
         with lock:
             if should_skip(var["combo"], failed, succeeded, opts):
-                gpu_q.put((worker, gpu))
+                gpu_q.put((worker, gpu, remote_dir))
                 skipped_count += 1
                 return
 
@@ -951,13 +998,9 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
         while os.path.exists(log):
             n += 1
             log = os.path.join(run_dir, f"training.{n}.log")
-        gpu_str = ",".join(str(g) for g in gpu)
-        gpu_label = f"gpu{'s' if len(gpu) > 1 else ''} {gpu_str}"
+        gpu_label = f"gpu{'s' if len(gpu) > 1 else ''} {','.join(str(g) for g in gpu)}"
+        loc = f"{_MAGENTA}{worker}{_RESET} {gpu_label}" if worker else gpu_label
         with lock:
-            if worker:
-                loc = f"{_MAGENTA}{worker}{_RESET} {gpu_label}"
-            else:
-                loc = gpu_label
             if sdesc:
                 sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log}{_RESET}")
             else:
@@ -977,7 +1020,7 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
             sweep_print(f"{_RED}ERROR{_RESET}  {var['name']}: unexpected exception: {e}")
             ok, elapsed, log = False, time.time() - job_t0, "?"
         finally:
-            gpu_q.put((worker, gpu))
+            gpu_q.put((worker, gpu, remote_dir))
 
         # Update sweep_status.json
         if exp_dir:
@@ -998,10 +1041,6 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
                 tag = f"{_YELLOW}PROBE{_RESET}"
             else:
                 tag = f"{_RED} FAIL{_RESET}"
-            if worker:
-                loc = f"{_MAGENTA}{worker}{_RESET} {gpu_label}"
-            else:
-                loc = gpu_label
             sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log}{_RESET} {elapsed:.1f}s [{nr}/{expected} resolved]")
 
         return
@@ -1010,12 +1049,14 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
         """Process any already-completed futures to update state before skip checks."""
         for f in [f for f in futures if f.done()]:
             f.result()
-            del futures[f]
+            futures.discard(f)
+        for tk, f in [item for item in inflight.items() if item[1].done()]:
+            del inflight[tk]
 
     inflight: dict[tuple, Any] = {}  # treatment_key -> most recent future for that treatment
 
     with ThreadPoolExecutor(max_workers=num_slots) as pool:
-        futures: dict[Any, Any] = {}
+        futures: set[Any] = set()
         remaining = list(variations)
         while remaining:
             deferred = []
@@ -1031,10 +1072,10 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
 
                 # Wait for a slot if pool is full
                 while len(futures) >= num_slots:
-                    done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
                     for f in done:
                         f.result()
-                        del futures[f]
+                        futures.discard(f)
 
                 # Check skip with most up-to-date state
                 with lock:
@@ -1045,15 +1086,15 @@ def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: 
                     continue
 
                 f = pool.submit(_job_worker, var)
-                futures[f] = var
+                futures.add(f)
                 inflight[tk] = f
 
             remaining = deferred
             if remaining and futures:
-                done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for f in done:
                     f.result()
-                    del futures[f]
+                    futures.discard(f)
 
         # Drain remaining futures
         for f in list(futures):
@@ -1121,49 +1162,60 @@ def print_summary(results: list[tuple[Any, ...]], skipped: int, elapsed: float, 
 # ── Main ───────────────────────────────────────────────────────────────────
 
 
-def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None) -> tuple[list[tuple[str | None, list[int]]], str | None]:
+def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None) -> tuple[list[tuple[str | None, list[int], str | None, int]], str | None]:
     """Resolve and return (gpu_slots, exp_server).
 
     Remote mode: discovers GPUs via SSH, groups them topology-aware per worker.
     Local mode: uses visible GPUs, groups them topology-aware locally.
+    Slots are (worker, gpu_group, remote_dir, jobs_per_slot);
+    worker=None and remote_dir=None for local.
     """
     if args.workers:
         # Remote mode: discover GPUs on each worker via SSH
         worker_list = _parse_workers(args.workers)
+        # Build per-worker gpu/jobs config from workers file
+        worker_config: dict[str, tuple[int | None, int]] = {
+            w: (gpus, jobs if jobs is not None else 1)
+            for w, _, gpus, jobs in worker_list
+        }
         sweep_print(f"Discovering GPUs on {len(worker_list)} workers...")
-        gpu_slots = _discover_remote_gpus(worker_list)
-        if not gpu_slots:
+        raw_slots = _discover_remote_gpus([(w, rd) for w, rd, _, _ in worker_list])
+        if not raw_slots:
             sweep_print(f"{_RED}Error: no reachable workers with GPUs{_RESET}")
             sys.exit(1)
         if exp_server is None:
             exp_server = _get_default_exp_server()
-        # Group raw [(worker, gpu_id)] by worker
-        worker_gpu_map: dict[str, list[int]] = {}
-        for w, g in gpu_slots:
-            worker_gpu_map.setdefault(w, []).append(g)
-        # Optional per-worker GPU cap (--gpus)
-        if args.gpus is not None and args.gpus > 0:
-            worker_gpu_map = {w: gpus[:args.gpus] for w, gpus in worker_gpu_map.items()}
+        # Group raw [(worker, remote_dir, gpu_id)] by worker: {w: (remote_dir, [gpus])}
+        worker_info: dict[str, tuple[str, list[int]]] = {}
+        for w, rd, g in raw_slots:
+            if w not in worker_info:
+                worker_info[w] = (rd, [])
+            worker_info[w][1].append(g)
         # Topology-aware slot building per worker
-        grouped_slots: list[tuple[str | None, list[int]]] = []
-        for w in sorted(worker_gpu_map):
-            worker_gpus = worker_gpu_map[w]
+        grouped_slots: list[tuple[str | None, list[int], str | None, int]] = []
+        for w in sorted(worker_info):
+            remote_dir, worker_gpus = worker_info[w]
+            w_gpus, w_jobs = worker_config.get(w, (None, 1))
+            if w_gpus is not None and w_gpus > 0:
+                worker_gpus = worker_gpus[:w_gpus]
             n_slots = len(worker_gpus) // gpus_per_run
             if n_slots == 0:
                 sweep_print(f"  {_YELLOW}WARN{_RESET}  {w}: only {len(worker_gpus)} GPU(s), "
                             f"need {gpus_per_run} per run — skipping")
                 continue
             groups = _best_gpu_groups(worker_gpus, gpus_per_run, n_slots, worker=w)
-            grouped_slots.extend((w, grp) for grp in groups)
+            grouped_slots.extend((w, grp, remote_dir, w_jobs) for grp in groups)
         if not grouped_slots:
             sweep_print(f"{_RED}Error: no workers with enough GPUs for GPUS_PER_RUN={gpus_per_run}{_RESET}")
             sys.exit(1)
         # Show discovered topology
-        worker_slot_counts = Counter(wk for wk, _ in grouped_slots)
+        worker_slot_counts = Counter(wk for wk, _, _, _ in grouped_slots)
         for wk, cnt in sorted(worker_slot_counts.items()):
             total_gpus = cnt * gpus_per_run
             slot_word = "slot" if cnt == 1 else "slots"
-            sweep_print(f"  {_GREEN}OK{_RESET}    {wk}: {cnt} {slot_word} ({total_gpus} GPUs)")
+            _, w_jobs = worker_config.get(wk, (None, 1))
+            jpg_str = f", {w_jobs} job{'s' if w_jobs != 1 else ''}/slot" if w_jobs != 1 else ""
+            sweep_print(f"  {_GREEN}OK{_RESET}    {wk}: {cnt} {slot_word} ({total_gpus} GPUs{jpg_str})")
         sweep_print(f"Exp server: {exp_server}")
         return grouped_slots, exp_server
     else:
@@ -1179,11 +1231,11 @@ def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None
             num_gpus = gpus_per_run   # default: one slot
         elif args.gpus == 0:
             num_gpus = len(visible)   # all visible
-        elif args.gpus > len(visible):
-            sweep_print(f"Error: requested {args.gpus} GPUs but only {len(visible)} visible")
-            sys.exit(1)
         else:
             num_gpus = args.gpus
+        if num_gpus > len(visible):
+            sweep_print(f"Error: need {num_gpus} GPUs but only {len(visible)} visible")
+            sys.exit(1)
         if num_gpus < gpus_per_run:
             sweep_print(f"Error: need at least {gpus_per_run} GPUs (GPUS_PER_RUN) "
                         f"but only {num_gpus} requested")
@@ -1194,8 +1246,9 @@ def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None
                         f"using {(num_gpus // gpus_per_run) * gpus_per_run}")
         n_slots = num_gpus // gpus_per_run
         usable = n_slots * gpus_per_run
+        jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
         groups = _best_gpu_groups(visible[:usable], gpus_per_run, n_slots)
-        return [(None, grp) for grp in groups], exp_server
+        return [(None, grp, None, jobs_per_slot) for grp in groups], exp_server
 
 
 def main() -> None:
@@ -1241,12 +1294,10 @@ def main() -> None:
                         help="Experiment name (default: <sweep>_<timestamp>)")
     parser.add_argument("--gpus", "-g", type=int, nargs="?", const=0, default=None,
                         help="Total GPUs to use (0 = all visible; default = GPUS_PER_RUN or 1)")
-    parser.add_argument("--jobs-per-gpu", "-j", type=int, default=1,
-                        help="Concurrent jobs per GPU (default: 1)")
+    parser.add_argument("--jobs-per-gpu", "-j", type=int, default=None,
+                        help="Concurrent jobs per GPU (default: 1; per-machine when using --workers, specify in workers file)")
     parser.add_argument("--workers", default=None,
-                        help="SSH targets for remote dispatch (comma-separated or @file)")
-    parser.add_argument("--remote-dir", default=None,
-                        help="Repo path on workers (default: same as local)")
+                        help="Path to workers file for remote dispatch (one '<host> <remote_dir>' per line)")
     parser.add_argument("--exp-server", default=None,
                         help="Exp tracking server host:port (default: auto-detect for remote workers)")
     parser.add_argument("--sync-artifacts", action="store_true",
@@ -1267,6 +1318,18 @@ def main() -> None:
     if extra and extra[0] == "--":
         extra = extra[1:]
 
+    if args.workers and (args.gpus is not None or args.jobs_per_gpu is not None):
+        conflicting = []
+        if args.gpus is not None:
+            conflicting.append("-g/--gpus")
+        if args.jobs_per_gpu is not None:
+            conflicting.append("-j/--jobs-per-gpu")
+        sweep_print(
+            f"Error: {' and '.join(conflicting)} cannot be used with --workers. "
+            f"Specify -g and -j per machine in the workers file instead."
+        )
+        sys.exit(1)
+
     if sweep_name is None:
         assert sweeps is not None
         info = sweeps[args.sweep]
@@ -1275,6 +1338,7 @@ def main() -> None:
         extra_flags = info.get("extra_flags", [])
         abbrev      = info.get("abbrev")
         gpus_per_run = info.get("gpus_per_run", 1)
+        run_from = info.get("run_from")
         validate_options(options)
 
     assert options is not None and command is not None
@@ -1300,8 +1364,7 @@ def main() -> None:
             sweep_print(f"  {var['name']}: {var['combo']}")
         sys.exit(0)
 
-    # GPU setup: build list of (worker, gpu_id) slots
-    remote_dir = args.remote_dir or _PROJECT_ROOT
+    # GPU setup: build list of (worker, gpu_group, remote_dir) slots
     exp_server = args.exp_server
     gpu_slots, exp_server = _setup_gpu_slots(args, gpus_per_run, exp_server)
 
@@ -1333,7 +1396,7 @@ def main() -> None:
     variations = all_variations
     n = len(variations)
 
-    num_total_slots = len(gpu_slots) * args.jobs_per_gpu
+    num_total_slots = sum(jpg for _, _, _, jpg in gpu_slots)
 
     # Header
     sweep_print(f"Command: {' '.join(command)}")
@@ -1343,10 +1406,10 @@ def main() -> None:
         sweep_print(f"Sweep: {sweep_name} ({n} runs)")
     sweep_print(f"Experiment: {experiment}")
     if args.workers:
-        sweep_print(f"GPU slots: {len(gpu_slots)}, jobs/GPU: {args.jobs_per_gpu},"
-                    f" workers: {num_total_slots}")
+        sweep_print(f"GPU slots: {len(gpu_slots)}, total workers: {num_total_slots}")
     else:
-        sweep_print(f"GPUs: {len(gpu_slots)}, jobs/GPU: {args.jobs_per_gpu},"
+        jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
+        sweep_print(f"GPUs: {len(gpu_slots)}, jobs/GPU: {jobs_per_slot},"
                     f" workers: {num_total_slots}")
     if gpus_per_run > 1:
         sweep_print(f"GPUs/run: {gpus_per_run}")
@@ -1386,7 +1449,7 @@ def main() -> None:
 
     results, skipped, elapsed = run_sweep(
         variations, command, output_dir, experiment, expected, extra,
-        gpu_slots, args.jobs_per_gpu, remote_dir=remote_dir,
+        gpu_slots,
         exp_server=exp_server, sync_artifacts=args.sync_artifacts,
         exp_dir=exp_dir, abbrev=abbrev, run_from=run_from)
 

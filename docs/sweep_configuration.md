@@ -153,10 +153,11 @@ See [Multi-GPU Runs (torchrun)](#multi-gpu-runs-torchrun) below for a complete e
 An optional string specifying the working directory passed to each local run's subprocess. Defaults to the git root of the directory where `mlsweep_run` is invoked.
 
 ```python
-RUN_FROM = "/home/user/myproject"
+RUN_FROM = "/abs/path/to/dir"   # absolute
+RUN_FROM = "subdir"              # relative — resolved from git root
 ```
 
-This is useful when the sweep file lives outside the project root, or when the training command uses paths relative to a specific directory. Ignored for remote runs (which `cd` to `--remote-dir` on the worker instead).
+This is useful when the sweep file lives outside the project root, or when the training command uses paths relative to a specific directory. Relative paths are resolved against the git root. Ignored for remote runs (which `cd` to the worker's `remote_dir` from the workers file instead).
 
 ### `EXTRA_FLAGS`
 
@@ -291,10 +292,9 @@ The shebang line to use is:
 | `--sweep <name>` | Name of the sweep (loads `sweeps/<name>.py`). Required in named mode. |
 | `--output_dir <dir>` | Directory where run outputs will be stored. Default: `<git-root>/outputs/sweeps`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>`. |
-| `-g [N]`, `--gpus [N]` | GPUs to use. `-g` alone = all visible GPUs. `-g N` = N GPUs. Default: 1. |
-| `-j N`, `--jobs-per-gpu N` | Concurrent jobs per GPU. Default: 1. Total workers = GPUs × jobs-per-GPU. |
-| `--workers <targets>` | SSH targets for remote dispatch. Comma-separated or `@file` (one host per line). |
-| `--remote-dir <path>` | Repo path on remote workers. Default: git root of the local working directory. |
+| `-g [N]`, `--gpus [N]` | GPUs to use (local mode only). `-g` alone = all visible GPUs. `-g N` = N GPUs. Default: 1. Cannot be combined with `--workers`. |
+| `-j N`, `--jobs-per-gpu N` | Concurrent jobs per GPU (local mode only). Default: 1. Cannot be combined with `--workers`. |
+| `--workers <file>` | Path to a workers file for remote dispatch. Each line: `<host> <remote_dir> [-g N] [-j N]`. |
 | `--exp-server <host:port>` | Experiment tracking server. Auto-detected in remote mode (local machine IP:53800). |
 | `--sync-artifacts` | After each remote job, rsync run outputs back to the local machine. |
 | `--resume` | Skip runs already recorded as completed in `sweep_status.json`. |
@@ -312,18 +312,25 @@ GPUs are allocated to jobs in a round-robin fashion; oversubscription with `-j` 
 Use `--workers` to dispatch jobs to remote machines via SSH (passwordless key-based auth required):
 
 ```bash
-mlsweep_run --sweep beta --workers user@host1,user@host2 --remote-dir /home/user/myproject
+mlsweep_run --sweep beta --workers workers.txt
 ```
 
-The runner SSH-discovers available GPUs on each worker, then dispatches jobs across all of them. The `--gpus` flag, when combined with `--workers`, acts as a per-worker GPU limit.
+The workers file lists one entry per line. `remote_dir` is the repo root on that machine — the directory the training command runs from. Lines starting with `#` are ignored.
 
-A `@file` syntax is supported for large worker lists:
-
-```bash
-mlsweep_run --sweep beta --workers @workers.txt --remote-dir /home/user/myproject
+```
+# workers.txt
+user@host1 /home/user/myproject
+user@host2 /home/user/myproject -g 4 -j 2
+user@host3 /home/user/myproject -g 8
 ```
 
-`workers.txt` should have one SSH target per line; lines starting with `#` are ignored.
+Each line supports optional `-g N` (GPUs to use on that machine) and `-j N` (concurrent jobs per GPU slot on that machine). If omitted, all discovered GPUs are used and jobs-per-slot defaults to 1.
+
+The `-g` and `-j` flags cannot be passed on the command line when `--workers` is specified — use the per-machine entries in the workers file instead.
+
+The runner SSH-discovers available GPUs on each worker, then dispatches jobs across all of them.
+
+Run outputs on each worker land at `<remote_dir>/<relative path of --output_dir from local git root>/`. With the default `--output_dir` this is `<remote_dir>/outputs/sweeps/`.
 
 An experiment tracking server is started on the local machine and its address is automatically passed to all workers via `EXP_SERVER`. Override with `--exp-server <host:port>`.
 
