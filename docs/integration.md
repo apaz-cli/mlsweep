@@ -86,11 +86,15 @@ with MLSweepLogger(**hparams) as logger:
     for step in range(1, num_steps + 1):
         loss = train_step()
         logger.log({"loss": loss}, step=step)
+
+        # Write checkpoints to MLSWEEP_RUN_DIR — they get rsynced back automatically.
+        # Call logger.sync() to trigger an immediate rsync mid-run (fire-and-forget).
+        if step % 1000 == 0:
+            save_checkpoint(os.environ["MLSWEEP_RUN_DIR"], step)
+            logger.sync()
 ```
 
-
-
-No-op when run outside of mlsweep_run. Results land in `outputs/sweeps/<experiment>/<run>/metrics.jsonl`.
+No-op when run outside of mlsweep_run. Metrics land in `outputs/sweeps/<experiment>/<run>/metrics.jsonl`. Anything written to `MLSWEEP_RUN_DIR` is rsynced to `outputs/sweeps/<experiment>/<run>/artifacts/` — at the end of every run, and immediately on `logger.sync()`.
 
 ### 4. Write a sweep.
 
