@@ -5,6 +5,7 @@
 ```bash
 git clone <your-project>
 cd <your-project>
+python -m venv .venv
 pip install mlsweep
 ```
 
@@ -93,8 +94,9 @@ No-op when run outside of mlsweep_run. Results land in `outputs/sweeps/<experime
 
 ### 4. Write a sweep.
 
+Add the following shebang, and use chmod +x so that that your sweep file can be directly executable.
+
 ```python
-# sweeps/my_sweep.py
 #!/usr/bin/env mlsweep_run
 
 COMMAND = ["python", "train.py"]
@@ -117,7 +119,7 @@ This produces 9 runs named `my_sweep_lr1e-4_bs32`, `my_sweep_lr1e-4_bs64`, etc.
 
 Each run receives its flags appended to `COMMAND`: `python train.py --optimizer.lr 0.0001 --training.batch_size 32`.
 
-See [sweep_configuration.md](sweep_configuration.md) for the full format: subdimensions, monotonic/singular skipping, `EXCLUDE`, `GPUS_PER_RUN`, and more.
+See [sweep_configuration.md](sweep_configuration.md) for the full format: subdimensions, monotonic/singular skipping, `EXCLUDE`, `GPUS_PER_RUN` for training with `torchrun`, and more.
 
 ### 5. Run.
 
@@ -136,6 +138,9 @@ mlsweep_viz experiment_name
 ```
 
 This will prompt you to open up a browser (or pass --open-browser to do so automatically) to see the sweep visualizer.
+It will watch your experiment folder and update the metrics viewer in real time.
+
+![Viewer in progress](./mlsweep_viz.png)
 
 ## Troubleshooting
 
