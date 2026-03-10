@@ -1,0 +1,7 @@
+[[workers]]
+host = "aaron@95.133.252.99"
+remote_dir = "/home/aaron/git/mlsweep"
+ssh_key = "~/.ssh/B300_key"
+venv = "/home/aaron/git/mlsweep"
+devices = [5, 6, 7]
+jobs = 10

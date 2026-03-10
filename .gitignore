@@ -1,5 +1,7 @@
 mlsweep.egg-info/**
+mlsweep/_bin/parsync
 .venv/**
 venv/**
 **/__pycache__/**
 **/outputs/**
+**/*.swp

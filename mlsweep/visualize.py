@@ -3,25 +3,22 @@
 """
 Sweep experiment visualizer.
 
-Loads training metrics from JSONL files (or mlsweep_server) and serves an
-interactive browser UI for exploring loss curves across experimental axes.
+Reads training metrics from local JSONL files and serves an interactive browser
+UI for exploring loss curves across experimental dims.
 
 Usage:
     mlsweep_viz                                                     # newest experiment
     mlsweep_viz debug_smoke_...                                     # specific experiment
     mlsweep_viz --open-browser
     mlsweep_viz --port 43801
-    mlsweep_viz --server http://host:53800                          # remote server
     mlsweep_viz --dir ./outputs/sweeps                              # local files
-
-Environment variables:
-    EXP_SERVER      Fallback for --server (http://host:port for mlsweep_server)
-    MLSWEEP_TOKEN   Fallback for --token (bearer auth token for mlsweep_server)
 """
 
 import argparse
 import base64
+import dataclasses
 import importlib.metadata
+import queue
 from typing import Any
 import json
 import math
@@ -31,36 +28,27 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from mlsweep._utils import _detect_sub_axes, _parse_tag_value, _val_sort_key
+from mlsweep._shared import _detect_sub_dims, _parse_tag_value, _val_sort_key
 
-# Default exp source: check EXP_SERVER env var, fall back to local sweeps dir.
-
-# ── Data loading (dual-mode: HTTP server OR direct file reads) ─────────────────
+# ── Data loading (file-based) ──────────────────────────────────────────────────
 
 
-def _http_get_json(base_url: str, path: str) -> dict:
-    """GET JSON from an HTTP server. Returns parsed dict."""
-    url = base_url.rstrip("/") + path
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        return json.loads(resp.read())  # type: ignore[no-any-return]
-
-
-def list_experiments(source: str) -> list[str]:
-    """Return all experiment names, sorted newest-first.
-
-    source: http://host:port  OR  local/path/to/sweeps
-    """
-    if source.startswith("http"):
-        return _http_get_json(source, "/experiments")["experiments"]  # type: ignore[no-any-return]
-
-    # File mode: walk subdirs, find experiment names from run_meta.json files
-    root = Path(source)
+def list_experiments(output_dir: str) -> list[str]:
+    """Return all experiment names, sorted newest-first."""
+    root = Path(output_dir)
     latest: dict[str, float] = {}
+
+    # New format: directories with sweep_manifest.json
+    for manifest_path in root.glob("*/sweep_manifest.json"):
+        exp = manifest_path.parent.name
+        t = manifest_path.stat().st_mtime
+        latest[exp] = max(latest.get(exp, 0.0), t)
+
+    # Old format: run_meta.json files (backward compat)
     for meta_path in root.glob("*/*/run_meta.json"):
         try:
             with open(meta_path) as f:
@@ -68,28 +56,52 @@ def list_experiments(source: str) -> list[str]:
             exp = meta.get("experiment")
             if exp:
                 t = meta.get("start_time", 0.0)
-                if exp not in latest or t > latest[exp]:
-                    latest[exp] = t
+                latest[exp] = max(latest.get(exp, 0.0), t)
         except (OSError, json.JSONDecodeError):
             pass
+
     return sorted(latest, key=lambda e: latest[e], reverse=True)
 
 
-def load_experiment_meta(experiment_name: str, source: str) -> dict:
-    """Return axes, run combos, and metric names — no metric data loaded.
+def load_experiment_meta(experiment_name: str, output_dir: str) -> dict[str, Any]:
+    """Return dims, run combos, and metric names — no metric data loaded.
 
-    Returns {"experiment", "axes", "runs", "metricNames", "subAxes"}.
+    Returns {"experiment", "dims", "runs", "metricNames", "subDims"}.
     Each run contains {"name", "hash", "combo"} where "hash" == run_name.
     """
-    if source.startswith("http"):
-        path = f"/data.json?name={urllib.parse.quote(experiment_name)}"
-        return _http_get_json(source, path)
+    root = Path(output_dir) / experiment_name
 
-    # File mode: walk source/experiment_name/*/run_meta.json
-    root = Path(source) / experiment_name
-    axis_values: dict[str, set] = {}
+    # New format: sweep_manifest.json has everything
+    manifest_path = root / "sweep_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest: dict[str, Any] = json.load(f)
+            # Populate metricNames if missing
+            if not manifest.get("metricNames"):
+                metric_names: set[str] = set()
+                for metrics_path in sorted(root.glob("*/metrics.jsonl")):
+                    try:
+                        with open(metrics_path) as f:
+                            first_line = f.readline()
+                        if first_line.strip():
+                            rec = json.loads(first_line)
+                            for k in rec:
+                                if k not in ("step",):
+                                    metric_names.add(k)
+                        if metric_names:
+                            break
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                manifest["metricNames"] = sorted(metric_names)
+            return manifest
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Old format: scan run_meta.json files
+    dim_values: dict[str, set[Any]] = {}
     runs: list[dict[str, Any]] = []
-    metric_names: set[str] = set()
+    old_metric_names: set[str] = set()
 
     for meta_path in sorted(root.glob("*/run_meta.json")):
         try:
@@ -102,12 +114,10 @@ def load_experiment_meta(experiment_name: str, source: str) -> dict:
         tags = meta.get("tags", {})
         combo = {k: _parse_tag_value(str(v)) for k, v in tags.items()}
         for k, v in combo.items():
-            axis_values.setdefault(k, set()).add(v)
+            dim_values.setdefault(k, set()).add(v)
 
-        # Use run_name as "hash" so JS METRIC_CACHE can key into it
         runs.append({"name": run_name, "hash": run_name, "combo": combo})
 
-        # Discover metric names from first line of metrics.jsonl (fast)
         metrics_path = meta_path.parent / "metrics.jsonl"
         try:
             with open(metrics_path) as f:
@@ -116,40 +126,30 @@ def load_experiment_meta(experiment_name: str, source: str) -> dict:
                 rec = json.loads(first_line)
                 for k in rec:
                     if k not in ("step", "t"):
-                        metric_names.add(k)
+                        old_metric_names.add(k)
         except (OSError, json.JSONDecodeError):
             pass
 
-    axes = {k: sorted(vs, key=_val_sort_key) for k, vs in axis_values.items()}
-    sub_axes = _detect_sub_axes(runs, axes)
+    dims = {k: sorted(vs, key=_val_sort_key) for k, vs in dim_values.items()}
+    sub_dims = _detect_sub_dims(runs, dims)
 
-    return {"experiment": experiment_name, "axes": axes, "runs": runs,
-            "metricNames": sorted(metric_names), "subAxes": sub_axes}
+    return {"experiment": experiment_name, "dims": dims, "runs": runs,
+            "metricNames": sorted(old_metric_names), "subDims": sub_dims}
 
 
-def load_manifest(experiment_name: str, source: str) -> dict | None:
+def load_manifest(experiment_name: str, output_dir: str) -> dict[str, Any] | None:
     """Return the sweep manifest dict, or None if not found."""
-    if source.startswith("http"):
-        try:
-            path = f"/manifest.json?name={urllib.parse.quote(experiment_name)}"
-            return _http_get_json(source, path)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            raise
-        except (urllib.error.URLError, OSError):
-            return None
-    p = Path(source) / experiment_name / "sweep_manifest.json"
+    p = Path(output_dir) / experiment_name / "sweep_manifest.json"
     try:
         with open(p) as f:
-            data: dict = json.load(f)
+            data: dict[str, Any] = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
 
     metric_names_val = data.get("metricNames")
     if not metric_names_val:
-        metric_names = set()
-        root = Path(source) / experiment_name
+        metric_names: set[str] = set()
+        root = Path(output_dir) / experiment_name
         for metrics_path in sorted(root.glob("*/metrics.jsonl")):
             try:
                 with open(metrics_path) as f:
@@ -168,99 +168,219 @@ def load_manifest(experiment_name: str, source: str) -> dict | None:
     return data
 
 
-def load_metric_since(experiment_name: str, metric_name: str, since_step: int, source: str) -> dict[str, dict[str, list[Any]]]:
-    """Return {run_name: {steps, values}} for steps strictly greater than since_step."""
-    if source.startswith("http"):
-        path = (f"/metric_since.json?name={urllib.parse.quote(experiment_name)}"
-                f"&metric={urllib.parse.quote(metric_name)}"
-                f"&since_step={int(since_step)}")
-        return _http_get_json(source, path)
-    root = Path(source) / experiment_name
-    result = {}
-    for metrics_path in sorted(root.glob("*/metrics.jsonl")):
-        run_name = metrics_path.parent.name
-        steps, values = [], []
+
+# ── Server-side file watcher ───────────────────────────────────────────────────
+
+
+@dataclasses.dataclass
+class _RunState:
+    offset: int = 0    # byte offset in metrics.jsonl (last fully read position)
+    mtime: float = 0.0
+    # metric_name → (steps, values)
+    metrics: dict[str, tuple[list[Any], list[Any]]] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class _ExpState:
+    runs: dict[str, _RunState] = dataclasses.field(default_factory=dict)
+    status: dict[str, str] = dataclasses.field(default_factory=dict)
+    status_mtime: float = 0.0
+
+
+_state_lock = threading.Lock()
+_experiments: dict[str, _ExpState] = {}
+_sub_lock = threading.Lock()
+_subscribers: dict[str, list["queue.Queue[bytes | None]"]] = {}
+_poll_interval: float = 1.0  # seconds; updated via /poll-interval endpoint
+
+
+def _broadcast(exp_name: str, event_type: str, data: dict[str, Any]) -> None:
+    msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
+    with _sub_lock:
+        subs = list(_subscribers.get(exp_name, []))
+    dead = []
+    for q in subs:
         try:
-            with open(metrics_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    step = rec.get("step")
-                    if step is None or step <= since_step:
-                        continue
-                    if metric_name in rec:
-                        steps.append(step)
-                        v = rec[metric_name]
-                        values.append(None if (isinstance(v, float) and math.isnan(v)) else v)
-        except OSError:
+            q.put_nowait(msg)
+        except queue.Full:
+            dead.append(q)
+    if dead:
+        with _sub_lock:
+            _subscribers[exp_name] = [q for q in _subscribers.get(exp_name, []) if q not in dead]
+
+
+def _broadcast_experiments(output_dir: str) -> None:
+    """Tell all connected clients about the current experiment list."""
+    exps = list_experiments(output_dir)
+    msg = f"event: experiments\ndata: {json.dumps({'experiments': exps})}\n\n".encode()
+    with _sub_lock:
+        all_queues = [q for subs in _subscribers.values() for q in subs]
+    for q in all_queues:
+        try:
+            q.put_nowait(msg)
+        except queue.Full:
+            pass
+
+
+def _check_exp_status(exp_name: str, exp_dir: Path) -> None:
+    status_path = exp_dir / "sweep_status.json"
+    try:
+        mtime = status_path.stat().st_mtime
+    except OSError:
+        return
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None or mtime <= state.status_mtime:
+            return
+        state.status_mtime = mtime
+    try:
+        with open(status_path) as f:
+            data: dict[str, Any] = json.load(f)
+        new_status = {k: v.get("status", "unknown") for k, v in data.items()}
+    except (OSError, json.JSONDecodeError):
+        return
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None:
+            return
+        changed = {k: v for k, v in new_status.items() if state.status.get(k) != v}
+        state.status.update(new_status)
+    for run, st in changed.items():
+        _broadcast(exp_name, "status", {"run": run, "status": st})
+
+
+def _check_run_metrics(
+    exp_name: str, run_name: str, metrics_path: Path
+) -> dict[str, dict[str, Any]] | None:
+    """Read new metric lines for one run. Returns {metric: {steps, values}} or None if no new data."""
+    try:
+        mtime = metrics_path.stat().st_mtime
+    except OSError:
+        return None
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None:
+            return None
+        if run_name not in state.runs:
+            state.runs[run_name] = _RunState()
+        run_state = state.runs[run_name]
+        if mtime <= run_state.mtime:
+            return None
+        run_state.mtime = mtime
+        offset = run_state.offset
+    try:
+        with open(metrics_path, "rb") as f:
+            f.seek(offset)
+            new_bytes = f.read()
+        new_offset = offset + len(new_bytes)
+    except OSError:
+        return None
+    if not new_bytes:
+        return None
+    updates: dict[str, tuple[list[Any], list[Any]]] = {}
+    for raw_line in new_bytes.decode(errors="replace").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
             continue
-        if steps:
-            result[run_name] = {"steps": steps, "values": values}
-    return result
-
-
-def load_run_status(experiment_name: str, source: str) -> dict[str, str]:
-    """Return {run_name: status_string} for all known runs."""
-    if source.startswith("http"):
-        path = f"/run_status.json?name={urllib.parse.quote(experiment_name)}"
-        return _http_get_json(source, path)
-    root = Path(source) / experiment_name
-    result = {}
-    for meta_path in sorted(root.glob("*/run_meta.json")):
         try:
-            with open(meta_path) as f:
+            rec: dict[str, Any] = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        step = rec.get("step")
+        if step is None:
+            continue
+        for k, v in rec.items():
+            if k == "step":
+                continue
+            if isinstance(v, float) and math.isnan(v):
+                v = None
+            if k not in updates:
+                updates[k] = ([], [])
+            updates[k][0].append(step)
+            updates[k][1].append(v)
+    if not updates:
+        return None
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None or run_name not in state.runs:
+            return None
+        run_state = state.runs[run_name]
+        run_state.offset = new_offset
+        for metric_name, (steps, values) in updates.items():
+            if metric_name not in run_state.metrics:
+                run_state.metrics[metric_name] = ([], [])
+            run_state.metrics[metric_name][0].extend(steps)
+            run_state.metrics[metric_name][1].extend(values)
+    return {k: {"steps": s, "values": v} for k, (s, v) in updates.items()}
+
+
+def _scan(output_dir: str) -> None:
+    root = Path(output_dir)
+    found: set[str] = set()
+    for p in root.glob("*/sweep_manifest.json"):
+        found.add(p.parent.name)
+    for p in root.glob("*/*/run_meta.json"):
+        try:
+            with open(p) as f:
                 meta = json.load(f)
+            if exp := meta.get("experiment"):
+                found.add(exp)
         except (OSError, json.JSONDecodeError):
-            continue
-        run_name = meta.get("run_name") or meta_path.parent.name
-        result[run_name] = meta.get("status", "unknown")
-    return result
+            pass
+    with _state_lock:
+        new_exps = found - set(_experiments)
+        for exp in new_exps:
+            _experiments[exp] = _ExpState()
+    if new_exps:
+        _broadcast_experiments(output_dir)
+    for exp_name in list(_experiments):
+        exp_dir = root / exp_name
+        _check_exp_status(exp_name, exp_dir)
+        # Collect all run updates for this tick, then broadcast once.
+        batch: dict[str, Any] = {}
+        for metrics_path in sorted(exp_dir.glob("*/metrics.jsonl")):
+            run_name = metrics_path.parent.name
+            run_updates = _check_run_metrics(exp_name, run_name, metrics_path)
+            if run_updates:
+                batch[run_name] = run_updates
+        if batch:
+            _broadcast(exp_name, "metrics", {"runs": batch})
 
 
-def load_metric_data(experiment_name: str, metric_name: str, source: str) -> dict[str, dict[str, list[Any]]]:
-    """Load one metric's values for all runs in an experiment.
-
-    Returns {run_name: {"steps": [...], "values": [...]}} — keyed by run_name
-    (same as "hash" in load_experiment_meta, so JS METRIC_CACHE works correctly).
-    """
-    if source.startswith("http"):
-        path = (f"/metric.json?name={urllib.parse.quote(experiment_name)}"
-                f"&metric={urllib.parse.quote(metric_name)}")
-        return _http_get_json(source, path)
-
-    # File mode: walk source/experiment_name/*/metrics.jsonl
-    root = Path(source) / experiment_name
-    result = {}
-
-    for metrics_path in sorted(root.glob("*/metrics.jsonl")):
-        run_name = metrics_path.parent.name
-        steps = []
-        values = []
+def _watch_loop(output_dir: str) -> None:
+    while True:
         try:
-            with open(metrics_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue  # skip truncated last line on live runs
-                    if metric_name in rec:
-                        steps.append(rec["step"])
-                        v = rec[metric_name]
-                        values.append(None if (isinstance(v, float) and math.isnan(v)) else v)
-        except OSError:
-            continue
-        if steps:
-            result[run_name] = {"steps": steps, "values": values}
+            _scan(output_dir)
+        except Exception:
+            pass
+        time.sleep(_poll_interval)
 
-    return result
+
+def _sse_init_snapshot(exp_name: str) -> dict[str, Any]:
+    """Build the initial snapshot for a new SSE subscriber (status only; metric data loaded on demand)."""
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None:
+            return {"status": {}}
+        return {"status": dict(state.status)}
+
+
+def _metric_data_snapshot(exp_name: str, metric_name: str) -> dict[str, Any]:
+    """Return all accumulated data for one metric across all runs.
+
+    Returns {run_name: {steps: [...], values: [...]}}.
+    """
+    with _state_lock:
+        state = _experiments.get(exp_name)
+        if state is None:
+            return {}
+        result: dict[str, Any] = {}
+        for run_name, run_state in state.runs.items():
+            if metric_name in run_state.metrics:
+                steps, values = run_state.metrics[metric_name]
+                result[run_name] = {"steps": list(steps), "values": list(values)}
+        return result
+
 
 
 # ── HTML / JS ─────────────────────────────────────────────────────────────────
@@ -426,7 +546,7 @@ input[type=number]::-webkit-outer-spin-button { opacity: 1; }
   <div class="section">
     <div class="section-title">Poll interval (sec)</div>
     <div class="row">
-      <input type="number" id="poll-interval" min="0.5" max="300" step="0.5" value="2" style="width:60px">
+      <input type="number" id="poll-interval" min="0.5" max="300" step="0.5" value="1" style="width:60px">
     </div>
   </div>
 
@@ -474,28 +594,25 @@ const PALETTE = [
   "#aec7e8","#ffbb78","#98df8a","#ff9896","#c5b0d5",
 ];
 
-let DATA         = null;  // experiment metadata (axes, runs, metricNames, subAxes)
+let DATA         = null;  // experiment metadata (dims, runs, metricNames, subDims)
 let METRIC_CACHE = {};    // metric_name → {run_hash: {steps, values}}, loaded on demand
-let colorBy      = null;  // axis name to color by (curves tab)
+let colorBy      = null;  // dim name to color by (curves tab)
 let metric       = "loss";
 let smoothAlpha  = 0;     // EMA alpha; 0 = disabled
-let filters      = {};    // axis → Set of visible values
+let filters      = {};    // dim → Set of visible values
 let METRIC_NAMES = [];    // populated by buildMetricSelect
 
 let activeTab    = "curves";
 const dirtyTabs  = new Set(["curves", "sensitivity"]);
 
-// ── Live-poll state ────────────────────────────────────────────────────────────
+// ── SSE state ─────────────────────────────────────────────────────────────────
 
-const CONFIG      = { poll_interval: 2 };   // seconds between poll ticks
-let LIVE_RUNS     = new Set();               // run hashes currently status=running
-let LAST_STEP     = {};                      // run_hash → last known step (int)
-let _pollActive   = false;                   // re-entrancy guard
-let _pollTimer    = null;                    // setInterval handle
+let LIVE_RUNS      = new Set();  // run hashes currently status=running
+let _evtSource     = null;       // EventSource for SSE updates
 // run_hash → line-trace index in chart-curves (populated by buildCurvesChart)
 let _traceIndexMap = {};
 // last EMA accumulator: {metric: {run_hash: s_prev}} for incremental smoothing
-const LAST_EMA_S  = {};
+let LAST_EMA_S     = {};
 
 // ── Tab management ────────────────────────────────────────────────────────────
 
@@ -570,10 +687,10 @@ function ema(vals, alpha) {
   return out;
 }
 
-// Map an array of axis values to palette colors.
-function colorMap(axisValues) {
+// Map an array of dim values to palette colors.
+function colorMap(dimValues) {
   const m = {};
-  axisValues.forEach((v, i) => { m[v] = PALETTE[i % PALETTE.length]; });
+  dimValues.forEach((v, i) => { m[v] = PALETTE[i % PALETTE.length]; });
   return m;
 }
 
@@ -604,14 +721,14 @@ function metricColorsForRuns(runs, metricName) {
   }));
 }
 
-function orderedComboEntries(combo, skipAxis) {
-  return Object.keys(DATA.axes)
-    .filter(k => k !== skipAxis && k in combo)
+function orderedComboEntries(combo, skipDim) {
+  return Object.keys(DATA.dims)
+    .filter(k => k !== skipDim && k in combo)
     .map(k => [k, combo[k]]);
 }
 
-function comboLabel(combo, skipAxis) {
-  return orderedComboEntries(combo, skipAxis)
+function comboLabel(combo, skipDim) {
+  return orderedComboEntries(combo, skipDim)
     .map(([k, v]) => `${k}=${v}`)
     .join("  ");
 }
@@ -624,7 +741,7 @@ function hoverText(combo) {
 
 function visibleRuns() {
   return DATA.runs.filter(r =>
-    Object.entries(filters).every(([axis, vals]) => !(axis in r.combo) || vals.has(r.combo[axis]))
+    Object.entries(filters).every(([dim, vals]) => !(dim in r.combo) || vals.has(r.combo[dim]))
   );
 }
 
@@ -648,20 +765,20 @@ function runScalar(runHash) {
   return vals.length ? vals[vals.length - 1] : null;
 }
 
-// For each axis, compute per-value means and the overall effect size
+// For each dim, compute per-value means and the overall effect size
 // (max_mean - min_mean). Returns array sorted descending by effect size.
-// Each element: { axis, effectSize, valueMeans: [{val, mean, scalars, count}] }
-function computeAxisEffects(runs) {
-  return Object.entries(DATA.axes).map(([axis, values]) => {
+// Each element: { dim, effectSize, valueMeans: [{val, mean, scalars, count}] }
+function computeDimEffects(runs) {
+  return Object.entries(DATA.dims).map(([dim, values]) => {
     const valueMeans = values.map(val => {
-      const matching = runs.filter(r => r.combo[axis] === val);
+      const matching = runs.filter(r => r.combo[dim] === val);
       const scalars = matching.map(r => runScalar(r.hash)).filter(v => v !== null);
       const mean = scalars.length ? scalars.reduce((a, b) => a + b, 0) / scalars.length : null;
       return { val, mean, scalars, count: scalars.length };
     }).filter(vm => vm.mean !== null);
     const means = valueMeans.map(vm => vm.mean);
     const effectSize = means.length >= 2 ? Math.max(...means) - Math.min(...means) : 0;
-    return { axis, effectSize, valueMeans };
+    return { dim, effectSize, valueMeans };
   }).sort((a, b) => b.effectSize - a.effectSize);
 }
 
@@ -671,9 +788,9 @@ function computeAxisEffects(runs) {
 function buildCurvesChart() {
   let runs = visibleRuns();
 
-  // When coloring by a sub-axis, hide runs that don't have that axis.
-  const subAxisInfo = DATA.subAxes || {};
-  if (!colorBy.startsWith("_m:") && subAxisInfo[colorBy])
+  // When coloring by a subdim, hide runs that don't have that dim.
+  const subDimInfo = DATA.subDims || {};
+  if (!colorBy.startsWith("_m:") && subDimInfo[colorBy])
     runs = runs.filter(r => colorBy in r.combo);
 
   const isMetricColor = colorBy.startsWith("_m:");
@@ -686,7 +803,7 @@ function buildCurvesChart() {
     showLegendFor   = ()    => false;
     legendGroupTitle = ()   => undefined;
   } else {
-    const cmap      = colorMap(DATA.axes[colorBy] || []);
+    const cmap      = colorMap(DATA.dims[colorBy] || []);
     const firstSeen = new Set();
     getColor  = r => cmap[r.combo[colorBy]] || "#888";
     getGroup  = r => String(r.combo[colorBy]);
@@ -782,7 +899,7 @@ function buildSensitivityChart() {
   const plotText = cssVar("--plot-text");
   const plotGrid = cssVar("--plot-grid");
 
-  const effects = computeAxisEffects(runs);
+  const effects = computeDimEffects(runs);
   if (!effects.length) {
     Plotly.react("chart-sensitivity", [], { paper_bgcolor: plotBg, plot_bgcolor: plotBg }, { responsive: true });
     document.getElementById("status").textContent = "No data";
@@ -791,7 +908,7 @@ function buildSensitivityChart() {
 
   const traces = [];
 
-  // Dumbbell connector lines: from min_mean to max_mean for each axis.
+  // Dumbbell connector lines: from min_mean to max_mean for each dim.
   effects.forEach(e => {
     if (e.valueMeans.length < 2) return;
     const xVals = e.valueMeans.map(vm => vm.mean);
@@ -800,14 +917,14 @@ function buildSensitivityChart() {
       type: "scatter",
       mode: "lines",
       x: [xMin, xMax],
-      y: [e.axis, e.axis],
+      y: [e.dim, e.dim],
       line: { color: cssVar("--text-dim"), width: 2 },
       showlegend: false,
       hoverinfo: "skip",
     });
   });
 
-  // One scatter trace per unique value label for consistent cross-axis coloring.
+  // One scatter trace per unique value label for consistent cross-dim coloring.
   const allLabels = [...new Set(
     effects.flatMap(e => e.valueMeans.map(vm => String(vm.val)))
   )];
@@ -819,9 +936,9 @@ function buildSensitivityChart() {
       const vm = e.valueMeans.find(v => String(v.val) === label);
       if (!vm) return;
       xs.push(vm.mean);
-      ys.push(e.axis);
+      ys.push(e.dim);
       customdata.push({
-        axis: e.axis, val: label, count: vm.count,
+        dim: e.dim, val: label, count: vm.count,
         effectSize: e.effectSize.toFixed(4),
       });
     });
@@ -839,7 +956,7 @@ function buildSensitivityChart() {
       },
       customdata,
       hovertemplate:
-        "<b>%{customdata.axis} = %{customdata.val}</b><br>" +
+        "<b>%{customdata.dim} = %{customdata.val}</b><br>" +
         `Mean ${metric}: %{x:.4f}<br>` +
         "n=%{customdata.count}<br>" +
         "Effect size: %{customdata.effectSize}<extra></extra>",
@@ -891,37 +1008,37 @@ function buildSensitivityChart() {
 // ── Sidebar builders ──────────────────────────────────────────────────────────
 
 function buildFilters() {
-  const subAxisInfo = DATA.subAxes || {};
-  const subAxisSet  = new Set(Object.keys(subAxisInfo));
+  const subDimInfo = DATA.subDims || {};
+  const subDimSet  = new Set(Object.keys(subDimInfo));
 
-  // childrenOf["parentAxis:parentValue"] = [childAxis, ...]
+  // childrenOf["parentDim:parentValue"] = [childDim, ...]
   const childrenOf = {};
-  for (const [axis, info] of Object.entries(subAxisInfo)) {
-    const key = `${info.parentAxis}:${info.parentValue}`;
-    (childrenOf[key] = childrenOf[key] || []).push(axis);
+  for (const [dim, info] of Object.entries(subDimInfo)) {
+    const key = `${info.parentDim}:${info.parentValue}`;
+    (childrenOf[key] = childrenOf[key] || []).push(dim);
   }
 
   const container = document.getElementById("filters");
   container.innerHTML = "";
 
-  function makeFilterGroup(axis, values, extraClass) {
-    const isColorAxis = !colorBy.startsWith("_m:") && axis === colorBy;
-    const cmap_       = isColorAxis ? colorMap(values) : {};
+  function makeFilterGroup(dim, values, extraClass) {
+    const isColorDim = !colorBy.startsWith("_m:") && dim === colorBy;
+    const cmap_      = isColorDim ? colorMap(values) : {};
 
     const group = document.createElement("div");
     group.className = "filter-group" + (extraClass ? " " + extraClass : "");
 
     const header = document.createElement("div");
     header.className = "filter-header";
-    header.innerHTML = `<span class="axis-label">${axis}</span>`;
+    header.innerHTML = `<span class="axis-label">${dim}</span>`;
     const btns = document.createElement("div");
     btns.className = "filter-btns";
     ["all", "none"].forEach(action => {
       const b = document.createElement("button");
       b.textContent = action;
       b.onclick = () => {
-        filters[axis] = action === "all" ? new Set(values) : new Set();
-        group.querySelectorAll(`input[data-axis="${CSS.escape(axis)}"]`)
+        filters[dim] = action === "all" ? new Set(values) : new Set();
+        group.querySelectorAll(`input[data-dim="${CSS.escape(dim)}"]`)
              .forEach(cb => { cb.checked = action === "all"; });
         buildActiveChart();
       };
@@ -938,15 +1055,15 @@ function buildFilters() {
 
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.dataset.axis = axis;
-      cb.checked = filters[axis]?.has(val) ?? true;
+      cb.dataset.dim = dim;
+      cb.checked = filters[dim]?.has(val) ?? true;
       cb.addEventListener("change", () => {
-        if (cb.checked) filters[axis].add(val); else filters[axis].delete(val);
+        if (cb.checked) filters[dim].add(val); else filters[dim].delete(val);
         buildActiveChart();
       });
       row.appendChild(cb);
 
-      if (isColorAxis) {
+      if (isColorDim) {
         const swatch = document.createElement("div");
         swatch.className = "color-swatch";
         swatch.style.background = cmap_[val] || "#ccc";
@@ -959,9 +1076,9 @@ function buildFilters() {
       row.appendChild(lbl);
       list.appendChild(row);
 
-      // Nest any child axes under this value, hidden when unchecked.
-      for (const childAxis of (childrenOf[`${axis}:${val}`] || [])) {
-        const childGroup = makeFilterGroup(childAxis, DATA.axes[childAxis] || [], "sub-filter-group");
+      // Nest any child dims under this value, hidden when unchecked.
+      for (const childDim of (childrenOf[`${dim}:${val}`] || [])) {
+        const childGroup = makeFilterGroup(childDim, DATA.dims[childDim] || [], "sub-filter-group");
         if (!cb.checked) childGroup.classList.add("hidden");
         cb.addEventListener("change", () => childGroup.classList.toggle("hidden", !cb.checked));
         list.appendChild(childGroup);
@@ -972,32 +1089,32 @@ function buildFilters() {
     return group;
   }
 
-  for (const [axis, values] of Object.entries(DATA.axes)) {
-    if (subAxisSet.has(axis)) continue;  // rendered inline under parent
-    container.appendChild(makeFilterGroup(axis, values, null));
+  for (const [dim, values] of Object.entries(DATA.dims)) {
+    if (subDimSet.has(dim)) continue;  // rendered inline under parent
+    container.appendChild(makeFilterGroup(dim, values, null));
   }
 }
 
 function buildColorBySelect() {
-  const container   = document.getElementById("color-by");
-  const subAxisInfo = DATA.subAxes || {};
+  const container  = document.getElementById("color-by");
+  const subDimInfo = DATA.subDims || {};
   container.innerHTML = "";
 
-  for (const axis of Object.keys(DATA.axes)) {
-    const id    = "cbr-" + axis;
+  for (const dim of Object.keys(DATA.dims)) {
+    const id    = "cbr-" + dim;
     const input = document.createElement("input");
-    input.type = "radio"; input.name = "color-by"; input.id = id; input.value = axis;
+    input.type = "radio"; input.name = "color-by"; input.id = id; input.value = dim;
 
     const lbl = document.createElement("label");
     lbl.htmlFor = id;
-    const info = subAxisInfo[axis];
-    lbl.textContent = info ? `${axis} (${info.parentValue})` : axis;
-    if (axis === colorBy) lbl.classList.add("checked");
+    const info = subDimInfo[dim];
+    lbl.textContent = info ? `${dim} (${info.parentValue})` : dim;
+    if (dim === colorBy) lbl.classList.add("checked");
 
     input.addEventListener("change", () => {
       container.querySelectorAll("label").forEach(l => l.classList.remove("checked"));
       lbl.classList.add("checked");
-      colorBy = axis;
+      colorBy = dim;
       buildFilters();
       buildActiveChart();
     });
@@ -1023,44 +1140,46 @@ function buildMetricSelect() {
 
 // ── Init & loading ────────────────────────────────────────────────────────────
 
-function loadMetric(name) {
-  const expNameEl = document.getElementById("exp-name");
+// Tracks metrics whose initial HTTP fetch is in-flight to avoid duplicate
+// population from concurrent SSE metric events.
+const _metricFetching = new Set();
 
-  if (METRIC_CACHE[name]) {
-    metric = name;
+function loadMetric(name) {
+  metric = name;
+  if (METRIC_CACHE[name] !== undefined) {
     buildActiveChart();
     return;
   }
-
+  if (_metricFetching.has(name)) return;
   const expName = document.getElementById("experiment-sel").value;
-  expNameEl.classList.add("loading");
-  expNameEl.textContent = `Loading ${name}…`;
-
-  fetch(`/metric.json?name=${encodeURIComponent(expName)}&metric=${encodeURIComponent(name)}`)
+  if (!expName) return;
+  _metricFetching.add(name);
+  fetch(`/metric_data.json?experiment=${encodeURIComponent(expName)}&metric=${encodeURIComponent(name)}`)
     .then(r => r.json())
     .then(data => {
-      METRIC_CACHE[name] = data;
-      metric = name;
-      // Initialize LAST_STEP so the poll loop fetches only new data.
-      for (const [runName, mdata] of Object.entries(data)) {
-        const steps = (mdata || {}).steps || [];
-        if (steps.length) LAST_STEP[runName] = steps[steps.length - 1];
+      _metricFetching.delete(name);
+      // Merge: SSE may have added live updates to METRIC_CACHE[name] while we
+      // were fetching; keep whichever is more complete per run.
+      if (!METRIC_CACHE[name]) {
+        METRIC_CACHE[name] = data;
+      } else {
+        // SSE already created entries; historical fetch wins for any run not
+        // already in cache (SSE events are incremental from live offset).
+        for (const [run, runData] of Object.entries(data)) {
+          if (!METRIC_CACHE[name][run]) {
+            METRIC_CACHE[name][run] = runData;
+          }
+        }
       }
-      expNameEl.classList.remove("loading");
-      expNameEl.textContent = DATA.experiment;
-      buildActiveChart();
+      if (metric === name) buildActiveChart();
     })
-    .catch(e => {
-      expNameEl.classList.remove("loading");
-      expNameEl.textContent = DATA.experiment;
-      document.getElementById("status").textContent = "Error loading metric: " + e;
-    });
+    .catch(() => { _metricFetching.delete(name); });
 }
 
 function init(data) {
   DATA         = data;
   METRIC_CACHE = {};
-  colorBy      = Object.keys(DATA.axes)[0];
+  colorBy      = Object.keys(DATA.dims)[0];
 
   const noteEl = document.getElementById("sweep-note");
   if (DATA.note) {
@@ -1071,7 +1190,7 @@ function init(data) {
   }
 
   filters = Object.fromEntries(
-    Object.entries(DATA.axes).map(([axis, vals]) => [axis, new Set(vals)])
+    Object.entries(DATA.dims).map(([dim, vals]) => [dim, new Set(vals)])
   );
 
   // Wire up one-time event listeners.
@@ -1105,7 +1224,7 @@ function init(data) {
   loadMetric(metric);
 }
 
-// ── Live poll ─────────────────────────────────────────────────────────────────
+// ── SSE connection ────────────────────────────────────────────────────────────
 
 function _applyEmaIncremental(newValues, lastS) {
   // Apply EMA to newValues using lastS as the seed accumulator.
@@ -1121,145 +1240,128 @@ function _applyEmaIncremental(newValues, lastS) {
   return [out, s];
 }
 
-async function pollTick() {
-  if (_pollActive || document.hidden || !DATA) return;
-  _pollActive = true;
-  const expName = document.getElementById("experiment-sel").value;
-  try {
-    // Step 1: fetch run statuses
-    let statusMap;
-    try {
-      const r = await fetch(`/run_status.json?name=${encodeURIComponent(expName)}`);
-      if (!r.ok) { _pollActive = false; return; }
-      statusMap = await r.json();
-    } catch (e) { _pollActive = false; return; }
+function connectSSE(expName) {
+  if (_evtSource) { _evtSource.close(); _evtSource = null; }
+  LIVE_RUNS  = new Set();
+  LAST_EMA_S = {};
+  _metricFetching.clear();
 
-    // Update LIVE_RUNS based on runs that exist in DATA.runs
-    const knownRuns = new Set(DATA.runs.map(r => r.name));
-    const statusMapFiltered = Object.fromEntries(
-      Object.entries(statusMap).filter(([name]) => knownRuns.has(name))
-    );
-    LIVE_RUNS = new Set(
-      Object.entries(statusMapFiltered)
-        .filter(([, s]) => s === "running")
-        .map(([n]) => n)
-    );
+  _evtSource = new EventSource(`/events?experiment=${encodeURIComponent(expName)}`);
 
-    // Step 2: fetch incremental metric data for ALL runs (to catch newly completed)
-    if (knownRuns.size === 0) { _pollActive = false; return; }
+  _evtSource.addEventListener("init", e => {
+    const msg = JSON.parse(e.data);
+    LIVE_RUNS = new Set(Object.entries(msg.status)
+      .filter(([, s]) => s === "running").map(([n]) => n));
+    // Metric data is loaded on demand via /metric_data.json — clear cache so
+    // loadMetric fetches fresh data for the current experiment.
+    METRIC_CACHE = {};
+    const expNameEl = document.getElementById("exp-name");
+    expNameEl.classList.remove("loading");
+    expNameEl.textContent = DATA ? DATA.experiment : expName;
+    // Load initial metric data.
+    loadMetric(metric);
+  });
 
-    let gotNewData = false;
+  _evtSource.addEventListener("metrics", e => {
+    const msg = JSON.parse(e.data);
+    // msg.runs: {run_name: {metric_name: {steps, values}}}
     const incrementalUpdates = [];
+    let gotNewData = false;
 
-    const fetchResults = await Promise.all(
-      [...knownRuns].map(async runName => {
-          const since = LAST_STEP[runName] ?? -1;
-          try {
-            const r = await fetch(
-              `/metric_since.json?name=${encodeURIComponent(expName)}` +
-              `&metric=${encodeURIComponent(metric)}` +
-              `&since_step=${since}`
-            );
-            return [runName, await r.json()];
-          } catch (e) { return [runName, null]; }
-        })
-      );
-
-      // Step 3: merge new data into METRIC_CACHE
-      if (!METRIC_CACHE[metric]) METRIC_CACHE[metric] = {};
-      const mcache = METRIC_CACHE[metric];
-      if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
-
-      for (const [runName, data] of fetchResults) {
-        if (!data) continue;
-        const newPiece = data[runName];
-        if (!newPiece || !newPiece.steps.length) continue;
+    for (const [run, perRunUpdates] of Object.entries(msg.runs)) {
+      for (const [mname, {steps, values}] of Object.entries(perRunUpdates)) {
+        if (!METRIC_CACHE[mname]) METRIC_CACHE[mname] = {};
+        if (!METRIC_CACHE[mname][run]) METRIC_CACHE[mname][run] = {steps: [], values: []};
+        METRIC_CACHE[mname][run].steps.push(...steps);
+        METRIC_CACHE[mname][run].values.push(...values);
         gotNewData = true;
 
-        if (!mcache[runName]) mcache[runName] = { steps: [], values: [] };
-        mcache[runName].steps.push(...newPiece.steps);
-        mcache[runName].values.push(...newPiece.values);
-        LAST_STEP[runName] = newPiece.steps[newPiece.steps.length - 1];
-
-        const [newSmoothed, newS] = _applyEmaIncremental(
-          newPiece.values, LAST_EMA_S[metric][runName] ?? null);
-        LAST_EMA_S[metric][runName] = newS;
-
-        const lineIdx = _traceIndexMap[runName];
-        if (lineIdx === undefined) continue;
-        const n = Object.keys(_traceIndexMap).length;
-        const dotIdx = n + lineIdx;
-        const lastStep = newPiece.steps[newPiece.steps.length - 1];
-        const lastY    = newSmoothed[newSmoothed.length - 1];
-        incrementalUpdates.push({ lineIdx, dotIdx, newSteps: newPiece.steps, newSmoothed, lastStep, lastY });
+        if (mname === metric) {
+          if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
+          const [newSmoothed, newS] = _applyEmaIncremental(values, LAST_EMA_S[metric][run] ?? null);
+          LAST_EMA_S[metric][run] = newS;
+          const lineIdx = _traceIndexMap[run];
+          if (lineIdx !== undefined) {
+            const n = Object.keys(_traceIndexMap).length;
+            const dotIdx = n + lineIdx;
+            const lastStep = steps[steps.length - 1];
+            const lastY    = newSmoothed[newSmoothed.length - 1];
+            incrementalUpdates.push({lineIdx, dotIdx, newSteps: steps, newSmoothed, lastStep, lastY});
+          }
+        }
       }
+    }
 
-    // Step 4: update Plotly
-    if (!gotNewData) { _pollActive = false; return; }
-
+    if (!gotNewData) return;
     if (activeTab === "curves" && !dirtyTabs.has("curves") && smoothAlpha === 0) {
-      // Incremental path: safe when no EMA and chart is not stale
+      // Batch all extendTraces/restyle calls: collect indices and data together
+      // to minimize Plotly re-renders.
+      const lineIdxs = [], lineXs = [], lineYs = [];
+      const dotIdxs  = [], dotXs  = [], dotYs  = [];
       for (const u of incrementalUpdates) {
-        Plotly.extendTraces("chart-curves",
-          { x: [u.newSteps], y: [u.newSmoothed] }, [u.lineIdx]);
-        Plotly.restyle("chart-curves",
-          { x: [[u.lastStep]], y: [[u.lastY]] }, [u.dotIdx]);
+        lineIdxs.push(u.lineIdx); lineXs.push(u.newSteps); lineYs.push(u.newSmoothed);
+        dotIdxs.push(u.dotIdx);   dotXs.push([u.lastStep]); dotYs.push([u.lastY]);
       }
-      // Update status line
-      const liveCount = incrementalUpdates.length;
+      if (lineIdxs.length) {
+        Plotly.extendTraces("chart-curves", {x: lineXs, y: lineYs}, lineIdxs);
+        Plotly.restyle("chart-curves",      {x: dotXs,  y: dotYs},  dotIdxs);
+      }
       const vis = Object.keys(_traceIndexMap).length;
       document.getElementById("status").textContent =
-        `${vis} / ${DATA.runs.length} runs visible` + (liveCount ? `  •  ${liveCount} live` : "");
-    } else if (gotNewData) {
+        `${vis} / ${DATA.runs.length} runs visible` +
+        (LIVE_RUNS.size ? `  •  ${LIVE_RUNS.size} live` : "");
+    } else {
       buildActiveChart();
     }
-  } finally {
-    _pollActive = false;
-  }
+  });
+
+  _evtSource.addEventListener("status", e => {
+    const msg = JSON.parse(e.data);
+    if (msg.status === "running") LIVE_RUNS.add(msg.run);
+    else LIVE_RUNS.delete(msg.run);
+  });
+
+  _evtSource.addEventListener("experiments", e => {
+    const msg = JSON.parse(e.data);
+    _updateExperimentList(msg.experiments);
+  });
 }
 
-function startPollLoop() {
-  if (_pollTimer !== null) { clearInterval(_pollTimer); _pollTimer = null; }
-  LIVE_RUNS  = new Set();
-  LAST_STEP  = {};
-  _pollActive = false;
-  // First tick after a short delay (let init() and loadMetric() settle first)
-  setTimeout(pollTick, 2000);
-  _pollTimer = setInterval(pollTick, CONFIG.poll_interval * 1000);
+function _updateExperimentList(experiments) {
+  const sel = document.getElementById("experiment-sel");
+  const current = sel.value;
+  sel.innerHTML = "";
+  for (const name of experiments) {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    if (name === current) opt.selected = true;
+    sel.appendChild(opt);
+  }
 }
 
 function loadExperiment(name) {
   const expNameEl = document.getElementById("exp-name");
   expNameEl.classList.add("loading");
   expNameEl.textContent = "Fetching data…";
-
-  // Stop existing poll before switching experiments
-  if (_pollTimer !== null) { clearInterval(_pollTimer); _pollTimer = null; }
+  if (_evtSource) { _evtSource.close(); _evtSource = null; }
 
   fetch(`/manifest.json?name=${encodeURIComponent(name)}`)
     .then(r => {
-      console.log("manifest.json response status:", r.status);
       if (r.status === 404) return null;
-      if (!r.ok) throw new Error(`manifest HTTP ${r.status}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
     })
     .then(manifest => {
-      console.log("manifest loaded:", manifest);
       if (manifest !== null) {
-        expNameEl.textContent = "Parsing JSON…";
         metric = "loss";
         init(manifest);
-        startPollLoop();
       } else {
         return fetch(`/data.json?name=${encodeURIComponent(name)}`)
-          .then(r => { expNameEl.textContent = "Parsing JSON…"; return r.json(); })
-          .then(data => {
-            metric = "loss";
-            init(data);
-            startPollLoop();
-          });
+          .then(r => r.json())
+          .then(data => { metric = "loss"; init(data); });
       }
     })
+    .then(() => connectSSE(name))
     .catch(e => {
       expNameEl.classList.remove("loading");
       expNameEl.textContent = "Error";
@@ -1267,48 +1369,32 @@ function loadExperiment(name) {
     });
 }
 
-// Refresh experiment list (for when new experiments are added)
 function refreshExperiments() {
   fetch("/experiments")
     .then(r => r.json())
-    .then(({ experiments, default: def }) => {
-      const sel = document.getElementById("experiment-sel");
-      const current = sel.value;
-      sel.innerHTML = "";
-      for (const name of experiments) {
-        const opt = document.createElement("option");
-        opt.value = name; opt.textContent = name;
-        if (name === current || ( !current && name === def)) opt.selected = true;
-        sel.appendChild(opt);
-      }
-      if (sel.value !== current && sel.value) {
-        loadExperiment(sel.value);
-      }
-    })
+    .then(({experiments}) => _updateExperimentList(experiments))
     .catch(e => {
-      document.getElementById("status").textContent = "Error refreshing experiments: " + e;
+      document.getElementById("status").textContent = "Error refreshing: " + e;
     });
 }
 
 // Bootstrap: fetch config, then experiment list, then load the default.
 fetch("/config.json").then(r => r.json()).then(cfg => {
-  if (cfg.poll_interval) {
-    CONFIG.poll_interval = cfg.poll_interval;
-    document.getElementById("poll-interval").value = cfg.poll_interval;
-  }
-}).catch(() => {});  // ignore errors — default CONFIG is fine
+  if (cfg.poll_interval) document.getElementById("poll-interval").value = cfg.poll_interval;
+}).catch(() => {});
 
 document.getElementById("poll-interval").addEventListener("change", e => {
   const val = parseFloat(e.target.value);
   if (val >= 0.5 && val <= 300) {
-    CONFIG.poll_interval = val;
-    if (_pollTimer) {
-      clearInterval(_pollTimer);
-      _pollTimer = setInterval(pollTick, CONFIG.poll_interval * 1000);
-    }
+    fetch("/poll-interval", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({seconds: val}),
+    }).catch(() => {});
   }
 });
 
+// Bootstrap: fetch experiment list then load the default.
 fetch("/experiments")
   .then(r => r.json())
   .then(({ experiments, default: def }) => {
@@ -1338,16 +1424,10 @@ fetch("/experiments")
 
 # ── HTTP server ────────────────────────────────────────────────────────────────
 
-_META_CACHE_TTL = 30.0  # seconds for live experiment discovery
-
 
 class Handler(BaseHTTPRequestHandler):
-    # experiment name → (timestamp, json_bytes); 30s TTL for live runs
-    _meta_cache: dict[str, tuple[float, bytes]] = {}
     _default: str | None = None
     exp_source: str = ""
-    poll_interval: int = 2
-    token: str | None = None
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -1355,10 +1435,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", HTML.encode())
-
-        elif parsed.path == "/config.json":
-            cfg = {"poll_interval": self.poll_interval}
-            self._send(200, "application/json", json.dumps(cfg).encode())
 
         elif parsed.path == "/experiments":
             names = list_experiments(self.exp_source)
@@ -1369,28 +1445,7 @@ class Handler(BaseHTTPRequestHandler):
             name = qs.get("name", [None])[0]
             if not name:
                 self.send_response(400); self.end_headers(); return
-            now = time.time()
-            if name in Handler._meta_cache:
-                ts, cached_body = Handler._meta_cache[name]
-                if now - ts < _META_CACHE_TTL:
-                    self._send(200, "application/json", cached_body)
-                    return
-            print(f"Loading metadata: {name}", flush=True)
             data = load_experiment_meta(name, self.exp_source)
-            print(f"  {len(data['runs'])} runs, {len(data['axes'])} axes, "
-                  f"{len(data['metricNames'])} metrics", flush=True)
-            body = json.dumps(data).encode()
-            Handler._meta_cache[name] = (now, body)
-            self._send(200, "application/json", body)
-
-        elif parsed.path == "/metric.json":
-            name   = qs.get("name",   [None])[0]
-            metric = qs.get("metric", [None])[0]
-            if not name or not metric:
-                self.send_response(400); self.end_headers(); return
-            # Not cached server-side: JS already caches, and data changes on live runs
-            print(f"  Loading metric '{metric}' for {name}…", flush=True)
-            data = load_metric_data(name, metric, self.exp_source)
             self._send(200, "application/json", json.dumps(data).encode())
 
         elif parsed.path == "/manifest.json":
@@ -1404,38 +1459,70 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "public, max-age=31536000")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
-        elif parsed.path == "/metric_since.json":
-            name   = qs.get("name",       [None])[0]
-            met    = qs.get("metric",     [None])[0]
-            since  = qs.get("since_step", [None])[0]
-            if not name or not met:
+        elif parsed.path == "/metric_data.json":
+            name   = qs.get("experiment", [None])[0]
+            metric = qs.get("metric",     [None])[0]
+            if not name or not metric:
                 self.send_response(400); self.end_headers(); return
-            since_step = int(since) if since is not None else -1
-            data = load_metric_since(name, met, since_step, self.exp_source)
+            data = _metric_data_snapshot(name, metric)
             self._send(200, "application/json", json.dumps(data).encode())
 
-        elif parsed.path == "/run_status.json":
-            name = qs.get("name", [None])[0]
+        elif parsed.path == "/config.json":
+            self._send(200, "application/json",
+                       json.dumps({"poll_interval": _poll_interval}).encode())
+
+        elif parsed.path == "/events":
+            name = qs.get("experiment", [None])[0]
             if not name:
                 self.send_response(400); self.end_headers(); return
-            data = load_run_status(name, self.exp_source)
-            self._send(200, "application/json", json.dumps(data).encode())
+            self._serve_sse(name)
 
         elif parsed.path == "/favicon.png":
             favicon_path = Path(__file__).parent / "static" / "favicon.png"
             if favicon_path.exists():
                 self._send(200, "image/png", favicon_path.read_bytes())
             else:
-                self.send_response(404)
-                self.end_headers()
+                self.send_response(404); self.end_headers()
 
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
+
+    def _serve_sse(self, exp_name: str) -> None:
+        q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=200)
+        with _sub_lock:
+            _subscribers.setdefault(exp_name, []).append(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            snapshot = _sse_init_snapshot(exp_name)
+            self.wfile.write(
+                f"event: init\ndata: {json.dumps(snapshot)}\n\n".encode()
+            )
+            self.wfile.flush()
+            while True:
+                try:
+                    chunk = q.get(timeout=15)
+                    if chunk is None:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            with _sub_lock:
+                subs = _subscribers.get(exp_name, [])
+                if q in subs:
+                    subs.remove(q)
 
     def _send(self, code: int, content_type: str, body: bytes) -> None:
         self.send_response(code)
@@ -1445,6 +1532,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:
+        global _poll_interval
+        if self.path == "/poll-interval":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length))
+                val = float(body["seconds"])
+                if 0.5 <= val <= 300:
+                    _poll_interval = val
+                self._send(200, "application/json", b"{}")
+            except (KeyError, ValueError, json.JSONDecodeError):
+                self.send_response(400); self.end_headers()
+        else:
+            self.send_response(404); self.end_headers()
+
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # suppress request logs
 
@@ -1453,70 +1555,59 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("experiment", nargs="?",
-                        help="Experiment name to pre-load (default: newest)")
-    parser.add_argument("--server", default=None, metavar="URL",
-                        help="http://host:port for mlsweep_server "
-                             "(also read from EXP_SERVER env var)")
+                        help="Experiment name to open (default: newest)")
     parser.add_argument("--dir", default=None, metavar="PATH",
-                        help="Local path to sweeps directory (default: ./outputs/sweeps)")
+                        help="Path to sweeps directory (default: ./outputs/sweeps)")
     parser.add_argument("--port", type=int, default=43801)
-    parser.add_argument("--open-browser", action="store_true")
-    parser.add_argument(
-        "--poll-interval", type=int, default=2, metavar="SECONDS",
-        help="Live-update poll interval in seconds (default: 10)")
-    parser.add_argument(
-        "--token", default=None, metavar="SECRET",
-        help="Bearer token to include in requests to mlsweep_server "
-             "(also read from MLSWEEP_TOKEN env var)")
+    parser.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS",
+                        help="File-watcher poll interval in seconds (default: 1)")
+    parser.add_argument("--open-browser", action="store_true",
+                        help="Open the browser automatically")
     parser.add_argument(
         "--version", action="version",
         version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
     args = parser.parse_args()
 
-    exp_source = (
-        args.server
-        or args.dir
-        or os.environ.get("EXP_SERVER")
-        or os.path.join(os.getcwd(), "outputs", "sweeps")
-    )
-    Handler.exp_source     = exp_source
-    Handler.poll_interval  = args.poll_interval
-    Handler.token          = args.token or os.environ.get("MLSWEEP_TOKEN")
+    global _poll_interval
+    output_dir = args.dir or os.path.join(os.getcwd(), "outputs", "sweeps")
+    Handler.exp_source = output_dir
+    _poll_interval = args.poll_interval
 
-    # Find and pre-load the default experiment so the first page load is fast.
-    experiments = list_experiments(exp_source)
+    experiments = list_experiments(output_dir)
     if not experiments:
         sys.exit(
-            f"No experiments found in: {exp_source}\n"
-            "  Run a training job with the mlsweep logger, or start the mlsweep server and pass --server http://host:port."
+            f"No experiments found in: {output_dir}\n"
+            "  Run a sweep with mlsweep_run first."
         )
 
     default_exp = args.experiment or experiments[0]
     if default_exp not in experiments:
         sys.exit(f"Experiment not found: {default_exp}")
 
-    print(f"Loading metadata: {default_exp}")
-    data = load_experiment_meta(default_exp, exp_source)
-    print(f"  {len(data['runs'])} runs, {len(data['axes'])} axes, "
-          f"{len(data['metricNames'])} metrics")
-
-    Handler._meta_cache[default_exp] = (time.time(), json.dumps(data).encode())
     Handler._default = default_exp
 
+    # Initial scan so SSE init events have data on first connect.
+    _scan(output_dir)
+
+    # Background watcher: polls files every 1s and pushes SSE events.
+    watcher = threading.Thread(target=_watch_loop, args=(output_dir,), daemon=True)
+    watcher.start()
+
     url = f"http://localhost:{args.port}"
-    print(f"  Source: {exp_source}")
-    print(f"  Serving at {url}  (Ctrl+C to stop)")
+    print(f"Sweep visualizer")
+    print(f"  Source:  {output_dir}")
+    print(f"  Browser: {url}  (Ctrl+C to stop)")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             public_ip = s.getsockname()[0]
         if public_ip != "127.0.0.1":
-            print(f"             http://{public_ip}:{args.port}")
+            print(f"           http://{public_ip}:{args.port}")
     except OSError:
         pass
 
     if args.open_browser:
-        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
     ThreadingHTTPServer(("", args.port), Handler).serve_forever()
 

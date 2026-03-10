@@ -3,32 +3,63 @@
 """Run experiment sweeps. See docs/sweep_configuration.md for format and usage."""
 
 import argparse
-import functools
+import dataclasses
 import importlib.metadata
-import importlib.util
-import itertools
 import json
 import os
 import queue
 import re
+import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
-import types
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # type: ignore[import-not-found]
 from collections import Counter
-from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
 
-from mlsweep._utils import _git_root, _val_sort_key
+from mlsweep._parsync import parsync_bin
+from mlsweep._shared import (
+    MsgCleanup,
+    MsgHello,
+    MsgReplay,
+    MsgRun,
+    MsgShutdown,
+    MsgWorkerHello,
+    MsgStarted,
+    MsgLog,
+    MsgMetric,
+    MsgSyncReq,
+    MsgResult,
+    MsgCleaned,
+    decode,
+    encode,
+)
+from mlsweep._sweep import (
+    _append_manifest_run,
+    _load_sweep_status,
+    _singular_desc,
+    _treatment_key,
+    _update_sweep_status,
+    _write_manifest,
+    count_expected,
+    generate_variations,
+    load_sweep_file,
+    should_skip,
+    validate_options,
+)
+from mlsweep._topology import _best_gpu_groups, _visible_devices
+from mlsweep._shared import _git_root
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-
 
 _PROJECT_ROOT = _git_root(os.getcwd()) or os.getcwd()
 
@@ -42,21 +73,7 @@ _BLUE = "\033[34m"
 _RESET = "\033[0m"
 _DIM_COLORS = [_CYAN, _YELLOW, _MAGENTA, _BLUE]
 
-# Metadata keys in a dimension spec (no dot prefix). Dot-prefixed keys are subdimensions.
-_METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic"}
-
-_log_file = None
-
-
-def _parse_flag_list(f: str | list[str] | None, ctx: str) -> list[str]:
-    """Normalize a flags field to a list of CLI strings (branch/fixed dims only)."""
-    if f is None:
-        return []
-    if isinstance(f, str):
-        return [f]
-    if isinstance(f, list):
-        return f
-    raise ValueError(f"{ctx}: flags must be str or list, got {type(f).__name__}")
+_log_file: IO[str] | None = None
 
 
 def sweep_print(msg: str, end: str = "\n") -> None:
@@ -75,1039 +92,568 @@ def fmt_time(s: float) -> str:
     return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
 
 
-# ── Sweep loading ──────────────────────────────────────────────────────────
+# ── Worker connection state ────────────────────────────────────────────────────
 
 
-def _load_module(path: str | Path) -> types.ModuleType:
-    path = Path(path)
-    if str(path.parent) not in sys.path:
-        sys.path.insert(0, str(path.parent))
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    if not spec or not spec.loader:
-        raise ImportError(f"Could not load: {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+@dataclasses.dataclass
+class WorkerState:
+    worker_id: int
+    host: str                           # "localhost" for local
+    port: int
+    remote_dir: str
+    scratch_dir: str                    # from MsgWorkerHello
+    gpus: list[int]
+    topo: dict[tuple[int, int], int]   # internal format {(a,b): score}
+    slots: list[list[int]]             # GPU groups computed from topo
+    busy_slots: set[int]               # indices into slots currently in use
+    send_queue: "queue.Queue[bytes | None]"
+    status: str                        # CONNECTING | CONNECTED | RECONNECTING | DEAD
+    in_flight: dict[str, dict[str, Any]]  # run_id → var dict
+    run_slots: dict[str, int] = dataclasses.field(default_factory=dict)  # run_id → slot_idx
+    jobs_per_slot: int = 1
+    password: str | None = None
+    ssh_key: str | None = None
 
 
-def load_sweep_file(path: str | Path) -> dict[str, Any]:
-    """Load a single sweep .py file, returning a sweep-info dict."""
-    mod = _load_module(path)
-    command = getattr(mod, "COMMAND", None)
-    if command is None:
-        raise ValueError(f"{path}: COMMAND is required (e.g. COMMAND = ['python', 'train.py'])")
-    if isinstance(command, str):
-        command = shlex.split(command)
-    elif not isinstance(command, list):
-        raise ValueError(f"{path}: COMMAND must be a str or list, got {type(command).__name__}")
-    gpus_per_run = getattr(mod, "GPUS_PER_RUN", 1)
-    if not isinstance(gpus_per_run, int) or gpus_per_run < 1:
-        raise ValueError(f"{path}: GPUS_PER_RUN must be a positive integer, got {gpus_per_run!r}")
-    run_from = getattr(mod, "RUN_FROM", None)
-    if run_from is not None and not isinstance(run_from, str):
-        raise ValueError(f"{path}: RUN_FROM must be a str, got {type(run_from).__name__}")
-    return {
-        "name": Path(path).stem,
-        "options": mod.OPTIONS,
-        "command": command,
-        "exclude": getattr(mod, "EXCLUDE", None),
-        "extra_flags": getattr(mod, "EXTRA_FLAGS", []),
-        "abbrev": getattr(mod, "ABBREV", None),
-        "gpus_per_run": gpus_per_run,
-        "run_from": run_from,
-    }
+def _parse_workers(
+    path: str,
+) -> list[tuple[str, str, int | None, int | None, list[int] | None, str | None, str | None, str | None]]:
+    """Parse a TOML workers file.
 
+    Each [[workers]] entry requires 'host' and 'remote_dir'. Optional fields:
+      gpus     (int)       total GPU count to use (default: all visible)
+      jobs     (int)       concurrent jobs per GPU slot (default: 1)
+      devices  (list[int]) specific GPU device IDs to use
+      pass     (str)       SSH password; falls back to MLSWEEP_SSH_PASS env var
+      ssh_key  (str)       path to SSH identity file (passed as -i)
+      venv     (str)       path to venv (or project root); activate is sourced before running
 
-def load_sweeps() -> dict[str, dict[str, Any]]:
-    """Import all sweep files from sweeps/ directory."""
-    return {
-        f.stem: load_sweep_file(f)
-        for f in sorted((Path(os.getcwd()) / "sweeps").glob("[!_]*.py"))
-    }
-
-
-def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | None = None) -> None:
-    """Validate and normalize OPTIONS dict.
-
-    Each key in options must start with '.' to identify it as a dimension.
-    Within a dim spec, dot-prefixed keys are subdimensions; non-dot keys are metadata.
-
-    Three dimension types (determined by content):
-      Value dim   — has 'values'; sweeps over that list with per-value flags.
-      Branch dim  — no 'values', has dot-prefixed subdim keys; each subdim is a
-                    mutually-exclusive branch (the dim's implicit "values").
-      Fixed dim   — no 'values', no subdims; flags are always appended (one combo).
-
-    Synthesizes _values, _flags, _sub_opts_map on each dim spec for use by
-    _expand_tree and related functions.
+    Returns [(host, remote_dir, gpus, jobs, devices, password, ssh_key, venv)].
     """
-    if _ancestor_keys is None:
-        _ancestor_keys = frozenset()
-    current_keys = frozenset(options.keys())
-
-    for key, opt in options.items():
-        if not key.startswith("."):
-            raise ValueError(
-                f"Dimension key {key!r} must start with '.' to mark it as a dimension "
-                f"(metadata keys inside a dim spec have no dot)"
-            )
-        subdim_keys = [k for k in opt if k.startswith(".")]
-        for mk in opt:
-            if not mk.startswith(".") and not mk.startswith("_") and mk not in _METADATA_KEYS:
-                raise ValueError(f"Unknown metadata key {mk!r} in dimension {key!r}")
-
-        m = opt.get("monotonic")
-        if m is not None and m not in ("increasing", "decreasing"):
-            raise ValueError(f"Dimension {key!r} monotonic must be 'increasing'|'decreasing'|None")
-
-        has_values = "values" in opt
-        has_subdims = bool(subdim_keys)
-
-        if has_values and has_subdims:
-            raise ValueError(
-                f"Dimension {key!r} has both 'values' and subdimensions {subdim_keys!r}. "
-                f"Use 'values' for a value dim or dot-prefixed subdim keys for a branch dim, not both."
-            )
-
-        if has_values:
-            # VALUE DIM — explicit list of values
-            values = opt["values"]
-            flags = opt.get("flags")
-            if flags is None:
-                flags_dict: dict[Any, list[str]] = {v: [] for v in values}
-            elif isinstance(flags, str):
-                flags_dict = {v: [flags, str(v)] for v in values}
-            elif isinstance(flags, dict):
-                flags_dict = dict(flags)
-            else:
-                raise ValueError(f"Dimension {key!r} flags must be str or dict, got {type(flags).__name__}")
-            for v in values:
-                if v not in flags_dict:
-                    raise ValueError(f"Dimension {key!r} missing flags for value {v!r}")
-            opt["_values"] = list(values)
-            opt["_flags"] = flags_dict
-            opt["_sub_opts_map"] = {}
-
-        elif has_subdims:
-            # BRANCH DIM — subdim keys are the mutually-exclusive branches
-            branch_values, flags_dict, sub_opts_map = [], {}, {}
-            for sdkey in subdim_keys:
-                sdspec = opt[sdkey]
-                val = sdkey[1:]  # branch value name = subdim key without leading dot
-                branch_values.append(val)
-                flags_dict[val] = _parse_flag_list(sdspec.get("flags"), f"Branch {sdkey!r} in {key!r}")
-                branch_subdims = {k: v for k, v in sdspec.items() if k.startswith(".")}
-                if branch_subdims:
-                    sub_opts_map[val] = branch_subdims
-                    for bk in branch_subdims:
-                        if bk in _ancestor_keys or bk in current_keys:
-                            raise ValueError(
-                                f"Subdim key {bk!r} (under branch {sdkey!r} of {key!r}) "
-                                f"collides with ancestor or sibling dim"
-                            )
-                    validate_options(branch_subdims, _ancestor_keys | current_keys)
-            opt["_values"] = branch_values
-            opt["_flags"] = flags_dict
-            opt["_sub_opts_map"] = sub_opts_map
-
-        else:
-            # FIXED DIM — no values, no subdims; flags always appended
-            f_list = _parse_flag_list(opt.get("flags"), f"Fixed dim {key!r}")
-            opt["_values"] = [None]
-            opt["_flags"] = {None: f_list}
-            opt["_sub_opts_map"] = {}
-
-
-# ── Variation generation ───────────────────────────────────────────────────
-
-
-def _make_part(nm: str | None, val: Any) -> str | None:
-    """Build a name part string from dim name and value, or None if no name/value."""
-    if nm is None:
-        return None
-    if isinstance(val, bool):
-        return f"{nm}{'T' if val else 'F'}"
-    return f"{nm}{val}"
-
-
-def _flatten_tokens(tokens: list[Any]) -> list[str]:
-    """Flatten a name_tokens list to a plain list of strings."""
-    parts = []
-    for tok in tokens:
-        if isinstance(tok, list):
-            parts.extend(tok)
-        else:
-            parts.append(tok)
-    return parts
-
-
-def _build_level_tokens(all_keys: list[str], vals: Any, options: dict[str, Any], contributing_keys: Any = (), child_tokens: Any = ()) -> list[Any]:
-    """Build name tokens for one level of the expansion tree.
-
-    contributing_keys: keys whose selected branch has child sub-dims (child_tokens
-                       are attributed to them, dotted onto this level's name part).
-    child_tokens:      name tokens from the recursive child expansion.
-    """
-    tokens: list[Any] = []
-    for key, val in zip(all_keys, vals):
-        nm = options[key].get("name", key[1:])
-        part = _make_part(nm, val)
-        if key in contributing_keys:
-            if part is not None:
-                tokens.append([part] + _flatten_tokens(child_tokens))
-            else:
-                # No name for this dim: pass child tokens through flat
-                tokens.extend(child_tokens)
-        elif part is not None:
-            tokens.append(part)
-    return tokens
-
-
-def _expand_tree(options: dict[str, Any], combo_so_far: dict[str, Any], effective_so_far: dict[str, Any]) -> Generator[tuple[dict[str, Any], dict[str, Any], list[Any]], None, None]:
-    """Recursively expand an options tree, yielding (combo, effective_options, name_tokens).
-
-    options: dict with dot-prefixed dimension keys (e.g. {".treatment": {...}}).
-    combo keys and effective_options keys use dim names WITHOUT the leading dot.
-
-    name_tokens is a list of:
-      - str       — a simple name part (from a non-branching dim)
-      - list[str] — a dot group: [parent_part, *child_parts], joined with '.'
-
-    Non-singular (lex) dims vary fastest in sorted order.
-    Singular (diag) dims vary slowest in diagonal order.
-    Branch dims expand their selected branch's sub-dims as additional dims.
-    """
-    lex_keys = sorted(k for k in options if not options[k].get("singular"))
-    diag_keys = sorted(k for k in options if options[k].get("singular"))
-    all_keys = lex_keys + diag_keys
-
-    if not all_keys:
-        yield combo_so_far, effective_so_far, []
-        return
-
-    lex_combos = (list(itertools.product(*(options[k]["_values"] for k in lex_keys)))
-                  if lex_keys else [()])
-
-    if diag_keys:
-        raw = list(itertools.product(*(range(len(options[k]["_values"])) for k in diag_keys)))
-        raw.sort(key=lambda idx: (sum(idx), idx))
-        diag_combos = [
-            tuple(options[diag_keys[i]]["_values"][j] for i, j in enumerate(idx))
-            for idx in raw
-        ]
-    else:
-        diag_combos = [()]
-
-    for dv in diag_combos:
-        for lv in lex_combos:
-            vals = lv + dv
-            # Combo and effective keys strip the leading dot from dim keys
-            combo = {**combo_so_far, **{k[1:]: v for k, v in zip(all_keys, vals)}}
-            effective = {**effective_so_far, **{k[1:]: v for k, v in options.items()}}
-
-            # Collect sub-options from dims whose selected value has branch sub-dims
-            sub_opts = {}
-            contributing_keys = set()
-            for key, val in zip(all_keys, vals):
-                opt = options[key]
-                children = opt["_sub_opts_map"].get(val, {})
-                if children:
-                    sub_opts.update(children)
-                    contributing_keys.add(key)
-
-            if sub_opts:
-                for child_combo, child_effective, child_tokens in _expand_tree(
-                    sub_opts, combo, effective
-                ):
-                    yield child_combo, child_effective, _build_level_tokens(
-                        all_keys, vals, options, contributing_keys, child_tokens)
-            else:
-                yield combo, effective, _build_level_tokens(all_keys, vals, options)
-
-
-def generate_variations(sweep_name: str, options: dict[str, Any], exclude_fn: Callable[[dict[str, Any]], bool] | None = None, extra_flags: Sequence[str] = ()) -> list[dict[str, Any]]:
-    """Generate all config variations using tree expansion.
-
-    Singular dims vary slowest (diagonal order — advances all singular dims
-    at roughly the same rate).  Non-singular dims vary fastest (lex order —
-    interleaves treatments for better parallel probing).
-
-    Branch dims expand their selected branch's sub-dims as additional dims.
-    Run names use '.' to signal branch ancestry and '_' to separate peer dims.
-    """
-    variations = []
-    for combo, effective, name_tokens in _expand_tree(options, {}, {}):
-        if exclude_fn and exclude_fn(combo):
-            continue
-        # Flatten name tokens: dot groups → "parent.child", peers → "_"-joined
-        segments = []
-        for tok in name_tokens:
-            if isinstance(tok, list):
-                segments.append(".".join(tok))
-            else:
-                segments.append(tok)
-        name = f"{sweep_name}_{'_'.join(segments) if segments else 'default'}"
-        # Build CLI overrides from all dims in this combo
-        overrides = list(extra_flags)
-        for key, val in combo.items():
-            if key in effective:
-                overrides.extend(effective[key]["_flags"].get(val, []))
-        variations.append({
-            "name": name,
-            "overrides": overrides,
-            "combo": combo,
-            "effective_options": effective,
-        })
-    return variations
-
-
-def _treatment_key(combo: dict[str, Any], options: dict[str, Any]) -> tuple[Any, ...]:
-    """Non-singular dims identify a treatment. Both combo and options use stripped keys (no dot)."""
-    return tuple(combo[k] for k in sorted(options) if not options[k].get("singular"))
-
-
-def count_expected(options: dict[str, Any]) -> int:
-    """Expected runs, computed recursively over the options tree.
-
-    Singular dims contribute 1 (we only need one working value).
-    Non-singular dims with no sub-options multiply by their value count.
-    Non-singular dims with sub-options: non-branching values count as 1,
-    branching values multiply by their subtree count.
-    """
-    n = 1
-    for key, opt in options.items():
-        if opt.get("singular"):
-            continue
-        n_vals = len(opt["_values"])
-        sub_opts_map = opt["_sub_opts_map"]
-        if not sub_opts_map:
-            n *= n_vals
-        else:
-            branch_sum = sum(count_expected(sub) for sub in sub_opts_map.values())
-            n *= (n_vals - len(sub_opts_map)) + branch_sum
-    return n
-
-
-# ── Skip logic ─────────────────────────────────────────────────────────────
-
-
-def should_skip(combo: dict[str, Any], failed: list[dict[str, Any]], succeeded: list[dict[str, Any]], options: dict[str, Any]) -> bool:
-    """Check monotonic (skip worse on failure) and singular (skip others on success).
-
-    Both combo and options use stripped keys (no dot prefix).
-    """
-    # Monotonic: skip values worse than a known failure (all other dims must match)
-    for fc in failed:
-        for key, opt in options.items():
-            m = opt.get("monotonic")
-            if not m:
-                continue
-            if not all(fc.get(k) == combo.get(k) for k in options if k != key):
-                continue
-            vals = opt["_values"]
-            try:
-                fi, ci = vals.index(fc[key]), vals.index(combo[key])
-            except (ValueError, TypeError, KeyError):
-                continue
-            if (m == "increasing" and fi <= ci) or (m == "decreasing" and fi >= ci):
-                return True
-
-    # Singular: skip different values once one succeeds
-    # Only require non-singular dims to match (multiple singular dims resolve independently)
-    for sc in succeeded:
-        for key, opt in options.items():
-            if not opt.get("singular"):
-                continue
-            if not all(sc.get(k) == combo.get(k)
-                       for k in options if k != key and not options[k].get("singular")):
-                continue
-            if sc.get(key) != combo.get(key):
-                return True
-
-    return False
-
-
-# ── Execution ──────────────────────────────────────────────────────────────
-
-
-
-
-def _visible_devices() -> list[int]:
-    """Get list of visible GPU device indices."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "") or os.environ.get("HIP_VISIBLE_DEVICES", "")
-    if cvd:
-        devs: list[int] = []
-        for p in cvd.split(","):
-            p = p.strip()
-            if "-" in p:
-                a, b = p.split("-", 1)
-                devs.extend(range(int(a), int(b) + 1))
-            else:
-                devs.append(int(p))
-        return devs
-    try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                           capture_output=True, text=True, check=True)
-        return [int(x) for x in r.stdout.strip().splitlines() if x.strip()]
-    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
-        pass
-    try:
-        r = subprocess.run(["amd-smi", "topology", "--json"],
-                           capture_output=True, text=True, check=True)
-        data = json.loads(r.stdout)
-        return [entry["gpu"] for entry in data if "gpu" in entry]
-    except (FileNotFoundError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError):
-        pass
-    return []
-
-
-def _discover_remote_gpus(workers: list[tuple[str, str]]) -> list[tuple[str, str, int]]:
-    """SSH to each worker, count GPUs. Returns [(worker, remote_dir, gpu_id), ...]."""
-    slots = []
-    for w, remote_dir in workers:
-        ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", w]
-
-        try:
-            result = subprocess.run(
-                ssh_prefix + ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired as e:
-            sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
-            continue
-        if result.returncode == 0:
-            slots.extend(
-                (w, remote_dir, int(line.strip()))
-                for line in result.stdout.splitlines() if line.strip()
-            )
-            continue
-
-        # nvidia-smi unavailable — try amd-smi
-        try:
-            result = subprocess.run(
-                ssh_prefix + ["amd-smi", "topology", "--json"],
-                capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired as e:
-            sweep_print(f"  {_RED}WARN{_RESET}  Cannot reach {w}: {e}")
-            continue
-        if result.returncode == 0:
-            try:
-                data = json.loads(result.stdout)
-                slots.extend((w, remote_dir, e["gpu"]) for e in data if "gpu" in e)
-                continue
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        sweep_print(f"  {_RED}WARN{_RESET}  {w}: no GPU management tool found (tried nvidia-smi, amd-smi)")
-    return slots
-
-
-def _topo_score(conn_type: str) -> int:
-    """Convert an nvidia-smi topology connection type to a numeric score (higher = better)."""
-    if conn_type.startswith("NV"):
-        try:
-            return 100 + int(conn_type[2:])  # NV12/NV18 -> 12, 18, etc.
-        except ValueError:
-            return 100
-    return {"PIX": 50, "PXB": 40, "PHB": 30, "NODE": 20, "SYS": 10}.get(conn_type, 0)
-
-
-def _parse_topo_output(text: str) -> dict[tuple[int, int], int]:
-    """Parse `nvidia-smi topo -m` stdout. Returns {(gpu_a, gpu_b): score}."""
-    lines = [l for l in text.splitlines() if l.strip()]
-    # Header line starts with whitespace (tab) before GPU0
-    col_gpus = None
-    for line in lines:
-        if "GPU0" in line and not line[0].isalpha():
-            col_gpus = [int(m.group(1)) for m in re.finditer(r"GPU(\d+)", line)]
-            break
-    if not col_gpus:
-        return {}
-    scores = {}
-    for line in lines:
-        if not line.startswith("GPU"):
-            continue
-        parts = line.split()
-        try:
-            row_gpu = int(parts[0][3:])
-        except (ValueError, IndexError):
-            continue
-        for ci, col_gpu in enumerate(col_gpus):
-            if col_gpu == row_gpu or ci + 1 >= len(parts):
-                continue
-            val = parts[ci + 1]
-            if val != "X":
-                scores[(row_gpu, col_gpu)] = _topo_score(val)
-    return scores
-
-
-def _amd_topo_score(link_type: str, num_hops: int) -> int:
-    """Convert an amd-smi topology link type to a numeric score (higher = better)."""
-    if link_type == "XGMI":
-        # AMD Infinity Fabric / xGMI: high-speed GPU interconnect analogous to NVLink
-        return max(100 - (num_hops - 1) * 10, 50)
-    if link_type in ("PCIE", "PCIX"):
-        return max(50 - (num_hops - 1) * 10, 10)
-    return 10
-
-
-def _parse_amd_topo_output(text: str) -> dict[tuple[int, int], int]:
-    """Parse `amd-smi topology --json` stdout. Returns {(gpu_a, gpu_b): score}."""
-    try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return {}
-    scores = {}
-    for gpu_entry in data:
-        gpu_a = gpu_entry.get("gpu")
-        if gpu_a is None:
-            continue
-        for link in gpu_entry.get("links", []):
-            gpu_b = link.get("gpu")
-            link_type = link.get("link_type", "")
-            num_hops = link.get("num_hops", 1)
-            if gpu_b is None or gpu_a == gpu_b or link_type == "SELF":
-                continue
-            scores[(gpu_a, gpu_b)] = _amd_topo_score(link_type, num_hops)
-    return scores
-
-
-@functools.lru_cache(maxsize=None)
-def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
-    """Query GPU interconnect topology via nvidia-smi or amd-smi.
-
-    Returns {(gpu_a, gpu_b): score} where higher score means better connectivity
-    (NVLink/XGMI >> PCIe switch >> PCIe host bridge >> NUMA >> cross-NUMA).
-    Falls back to {} if all queries fail.
-    worker: None for local; SSH target string for remote.
-    """
-    ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", worker] if worker else []
-
-    # Try nvidia-smi first
-    cmd = ssh_prefix + ["nvidia-smi", "topo", "-m"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            return _parse_topo_output(r.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-
-    # Fall back to amd-smi (AMD GPUs)
-    cmd = ssh_prefix + ["amd-smi", "topology", "--json"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            return _parse_amd_topo_output(r.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-
-    return {}
-
-
-def _best_gpu_groups(devices: list[int], group_size: int, n_groups: int, worker: str | None = None) -> list[list[int]]:
-    """Select n_groups non-overlapping groups of group_size GPUs from devices,
-    preferring groups with the best NVLink/PCIe interconnect.
-
-    Uses a greedy algorithm: seeds each group with the highest-scoring pair,
-    then expands by adding the GPU that maximises total score to the existing group.
-    Falls back to sequential grouping when topology is unavailable (all scores zero).
-    worker=None means local; SSH target string for remote topology query.
-    """
-    if group_size == 1:
-        return [[d] for d in devices[:n_groups]]
-
-    topo = _gpu_topology(worker)
-
-    def pair_score(a: int, b: int) -> int:
-        return topo.get((a, b), 0) + topo.get((b, a), 0)
-
-    available = list(devices)
-    groups = []
-
-    for _ in range(n_groups):
-        if len(available) < group_size:
-            break
-        # Seed with the highest-scoring pair (O(n^2), fine for ≤64 GPUs)
-        best_pair = (available[0], available[1] if len(available) > 1 else available[0])
-        best_pair_score = -1
-        for a, b in itertools.combinations(available, 2):
-            s = pair_score(a, b)
-            if s > best_pair_score:
-                best_pair_score, best_pair = s, (a, b)
-        # Greedily expand to group_size
-        group = list(best_pair)
-        remaining = [d for d in available if d not in set(group)]
-        while len(group) < group_size and remaining:
-            best_g = max(remaining, key=lambda g: sum(pair_score(g, e) for e in group))
-            group.append(best_g)
-            remaining.remove(best_g)
-
-        if len(group) < group_size:
-            break
-        groups.append(group)
-        used = set(group)
-        available = [g for g in available if g not in used]
-
-    return groups
-
-
-def _parse_workers(path: str) -> list[tuple[str, str, int | None, int | None]]:
-    """Parse workers file. Each line: <ssh_target> <remote_dir> [-g N] [-j N].
-
-    Returns [(worker, remote_dir, gpus, jobs_per_gpu)] where gpus and jobs_per_gpu are
-    None if not specified.
-    """
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    global_pass = os.environ.get("MLSWEEP_SSH_PASS")
     result = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                raise ValueError(
-                    f"{path}:{lineno}: expected '<host> <remote_dir> [-g N] [-j N]', got {line!r}"
-                )
-            host, remote_dir = parts[0], parts[1]
-            gpus: int | None = None
-            jobs: int | None = None
-            i = 2
-            while i < len(parts):
-                if parts[i] in ("-g", "-j") and i + 1 < len(parts):
-                    try:
-                        val = int(parts[i + 1])
-                    except ValueError:
-                        raise ValueError(
-                            f"{path}:{lineno}: {parts[i]} requires an integer, got {parts[i + 1]!r}"
-                        )
-                    if parts[i] == "-g":
-                        gpus = val
-                    else:
-                        jobs = val
-                    i += 2
-                else:
-                    raise ValueError(
-                        f"{path}:{lineno}: unexpected token {parts[i]!r}; "
-                        f"expected '<host> <remote_dir> [-g N] [-j N]'"
-                    )
-            result.append((host, remote_dir, gpus, jobs))
+    for i, entry in enumerate(data.get("workers", [])):
+        host = entry.get("host")
+        remote_dir = entry.get("remote_dir")
+        if not host or not remote_dir:
+            raise ValueError(f"{path}: workers entry {i + 1} missing required field 'host' or 'remote_dir'")
+        gpus: int | None = entry.get("gpus")
+        jobs: int | None = entry.get("jobs")
+        devices: list[int] | None = entry.get("devices")
+        password: str | None = entry.get("pass") or global_pass
+        ssh_key: str | None = entry.get("ssh_key")
+        venv: str | None = entry.get("venv") or remote_dir
+        result.append((host, remote_dir, gpus, jobs, devices, password, ssh_key, venv))
     return result
 
 
-def _get_default_exp_server() -> str:
-    """Get default exp server address (this machine's hostname + default port)."""
-    try:
-        # Get the first non-loopback IP (doesn't actually send a request)
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return f"{ip}:53800"
-    except Exception:
-        return f"{socket.gethostname()}:53800"
+# ── Event types (controller-internal) ─────────────────────────────────────────
 
 
-def _run_env_dict(device: str, run_dir: str, name: str, experiment: str,
-                  tag_str: str, exp_server: str | None) -> dict[str, str]:
-    """Common env vars for a training run, as a plain dict."""
-    env = {
-        "CUDA_VISIBLE_DEVICES": device,
-        "HIP_VISIBLE_DEVICES": device,
-        "MLSWEEP_RUN_DIR": run_dir,
-        "MLSWEEP_RUN_NAME": name,
-        "EXP_EXPERIMENT": experiment,
-    }
-    if tag_str:
-        env["EXP_TAGS"] = tag_str
-    if exp_server:
-        env["EXP_SERVER"] = f"http://{exp_server}"
-    return env
+@dataclasses.dataclass
+class EvWorkerConnected:
+    worker_id: int
+    gpus: list[int]
+    topo: dict[str, int]
+    resuming: list[dict[str, Any]]
+    scratch_dir: str
 
 
-def _run_one(command: list[str], var: dict[str, Any], output_dir: str, experiment: str,
-             extra: list[str], gpu: list[int], log: str,
-             worker: str | None = None, remote_dir: str | None = None,
-             exp_server: str | None = None, sync_artifacts: bool = False,
-             run_from: str | None = None) -> tuple[dict, bool, float, str]:
-    """Execute one training run. Returns (var, success, elapsed, log_file).
-
-    When worker is None, runs locally.
-    When worker is an SSH target (e.g. 'user@host'), dispatches via SSH.
-    command: list[str] from the sweep file's COMMAND.
-    """
-    name = var["name"]
-    run_dir = os.path.join(output_dir, experiment, name)
-    os.makedirs(run_dir, exist_ok=True)
-
-    cmd = list(command) + var["overrides"] + list(extra)
-    tag_str = ",".join(f"{k}={v}" for k, v in var["combo"].items())
-
-    device = ",".join(str(g) for g in gpu)
-    t0 = time.time()
-    try:
-        if worker is None:
-            # === LOCAL execution ===
-            run_vars = _run_env_dict(device, run_dir, name, experiment, tag_str, exp_server)
-            env = {**os.environ, **run_vars}
-
-            effective_cwd = (
-                os.path.join(_PROJECT_ROOT, run_from)
-                if run_from and not os.path.isabs(run_from)
-                else run_from or _PROJECT_ROOT
-            )
-            with open(log, "w", buffering=1) as f:
-                subprocess.run(cmd, env=env, stdout=f,
-                               stderr=subprocess.STDOUT, check=True,
-                               cwd=effective_cwd)
-        else:
-            # === REMOTE execution via SSH ===
-            assert remote_dir is not None, "remote_dir required for SSH dispatch"
-            rel = os.path.relpath(output_dir, _PROJECT_ROOT)
-            remote_output_dir = (
-                os.path.join(remote_dir, rel)
-                if not rel.startswith("..")
-                else os.path.join(remote_dir, "outputs", "sweeps")
-            )
-            remote_run_dir = os.path.join(remote_output_dir, experiment, name)
-            remote_log = os.path.join(remote_run_dir, "training.log")
-
-            run_vars = _run_env_dict(device, remote_run_dir, name, experiment, tag_str, exp_server)
-            env_parts = [f"{k}={shlex.quote(str(v))}" for k, v in run_vars.items()]
-            if os.environ.get("MLSWEEP_TOKEN"):
-                env_parts.append(f"MLSWEEP_TOKEN={shlex.quote(os.environ['MLSWEEP_TOKEN'])}")
-            env_str = " ".join(env_parts)
-
-            remote_cmd_str = " ".join(shlex.quote(c) for c in cmd)
-
-            remote_cmd = (
-                f"mkdir -p {shlex.quote(remote_run_dir)} && "
-                f"cd {shlex.quote(remote_dir)} && "
-                f"{env_str} {remote_cmd_str}"
-                f" 2>&1 | tee {shlex.quote(remote_log)}"
-            )
-
-            with open(log, "w", buffering=1) as f:
-                subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                     worker, remote_cmd],
-                    stdout=f, stderr=subprocess.STDOUT, check=True)
-
-            # Optional: sync artifacts (checkpoints, profiling) back to controller
-            if sync_artifacts:
-                subprocess.run(
-                    ["rsync", "-a", "--exclude=training.log",
-                     f"{worker}:{remote_run_dir}/", f"{run_dir}/"],
-                    capture_output=True)
-
-        return var, True, time.time() - t0, log
-    except subprocess.CalledProcessError:
-        return var, False, time.time() - t0, log
+@dataclasses.dataclass
+class EvWorkerDisconnected:
+    worker_id: int
 
 
-def _singular_desc(combo: dict[str, Any], options: dict[str, Any], abbrev: dict[str, str] | None = None) -> str:
-    """Short description of singular dim values, e.g. 'bs=64, ac=full'.
-
-    Both combo and options use stripped keys (no dot prefix).
-    abbrev: optional dict mapping dim names to short labels (configurable per sweep).
-    """
-    _abbrev = abbrev or {}
-    return ", ".join(
-        f"{_abbrev.get(k, k[:4])}={combo[k]}"
-        for k in sorted(options) if options[k].get("singular")
-    )
+@dataclasses.dataclass
+class EvRunStarted:
+    worker_id: int
+    run_id: str
+    pid: int
 
 
-# ── Manifest & status helpers ──────────────────────────────────────────────────
+@dataclasses.dataclass
+class EvLogLine:
+    run_id: str
+    seq: int
+    data: str
 
 
-def _manifest_axes_from_variations(variations: list[dict[str, Any]]) -> tuple[dict[str, list[Any]], dict[str, dict[str, Any]]]:
-    """Extract axes and sub_axes from a list of variations.
-
-    Returns (axes, sub_axes_fmt) where:
-      axes:          {dim_name: [sorted values]}
-      sub_axes_fmt:  {dim_name: {"parentAxis": ..., "parentValue": ...}}
-    """
-    axis_values: dict[str, set] = {}
-    all_names: set = set()
-    names_with: dict[str, set] = {}
-
-    for var in variations:
-        combo = var["combo"]
-        all_names.add(var["name"])
-        for k, v in combo.items():
-            axis_values.setdefault(k, set()).add(v)
-            names_with.setdefault(k, set()).add(var["name"])
-
-    axes = {k: sorted(vs, key=_val_sort_key) for k, vs in axis_values.items()}
-
-    # Detect sub-axes: axes that only appear when a parent has a specific value
-    sub_axes_fmt: dict[str, dict[str, Any]] = {}
-    for axis in axes:
-        if names_with.get(axis) == all_names:
-            continue  # universal axis
-        for parent_axis in axes:
-            if parent_axis == axis:
-                continue
-            for parent_val in axes[parent_axis]:
-                names_with_parent = {
-                    var["name"] for var in variations
-                    if var["combo"].get(parent_axis) == parent_val
-                }
-                if names_with_parent == names_with.get(axis, set()):
-                    sub_axes_fmt[axis] = {
-                        "parentAxis": parent_axis,
-                        "parentValue": parent_val,
-                    }
-                    break
-            if axis in sub_axes_fmt:
-                break
-
-    return axes, sub_axes_fmt
+@dataclasses.dataclass
+class EvMetricLine:
+    run_id: str
+    step: int
+    data: dict[str, Any]
 
 
-def _write_manifest(exp_dir: str, experiment: str, variations: list[dict[str, Any]], note: str | None = None) -> None:
-    """Write the initial sweep_manifest.json before any jobs are dispatched."""
-    axes, sub_axes = _manifest_axes_from_variations(variations)
-    manifest = {
-        "experiment": experiment,
-        "axes": axes,
-        "subAxes": sub_axes,
-        "runs": [],         # populated as jobs are dispatched
-        "metricNames": [],  # populated dynamically by server
-    }
-    if note:
-        manifest["note"] = note
-    path = os.path.join(exp_dir, "sweep_manifest.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(manifest, f, indent=2)
-    os.replace(tmp, path)
+@dataclasses.dataclass
+class EvSyncRequest:
+    run_id: str
+    worker_id: int
 
 
-_manifest_lock = threading.Lock()
-_status_lock = threading.Lock()
+@dataclasses.dataclass
+class EvRunResult:
+    worker_id: int
+    run_id: str
+    success: bool
+    elapsed: float
+    exit_code: int
 
 
-def _append_manifest_run(exp_dir: str, var: dict[str, Any]) -> None:
-    """Append a dispatched run entry to sweep_manifest.json (thread-safe)."""
-    path = os.path.join(exp_dir, "sweep_manifest.json")
-    with _manifest_lock:
+@dataclasses.dataclass
+class EvArtifactSynced:
+    run_id: str
+
+
+@dataclasses.dataclass
+class EvWorkerCleaned:
+    run_id: str
+
+
+@dataclasses.dataclass
+class EvReconnectWorker:
+    worker_id: int
+    success: bool
+    resuming: list[dict[str, Any]]
+
+
+@dataclasses.dataclass
+class EvInteractiveCommand:
+    cmd: str
+    args: list[str]
+
+
+# ── Worker write thread ────────────────────────────────────────────────────────
+
+
+def _worker_write_thread(ws: WorkerState) -> None:
+    """Drain the worker's send_queue and write to socket."""
+    while True:
+        item = ws.send_queue.get()
+        if item is None:
+            break
         try:
-            with open(path) as f:
-                manifest = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return
-        manifest["runs"].append({"name": var["name"], "hash": var["name"], "combo": var["combo"]})
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, indent=2)
-        os.replace(tmp, path)
+            ws.sock.sendall(item)  # type: ignore[attr-defined]
+        except OSError:
+            break
 
 
-def _load_sweep_status(exp_dir: str) -> dict[str, Any]:
-    """Load sweep_status.json if present. Returns {} if missing or corrupt."""
-    path = os.path.join(exp_dir, "sweep_status.json")
+# ── Worker read thread ─────────────────────────────────────────────────────────
+
+
+class _LineReader:
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._buf = b""
+
+    def readline(self) -> bytes | None:
+        while True:
+            if b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                return line + b"\n"
+            try:
+                chunk = self._sock.recv(4096)
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+
+def _worker_read_thread(
+    ws: WorkerState,
+    sock: socket.socket,
+    event_queue: "queue.Queue[Any]",
+) -> None:
+    """Read messages from worker and post events to the controller's event queue."""
+    reader = _LineReader(sock)
+
+    # First message: MsgWorkerHello
+    line = reader.readline()
+    if not line:
+        event_queue.put(EvWorkerDisconnected(ws.worker_id))
+        return
     try:
-        with open(path) as f:
-            return json.load(f)  # type: ignore[no-any-return]
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _update_sweep_status(exp_dir: str, run_name: str, status: str,
-                          elapsed: float, combo: dict[str, Any]) -> None:
-    """Append/update a run's entry in sweep_status.json (thread-safe)."""
-    path = os.path.join(exp_dir, "sweep_status.json")
-    with _status_lock:
-        try:
-            with open(path) as f:
-                status_data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            status_data = {}
-        status_data[run_name] = {
-            "status": status,
-            "elapsed": round(elapsed, 2),
-            "combo": combo,
-        }
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(status_data, f, indent=2)
-        os.replace(tmp, path)
-
-
-# ── Sweep execution ────────────────────────────────────────────────────────
-
-
-def run_sweep(variations: list[dict[str, Any]], command: list[str], output_dir: str, experiment: str,
-              expected: int, extra: list[str],
-              gpu_slots: list[tuple[str | None, list[int], str | None, int]],
-              exp_server: str | None = None,
-              sync_artifacts: bool = False, exp_dir: str | None = None,
-              abbrev: dict[str, str] | None = None, run_from: str | None = None) -> tuple[list[tuple[Any, ...]], int, float]:
-    """Execute all variations. Single code path for sequential and parallel.
-
-    gpu_slots: list of (worker, gpu_group, remote_dir, jobs_per_slot) tuples.
-               worker=None and remote_dir=None means local.
-    expected:  expected number of resolved treatments (from count_expected).
-    command:   list[str] from the sweep file's COMMAND.
-    exp_dir:   experiment output directory (for manifest/status updates).
-    abbrev:    optional abbreviation dict for singular dim display.
-    """
-    num_slots = sum(jpg for _, _, _, jpg in gpu_slots)
-    has_singular = any(
-        o.get("singular")
-        for var in variations
-        for o in var["effective_options"].values()
-    )
-
-    # Shared state (protected by lock)
-    results: list[tuple[Any, ...]] = []    # (var, success, elapsed, log_file)
-    failed: list[dict[str, Any]] = []
-    succeeded: list[dict[str, Any]] = []
-    resolved = set()      # treatment keys with at least one success
-    lock = threading.Lock()
-    t0 = time.time()
-    pad = max((len(v["name"]) for v in variations), default=0)
-
-    # GPU pool: each slot appears jobs_per_slot times
-    # Slots are (worker, gpu_group, remote_dir) — worker=None and remote_dir=None for local
-    gpu_q: queue.Queue[tuple[str | None, list[int], str | None]] = queue.Queue()
-    for worker, gpu_group, remote_dir, jobs_per_slot in gpu_slots:
-        for _ in range(jobs_per_slot):
-            gpu_q.put((worker, gpu_group, remote_dir))
-
-    skipped_count = 0
-
-    def _job_worker(var: dict[str, Any]) -> None:
-        nonlocal skipped_count
-        worker, gpu, remote_dir = gpu_q.get()
-        opts = var["effective_options"]
-
-        # Pre-flight: re-check skip in case treatment was resolved while queued
-        with lock:
-            if should_skip(var["combo"], failed, succeeded, opts):
-                gpu_q.put((worker, gpu, remote_dir))
-                skipped_count += 1
-                return
-
-        nm = var["name"].ljust(pad)
-        sdesc = _singular_desc(var["combo"], opts, abbrev) if has_singular else ""
-        # Compute log path here so we can print it at START
-        run_dir = os.path.join(output_dir, experiment, var["name"])
-        log = os.path.join(run_dir, "training.log")
-        n = 0
-        while os.path.exists(log):
-            n += 1
-            log = os.path.join(run_dir, f"training.{n}.log")
-        gpu_label = f"gpu{'s' if len(gpu) > 1 else ''} {','.join(str(g) for g in gpu)}"
-        loc = f"{_MAGENTA}{worker}{_RESET} {gpu_label}" if worker else gpu_label
-        with lock:
-            if sdesc:
-                sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log}{_RESET}")
-            else:
-                sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log}{_RESET}")
-
-        # Record run in manifest as dispatched
-        if exp_dir:
-            _append_manifest_run(exp_dir, var)
-
-        job_t0 = time.time()
-        try:
-            _, ok, elapsed, log = _run_one(
-                command, var, output_dir, experiment, extra, gpu, log,
-                worker=worker, remote_dir=remote_dir, exp_server=exp_server,
-                sync_artifacts=sync_artifacts, run_from=run_from)
-        except Exception as e:
-            sweep_print(f"{_RED}ERROR{_RESET}  {var['name']}: unexpected exception: {e}")
-            ok, elapsed, log = False, time.time() - job_t0, "?"
-        finally:
-            gpu_q.put((worker, gpu, remote_dir))
-
-        # Update sweep_status.json
-        if exp_dir:
-            _update_sweep_status(exp_dir, var["name"],
-                                  "ok" if ok else "failed", elapsed, var["combo"])
-
-        with lock:
-            results.append((var, ok, elapsed, log))
-            tk = _treatment_key(var["combo"], opts)
-            (succeeded if ok else failed).append(var["combo"])
-            if ok:
-                resolved.add(tk)
-            nr = len(resolved)
-
-            if ok:
-                tag = f"{_GREEN}   OK{_RESET}"
-            elif has_singular and tk not in resolved:
-                tag = f"{_YELLOW}PROBE{_RESET}"
-            else:
-                tag = f"{_RED} FAIL{_RESET}"
-            sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log}{_RESET} {elapsed:.1f}s [{nr}/{expected} resolved]")
-
+        msg = decode(line)
+    except (ValueError, json.JSONDecodeError, TypeError):
+        event_queue.put(EvWorkerDisconnected(ws.worker_id))
+        return
+    if not isinstance(msg, MsgWorkerHello):
+        event_queue.put(EvWorkerDisconnected(ws.worker_id))
         return
 
-    def _drain_completed() -> None:
-        """Process any already-completed futures to update state before skip checks."""
-        for f in [f for f in futures if f.done()]:
-            f.result()
-            futures.discard(f)
-        for tk, f in [item for item in inflight.items() if item[1].done()]:
-            del inflight[tk]
+    event_queue.put(EvWorkerConnected(
+        worker_id=ws.worker_id,
+        gpus=msg.gpus,
+        topo=msg.topo,
+        resuming=msg.resuming,
+        scratch_dir=msg.scratch_dir,
+    ))
 
-    inflight: dict[tuple, Any] = {}  # treatment_key -> most recent future for that treatment
+    # Main loop
+    while True:
+        line = reader.readline()
+        if not line:
+            break
+        try:
+            msg = decode(line)
+        except (ValueError, json.JSONDecodeError, TypeError):
+            continue
 
-    with ThreadPoolExecutor(max_workers=num_slots) as pool:
-        futures: set[Any] = set()
-        remaining = list(variations)
-        while remaining:
-            deferred = []
-            for var in remaining:
-                _drain_completed()
+        if isinstance(msg, MsgStarted):
+            event_queue.put(EvRunStarted(
+                worker_id=ws.worker_id, run_id=msg.run_id, pid=msg.pid
+            ))
+        elif isinstance(msg, MsgLog):
+            event_queue.put(EvLogLine(run_id=msg.run_id, seq=msg.seq, data=msg.data))
+        elif isinstance(msg, MsgMetric):
+            event_queue.put(EvMetricLine(
+                run_id=msg.run_id, step=msg.step, data=msg.data
+            ))
+        elif isinstance(msg, MsgSyncReq):
+            event_queue.put(EvSyncRequest(run_id=msg.run_id, worker_id=ws.worker_id))
+        elif isinstance(msg, MsgResult):
+            event_queue.put(EvRunResult(
+                worker_id=ws.worker_id,
+                run_id=msg.run_id,
+                success=msg.success,
+                elapsed=msg.elapsed,
+                exit_code=msg.exit_code,
+            ))
+        elif isinstance(msg, MsgCleaned):
+            event_queue.put(EvWorkerCleaned(run_id=msg.run_id))
 
-                # Defer if previous run of same treatment is still in-flight
-                tk = _treatment_key(var["combo"], var["effective_options"])
-                prev = inflight.get(tk)
-                if prev is not None and not prev.done():
-                    deferred.append(var)
-                    continue
-
-                # Wait for a slot if pool is full
-                while len(futures) >= num_slots:
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    for f in done:
-                        f.result()
-                        futures.discard(f)
-
-                # Check skip with most up-to-date state
-                with lock:
-                    skip = should_skip(var["combo"], failed, succeeded,
-                                       var["effective_options"])
-                if skip:
-                    skipped_count += 1
-                    continue
-
-                f = pool.submit(_job_worker, var)
-                futures.add(f)
-                inflight[tk] = f
-
-            remaining = deferred
-            if remaining and futures:
-                done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                for f in done:
-                    f.result()
-                    futures.discard(f)
-
-        # Drain remaining futures
-        for f in list(futures):
-            f.result()
-
-    return results, skipped_count, time.time() - t0
+    event_queue.put(EvWorkerDisconnected(ws.worker_id))
 
 
-# ── Summary ────────────────────────────────────────────────────────────────
+# ── Reconnect thread ───────────────────────────────────────────────────────────
 
 
-def print_summary(results: list[tuple[Any, ...]], skipped: int, elapsed: float, abbrev: dict[str, str] | None = None) -> bool:
-    """Print per-treatment summary."""
+def _reconnect_thread(
+    ws: WorkerState,
+    event_queue: "queue.Queue[Any]",
+    token: str,
+    max_attempts: int = 10,
+) -> None:
+    """Try to reconnect to a worker after disconnect; post EvReconnectWorker."""
+    backoff = 1.0
+    for _ in range(max_attempts):
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
+        try:
+            sock = socket.create_connection((ws.host, ws.port), timeout=5)
+            sock.sendall(encode(MsgHello(token=token, controller_id="controller")))
+            reader = _LineReader(sock)
+            line = reader.readline()
+            if not line:
+                sock.close()
+                continue
+            msg = decode(line)
+            if not isinstance(msg, MsgWorkerHello):
+                sock.close()
+                continue
+            # Reconnected — attach new socket to WorkerState
+            ws.sock = sock  # type: ignore[attr-defined]
+            ws.send_queue = queue.Queue()
+            ws.status = "CONNECTED"
+            event_queue.put(EvReconnectWorker(
+                worker_id=ws.worker_id, success=True, resuming=msg.resuming
+            ))
+            # Restart read/write threads
+            threading.Thread(
+                target=_worker_write_thread, args=(ws,), daemon=True
+            ).start()
+            threading.Thread(
+                target=_worker_read_thread, args=(ws, sock, event_queue), daemon=True
+            ).start()
+            return
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+
+    ws.status = "DEAD"
+    event_queue.put(EvReconnectWorker(worker_id=ws.worker_id, success=False, resuming=[]))
+
+
+# ── Sync thread ────────────────────────────────────────────────────────────────
+
+
+def _rsync_thread(
+    worker_host: str,
+    remote_scratch: str,
+    local_run_dir: str,
+    run_id: str,
+    event_queue: "queue.Queue[Any]",
+    password: str | None = None,
+    ssh_key: str | None = None,
+) -> None:
+    """Sync artifacts from worker scratch to local output dir."""
+    if worker_host == "localhost":
+        # Local worker: copy artifacts dir if scratch != output
+        src = os.path.join(remote_scratch, "artifacts")
+        dst = os.path.join(local_run_dir, "artifacts")
+        if src != dst and os.path.isdir(src):
+            try:
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            except OSError as e:
+                sweep_print(f"  {_YELLOW}WARN{_RESET}  parsync failed for {run_id}: {e}")
+    else:
+        # parsync authenticates via SSH agent, ~/.ssh/config, or PARSYNC_SSH_PASSWORD.
+        # ssh_key must be registered with the agent or listed in ~/.ssh/config.
+        env = os.environ.copy()
+        if password:
+            env["PARSYNC_SSH_PASSWORD"] = password
+        result = subprocess.run(
+            [
+                parsync_bin(),
+                "-rlu",
+                f"{worker_host}:{remote_scratch}/",
+                f"{local_run_dir}/",
+            ],
+            capture_output=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            sweep_print(
+                f"  {_YELLOW}WARN{_RESET}  parsync failed for {run_id}: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+    event_queue.put(EvArtifactSynced(run_id=run_id))
+
+
+# ── SSH helpers ────────────────────────────────────────────────────────────────
+
+_sshpass_available: bool | None = None
+
+
+def _worker_candidates(venv: str | None) -> list[str]:
+    """Return candidate mlsweep_worker binary paths to try, given a venv specifier.
+
+    Interprets the venv value and produces an ordered list; the caller tries
+    each in sequence and execs the first one that exists and is executable.
+    Falls back to mlsweep_worker on PATH if nothing else matches.
+    """
+    candidates: list[str] = []
+    if venv:
+        p = venv.rstrip("/")
+        bn = os.path.basename(p)
+        if bn == "mlsweep_worker":
+            candidates.append(p)
+        elif bn in ("python", "python3", "activate"):
+            # Points at a file inside bin/ — use the same bin/
+            candidates.append(os.path.join(os.path.dirname(p), "mlsweep_worker"))
+        elif bn == "bin":
+            # Points at a bin/ directory directly
+            candidates.append(os.path.join(p, "mlsweep_worker"))
+        else:
+            # venv root or project root — try common layouts in order
+            candidates += [
+                os.path.join(p, "bin", "mlsweep_worker"),          # venv root
+                os.path.join(p, ".venv", "bin", "mlsweep_worker"),  # project/.venv
+                os.path.join(p, "venv", "bin", "mlsweep_worker"),   # project/venv
+            ]
+    candidates.append("mlsweep_worker")  # last resort: whatever is on PATH
+    return candidates
+
+
+def _worker_shell_cmd(candidates: list[str], worker_args: list[str]) -> str:
+    """Return a self-contained shell command that execs the first available worker binary."""
+    args_str = shlex.join(worker_args)
+    paths_str = " ".join(shlex.quote(c) for c in candidates)
+    return (
+        f"for _p in {paths_str}; do\n"
+        f"    [ -x \"$_p\" ] && exec \"$_p\" {args_str}\n"
+        f"done\n"
+        f"echo 'mlsweep: mlsweep_worker not found (tried: {paths_str})' >&2; exit 1"
+    )
+
+
+def _sshpass_prefix(password: str | None) -> list[str]:
+    """Return ['sshpass', '-p', password] if a password is given, else []."""
+    global _sshpass_available
+    if not password:
+        return []
+    if _sshpass_available is None:
+        _sshpass_available = shutil.which("sshpass") is not None
+    if not _sshpass_available:
+        raise RuntimeError("sshpass is not installed but a password was specified")
+    return ["sshpass", "-p", password]
+
+
+
+
+# ── Stdin thread ───────────────────────────────────────────────────────────────
+
+
+def _stdin_thread(event_queue: "queue.Queue[Any]") -> None:
+    """Read interactive commands from stdin and post them as events."""
+    try:
+        for line in sys.stdin:
+            parts = line.strip().split()
+            if parts:
+                event_queue.put(EvInteractiveCommand(cmd=parts[0], args=parts[1:]))
+    except (OSError, EOFError):
+        pass
+
+
+# ── Worker connection setup ────────────────────────────────────────────────────
+
+
+def _start_worker(
+    host: str,
+    remote_dir: str,
+    token: str,
+    scratch_dir: str,
+    devices: list[int] | None = None,
+    password: str | None = None,
+    ssh_key: str | None = None,
+    venv: str | None = None,
+) -> tuple[socket.socket, int]:
+    """SSH to start (or re-use) a worker daemon and return (socket, port).
+
+    For local mode, host should be "localhost" and we use subprocess directly.
+    """
+    devices_args = ["--devices", ",".join(str(d) for d in devices)] if devices else []
+    key_args = ["-i", ssh_key] if ssh_key else []
+    if host == "localhost":
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "mlsweep.worker",
+                "--token", token,
+                "--remote-dir", remote_dir,
+                "--scratch-dir", scratch_dir,
+                *devices_args,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    else:
+        worker_args = [
+            "--token", token,
+            "--remote-dir", remote_dir,
+            *devices_args,
+        ]
+        shell_cmd = _worker_shell_cmd(_worker_candidates(venv), worker_args)
+        proc = subprocess.Popen(
+            [
+                *_sshpass_prefix(password),
+                "ssh", "-o", "ConnectTimeout=10", *key_args,
+                host, shell_cmd,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    assert proc.stdout is not None and proc.stderr is not None
+    line = proc.stdout.readline().strip()
+    if not line.startswith("PORT="):
+        stderr_out = proc.stderr.read().strip()
+        proc.wait()
+        # Diagnose common SSH/auth failures
+        hint = ""
+        if "Permission denied" in stderr_out or "Authentication failed" in stderr_out:
+            hint = "\n  hint: authentication failed — check ssh_key / pass / MLSWEEP_SSH_PASS"
+        elif "Host key verification failed" in stderr_out:
+            hint = "\n  hint: host key not in known_hosts — ssh to the machine manually first"
+        elif "Connection refused" in stderr_out:
+            hint = "\n  hint: connection refused — is the host reachable on port 22?"
+        elif "Connection timed out" in stderr_out or "Operation timed out" in stderr_out:
+            hint = "\n  hint: connection timed out — check the hostname/IP and firewall"
+        elif "Could not resolve" in stderr_out or "Name or service not known" in stderr_out:
+            hint = "\n  hint: hostname not found — check the host field in workers.toml"
+        elif "No module named mlsweep" in stderr_out:
+            hint = "\n  hint: mlsweep is not installed on the remote machine"
+        elif "python: command not found" in stderr_out or "python3: command not found" in stderr_out:
+            hint = "\n  hint: python not found on remote — is it in PATH?"
+        elif "UNPROTECTED PRIVATE KEY" in stderr_out:
+            hint = "\n  hint: ssh_key permissions are too open — run: chmod 600 <key>"
+        last_line = stderr_out.splitlines()[-1] if stderr_out else (line or "(no output)")
+        raise RuntimeError(f"worker failed to start: {last_line}{hint}")
+    port = int(line.split("=")[1])
+
+    connect_host = "localhost" if host == "localhost" else host
+    sock = socket.create_connection((connect_host, port), timeout=10)
+    return sock, port
+
+
+def _connect_workers(
+    workers_file: str | None,
+    gpus_per_run: int,
+    token: str,
+    event_queue: "queue.Queue[Any]",
+    scratch_dir: str = "/tmp/mlsweep",
+    max_gpus: int | None = None,
+    jobs_per_slot: int = 1,
+) -> list[WorkerState]:
+    """Start worker daemons and set up connections.
+
+    Returns a list of WorkerState objects (status=CONNECTING until
+    EvWorkerConnected event is received from the read thread).
+    """
+    if workers_file:
+        worker_configs = _parse_workers(workers_file)
+    else:
+        # Local mode
+        worker_configs = [("localhost", _PROJECT_ROOT, max_gpus, jobs_per_slot, None, None, None, None)]
+
+    workers: list[WorkerState] = []
+
+    for worker_id, (host, remote_dir, w_gpus, w_jobs, w_devices, w_pass, w_key, w_venv) in enumerate(worker_configs):
+        try:
+            sock, port = _start_worker(host, remote_dir, token, scratch_dir, w_devices, w_pass, w_key, w_venv)
+        except Exception as e:
+            sweep_print(f"  {_RED}WARN{_RESET}  Cannot start worker on {host}: {e}")
+            continue
+
+        # Send MsgHello — worker will respond with MsgWorkerHello (handled by read thread)
+        ws = WorkerState(
+            worker_id=worker_id,
+            host=host,
+            port=port,
+            remote_dir=remote_dir,
+            scratch_dir=scratch_dir,
+            gpus=[],
+            topo={},
+            slots=[],
+            busy_slots=set(),
+            send_queue=queue.Queue(),
+            status="CONNECTING",
+            in_flight={},
+            jobs_per_slot=w_jobs if w_jobs is not None else jobs_per_slot,
+            password=w_pass,
+            ssh_key=w_key,
+        )
+        ws.sock = sock  # type: ignore[attr-defined]
+
+        sock.sendall(encode(MsgHello(token=token, controller_id="controller")))
+
+        # Start read/write threads
+        threading.Thread(
+            target=_worker_write_thread, args=(ws,), daemon=True
+        ).start()
+        threading.Thread(
+            target=_worker_read_thread, args=(ws, sock, event_queue), daemon=True
+        ).start()
+
+        workers.append(ws)
+
+    return workers
+
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+
+
+def print_summary(
+    results: list[tuple[Any, ...]],
+    skipped: int,
+    elapsed: float,
+) -> bool:
+    """Print per-treatment summary. Returns True if any treatment failed."""
     has_singular = any(
         o.get("singular")
         for var, _, _, _ in results
@@ -1144,7 +690,7 @@ def print_summary(results: list[tuple[Any, ...]], skipped: int, elapsed: float, 
         successes = [(v, e, lf) for v, s, e, lf in runs if s]
         if successes:
             best_var, best_el, best_log = min(successes, key=lambda x: x[1])
-            sdesc = _singular_desc(best_var["combo"], best_var["effective_options"], abbrev) if has_singular else ""
+            sdesc = _singular_desc(best_var["combo"], best_var["effective_options"]) if has_singular else ""
             n_probes = sum(1 for _, s, _, _ in runs if not s)
             pnote = f", {n_probes} probes" if n_probes else ""
             sweep_print(f"  {_GREEN}   OK{_RESET}  {best_var['name']:<40}"
@@ -1159,117 +705,120 @@ def print_summary(results: list[tuple[Any, ...]], skipped: int, elapsed: float, 
     return ok_count < total_treatments
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Scheduling helpers ─────────────────────────────────────────────────────────
 
 
-def _setup_gpu_slots(args: Any, gpus_per_run: int, exp_server: str | None = None) -> tuple[list[tuple[str | None, list[int], str | None, int]], str | None]:
-    """Resolve and return (gpu_slots, exp_server).
+def _dispatch_pending(
+    workers: list[WorkerState],
+    pending: list[dict[str, Any]],
+    in_flight: dict[str, dict[str, Any]],
+    failed: list[dict[str, Any]],
+    succeeded: list[dict[str, Any]],
+    output_dir: str,
+    experiment: str,
+    exp_dir: str,
+    token: str,
+    command: list[str],
+    extra: list[str],
+    run_from: str | None,
+    gpus_per_run: int,
+    has_singular: bool,
+) -> list[dict[str, Any]]:
+    """Try to assign pending variations to free slots. Returns still-pending list."""
+    # Build set of treatment keys currently in-flight (for deferral)
+    inflight_treatments: set[tuple[Any, ...]] = set()
+    for run_id, var in in_flight.items():
+        tk = _treatment_key(var["combo"], var["effective_options"])
+        inflight_treatments.add(tk)
 
-    Remote mode: discovers GPUs via SSH, groups them topology-aware per worker.
-    Local mode: uses visible GPUs, groups them topology-aware locally.
-    Slots are (worker, gpu_group, remote_dir, jobs_per_slot);
-    worker=None and remote_dir=None for local.
-    """
-    if args.workers:
-        # Remote mode: discover GPUs on each worker via SSH
-        worker_list = _parse_workers(args.workers)
-        # Build per-worker gpu/jobs config from workers file
-        worker_config: dict[str, tuple[int | None, int]] = {
-            w: (gpus, jobs if jobs is not None else 1)
-            for w, _, gpus, jobs in worker_list
-        }
-        sweep_print(f"Discovering GPUs on {len(worker_list)} workers...")
-        raw_slots = _discover_remote_gpus([(w, rd) for w, rd, _, _ in worker_list])
-        if not raw_slots:
-            sweep_print(f"{_RED}Error: no reachable workers with GPUs{_RESET}")
-            sys.exit(1)
-        if exp_server is None:
-            exp_server = _get_default_exp_server()
-        # Group raw [(worker, remote_dir, gpu_id)] by worker: {w: (remote_dir, [gpus])}
-        worker_info: dict[str, tuple[str, list[int]]] = {}
-        for w, rd, g in raw_slots:
-            if w not in worker_info:
-                worker_info[w] = (rd, [])
-            worker_info[w][1].append(g)
-        # Topology-aware slot building per worker
-        grouped_slots: list[tuple[str | None, list[int], str | None, int]] = []
-        for w in sorted(worker_info):
-            remote_dir, worker_gpus = worker_info[w]
-            w_gpus, w_jobs = worker_config.get(w, (None, 1))
-            if w_gpus is not None and w_gpus > 0:
-                worker_gpus = worker_gpus[:w_gpus]
-            n_slots = len(worker_gpus) // gpus_per_run
-            if n_slots == 0:
-                sweep_print(f"  {_YELLOW}WARN{_RESET}  {w}: only {len(worker_gpus)} GPU(s), "
-                            f"need {gpus_per_run} per run — skipping")
+    deferred = []
+    remaining = list(pending)
+
+    for var in remaining:
+        opts = var["effective_options"]
+        tk = _treatment_key(var["combo"], opts)
+
+        # Skip if monotonic/singular logic says to skip
+        if should_skip(var["combo"], failed, succeeded, opts):
+            # Don't add to deferred — permanently skip
+            continue
+
+        # Defer if same treatment is in-flight
+        if tk in inflight_treatments:
+            deferred.append(var)
+            continue
+
+        # Find a free slot on any CONNECTED worker
+        slot_found = False
+        for ws in workers:
+            if ws.status != "CONNECTED":
                 continue
-            groups = _best_gpu_groups(worker_gpus, gpus_per_run, n_slots, worker=w)
-            grouped_slots.extend((w, grp, remote_dir, w_jobs) for grp in groups)
-        if not grouped_slots:
-            sweep_print(f"{_RED}Error: no workers with enough GPUs for GPUS_PER_RUN={gpus_per_run}{_RESET}")
-            sys.exit(1)
-        # Show discovered topology
-        worker_slot_counts = Counter(wk for wk, _, _, _ in grouped_slots)
-        for wk, cnt in sorted(worker_slot_counts.items()):
-            total_gpus = cnt * gpus_per_run
-            slot_word = "slot" if cnt == 1 else "slots"
-            _, w_jobs = worker_config.get(wk, (None, 1))
-            jpg_str = f", {w_jobs} job{'s' if w_jobs != 1 else ''}/slot" if w_jobs != 1 else ""
-            sweep_print(f"  {_GREEN}OK{_RESET}    {wk}: {cnt} {slot_word} ({total_gpus} GPUs{jpg_str})")
-        sweep_print(f"Exp server: {exp_server}")
-        return grouped_slots, exp_server
-    else:
-        # Local mode
-        visible = _visible_devices()
-        if not visible:
-            if args.gpus is not None or os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES"):
-                sweep_print(f"{_RED}Error: GPUs requested but no GPU management tool found "
-                            f"(tried nvidia-smi, amd-smi){_RESET}")
-                sys.exit(1)
-            visible = [0]
-        if args.gpus is None:
-            num_gpus = gpus_per_run   # default: one slot
-        elif args.gpus == 0:
-            num_gpus = len(visible)   # all visible
-        else:
-            num_gpus = args.gpus
-        if num_gpus > len(visible):
-            sweep_print(f"Error: need {num_gpus} GPUs but only {len(visible)} visible")
-            sys.exit(1)
-        if num_gpus < gpus_per_run:
-            sweep_print(f"Error: need at least {gpus_per_run} GPUs (GPUS_PER_RUN) "
-                        f"but only {num_gpus} requested")
-            sys.exit(1)
-        if num_gpus % gpus_per_run != 0:
-            sweep_print(f"Warning: {num_gpus} GPUs is not a multiple of "
-                        f"GPUS_PER_RUN={gpus_per_run}; "
-                        f"using {(num_gpus // gpus_per_run) * gpus_per_run}")
-        n_slots = num_gpus // gpus_per_run
-        usable = n_slots * gpus_per_run
-        jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
-        groups = _best_gpu_groups(visible[:usable], gpus_per_run, n_slots)
-        return [(None, grp, None, jobs_per_slot) for grp in groups], exp_server
+            for slot_idx, gpu_group in enumerate(ws.slots):
+                if slot_idx not in ws.busy_slots:
+                    # Dispatch this run
+                    ws.busy_slots.add(slot_idx)
+                    run_id = var["name"]
+                    in_flight[run_id] = var
+
+                    run_dir = os.path.join(output_dir, experiment, run_id)
+                    os.makedirs(run_dir, exist_ok=True)
+
+                    run_scratch = os.path.join(ws.scratch_dir, experiment, run_id)
+                    tag_str = ",".join(f"{k}={v}" for k, v in var["combo"].items() if v is not None)
+                    env: dict[str, str] = {}
+                    if tag_str:
+                        env["EXP_TAGS"] = tag_str
+
+                    run_msg = MsgRun(
+                        run_id=run_id,
+                        experiment=experiment,
+                        command=list(command) + var["overrides"] + list(extra),
+                        env=env,
+                        gpu_ids=gpu_group,
+                        remote_dir=ws.remote_dir,
+                        scratch=run_scratch,
+                        run_from=run_from,
+                    )
+                    ws.send_queue.put(encode(run_msg))
+                    ws.in_flight[run_id] = var
+                    ws.run_slots[run_id] = slot_idx
+
+                    _append_manifest_run(exp_dir, var)
+
+                    # Print dispatch line
+                    nm = run_id.ljust(max(len(v["name"]) for v in remaining + deferred + list(in_flight.values())) if remaining or deferred or in_flight else len(run_id))
+                    sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
+                    gpu_label = f"gpu{'s' if len(gpu_group) > 1 else ''} {','.join(str(g) for g in gpu_group)}"
+                    loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
+                           if ws.host != "localhost" else gpu_label)
+                    log_path = os.path.join(run_dir, "training.log")
+                    if sdesc:
+                        sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path}{_RESET}")
+                    else:
+                        sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path}{_RESET}")
+
+                    inflight_treatments.add(tk)
+                    slot_found = True
+                    break
+            if slot_found:
+                break
+
+        if not slot_found:
+            deferred.append(var)
+
+    return deferred
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     global _log_file
 
-    # Shebang mode: first arg is a .py sweep file
     argv = sys.argv[1:]
-    sweep_name = options = command = exclude_fn = sweeps = None
-    extra_flags = []
-    abbrev = None
+    extra_flags: list[str] = []
     gpus_per_run = 1
     run_from = None
-    if argv and argv[0].endswith(".py") and os.path.isfile(argv[0]):
-        info = load_sweep_file(argv[0])
-        sweep_name, options, command, exclude_fn, extra_flags, abbrev = (
-            info["name"], info["options"], info["command"],
-            info["exclude"], info["extra_flags"], info.get("abbrev"))
-        gpus_per_run = info.get("gpus_per_run", 1)
-        run_from = info.get("run_from")
-        validate_options(options)
-        argv = argv[1:]
 
     parser = argparse.ArgumentParser(
         description="Run experiment sweeps",
@@ -1281,13 +830,8 @@ def main() -> None:
             "                        (used when --gpus is not set)\n"
             "  HIP_VISIBLE_DEVICES   AMD GPU indices available for scheduling\n"
             "                        (used when --gpus is not set)\n"
-            "  MLSWEEP_TOKEN         Bearer token forwarded to each training process\n"
-            "                        for exp-server auth (see --exp-server)\n"
         ))
-    if sweep_name is None:
-        sweeps = load_sweeps()
-        parser.add_argument("--sweep", required=True, choices=sorted(sweeps),
-                            help="Sweep name")
+    parser.add_argument("sweep_file", help="Path to sweep .py file")
     parser.add_argument("--output_dir", default=os.path.join(_PROJECT_ROOT, "outputs", "sweeps"),
                         help="Output directory")
     parser.add_argument("--experiment", default=None,
@@ -1295,13 +839,9 @@ def main() -> None:
     parser.add_argument("--gpus", "-g", type=int, nargs="?", const=0, default=None,
                         help="Total GPUs to use (0 = all visible; default = GPUS_PER_RUN or 1)")
     parser.add_argument("--jobs-per-gpu", "-j", type=int, default=None,
-                        help="Concurrent jobs per GPU (default: 1; per-machine when using --workers, specify in workers file)")
+                        help="Concurrent jobs per GPU (default: 1)")
     parser.add_argument("--workers", default=None,
                         help="Path to workers file for remote dispatch (one '<host> <remote_dir>' per line)")
-    parser.add_argument("--exp-server", default=None,
-                        help="Exp tracking server host:port (default: auto-detect for remote workers)")
-    parser.add_argument("--sync-artifacts", action="store_true",
-                        help="Rsync dump_folder back from workers after each job")
     parser.add_argument("--resume", action="store_true",
                         help="Skip runs already recorded as completed in sweep_status.json")
     parser.add_argument("--dry-run", action="store_true",
@@ -1310,6 +850,10 @@ def main() -> None:
                         help="Validate sweep config, print all combinations, and exit (no jobs launched)")
     parser.add_argument("--note", default=None,
                         help="Human-readable note stored in sweep_manifest.json")
+    parser.add_argument("--max-retries", type=int, default=2,
+                        help="Max retries for orphaned runs (default: 2)")
+    parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
+                        help="Worker scratch directory (default: /tmp/mlsweep)")
     parser.add_argument(
         "--version", action="version",
         version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
@@ -1330,24 +874,21 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if sweep_name is None:
-        assert sweeps is not None
-        info = sweeps[args.sweep]
-        sweep_name, options, command = args.sweep, info["options"], info["command"]
-        exclude_fn  = info.get("exclude")
-        extra_flags = info.get("extra_flags", [])
-        abbrev      = info.get("abbrev")
-        gpus_per_run = info.get("gpus_per_run", 1)
-        run_from = info.get("run_from")
-        validate_options(options)
+    info = load_sweep_file(args.sweep_file)
+    sweep_name, options, command, exclude_fn, extra_flags = (
+        info["name"], info["options"], info["command"],
+        info["exclude"], info["extra_flags"])
+    gpus_per_run = info.get("gpus_per_run", 1)
+    run_from = info.get("run_from")
+    validate_options(options)
 
     assert options is not None and command is not None
+
     # --validate: check config, print all combinations, exit (no jobs, no files)
     if args.validate:
         all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
         expected = count_expected(options)
         excluded = expected - len(all_variations)
-        # Collect top-level dimension names (strip leading dot)
         dim_names = [k[1:] for k in options]
         sweep_print(f"Sweep: {sweep_name}")
         sweep_print(f"Dimensions: {', '.join(dim_names) if dim_names else '(none)'}")
@@ -1364,10 +905,6 @@ def main() -> None:
             sweep_print(f"  {var['name']}: {var['combo']}")
         sys.exit(0)
 
-    # GPU setup: build list of (worker, gpu_group, remote_dir) slots
-    exp_server = args.exp_server
-    gpu_slots, exp_server = _setup_gpu_slots(args, gpus_per_run, exp_server)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     experiment = args.experiment or f"{sweep_name}_{timestamp}"
     output_dir = os.path.abspath(args.output_dir)
@@ -1380,8 +917,7 @@ def main() -> None:
     all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
     expected = count_expected(options)
 
-    # Resume: skip variations that already completed in a prior run
-    prior_status = {}
+    # Resume: skip variations already completed
     resumed_count = 0
     if args.resume:
         prior_status = _load_sweep_status(exp_dir)
@@ -1396,8 +932,6 @@ def main() -> None:
     variations = all_variations
     n = len(variations)
 
-    num_total_slots = sum(jpg for _, _, _, jpg in gpu_slots)
-
     # Header
     sweep_print(f"Command: {' '.join(command)}")
     if expected < n:
@@ -1405,19 +939,8 @@ def main() -> None:
     else:
         sweep_print(f"Sweep: {sweep_name} ({n} runs)")
     sweep_print(f"Experiment: {experiment}")
-    if args.workers:
-        sweep_print(f"GPU slots: {len(gpu_slots)}, total workers: {num_total_slots}")
-    else:
-        jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
-        sweep_print(f"GPUs: {len(gpu_slots)}, jobs/GPU: {jobs_per_slot},"
-                    f" workers: {num_total_slots}")
-    if gpus_per_run > 1:
-        sweep_print(f"GPUs/run: {gpus_per_run}")
     if extra:
         sweep_print(f"Extra overrides: {' '.join(extra)}")
-    if not args.dry_run:
-        sweep_print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
-    sweep_print(f"Output: {output_dir}\n")
 
     # List all variations with colored flags
     for var in variations:
@@ -1439,7 +962,7 @@ def main() -> None:
         sweep_print(f"{'=' * 80}")
         return
 
-    # Write sweep_manifest.json before dispatching any jobs
+    # Write sweep_manifest.json
     _write_manifest(exp_dir, experiment, variations, note=args.note)
 
     run_desc = f"{expected} runs, {n} possible" if expected < n else f"{n} runs"
@@ -1447,17 +970,365 @@ def main() -> None:
     sweep_print(f"Starting sweep - ({run_desc})")
     sweep_print(f"{'=' * 80}\n")
 
-    results, skipped, elapsed = run_sweep(
-        variations, command, output_dir, experiment, expected, extra,
-        gpu_slots,
-        exp_server=exp_server, sync_artifacts=args.sync_artifacts,
-        exp_dir=exp_dir, abbrev=abbrev, run_from=run_from)
+    if not args.dry_run and not args.validate:
+        sweep_print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
+    sweep_print(f"Output: {output_dir}\n")
 
-    has_failures = print_summary(results, skipped, elapsed, abbrev=abbrev)
+    # Generate auth token
+    token = secrets.token_hex(16)
+
+    # Determine GPU configuration for local mode
+    local_gpus: int | None = args.gpus
+    jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
+
+    if not args.workers:
+        visible = _visible_devices()
+        if not visible:
+            if args.gpus is not None or os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES"):
+                sweep_print(f"{_RED}Error: GPUs requested but no GPU management tool found "
+                            f"(tried nvidia-smi, amd-smi){_RESET}")
+                sys.exit(1)
+            visible = [0]
+        if args.gpus is None:
+            num_gpus = gpus_per_run  # default: one slot
+        elif args.gpus == 0:
+            num_gpus = len(visible)  # all visible
+        else:
+            num_gpus = args.gpus
+        if num_gpus > len(visible):
+            sweep_print(f"Error: need {num_gpus} GPUs but only {len(visible)} visible")
+            sys.exit(1)
+        if num_gpus < gpus_per_run:
+            sweep_print(f"Error: need at least {gpus_per_run} GPUs (GPUS_PER_RUN) "
+                        f"but only {num_gpus} requested")
+            sys.exit(1)
+        if num_gpus % gpus_per_run != 0:
+            sweep_print(f"Warning: {num_gpus} GPUs is not a multiple of "
+                        f"GPUS_PER_RUN={gpus_per_run}; "
+                        f"using {(num_gpus // gpus_per_run) * gpus_per_run}")
+        local_gpus = num_gpus
+
+    # Set up event queue and connect workers
+    event_queue: queue.Queue[Any] = queue.Queue()
+
+    sweep_print(f"Connecting to workers...")
+    workers = _connect_workers(
+        workers_file=args.workers,
+        gpus_per_run=gpus_per_run,
+        token=token,
+        event_queue=event_queue,
+        scratch_dir=args.scratch_dir,
+        max_gpus=local_gpus,
+        jobs_per_slot=jobs_per_slot,
+    )
+
+    if not workers:
+        sweep_print(f"{_RED}Error: no workers could be started{_RESET}")
+        sys.exit(1)
+
+    # Wait for all workers to send MsgWorkerHello (with timeout)
+    connected_count = 0
+    connect_deadline = time.time() + 30.0
+    while connected_count < len(workers) and time.time() < connect_deadline:
+        try:
+            ev = event_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if isinstance(ev, EvWorkerConnected):
+            ws = workers[ev.worker_id]
+            ws.gpus = ev.gpus
+            ws.scratch_dir = ev.scratch_dir
+            # Convert topo from wire format to internal format
+            ws.topo = {
+                tuple(int(x) for x in k.split(",")): v  # type: ignore[misc]
+                for k, v in ev.topo.items()
+            }
+            # Limit GPUs if requested (local mode)
+            if ws.host == "localhost" and local_gpus is not None:
+                ws.gpus = ws.gpus[:local_gpus]
+            n_slots = len(ws.gpus) // gpus_per_run
+            if n_slots == 0:
+                sweep_print(f"  {_YELLOW}WARN{_RESET}  {ws.host}: only {len(ws.gpus)} GPU(s), "
+                            f"need {gpus_per_run} per run — skipping")
+                ws.status = "DEAD"
+                connected_count += 1
+                continue
+            base_slots = _best_gpu_groups(ws.gpus, gpus_per_run, n_slots, topo=ws.topo)
+            # Expand by jobs_per_slot: each physical GPU group gets N slot entries
+            ws.slots = [grp for grp in base_slots for _ in range(ws.jobs_per_slot)]
+            ws.status = "CONNECTED"
+            connected_count += 1
+
+            phys_slots = n_slots
+            total_jobs = len(ws.slots)  # already expanded by jobs_per_slot
+            slot_word = "slot" if phys_slots == 1 else "slots"
+            jobs_note = f" × {ws.jobs_per_slot} jobs" if ws.jobs_per_slot > 1 else ""
+            sweep_print(f"  {_GREEN}OK{_RESET}    {ws.host}: {phys_slots} {slot_word} ({phys_slots * gpus_per_run} GPUs){jobs_note} = {total_jobs} concurrent jobs")
+        elif isinstance(ev, EvWorkerDisconnected):
+            ws = workers[ev.worker_id]
+            ws.status = "DEAD"
+            connected_count += 1
+            sweep_print(f"  {_RED}FAIL{_RESET}  {ws.host}: failed to connect")
+
+    active_workers = [ws for ws in workers if ws.status == "CONNECTED"]
+    if not active_workers:
+        sweep_print(f"{_RED}Error: no workers available{_RESET}")
+        sys.exit(1)
+
+    total_slots = sum(len(ws.slots) for ws in active_workers)
+    sweep_print(f"Total slots: {total_slots}\n")
+
+    # Start stdin thread for interactive commands
+    stdin_t = threading.Thread(target=_stdin_thread, args=(event_queue,), daemon=True)
+    stdin_t.start()
+
+    # ── Scheduling loop ────────────────────────────────────────────────────────
+
+    has_singular = any(
+        o.get("singular")
+        for var in variations
+        for o in var["effective_options"].values()
+    )
+
+    pending: list[dict[str, Any]] = list(variations)
+    in_flight: dict[str, dict[str, Any]] = {}   # run_id → var
+    results: list[tuple[Any, ...]] = []          # (var, success, elapsed, log_file)
+    failed: list[dict[str, Any]] = []
+    succeeded: list[dict[str, Any]] = []
+    skipped_count = 0
+    retry_counts: dict[str, int] = {}           # run_id → retry count
+    # Open output file handles per run  {run_id: (log_fh, metric_fh)}
+    run_handles: dict[str, tuple[IO[str], IO[str]]] = {}
+    t0 = time.time()
+
+    # Initial dispatch
+    pending = _dispatch_pending(
+        workers, pending, in_flight, failed, succeeded,
+        output_dir, experiment, exp_dir, token, command, extra, run_from,
+        gpus_per_run, has_singular,
+    )
+
+    while pending or in_flight:
+        try:
+            ev = event_queue.get(timeout=0.5)
+        except queue.Empty:
+            # Re-try dispatch in case a slot freed up
+            if pending:
+                pending = _dispatch_pending(
+                    workers, pending, in_flight, failed, succeeded,
+                    output_dir, experiment, exp_dir, token, command, extra, run_from,
+                    gpus_per_run, has_singular,
+                )
+            continue
+
+        if isinstance(ev, EvRunStarted):
+            # Open output files for this run
+            run_dir = os.path.join(output_dir, experiment, ev.run_id)
+            os.makedirs(run_dir, exist_ok=True)
+            log_fh: IO[str] = open(os.path.join(run_dir, "training.log"), "w", buffering=1)
+            metric_fh: IO[str] = open(os.path.join(run_dir, "metrics.jsonl"), "w", buffering=1)
+            run_handles[ev.run_id] = (log_fh, metric_fh)
+
+        elif isinstance(ev, EvLogLine):
+            handles = run_handles.get(ev.run_id)
+            if handles:
+                handles[0].write(ev.data)
+                handles[0].flush()
+
+        elif isinstance(ev, EvMetricLine):
+            handles = run_handles.get(ev.run_id)
+            if handles:
+                record: dict[str, Any] = {"step": ev.step, **ev.data}
+                handles[1].write(json.dumps(record) + "\n")
+                handles[1].flush()
+
+        elif isinstance(ev, EvSyncRequest):
+            var_sync = in_flight.get(ev.run_id)
+            if var_sync:
+                ws = workers[ev.worker_id]  # noqa: F841 — ws used below
+                run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
+                run_dir = os.path.join(output_dir, experiment, ev.run_id)
+                threading.Thread(
+                    target=_rsync_thread,
+                    args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
+                          ws.password, ws.ssh_key),
+                    daemon=True,
+                ).start()
+
+        elif isinstance(ev, EvRunResult):
+            ws = workers[ev.worker_id]
+            var = in_flight.pop(ev.run_id, {})
+            ws.in_flight.pop(ev.run_id, {})
+
+            # Free the exact slot that was used for this run
+            used_slot_idx = ws.run_slots.pop(ev.run_id, None)
+            if used_slot_idx is not None:
+                ws.busy_slots.discard(used_slot_idx)
+                used_gpu_group = ws.slots[used_slot_idx] if used_slot_idx < len(ws.slots) else []
+            else:
+                used_gpu_group = []
+
+            # Close output file handles
+            handles = run_handles.pop(ev.run_id, None)
+            if handles:
+                try:
+                    handles[0].close()
+                    handles[1].close()
+                except OSError:
+                    pass
+
+            if var is not None:
+                log_path = os.path.join(output_dir, experiment, ev.run_id, "training.log")
+                results.append((var, ev.success, ev.elapsed, log_path))
+                opts = var["effective_options"]
+                tk = _treatment_key(var["combo"], opts)
+
+                (succeeded if ev.success else failed).append(var["combo"])
+
+                _update_sweep_status(exp_dir, ev.run_id,
+                                     "ok" if ev.success else "failed",
+                                     ev.elapsed, var["combo"])
+
+                pad = max((len(v["name"]) for v in variations), default=0)
+                nm = ev.run_id.ljust(pad)
+                sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
+                log_path_str = log_path
+                resolved = len({_treatment_key(r[0]["combo"], r[0]["effective_options"])
+                                 for r in results if r[1]})
+
+                if ev.success:
+                    tag = f"{_GREEN}   OK{_RESET}"
+                elif has_singular and tk not in {_treatment_key(r[0]["combo"], r[0]["effective_options"]) for r in results if r[1]}:
+                    tag = f"{_YELLOW}PROBE{_RESET}"
+                else:
+                    tag = f"{_RED} FAIL{_RESET}"
+
+                gpu_label = (f"gpu{'s' if len(used_gpu_group) > 1 else ''} "
+                             f"{','.join(str(g) for g in used_gpu_group)}"
+                             if used_gpu_group else "")
+                loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
+                       if ws.host != "localhost" and gpu_label else gpu_label)
+                if sdesc:
+                    sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s [{resolved}/{expected} resolved]")
+                else:
+                    sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s [{resolved}/{expected} resolved]")
+
+                # Sync artifacts after run completes
+                run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
+                run_dir = os.path.join(output_dir, experiment, ev.run_id)
+                threading.Thread(
+                    target=_rsync_thread,
+                    args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
+                          ws.password, ws.ssh_key),
+                    daemon=True,
+                ).start()
+
+            # Re-dispatch
+            pending = _dispatch_pending(
+                workers, pending, in_flight, failed, succeeded,
+                output_dir, experiment, exp_dir, token, command, extra, run_from,
+                gpus_per_run, has_singular,
+            )
+
+        elif isinstance(ev, EvArtifactSynced):
+            # Send MsgCleanup to the worker that ran this job
+            for ws in workers:
+                if ev.run_id in ws.in_flight and ws.status == "CONNECTED":
+                    ws.send_queue.put(encode(MsgCleanup(run_id=ev.run_id)))
+                    break
+
+        elif isinstance(ev, EvWorkerCleaned):
+            pass  # nothing to do
+
+        elif isinstance(ev, EvWorkerDisconnected):
+            ws = workers[ev.worker_id]
+            if ws.status == "CONNECTED":
+                sweep_print(f"  {_YELLOW}WARN{_RESET}  Worker {ws.host} disconnected; reconnecting...")
+                ws.status = "RECONNECTING"
+                # Mark in-flight runs as orphaned
+                for run_id in list(ws.in_flight.keys()):
+                    _update_sweep_status(exp_dir, run_id, "orphaned", 0.0,
+                                         ws.in_flight[run_id].get("combo", {}))
+                threading.Thread(
+                    target=_reconnect_thread,
+                    args=(ws, event_queue, token),
+                    daemon=True,
+                ).start()
+
+        elif isinstance(ev, EvReconnectWorker):
+            ws = workers[ev.worker_id]
+            if ev.success:
+                sweep_print(f"  {_GREEN}OK{_RESET}    Worker {ws.host} reconnected")
+                # Send MsgReplay for each resuming run
+                for rinfo in ev.resuming:
+                    ws.send_queue.put(encode(MsgReplay(
+                        run_id=rinfo["run_id"],
+                        log_seq=rinfo["log_seq"],
+                        metric_seq=rinfo["metric_seq"],
+                    )))
+                # Re-queue orphaned runs that this worker was handling
+                orphaned = [run_id for run_id, var in ws.in_flight.items()
+                            if run_id not in {r["run_id"] for r in ev.resuming}]
+                for run_id in orphaned:
+                    var = ws.in_flight.pop(run_id, {})
+                    if var:
+                        rc = retry_counts.get(run_id, 0) + 1
+                        retry_counts[run_id] = rc
+                        if rc <= args.max_retries:
+                            pending.append(var)
+                        else:
+                            sweep_print(f"  {_RED}FAIL{_RESET}  {run_id}: max retries exceeded")
+                            results.append((var, False, 0.0,
+                                            os.path.join(output_dir, experiment, run_id, "training.log")))
+                            failed.append(var["combo"])
+                            _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
+            else:
+                sweep_print(f"  {_RED}FAIL{_RESET}  Worker {ws.host} unreachable; re-queuing runs")
+                for run_id, var in ws.in_flight.items():
+                    rc = retry_counts.get(run_id, 0) + 1
+                    retry_counts[run_id] = rc
+                    if rc <= args.max_retries:
+                        pending.append(var)
+                    else:
+                        results.append((var, False, 0.0,
+                                        os.path.join(output_dir, experiment, run_id, "training.log")))
+                        failed.append(var["combo"])
+                        _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
+                ws.in_flight.clear()
+                ws.busy_slots.clear()
+
+            # Try dispatch now that slots may be free
+            if ev.success:
+                pending = _dispatch_pending(
+                    workers, pending, in_flight, failed, succeeded,
+                    output_dir, experiment, exp_dir, token, command, extra, run_from,
+                    gpus_per_run, has_singular,
+                )
+
+        elif isinstance(ev, EvInteractiveCommand):
+            if ev.cmd == "status":
+                n_pending = len(pending)
+                n_inflight = len(in_flight)
+                n_done = len(results)
+                sweep_print(f"Status: {n_inflight} running, {n_pending} pending, {n_done} done")
+            elif ev.cmd == "pause":
+                sweep_print("Pause not yet implemented")
+            elif ev.cmd == "resume":
+                sweep_print("Resume not yet implemented")
+
+    # Shut down all workers
+    for ws in workers:
+        if ws.status == "CONNECTED":
+            ws.send_queue.put(encode(MsgShutdown()))
+            ws.send_queue.put(None)  # drain and close write thread
+
+    elapsed = time.time() - t0
+    has_failures = print_summary(results, skipped_count, elapsed)
     sweep_print(f"\nOutput: {output_dir}")
     if _log_file:
         _log_file.close()
         print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
+
 
     if has_failures:
         sys.exit(1)
