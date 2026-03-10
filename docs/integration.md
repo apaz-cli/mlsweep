@@ -1,5 +1,9 @@
 # Integration
 
+`mlsweep` is slightly opinionated but very general solution for managing tons of machine learning runs. It takes flexible combinations of hyperparameters and schedules them across your hardware.
+
+The project contains a controller which manages scheduling jobs across workers, and a visualizer. Think a scheduler plus wandb. You don't have to use both halves.
+
 ## Local setup
 
 ```bash
@@ -51,8 +55,8 @@ ssh user@host mlsweep_worker --help
 host = "user@host1"
 remote_dir = "/absolute/path/to/project"
 ssh_key = "~/.ssh/id_ed25519"
-venv = "/absolute/path/to/venv/"  # Optional, resolves .venv/, venv/, calls bin/activate, defaults to remote_dir
-devices = [0, 1, 2, 3]
+venv = "/absolute/path/to/venv/"          # Optional, resolves .venv/, venv/, calls bin/activate, defaults to remote_dir
+devices = [0, 1, 2, 3]                    # Sets CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES
 jobs = 2
 ```
 
