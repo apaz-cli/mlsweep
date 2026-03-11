@@ -18,7 +18,8 @@ from typing import Any
 from mlsweep._shared import _val_sort_key
 
 # Metadata keys in a dimension spec (no dot prefix). Dot-prefixed keys are subdimensions.
-_METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic"}
+_METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic",
+                  "distribution", "min", "max", "samples"}
 
 
 # ── Sweep loading ──────────────────────────────────────────────────────────────

@@ -10,10 +10,16 @@ dependencies = [
     "tomli >= 2.0; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+wandb = ["wandb"]
+tensorboard = ["tensorboard"]
+all = ["wandb", "tensorboard"]
+
 [project.scripts]
 mlsweep_run = "mlsweep.run_sweep:main"
 mlsweep_viz = "mlsweep.visualize:main"
 mlsweep_worker = "mlsweep.worker:main"
+mlsweep_export = "mlsweep.export_cmd:main"
 
 [tool.setuptools.packages.find]
 where = [""]
@@ -25,3 +31,7 @@ mlsweep = ["_bin/parsync"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["wandb", "wandb.*", "tensorboard", "tensorboard.*", "tensorboardX", "tensorboardX.*", "torch.*"]
+ignore_missing_imports = true

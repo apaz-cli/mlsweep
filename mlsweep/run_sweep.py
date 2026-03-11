@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, IO
 
+from mlsweep._writers import MlsweepWriterFactory, MultiWriterFactory, RunWriter, WriterFactory
+
 from mlsweep._parsync import parsync_bin
 from mlsweep._shared import (
     MsgCleanup,
@@ -768,6 +770,10 @@ def _dispatch_pending(
                     env: dict[str, str] = {}
                     if tag_str:
                         env["EXP_TAGS"] = tag_str
+                    _wandb_skip = {"WANDB_RUN_ID", "WANDB_RESUME"}
+                    for _k, _v in os.environ.items():
+                        if _k.startswith("WANDB_") and _k not in _wandb_skip:
+                            env[_k] = _v
 
                     run_msg = MsgRun(
                         run_id=run_id,
@@ -854,6 +860,12 @@ def main() -> None:
                         help="Max retries for orphaned runs (default: 2)")
     parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
                         help="Worker scratch directory (default: /tmp/mlsweep)")
+    parser.add_argument("--wandb-project", default=None,
+                        help="W&B project name (enables wandb logging)")
+    parser.add_argument("--wandb-entity", default=None,
+                        help="W&B entity/team")
+    parser.add_argument("--tensorboard-dir", default=None,
+                        help="TensorBoard output directory (enables TensorBoard logging)")
     parser.add_argument(
         "--version", action="version",
         version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
@@ -964,6 +976,23 @@ def main() -> None:
 
     # Write sweep_manifest.json
     _write_manifest(exp_dir, experiment, variations, note=args.note)
+
+    # Build writer factory
+    _writer_factories: list[WriterFactory] = [MlsweepWriterFactory()]
+    if args.wandb_project:
+        from mlsweep._writer_wandb import WandbWriterFactory
+        _writer_factories.append(WandbWriterFactory(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+        ))
+    if args.tensorboard_dir:
+        from mlsweep._writer_tensorboard import TensorBoardWriterFactory
+        _writer_factories.append(TensorBoardWriterFactory(
+            tb_dir=args.tensorboard_dir,
+        ))
+    factory: WriterFactory = MultiWriterFactory(_writer_factories)
+    dims = list(variations[0]["combo"].keys()) if variations else []
+    factory.on_sweep_start(experiment, dims, [v["name"] for v in variations])
 
     run_desc = f"{expected} runs, {n} possible" if expected < n else f"{n} runs"
     sweep_print(f"\n{'=' * 80}")
@@ -1097,8 +1126,8 @@ def main() -> None:
     succeeded: list[dict[str, Any]] = []
     skipped_count = 0
     retry_counts: dict[str, int] = {}           # run_id → retry count
-    # Open output file handles per run  {run_id: (log_fh, metric_fh)}
-    run_handles: dict[str, tuple[IO[str], IO[str]]] = {}
+    log_handles: dict[str, IO[str]] = {}        # run_id → training.log file handle
+    run_writers: dict[str, RunWriter] = {}      # run_id → metric writer
     t0 = time.time()
 
     # Initial dispatch
@@ -1125,22 +1154,21 @@ def main() -> None:
             # Open output files for this run
             run_dir = os.path.join(output_dir, experiment, ev.run_id)
             os.makedirs(run_dir, exist_ok=True)
-            log_fh: IO[str] = open(os.path.join(run_dir, "training.log"), "w", buffering=1)
-            metric_fh: IO[str] = open(os.path.join(run_dir, "metrics.jsonl"), "w", buffering=1)
-            run_handles[ev.run_id] = (log_fh, metric_fh)
+            log_handles[ev.run_id] = open(os.path.join(run_dir, "training.log"), "w", buffering=1)
+            _var = in_flight.get(ev.run_id)
+            _combo: dict[str, Any] = _var.get("combo", {}) if _var is not None else {}
+            run_writers[ev.run_id] = factory.make(ev.run_id, _combo, run_dir)
 
         elif isinstance(ev, EvLogLine):
-            handles = run_handles.get(ev.run_id)
-            if handles:
-                handles[0].write(ev.data)
-                handles[0].flush()
+            _log_fh = log_handles.get(ev.run_id)
+            if _log_fh is not None:
+                _log_fh.write(ev.data)
+                _log_fh.flush()
 
         elif isinstance(ev, EvMetricLine):
-            handles = run_handles.get(ev.run_id)
-            if handles:
-                record: dict[str, Any] = {"step": ev.step, **ev.data}
-                handles[1].write(json.dumps(record) + "\n")
-                handles[1].flush()
+            _writer = run_writers.get(ev.run_id)
+            if _writer is not None:
+                _writer.on_metric(ev.step, ev.data)
 
         elif isinstance(ev, EvSyncRequest):
             var_sync = in_flight.get(ev.run_id)
@@ -1168,14 +1196,16 @@ def main() -> None:
             else:
                 used_gpu_group = []
 
-            # Close output file handles
-            handles = run_handles.pop(ev.run_id, None)
-            if handles:
+            # Close log file handle and finish metric writer
+            _log_fh = log_handles.pop(ev.run_id, None)
+            if _log_fh is not None:
                 try:
-                    handles[0].close()
-                    handles[1].close()
+                    _log_fh.close()
                 except OSError:
                     pass
+            _writer = run_writers.pop(ev.run_id, None)
+            if _writer is not None:
+                _writer.on_finish("ok" if ev.success else "failed", ev.elapsed)
 
             if var is not None:
                 log_path = os.path.join(output_dir, experiment, ev.run_id, "training.log")
@@ -1329,6 +1359,7 @@ def main() -> None:
         _log_file.close()
         print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
 
+    factory.on_sweep_end()
 
     if has_failures:
         sys.exit(1)

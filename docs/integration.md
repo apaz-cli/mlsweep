@@ -29,7 +29,7 @@ Run locally:
 mlsweep_run sweeps/my_sweep.py             # 1 GPU
 mlsweep_run sweeps/my_sweep.py -g 4        # 4 GPUs in parallel
 mlsweep_run sweeps/my_sweep.py -g          # all visible GPUs
-mlsweep_run sweeps/my_sweep.py -g 4 -j 5   # 5 jobs per GPU (20 jobs)
+mlsweep_run sweeps/my_sweep.py -g 4 -j 5   # 5 jobs per GPU (20 total)
 ```
 
 ## Remote workers
