@@ -65,11 +65,10 @@ def _verify_and_install(data: bytes, expected_sha256: str, dest: Path) -> None:
 
 
 def parsync_bin() -> str:
-    """Return the path to the bundled parsync binary.
-
-    Raises RuntimeError if the binary has not been installed.
-    """
+    """Return the path to the parsync binary, downloading it if necessary."""
     binary = _BIN_DIR / "parsync"
     if not binary.exists():
-        raise RuntimeError("parsync binary not found; reinstall mlsweep")
+        fetch_parsync()
+    if not binary.exists():
+        raise RuntimeError(f"parsync is not available for {platform.system()}/{platform.machine()}")
     return str(binary)

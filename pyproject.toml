@@ -27,7 +27,7 @@ where = [""]
 include = ["mlsweep*"]
 
 [tool.setuptools.package-data]
-mlsweep = ["_bin/parsync"]
+mlsweep = ["_bin/.gitkeep"]
 
 [tool.mypy]
 python_version = "3.10"
