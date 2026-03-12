@@ -1,0 +1,87 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".opt": {
+      "name": "opt",
+      "singular": true,
+      ".adam": {
+        "flags": [
+          "--optimizer",
+          "adam"
+        ]
+      },
+      ".muon": {
+        "flags": [
+          "--optimizer",
+          "muon"
+        ]
+      }
+    },
+    ".lr": {
+      "values": [
+        0.0001,
+        0.001
+      ],
+      "flags": "--lr",
+      "name": "lr"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_lr0.0001_optadam",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--optimizer",
+      "adam"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "opt": "adam"
+    }
+  },
+  {
+    "name": "s_lr0.001_optadam",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--optimizer",
+      "adam"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "opt": "adam"
+    }
+  },
+  {
+    "name": "s_lr0.0001_optmuon",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--optimizer",
+      "muon"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "opt": "muon"
+    }
+  },
+  {
+    "name": "s_lr0.001_optmuon",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--optimizer",
+      "muon"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "opt": "muon"
+    }
+  }
+]

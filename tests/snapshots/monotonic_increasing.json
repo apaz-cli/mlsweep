@@ -1,0 +1,62 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".bs": {
+      "values": [
+        8,
+        16,
+        32,
+        64
+      ],
+      "flags": "--bs",
+      "name": "bs",
+      "monotonic": "increasing"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_bs8",
+    "overrides": [
+      "--bs",
+      "8"
+    ],
+    "combo": {
+      "bs": 8
+    }
+  },
+  {
+    "name": "s_bs16",
+    "overrides": [
+      "--bs",
+      "16"
+    ],
+    "combo": {
+      "bs": 16
+    }
+  },
+  {
+    "name": "s_bs32",
+    "overrides": [
+      "--bs",
+      "32"
+    ],
+    "combo": {
+      "bs": 32
+    }
+  },
+  {
+    "name": "s_bs64",
+    "overrides": [
+      "--bs",
+      "64"
+    ],
+    "combo": {
+      "bs": 64
+    }
+  }
+]

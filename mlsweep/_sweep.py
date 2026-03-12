@@ -222,7 +222,11 @@ def validate_options(
             # VALUE DIM — values explicit, or inferred from flags dict keys
             values = opt["values"] if has_values else list(flags.keys())
             if flags is None:
-                flags_dict = {v: [] for v in values}
+                raise ValueError(
+                    f"Dimension {key!r}: flags=None is not supported. "
+                    f"Use 'name': None to omit the dim from the run name, "
+                    f"or supply flags."
+                )
             elif isinstance(flags, str):
                 flags_dict = {v: [flags, str(v)] for v in values}
             elif isinstance(flags, dict):

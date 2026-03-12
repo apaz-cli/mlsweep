@@ -1,0 +1,46 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".mode": {
+      "name": "mode",
+      ".train": {
+        "flags": "--train"
+      },
+      ".eval": {
+        "flags": "--eval"
+      }
+    },
+    ".debug": {
+      "flags": "--debug",
+      "name": null
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_modetrain",
+    "overrides": [
+      "--train",
+      "--debug"
+    ],
+    "combo": {
+      "mode": "train",
+      "debug": null
+    }
+  },
+  {
+    "name": "s_modeeval",
+    "overrides": [
+      "--eval",
+      "--debug"
+    ],
+    "combo": {
+      "mode": "eval",
+      "debug": null
+    }
+  }
+]

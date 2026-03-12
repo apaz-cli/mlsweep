@@ -1,0 +1,52 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".seed": {
+      "values": [
+        1,
+        2
+      ],
+      "flags": "--seed",
+      "name": null
+    },
+    ".prec": {
+      "flags": [
+        "--dtype",
+        "bfloat16"
+      ],
+      "name": null
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_default",
+    "overrides": [
+      "--seed",
+      "1",
+      "--dtype",
+      "bfloat16"
+    ],
+    "combo": {
+      "seed": 1,
+      "prec": null
+    }
+  },
+  {
+    "name": "s_default",
+    "overrides": [
+      "--seed",
+      "2",
+      "--dtype",
+      "bfloat16"
+    ],
+    "combo": {
+      "seed": 2,
+      "prec": null
+    }
+  }
+]

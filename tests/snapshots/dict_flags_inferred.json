@@ -1,0 +1,62 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".ac": {
+      "flags": {
+        "none": [
+          "--ac.mode",
+          "none"
+        ],
+        "op": [
+          "--ac.mode",
+          "selective",
+          "--ac.option",
+          "op"
+        ],
+        "full": [
+          "--ac.mode",
+          "full"
+        ]
+      },
+      "name": "ac"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_acnone",
+    "overrides": [
+      "--ac.mode",
+      "none"
+    ],
+    "combo": {
+      "ac": "none"
+    }
+  },
+  {
+    "name": "s_acop",
+    "overrides": [
+      "--ac.mode",
+      "selective",
+      "--ac.option",
+      "op"
+    ],
+    "combo": {
+      "ac": "op"
+    }
+  },
+  {
+    "name": "s_acfull",
+    "overrides": [
+      "--ac.mode",
+      "full"
+    ],
+    "combo": {
+      "ac": "full"
+    }
+  }
+]

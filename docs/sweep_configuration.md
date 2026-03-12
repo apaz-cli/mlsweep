@@ -74,7 +74,6 @@ OPTIONS = {
 The `flags` field accepts:
 - `str` — shorthand: generates `["--flag", str(v)]` for each value `v`
 - `dict` — explicit per-value mapping: `{v: [args...], ...}`
-- `None` — no flags added (value affects naming only)
 
 #### Subdims (mutually exclusive cases)
 
@@ -132,7 +131,6 @@ The `flags` field works differently depending on the dim type.
 |------|---------|------------|
 | `str` | `"--lr"` | `["--lr", str(v)]` for each value `v` |
 | `dict` | `{v: [tokens...], ...}` | the token list you supply per value |
-| `None` | `None` | no flags (value affects naming only) |
 
 The `str` shorthand is the common case. The `dict` form is used when different values need different flag structures — a different number of tokens, or flags that aren't simply `--key value`. **Dict values must be lists**; passing a string as a dict value is an error caught at validation time.
 
@@ -163,9 +161,6 @@ When `flags` is a dict, `"values"` is optional — the values are inferred from 
         "8":  ["--batch-size", "8"],
     },
 }
-
-# None — vary the name only, no flags passed (values required)
-".seed": {"values": [1, 2, 3], "flags": None, "name": "seed"}
 ```
 
 **Boolean values:** The `str` shorthand converts values with `str(v)`, so Python `True` becomes the token `"True"` and `False` becomes `"False"` (capital T/F). This works for frameworks that accept Python-style booleans (e.g. hydra). If your framework expects lowercase `true`/`false`, a different convention, or a flag with no value argument, use the `dict` form or use string values instead of Python booleans:

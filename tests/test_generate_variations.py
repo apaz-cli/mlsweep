@@ -54,16 +54,16 @@ def _snapshot(name: str, opts: dict, sweep_name: str = "s", extra_flags: tuple =
 
 def test_simple_cartesian():
     """Two value dims — basic cartesian product, names and flags."""
-    opts = {
+    OPTIONS = {
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
         ".bs": {"values": [32, 64], "flags": "--bs", "name": "bs"},
     }
-    _snapshot("simple_cartesian", opts)
+    _snapshot("simple_cartesian", OPTIONS)
 
 
 def test_subdim_with_nested_child():
     """Subdim with a nested child dim — dotted run names, conditional flags."""
-    opts = {
+    OPTIONS = {
         ".opt": {
             "name": "opt",
             ".adam": {"flags": ["--optimizer", "adam"]},
@@ -74,21 +74,21 @@ def test_subdim_with_nested_child():
         },
         ".bs": {"values": [32, 64], "flags": "--bs", "name": "bs"},
     }
-    _snapshot("subdim_nested", opts)
+    _snapshot("subdim_nested", OPTIONS)
 
 
 def test_singular_ordering():
     """Singular dim varies slowest; non-singular dims fill the inner loop."""
-    opts = {
+    OPTIONS = {
         ".bs": {"values": [64, 32, 16], "flags": "--bs", "name": "bs", "singular": True},
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
     }
-    _snapshot("singular_ordering", opts)
+    _snapshot("singular_ordering", OPTIONS)
 
 
 def test_multiple_singular_diagonal():
     """Two singular dims advance diagonally (sum-of-indices order)."""
-    opts = {
+    OPTIONS = {
         ".bs": {"values": [64, 32], "flags": "--bs", "name": "bs", "singular": True},
         ".ac": {
             "flags": {
@@ -100,63 +100,63 @@ def test_multiple_singular_diagonal():
         },
         ".lr": {"values": [1e-3, 1e-4], "flags": "--lr", "name": "lr"},
     }
-    _snapshot("multiple_singular_diagonal", opts)
+    _snapshot("multiple_singular_diagonal", OPTIONS)
 
 
 def test_fixed_dim():
     """Fixed dim always appends its flags and does not appear in the run name."""
-    opts = {
+    OPTIONS = {
         ".prec": {"flags": ["--dtype", "bfloat16"], "name": None},
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
     }
-    _snapshot("fixed_dim", opts)
+    _snapshot("fixed_dim", OPTIONS)
 
 
 def test_none_name_suppresses_segment():
     """name=None omits the dim from the run name entirely."""
-    opts = {
+    OPTIONS = {
         ".seed": {"values": [1, 2], "flags": "--seed", "name": None},
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
     }
-    _snapshot("none_name", opts)
+    _snapshot("none_name", OPTIONS)
 
 
 def test_extra_flags_prepended():
     """EXTRA_FLAGS appear before per-dim flags in overrides."""
-    opts = {
+    OPTIONS = {
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
     }
-    _snapshot("extra_flags", opts, extra_flags=("--steps", "1000"))
+    _snapshot("extra_flags", OPTIONS, extra_flags=("--steps", "1000"))
 
 
 def test_exclude_filters_combos():
     """EXCLUDE removes matching combos before dispatch."""
-    opts = {
+    OPTIONS = {
         ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
         ".bs": {"values": [32, 64], "flags": "--bs", "name": "bs"},
     }
-    _snapshot("exclude", opts, exclude=lambda c: c["lr"] == 1e-3 and c["bs"] == 64)
+    _snapshot("exclude", OPTIONS, exclude=lambda c: c["lr"] == 1e-3 and c["bs"] == 64)
 
 
 def test_bool_value_abbreviation():
     """True/False values in run names are abbreviated as T/F."""
-    opts = {
+    OPTIONS = {
         ".amp": {"values": [True, False], "flags": "--amp", "name": "amp"},
     }
-    _snapshot("bool_abbreviation", opts)
+    _snapshot("bool_abbreviation", OPTIONS)
 
 
 def test_monotonic_decreasing_trial_order():
     """Decreasing monotonic dim is tried smallest-first."""
-    opts = {
+    OPTIONS = {
         ".bs": {"values": [64, 32, 16, 8], "flags": "--bs", "name": "bs", "monotonic": "decreasing"},
     }
-    _snapshot("monotonic_decreasing", opts)
+    _snapshot("monotonic_decreasing", OPTIONS)
 
 
 def test_dict_flags_with_explicit_values():
     """Dict flags with explicit values list respects the values order."""
-    opts = {
+    OPTIONS = {
         ".ac": {
             "values": ["none", "op", "full"],
             "flags": {
@@ -167,4 +167,110 @@ def test_dict_flags_with_explicit_values():
             "name": "ac",
         },
     }
-    _snapshot("dict_flags", opts)
+    _snapshot("dict_flags", OPTIONS)
+
+
+def test_dict_flags_inferred_values():
+    """Dict flags without explicit values — values inferred from dict key order."""
+    OPTIONS = {
+        ".ac": {
+            "flags": {
+                "none": ["--ac.mode", "none"],
+                "op":   ["--ac.mode", "selective", "--ac.option", "op"],
+                "full": ["--ac.mode", "full"],
+            },
+            "name": "ac",
+        },
+    }
+    _snapshot("dict_flags_inferred", OPTIONS)
+
+
+def test_monotonic_increasing():
+    """Increasing monotonic dim keeps values in declaration order (no reversal)."""
+    OPTIONS = {
+        ".bs": {"values": [8, 16, 32, 64], "flags": "--bs", "name": "bs", "monotonic": "increasing"},
+    }
+    _snapshot("monotonic_increasing", OPTIONS)
+
+
+def test_subdim_name_none_parent():
+    """Subdim parent name=None: child tokens pass through flat, not dotted onto parent."""
+    OPTIONS = {
+        ".opt": {
+            "name": None,
+            ".adam": {"flags": ["--optimizer", "adam"]},
+            ".muon": {
+                "flags": ["--optimizer", "muon"],
+                ".lr_scale": {"values": [0.1, 1.0], "flags": "--lr-scale", "name": "lrs"},
+            },
+        },
+        ".bs": {"values": [32, 64], "flags": "--bs", "name": "bs"},
+    }
+    _snapshot("subdim_name_none_parent", OPTIONS)
+
+
+def test_three_level_nesting():
+    """Three levels of subdim nesting produce correctly dotted run names."""
+    OPTIONS = {
+        ".opt": {
+            "name": "opt",
+            ".muon": {
+                "flags": ["--optimizer", "muon"],
+                ".sched": {
+                    "name": "sched",
+                    ".cosine": {
+                        "flags": ["--sched", "cosine"],
+                        ".warmup": {"values": [100, 500], "flags": "--warmup", "name": "wu"},
+                    },
+                    ".linear": {"flags": ["--sched", "linear"]},
+                },
+            },
+            ".adam": {"flags": ["--optimizer", "adam"]},
+        },
+    }
+    _snapshot("three_level_nesting", OPTIONS)
+
+
+def test_all_unnamed_default():
+    """When all dims have name=None the run name falls back to {sweep_name}_default."""
+    OPTIONS = {
+        ".seed": {"values": [1, 2], "flags": "--seed", "name": None},
+        ".prec": {"flags": ["--dtype", "bfloat16"], "name": None},
+    }
+    _snapshot("all_unnamed_default", OPTIONS)
+
+
+def test_singular_subdim():
+    """singular=True on a subdim: branches vary slowest alongside a non-singular dim."""
+    OPTIONS = {
+        ".opt": {
+            "name": "opt",
+            "singular": True,
+            ".adam": {"flags": ["--optimizer", "adam"]},
+            ".muon": {"flags": ["--optimizer", "muon"]},
+        },
+        ".lr": {"values": [1e-4, 1e-3], "flags": "--lr", "name": "lr"},
+    }
+    _snapshot("singular_subdim", OPTIONS)
+
+
+def test_default_name_from_key():
+    """Omitting name uses the dim key without the leading dot as the name prefix."""
+    OPTIONS = {
+        ".lr": {"values": [1e-4, 1e-3], "flags": "--lr"},
+        ".bs": {"values": [32, 64], "flags": "--bs"},
+    }
+    _snapshot("default_name_from_key", OPTIONS)
+
+
+def test_str_flags_on_fixed_and_subdim():
+    """Single-token str form for flags on fixed dims and subdim branches."""
+    OPTIONS = {
+        ".mode": {
+            "name": "mode",
+            ".train": {"flags": "--train"},
+            ".eval":  {"flags": "--eval"},
+        },
+        ".debug": {"flags": "--debug", "name": None},
+    }
+    _snapshot("str_flags_fixed_subdim", OPTIONS)

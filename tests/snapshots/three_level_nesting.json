@@ -1,0 +1,104 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".opt": {
+      "name": "opt",
+      ".muon": {
+        "flags": [
+          "--optimizer",
+          "muon"
+        ],
+        ".sched": {
+          "name": "sched",
+          ".cosine": {
+            "flags": [
+              "--sched",
+              "cosine"
+            ],
+            ".warmup": {
+              "values": [
+                100,
+                500
+              ],
+              "flags": "--warmup",
+              "name": "wu"
+            }
+          },
+          ".linear": {
+            "flags": [
+              "--sched",
+              "linear"
+            ]
+          }
+        }
+      },
+      ".adam": {
+        "flags": [
+          "--optimizer",
+          "adam"
+        ]
+      }
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_optmuon.schedcosine.wu100",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--sched",
+      "cosine",
+      "--warmup",
+      "100"
+    ],
+    "combo": {
+      "opt": "muon",
+      "sched": "cosine",
+      "warmup": 100
+    }
+  },
+  {
+    "name": "s_optmuon.schedcosine.wu500",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--sched",
+      "cosine",
+      "--warmup",
+      "500"
+    ],
+    "combo": {
+      "opt": "muon",
+      "sched": "cosine",
+      "warmup": 500
+    }
+  },
+  {
+    "name": "s_optmuon.schedlinear",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--sched",
+      "linear"
+    ],
+    "combo": {
+      "opt": "muon",
+      "sched": "linear"
+    }
+  },
+  {
+    "name": "s_optadam",
+    "overrides": [
+      "--optimizer",
+      "adam"
+    ],
+    "combo": {
+      "opt": "adam"
+    }
+  }
+]
