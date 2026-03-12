@@ -26,7 +26,6 @@ class MlsweepRunWriter:
     def on_metric(self, step: int, data: dict[str, Any]) -> None:
         record: dict[str, Any] = {"step": step, **data}
         self._fh.write(json.dumps(record) + "\n")
-        self._fh.flush()
 
     def on_finish(self, status: str, elapsed: float) -> None:
         self._fh.close()

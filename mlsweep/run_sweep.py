@@ -53,6 +53,7 @@ from mlsweep._sweep import (
     _update_sweep_status,
     _write_manifest,
     count_expected,
+    extract_objective_metric,
     generate_variations,
     load_sweep_file,
     should_skip,
@@ -770,10 +771,7 @@ def _dispatch_pending(
                     env: dict[str, str] = {}
                     if tag_str:
                         env["EXP_TAGS"] = tag_str
-                    _wandb_skip = {"WANDB_RUN_ID", "WANDB_RESUME"}
-                    for _k, _v in os.environ.items():
-                        if _k.startswith("WANDB_") and _k not in _wandb_skip:
-                            env[_k] = _v
+                    env.update(_wandb_env)
 
                     run_msg = MsgRun(
                         run_id=run_id,
@@ -819,551 +817,630 @@ def _dispatch_pending(
 
 
 def main() -> None:
-    global _log_file
+    try:
+        global _log_file
 
-    argv = sys.argv[1:]
-    extra_flags: list[str] = []
-    gpus_per_run = 1
-    run_from = None
+        argv = sys.argv[1:]
+        extra_flags: list[str] = []
+        gpus_per_run = 1
+        run_from = None
 
-    parser = argparse.ArgumentParser(
-        description="Run experiment sweeps",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Extra args after -- are passed to every training run.\n\n"
-            "Environment variables:\n"
-            "  CUDA_VISIBLE_DEVICES  Nvidia GPU indices available for scheduling\n"
-            "                        (used when --gpus is not set)\n"
-            "  HIP_VISIBLE_DEVICES   AMD GPU indices available for scheduling\n"
-            "                        (used when --gpus is not set)\n"
-        ))
-    parser.add_argument("sweep_file", help="Path to sweep .py file")
-    parser.add_argument("--output_dir", default=os.path.join(_PROJECT_ROOT, "outputs", "sweeps"),
-                        help="Output directory")
-    parser.add_argument("--experiment", default=None,
-                        help="Experiment name (default: <sweep>_<timestamp>)")
-    parser.add_argument("--gpus", "-g", type=int, nargs="?", const=0, default=None,
-                        help="Total GPUs to use (0 = all visible; default = GPUS_PER_RUN or 1)")
-    parser.add_argument("--jobs-per-gpu", "-j", type=int, default=None,
-                        help="Concurrent jobs per GPU (default: 1)")
-    parser.add_argument("--workers", default=None,
-                        help="Path to workers file for remote dispatch (one '<host> <remote_dir>' per line)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Skip runs already recorded as completed in sweep_status.json")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print commands without execution")
-    parser.add_argument("--validate", action="store_true",
-                        help="Validate sweep config, print all combinations, and exit (no jobs launched)")
-    parser.add_argument("--note", default=None,
-                        help="Human-readable note stored in sweep_manifest.json")
-    parser.add_argument("--max-retries", type=int, default=2,
-                        help="Max retries for orphaned runs (default: 2)")
-    parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
-                        help="Worker scratch directory (default: /tmp/mlsweep)")
-    parser.add_argument("--wandb-project", default=None,
-                        help="W&B project name (enables wandb logging)")
-    parser.add_argument("--wandb-entity", default=None,
-                        help="W&B entity/team")
-    parser.add_argument("--tensorboard-dir", default=None,
-                        help="TensorBoard output directory (enables TensorBoard logging)")
-    parser.add_argument(
-        "--version", action="version",
-        version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
+        parser = argparse.ArgumentParser(
+            description="Run experiment sweeps",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=(
+                "Extra args after -- are passed to every training run.\n\n"
+                "Environment variables:\n"
+                "  CUDA_VISIBLE_DEVICES  Nvidia GPU indices available for scheduling\n"
+                "                        (used when --gpus is not set)\n"
+                "  HIP_VISIBLE_DEVICES   AMD GPU indices available for scheduling\n"
+                "                        (used when --gpus is not set)\n"
+            ))
+        parser.add_argument("sweep_file", help="Path to sweep .py file")
+        parser.add_argument("--output_dir", default=os.path.join(_PROJECT_ROOT, "outputs", "sweeps"),
+                            help="Output directory")
+        parser.add_argument("--experiment", default=None,
+                            help="Experiment name (default: <sweep>_<timestamp>)")
+        parser.add_argument("--gpus", "-g", type=int, nargs="?", const=0, default=None,
+                            help="Total GPUs to use (0 = all visible; default = GPUS_PER_RUN or 1)")
+        parser.add_argument("--jobs-per-gpu", "-j", type=int, default=None,
+                            help="Concurrent jobs per GPU (default: 1)")
+        parser.add_argument("--workers", default=None,
+                            help="Path to workers file for remote dispatch (one '<host> <remote_dir>' per line)")
+        parser.add_argument("--resume", action="store_true",
+                            help="Skip runs already recorded as completed in sweep_status.json")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Print commands without execution")
+        parser.add_argument("--validate", action="store_true",
+                            help="Validate sweep config, print all combinations, and exit (no jobs launched)")
+        parser.add_argument("--note", default=None,
+                            help="Human-readable note stored in sweep_manifest.json")
+        parser.add_argument("--max-retries", type=int, default=2,
+                            help="Max retries for orphaned runs (default: 2)")
+        parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
+                            help="Worker scratch directory (default: /tmp/mlsweep)")
+        parser.add_argument("--wandb-project", default=None,
+                            help="W&B project name (enables wandb logging)")
+        parser.add_argument("--wandb-entity", default=None,
+                            help="W&B entity/team")
+        parser.add_argument("--tensorboard-dir", default=None,
+                            help="TensorBoard output directory (enables TensorBoard logging)")
+        parser.add_argument(
+            "--version", action="version",
+            version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
 
-    args, extra = parser.parse_known_args(argv)
-    if extra and extra[0] == "--":
-        extra = extra[1:]
+        args, extra = parser.parse_known_args(argv)
+        if extra and extra[0] == "--":
+            extra = extra[1:]
 
-    if args.workers and (args.gpus is not None or args.jobs_per_gpu is not None):
-        conflicting = []
-        if args.gpus is not None:
-            conflicting.append("-g/--gpus")
-        if args.jobs_per_gpu is not None:
-            conflicting.append("-j/--jobs-per-gpu")
-        sweep_print(
-            f"Error: {' and '.join(conflicting)} cannot be used with --workers. "
-            f"Specify -g and -j per machine in the workers file instead."
-        )
-        sys.exit(1)
+        if args.workers and (args.gpus is not None or args.jobs_per_gpu is not None):
+            conflicting = []
+            if args.gpus is not None:
+                conflicting.append("-g/--gpus")
+            if args.jobs_per_gpu is not None:
+                conflicting.append("-j/--jobs-per-gpu")
+            sweep_print(
+                f"Error: {' and '.join(conflicting)} cannot be used with --workers. "
+                f"Specify -g and -j per machine in the workers file instead."
+            )
+            sys.exit(1)
 
-    info = load_sweep_file(args.sweep_file)
-    sweep_name, options, command, exclude_fn, extra_flags = (
-        info["name"], info["options"], info["command"],
-        info["exclude"], info["extra_flags"])
-    gpus_per_run = info.get("gpus_per_run", 1)
-    run_from = info.get("run_from")
-    validate_options(options)
+        info = load_sweep_file(args.sweep_file)
+        sweep_name, options, command, exclude_fn, extra_flags = (
+            info["name"], info["options"], info["command"],
+            info["exclude"], info["extra_flags"])
+        gpus_per_run = info.get("gpus_per_run", 1)
+        run_from = info.get("run_from")
+        method: str = info.get("method", "grid")
+        optimize_cfg: dict[str, Any] = info.get("optimize") or {}
+        validate_options(options, method=method)
 
-    assert options is not None and command is not None
+        assert options is not None and command is not None
 
-    # --validate: check config, print all combinations, exit (no jobs, no files)
-    if args.validate:
-        all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
-        expected = count_expected(options)
-        excluded = expected - len(all_variations)
-        dim_names = [k[1:] for k in options]
-        sweep_print(f"Sweep: {sweep_name}")
-        sweep_print(f"Dimensions: {', '.join(dim_names) if dim_names else '(none)'}")
-        for key in options:
-            dim_name = key[1:]
-            values = options[key].get("_values", [])
-            if values != [None]:
-                sweep_print(f"  {dim_name}: {values}")
-        sweep_print(f"\nTotal combinations: {len(all_variations)}")
-        if excluded:
-            sweep_print(f"Excluded by EXCLUDE filter: {excluded}")
-        sweep_print(f"\nRuns:")
-        for var in all_variations:
-            sweep_print(f"  {var['name']}: {var['combo']}")
-        sys.exit(0)
+        # --validate: check config, print all combinations, exit (no jobs, no files)
+        if args.validate:
+            if method == "bayes":
+                sweep_print(f"Sweep: {sweep_name} (bayes, budget={optimize_cfg['budget']})")
+                sweep_print(f"Metric: {optimize_cfg['metric']} ({optimize_cfg['goal']})")
+                sweep_print(f"Dimensions ({len(options)}):")
+                for key, opt in options.items():
+                    dim = key[1:]
+                    if opt.get("_type") == "continuous":
+                        sweep_print(f"  {dim}: {opt['distribution']} [{opt['min']}, {opt['max']}]"
+                                    + (" [singular]" if opt.get("singular") else ""))
+                    elif opt["_values"] != [None]:
+                        sweep_print(f"  {dim}: {opt['_values']}"
+                                    + (" [singular]" if opt.get("singular") else ""))
+                sys.exit(0)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    experiment = args.experiment or f"{sweep_name}_{timestamp}"
-    output_dir = os.path.abspath(args.output_dir)
-    exp_dir = os.path.join(output_dir, experiment)
-    os.makedirs(exp_dir, exist_ok=True)
+            all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
+            expected = count_expected(options)
+            excluded = expected - len(all_variations)
+            dim_names = [k[1:] for k in options]
+            sweep_print(f"Sweep: {sweep_name}")
+            sweep_print(f"Dimensions: {', '.join(dim_names) if dim_names else '(none)'}")
+            for key in options:
+                dim_name = key[1:]
+                values = options[key].get("_values", [])
+                if values != [None]:
+                    sweep_print(f"  {dim_name}: {values}")
+            sweep_print(f"\nTotal combinations: {len(all_variations)}")
+            if excluded:
+                sweep_print(f"Excluded by EXCLUDE filter: {excluded}")
+            sweep_print(f"\nRuns:")
+            for var in all_variations:
+                sweep_print(f"  {var['name']}: {var['combo']}")
+            sys.exit(0)
 
-    if not args.dry_run:
-        _log_file = open(os.path.join(exp_dir, "sweep.log"), "w")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        experiment = args.experiment or f"{sweep_name}_{timestamp}"
+        output_dir = os.path.abspath(args.output_dir)
+        exp_dir = os.path.join(output_dir, experiment)
+        os.makedirs(exp_dir, exist_ok=True)
 
-    all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
-    expected = count_expected(options)
+        if not args.dry_run:
+            _log_file = open(os.path.join(exp_dir, "sweep.log"), "w")
 
-    # Resume: skip variations already completed
-    resumed_count = 0
-    if args.resume:
-        prior_status = _load_sweep_status(exp_dir)
-        if prior_status:
-            completed = {name for name, s in prior_status.items() if s.get("status") == "ok"}
-            original_n = len(all_variations)
-            all_variations = [v for v in all_variations if v["name"] not in completed]
-            resumed_count = original_n - len(all_variations)
-            if resumed_count:
-                sweep_print(f"Resume: skipping {resumed_count} already-completed runs")
+        if method == "bayes":
+            from mlsweep._bayes import BayesianOptimizer
+            optimizer: BayesianOptimizer | None = BayesianOptimizer(
+                sweep_name, options, optimize_cfg, extra_flags=list(extra_flags)
+            )
+            variations: list[dict[str, Any]] = []
+            expected = optimize_cfg["budget"]
+            n = expected
+        else:
+            optimizer = None
+            all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
+            expected = count_expected(options)
 
-    variations = all_variations
-    n = len(variations)
+            # Resume: skip variations already completed
+            resumed_count = 0
+            if args.resume:
+                prior_status = _load_sweep_status(exp_dir)
+                if prior_status:
+                    completed = {name for name, s in prior_status.items() if s.get("status") == "ok"}
+                    original_n = len(all_variations)
+                    all_variations = [v for v in all_variations if v["name"] not in completed]
+                    resumed_count = original_n - len(all_variations)
+                    if resumed_count:
+                        sweep_print(f"Resume: skipping {resumed_count} already-completed runs")
 
-    # Header
-    sweep_print(f"Command: {' '.join(command)}")
-    if expected < n:
-        sweep_print(f"Sweep: {sweep_name} ({expected} expected, {n} worst case)")
-    else:
-        sweep_print(f"Sweep: {sweep_name} ({n} runs)")
-    sweep_print(f"Experiment: {experiment}")
-    if extra:
-        sweep_print(f"Extra overrides: {' '.join(extra)}")
+            variations = all_variations
+            n = len(variations)
 
-    # List all variations with colored flags
-    for var in variations:
-        colored = []
-        for ci, (key, val) in enumerate(var["combo"].items()):
-            flags = var["effective_options"].get(key, {}).get("_flags", {}).get(val, [])
-            if flags:
-                color = _DIM_COLORS[ci % len(_DIM_COLORS)]
-                colored.append(f"{color}{' '.join(flags)}{_RESET}")
-        sweep_print(f"{_GREEN}{var['name']}{_RESET}: {' '.join(colored)}")
-        sweep_print(f"{' '.join(list(command) + var['overrides'] + list(extra))}\n")
+        # Header
+        sweep_print(f"Command: {' '.join(command)}")
+        if method == "bayes":
+            sweep_print(f"Sweep: {sweep_name} (bayes, budget={expected})")
+        elif expected < n:
+            sweep_print(f"Sweep: {sweep_name} ({expected} expected, {n} worst case)")
+        else:
+            sweep_print(f"Sweep: {sweep_name} ({n} runs)")
+        sweep_print(f"Experiment: {experiment}")
+        if extra:
+            sweep_print(f"Extra overrides: {' '.join(extra)}")
 
-    if args.dry_run:
+        # List all variations with colored flags (grid mode only — bayes has none yet)
+        if method != "bayes":
+            for var in variations:
+                colored = []
+                for ci, (key, val) in enumerate(var["combo"].items()):
+                    flags = var["effective_options"].get(key, {}).get("_flags", {}).get(val, [])
+                    if flags:
+                        color = _DIM_COLORS[ci % len(_DIM_COLORS)]
+                        colored.append(f"{color}{' '.join(flags)}{_RESET}")
+                sweep_print(f"{_GREEN}{var['name']}{_RESET}: {' '.join(colored)}")
+                sweep_print(f"{' '.join(list(command) + var['overrides'] + list(extra))}\n")
+
+        if args.dry_run:
+            sweep_print(f"\n{'=' * 80}")
+            if method == "bayes":
+                sweep_print(f"DRY RUN — {expected} bayes budget (runs generated at runtime)")
+            elif expected < n:
+                sweep_print(f"DRY RUN — {expected} expected ({n} worst case)")
+            else:
+                sweep_print(f"DRY RUN — {n} runs would be executed")
+            sweep_print(f"{'=' * 80}")
+            return
+
+        # Write sweep_manifest.json
+        _write_manifest(exp_dir, experiment, variations if method != "bayes" else [], note=args.note)
+
+        # Build writer factory
+        _writer_factories: list[WriterFactory] = [MlsweepWriterFactory()]
+        if args.wandb_project:
+            from mlsweep._writer_wandb import WandbWriterFactory
+            _writer_factories.append(WandbWriterFactory(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+            ))
+        if args.tensorboard_dir:
+            from mlsweep._writer_tensorboard import TensorBoardWriterFactory
+            _writer_factories.append(TensorBoardWriterFactory(
+                tb_dir=args.tensorboard_dir,
+            ))
+        factory: WriterFactory = MultiWriterFactory(_writer_factories)
+        dims = list(variations[0]["combo"].keys()) if variations else []
+        factory.on_sweep_start(experiment, dims, [v["name"] for v in variations])
+
+        _wandb_skip = {"WANDB_RUN_ID", "WANDB_RESUME"}
+        _wandb_env: dict[str, str] = {
+            k: v for k, v in os.environ.items()
+            if k.startswith("WANDB_") and k not in _wandb_skip
+        }
+
+        if method == "bayes":
+            run_desc = f"bayes budget={expected}"
+        else:
+            run_desc = f"{expected} runs, {n} possible" if expected < n else f"{n} runs"
         sweep_print(f"\n{'=' * 80}")
-        if expected < n:
-            sweep_print(f"DRY RUN — {expected} expected ({n} worst case)")
-        else:
-            sweep_print(f"DRY RUN — {n} runs would be executed")
-        sweep_print(f"{'=' * 80}")
-        return
+        sweep_print(f"Starting sweep - ({run_desc})")
+        sweep_print(f"{'=' * 80}\n")
 
-    # Write sweep_manifest.json
-    _write_manifest(exp_dir, experiment, variations, note=args.note)
+        if not args.dry_run and not args.validate:
+            sweep_print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
+        sweep_print(f"Output: {output_dir}\n")
 
-    # Build writer factory
-    _writer_factories: list[WriterFactory] = [MlsweepWriterFactory()]
-    if args.wandb_project:
-        from mlsweep._writer_wandb import WandbWriterFactory
-        _writer_factories.append(WandbWriterFactory(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-        ))
-    if args.tensorboard_dir:
-        from mlsweep._writer_tensorboard import TensorBoardWriterFactory
-        _writer_factories.append(TensorBoardWriterFactory(
-            tb_dir=args.tensorboard_dir,
-        ))
-    factory: WriterFactory = MultiWriterFactory(_writer_factories)
-    dims = list(variations[0]["combo"].keys()) if variations else []
-    factory.on_sweep_start(experiment, dims, [v["name"] for v in variations])
+        # Generate auth token
+        token = secrets.token_hex(16)
 
-    run_desc = f"{expected} runs, {n} possible" if expected < n else f"{n} runs"
-    sweep_print(f"\n{'=' * 80}")
-    sweep_print(f"Starting sweep - ({run_desc})")
-    sweep_print(f"{'=' * 80}\n")
+        # Determine GPU configuration for local mode
+        local_gpus: int | None = args.gpus
+        jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
 
-    if not args.dry_run and not args.validate:
-        sweep_print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
-    sweep_print(f"Output: {output_dir}\n")
-
-    # Generate auth token
-    token = secrets.token_hex(16)
-
-    # Determine GPU configuration for local mode
-    local_gpus: int | None = args.gpus
-    jobs_per_slot = args.jobs_per_gpu if args.jobs_per_gpu is not None else 1
-
-    if not args.workers:
-        visible = _visible_devices()
-        if not visible:
-            if args.gpus is not None or os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES"):
-                sweep_print(f"{_RED}Error: GPUs requested but no GPU management tool found "
-                            f"(tried nvidia-smi, amd-smi){_RESET}")
+        if not args.workers:
+            visible = _visible_devices()
+            if not visible:
+                if args.gpus is not None or os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES"):
+                    sweep_print(f"{_RED}Error: GPUs requested but no GPU management tool found "
+                                f"(tried nvidia-smi, amd-smi){_RESET}")
+                    sys.exit(1)
+                visible = [0]
+            if args.gpus is None:
+                num_gpus = gpus_per_run  # default: one slot
+            elif args.gpus == 0:
+                num_gpus = len(visible)  # all visible
+            else:
+                num_gpus = args.gpus
+            if num_gpus > len(visible):
+                sweep_print(f"Error: need {num_gpus} GPUs but only {len(visible)} visible")
                 sys.exit(1)
-            visible = [0]
-        if args.gpus is None:
-            num_gpus = gpus_per_run  # default: one slot
-        elif args.gpus == 0:
-            num_gpus = len(visible)  # all visible
-        else:
-            num_gpus = args.gpus
-        if num_gpus > len(visible):
-            sweep_print(f"Error: need {num_gpus} GPUs but only {len(visible)} visible")
+            if num_gpus < gpus_per_run:
+                sweep_print(f"Error: need at least {gpus_per_run} GPUs (GPUS_PER_RUN) "
+                            f"but only {num_gpus} requested")
+                sys.exit(1)
+            if num_gpus % gpus_per_run != 0:
+                sweep_print(f"Warning: {num_gpus} GPUs is not a multiple of "
+                            f"GPUS_PER_RUN={gpus_per_run}; "
+                            f"using {(num_gpus // gpus_per_run) * gpus_per_run}")
+            local_gpus = num_gpus
+
+        # Set up event queue and connect workers
+        event_queue: queue.Queue[Any] = queue.Queue()
+
+        sweep_print(f"Connecting to workers...")
+        workers = _connect_workers(
+            workers_file=args.workers,
+            gpus_per_run=gpus_per_run,
+            token=token,
+            event_queue=event_queue,
+            scratch_dir=args.scratch_dir,
+            max_gpus=local_gpus,
+            jobs_per_slot=jobs_per_slot,
+        )
+
+        if not workers:
+            sweep_print(f"{_RED}Error: no workers could be started{_RESET}")
             sys.exit(1)
-        if num_gpus < gpus_per_run:
-            sweep_print(f"Error: need at least {gpus_per_run} GPUs (GPUS_PER_RUN) "
-                        f"but only {num_gpus} requested")
-            sys.exit(1)
-        if num_gpus % gpus_per_run != 0:
-            sweep_print(f"Warning: {num_gpus} GPUs is not a multiple of "
-                        f"GPUS_PER_RUN={gpus_per_run}; "
-                        f"using {(num_gpus // gpus_per_run) * gpus_per_run}")
-        local_gpus = num_gpus
 
-    # Set up event queue and connect workers
-    event_queue: queue.Queue[Any] = queue.Queue()
+        # Wait for all workers to send MsgWorkerHello (with timeout)
+        connected_count = 0
+        connect_deadline = time.time() + 30.0
+        while connected_count < len(workers) and time.time() < connect_deadline:
+            try:
+                ev = event_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if isinstance(ev, EvWorkerConnected):
+                ws = workers[ev.worker_id]
+                ws.gpus = ev.gpus
+                ws.scratch_dir = ev.scratch_dir
+                # Convert topo from wire format to internal format
+                ws.topo = {
+                    tuple(int(x) for x in k.split(",")): v  # type: ignore[misc]
+                    for k, v in ev.topo.items()
+                }
+                # Limit GPUs if requested (local mode)
+                if ws.host == "localhost" and local_gpus is not None:
+                    ws.gpus = ws.gpus[:local_gpus]
+                n_slots = len(ws.gpus) // gpus_per_run
+                if n_slots == 0:
+                    sweep_print(f"  {_YELLOW}WARN{_RESET}  {ws.host}: only {len(ws.gpus)} GPU(s), "
+                                f"need {gpus_per_run} per run — skipping")
+                    ws.status = "DEAD"
+                    connected_count += 1
+                    continue
+                base_slots = _best_gpu_groups(ws.gpus, gpus_per_run, n_slots, topo=ws.topo)
+                # Expand by jobs_per_slot: each physical GPU group gets N slot entries
+                ws.slots = [grp for grp in base_slots for _ in range(ws.jobs_per_slot)]
+                ws.status = "CONNECTED"
+                connected_count += 1
 
-    sweep_print(f"Connecting to workers...")
-    workers = _connect_workers(
-        workers_file=args.workers,
-        gpus_per_run=gpus_per_run,
-        token=token,
-        event_queue=event_queue,
-        scratch_dir=args.scratch_dir,
-        max_gpus=local_gpus,
-        jobs_per_slot=jobs_per_slot,
-    )
-
-    if not workers:
-        sweep_print(f"{_RED}Error: no workers could be started{_RESET}")
-        sys.exit(1)
-
-    # Wait for all workers to send MsgWorkerHello (with timeout)
-    connected_count = 0
-    connect_deadline = time.time() + 30.0
-    while connected_count < len(workers) and time.time() < connect_deadline:
-        try:
-            ev = event_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        if isinstance(ev, EvWorkerConnected):
-            ws = workers[ev.worker_id]
-            ws.gpus = ev.gpus
-            ws.scratch_dir = ev.scratch_dir
-            # Convert topo from wire format to internal format
-            ws.topo = {
-                tuple(int(x) for x in k.split(",")): v  # type: ignore[misc]
-                for k, v in ev.topo.items()
-            }
-            # Limit GPUs if requested (local mode)
-            if ws.host == "localhost" and local_gpus is not None:
-                ws.gpus = ws.gpus[:local_gpus]
-            n_slots = len(ws.gpus) // gpus_per_run
-            if n_slots == 0:
-                sweep_print(f"  {_YELLOW}WARN{_RESET}  {ws.host}: only {len(ws.gpus)} GPU(s), "
-                            f"need {gpus_per_run} per run — skipping")
+                phys_slots = n_slots
+                total_jobs = len(ws.slots)  # already expanded by jobs_per_slot
+                slot_word = "slot" if phys_slots == 1 else "slots"
+                jobs_note = f" × {ws.jobs_per_slot} jobs" if ws.jobs_per_slot > 1 else ""
+                sweep_print(f"  {_GREEN}OK{_RESET}    {ws.host}: {phys_slots} {slot_word} ({phys_slots * gpus_per_run} GPUs){jobs_note} = {total_jobs} concurrent jobs")
+            elif isinstance(ev, EvWorkerDisconnected):
+                ws = workers[ev.worker_id]
                 ws.status = "DEAD"
                 connected_count += 1
+                sweep_print(f"  {_RED}FAIL{_RESET}  {ws.host}: failed to connect")
+
+        active_workers = [ws for ws in workers if ws.status == "CONNECTED"]
+        if not active_workers:
+            sweep_print(f"{_RED}Error: no workers available{_RESET}")
+            sys.exit(1)
+
+        total_slots = sum(len(ws.slots) for ws in active_workers)
+        sweep_print(f"Total slots: {total_slots}\n")
+
+        # Start stdin thread for interactive commands
+        stdin_t = threading.Thread(target=_stdin_thread, args=(event_queue,), daemon=True)
+        stdin_t.start()
+
+        # ── Scheduling loop ────────────────────────────────────────────────────────
+
+        if method == "bayes":
+            has_singular = any(v.get("singular") for v in options.values())
+        else:
+            has_singular = any(
+                o.get("singular")
+                for var in variations
+                for o in var["effective_options"].values()
+            )
+
+        if method == "bayes":
+            assert optimizer is not None
+            n_lex_dims = sum(
+                1 for v in options.values()
+                if not v.get("singular") and v.get("_values") != [None]
+            )
+            initial_n = optimize_cfg.get("n_initial") or max(5, 2 * n_lex_dims)
+            initial_n = min(initial_n, optimize_cfg["budget"])
+            initial_vars = optimizer.suggest(n=initial_n)
+            variations.extend(initial_vars)
+            pending: list[dict[str, Any]] = list(initial_vars)
+        else:
+            pending = list(variations)
+
+        told_treatments: set[tuple[Any, ...]] = set()
+        in_flight: dict[str, dict[str, Any]] = {}   # run_id → var
+        results: list[tuple[Any, ...]] = []          # (var, success, elapsed, log_file)
+        failed: list[dict[str, Any]] = []
+        succeeded: list[dict[str, Any]] = []
+        skipped_count = 0
+        retry_counts: dict[str, int] = {}           # run_id → retry count
+        log_handles: dict[str, IO[str]] = {}        # run_id → training.log file handle
+        run_writers: dict[str, RunWriter] = {}      # run_id → metric writer
+        t0 = time.time()
+
+        # Initial dispatch
+        pending = _dispatch_pending(
+            workers, pending, in_flight, failed, succeeded,
+            output_dir, experiment, exp_dir, token, command, extra, run_from,
+            gpus_per_run, has_singular,
+        )
+
+        while pending or in_flight:
+            try:
+                ev = event_queue.get(timeout=0.5)
+            except queue.Empty:
+                # Re-try dispatch in case a slot freed up
+                if pending:
+                    pending = _dispatch_pending(
+                        workers, pending, in_flight, failed, succeeded,
+                        output_dir, experiment, exp_dir, token, command, extra, run_from,
+                        gpus_per_run, has_singular,
+                    )
                 continue
-            base_slots = _best_gpu_groups(ws.gpus, gpus_per_run, n_slots, topo=ws.topo)
-            # Expand by jobs_per_slot: each physical GPU group gets N slot entries
-            ws.slots = [grp for grp in base_slots for _ in range(ws.jobs_per_slot)]
-            ws.status = "CONNECTED"
-            connected_count += 1
 
-            phys_slots = n_slots
-            total_jobs = len(ws.slots)  # already expanded by jobs_per_slot
-            slot_word = "slot" if phys_slots == 1 else "slots"
-            jobs_note = f" × {ws.jobs_per_slot} jobs" if ws.jobs_per_slot > 1 else ""
-            sweep_print(f"  {_GREEN}OK{_RESET}    {ws.host}: {phys_slots} {slot_word} ({phys_slots * gpus_per_run} GPUs){jobs_note} = {total_jobs} concurrent jobs")
-        elif isinstance(ev, EvWorkerDisconnected):
-            ws = workers[ev.worker_id]
-            ws.status = "DEAD"
-            connected_count += 1
-            sweep_print(f"  {_RED}FAIL{_RESET}  {ws.host}: failed to connect")
+            if isinstance(ev, EvRunStarted):
+                # Open output files for this run
+                run_dir = os.path.join(output_dir, experiment, ev.run_id)
+                os.makedirs(run_dir, exist_ok=True)
+                log_handles[ev.run_id] = open(os.path.join(run_dir, "training.log"), "w", buffering=1)
+                _var = in_flight.get(ev.run_id)
+                _combo: dict[str, Any] = _var.get("combo", {}) if _var is not None else {}
+                run_writers[ev.run_id] = factory.make(ev.run_id, _combo, run_dir)
 
-    active_workers = [ws for ws in workers if ws.status == "CONNECTED"]
-    if not active_workers:
-        sweep_print(f"{_RED}Error: no workers available{_RESET}")
-        sys.exit(1)
+            elif isinstance(ev, EvLogLine):
+                _log_fh = log_handles.get(ev.run_id)
+                if _log_fh is not None:
+                    _log_fh.write(ev.data)
+                    _log_fh.flush()
 
-    total_slots = sum(len(ws.slots) for ws in active_workers)
-    sweep_print(f"Total slots: {total_slots}\n")
+            elif isinstance(ev, EvMetricLine):
+                _writer = run_writers.get(ev.run_id)
+                if _writer is not None:
+                    _writer.on_metric(ev.step, ev.data)
 
-    # Start stdin thread for interactive commands
-    stdin_t = threading.Thread(target=_stdin_thread, args=(event_queue,), daemon=True)
-    stdin_t.start()
+            elif isinstance(ev, EvSyncRequest):
+                var_sync = in_flight.get(ev.run_id)
+                if var_sync:
+                    ws = workers[ev.worker_id]  # noqa: F841 — ws used below
+                    run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
+                    run_dir = os.path.join(output_dir, experiment, ev.run_id)
+                    threading.Thread(
+                        target=_rsync_thread,
+                        args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
+                              ws.password, ws.ssh_key),
+                        daemon=True,
+                    ).start()
 
-    # ── Scheduling loop ────────────────────────────────────────────────────────
+            elif isinstance(ev, EvRunResult):
+                ws = workers[ev.worker_id]
+                var = in_flight.pop(ev.run_id, {})
+                ws.in_flight.pop(ev.run_id, {})
 
-    has_singular = any(
-        o.get("singular")
-        for var in variations
-        for o in var["effective_options"].values()
-    )
+                # Free the exact slot that was used for this run
+                used_slot_idx = ws.run_slots.pop(ev.run_id, None)
+                if used_slot_idx is not None:
+                    ws.busy_slots.discard(used_slot_idx)
+                    used_gpu_group = ws.slots[used_slot_idx] if used_slot_idx < len(ws.slots) else []
+                else:
+                    used_gpu_group = []
 
-    pending: list[dict[str, Any]] = list(variations)
-    in_flight: dict[str, dict[str, Any]] = {}   # run_id → var
-    results: list[tuple[Any, ...]] = []          # (var, success, elapsed, log_file)
-    failed: list[dict[str, Any]] = []
-    succeeded: list[dict[str, Any]] = []
-    skipped_count = 0
-    retry_counts: dict[str, int] = {}           # run_id → retry count
-    log_handles: dict[str, IO[str]] = {}        # run_id → training.log file handle
-    run_writers: dict[str, RunWriter] = {}      # run_id → metric writer
-    t0 = time.time()
+                # Close log file handle and finish metric writer
+                _log_fh = log_handles.pop(ev.run_id, None)
+                if _log_fh is not None:
+                    try:
+                        _log_fh.close()
+                    except OSError:
+                        pass
+                _writer = run_writers.pop(ev.run_id, None)
+                if _writer is not None:
+                    _writer.on_finish("ok" if ev.success else "failed", ev.elapsed)
 
-    # Initial dispatch
-    pending = _dispatch_pending(
-        workers, pending, in_flight, failed, succeeded,
-        output_dir, experiment, exp_dir, token, command, extra, run_from,
-        gpus_per_run, has_singular,
-    )
+                if var:
+                    log_path = os.path.join(output_dir, experiment, ev.run_id, "training.log")
+                    results.append((var, ev.success, ev.elapsed, log_path))
+                    opts = var["effective_options"]
+                    tk = _treatment_key(var["combo"], opts)
 
-    while pending or in_flight:
-        try:
-            ev = event_queue.get(timeout=0.5)
-        except queue.Empty:
-            # Re-try dispatch in case a slot freed up
-            if pending:
+                    (succeeded if ev.success else failed).append(var["combo"])
+
+                    _update_sweep_status(exp_dir, ev.run_id,
+                                         "ok" if ev.success else "failed",
+                                         ev.elapsed, var["combo"])
+
+                    # Bayes: report result to optimizer and queue next suggestion
+                    if optimizer is not None and ev.success and tk not in told_treatments:
+                        told_treatments.add(tk)
+                        mpath = os.path.join(output_dir, experiment, ev.run_id, "metrics.jsonl")
+                        mval = extract_objective_metric(mpath, optimize_cfg["metric"], optimize_cfg["goal"])
+                        optimizer.tell(var["combo"], mval)
+                        if not optimizer.exhausted:
+                            new_vars = optimizer.suggest(n=1)
+                            pending.extend(new_vars)
+                            variations.extend(new_vars)
+
+                    pad = max((len(v["name"]) for v in variations), default=0)
+                    nm = ev.run_id.ljust(pad)
+                    sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
+                    log_path_str = log_path
+
+                    if ev.success:
+                        tag = f"{_GREEN}   OK{_RESET}"
+                    elif has_singular and tk not in {_treatment_key(r[0]["combo"], r[0]["effective_options"]) for r in results if r[1]}:
+                        tag = f"{_YELLOW}PROBE{_RESET}"
+                    else:
+                        tag = f"{_RED} FAIL{_RESET}"
+
+                    gpu_label = (f"gpu{'s' if len(used_gpu_group) > 1 else ''} "
+                                 f"{','.join(str(g) for g in used_gpu_group)}"
+                                 if used_gpu_group else "")
+                    loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
+                           if ws.host != "localhost" and gpu_label else gpu_label)
+
+                    if method == "bayes":
+                        told = len(told_treatments)
+                        progress = f"[{told}/{expected} evaluated]"
+                    else:
+                        resolved = len({_treatment_key(r[0]["combo"], r[0]["effective_options"])
+                                         for r in results if r[1]})
+                        progress = f"[{resolved}/{expected} resolved]"
+
+                    if sdesc:
+                        sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s {progress}")
+                    else:
+                        sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s {progress}")
+
+                    # Sync artifacts after run completes
+                    run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
+                    run_dir = os.path.join(output_dir, experiment, ev.run_id)
+                    threading.Thread(
+                        target=_rsync_thread,
+                        args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
+                              ws.password, ws.ssh_key),
+                        daemon=True,
+                    ).start()
+
+                # Re-dispatch
                 pending = _dispatch_pending(
                     workers, pending, in_flight, failed, succeeded,
                     output_dir, experiment, exp_dir, token, command, extra, run_from,
                     gpus_per_run, has_singular,
                 )
-            continue
 
-        if isinstance(ev, EvRunStarted):
-            # Open output files for this run
-            run_dir = os.path.join(output_dir, experiment, ev.run_id)
-            os.makedirs(run_dir, exist_ok=True)
-            log_handles[ev.run_id] = open(os.path.join(run_dir, "training.log"), "w", buffering=1)
-            _var = in_flight.get(ev.run_id)
-            _combo: dict[str, Any] = _var.get("combo", {}) if _var is not None else {}
-            run_writers[ev.run_id] = factory.make(ev.run_id, _combo, run_dir)
+            elif isinstance(ev, EvArtifactSynced):
+                # Send MsgCleanup to the worker that ran this job
+                for ws in workers:
+                    if ev.run_id in ws.in_flight and ws.status == "CONNECTED":
+                        ws.send_queue.put(encode(MsgCleanup(run_id=ev.run_id)))
+                        break
 
-        elif isinstance(ev, EvLogLine):
-            _log_fh = log_handles.get(ev.run_id)
-            if _log_fh is not None:
-                _log_fh.write(ev.data)
-                _log_fh.flush()
+            elif isinstance(ev, EvWorkerCleaned):
+                pass  # nothing to do
 
-        elif isinstance(ev, EvMetricLine):
-            _writer = run_writers.get(ev.run_id)
-            if _writer is not None:
-                _writer.on_metric(ev.step, ev.data)
+            elif isinstance(ev, EvWorkerDisconnected):
+                ws = workers[ev.worker_id]
+                if ws.status == "CONNECTED":
+                    sweep_print(f"  {_YELLOW}WARN{_RESET}  Worker {ws.host} disconnected; reconnecting...")
+                    ws.status = "RECONNECTING"
+                    # Mark in-flight runs as orphaned
+                    for run_id in list(ws.in_flight.keys()):
+                        _update_sweep_status(exp_dir, run_id, "orphaned", 0.0,
+                                             ws.in_flight[run_id].get("combo", {}))
+                    threading.Thread(
+                        target=_reconnect_thread,
+                        args=(ws, event_queue, token),
+                        daemon=True,
+                    ).start()
 
-        elif isinstance(ev, EvSyncRequest):
-            var_sync = in_flight.get(ev.run_id)
-            if var_sync:
-                ws = workers[ev.worker_id]  # noqa: F841 — ws used below
-                run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
-                run_dir = os.path.join(output_dir, experiment, ev.run_id)
-                threading.Thread(
-                    target=_rsync_thread,
-                    args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
-                          ws.password, ws.ssh_key),
-                    daemon=True,
-                ).start()
-
-        elif isinstance(ev, EvRunResult):
-            ws = workers[ev.worker_id]
-            var = in_flight.pop(ev.run_id, {})
-            ws.in_flight.pop(ev.run_id, {})
-
-            # Free the exact slot that was used for this run
-            used_slot_idx = ws.run_slots.pop(ev.run_id, None)
-            if used_slot_idx is not None:
-                ws.busy_slots.discard(used_slot_idx)
-                used_gpu_group = ws.slots[used_slot_idx] if used_slot_idx < len(ws.slots) else []
-            else:
-                used_gpu_group = []
-
-            # Close log file handle and finish metric writer
-            _log_fh = log_handles.pop(ev.run_id, None)
-            if _log_fh is not None:
-                try:
-                    _log_fh.close()
-                except OSError:
-                    pass
-            _writer = run_writers.pop(ev.run_id, None)
-            if _writer is not None:
-                _writer.on_finish("ok" if ev.success else "failed", ev.elapsed)
-
-            if var is not None:
-                log_path = os.path.join(output_dir, experiment, ev.run_id, "training.log")
-                results.append((var, ev.success, ev.elapsed, log_path))
-                opts = var["effective_options"]
-                tk = _treatment_key(var["combo"], opts)
-
-                (succeeded if ev.success else failed).append(var["combo"])
-
-                _update_sweep_status(exp_dir, ev.run_id,
-                                     "ok" if ev.success else "failed",
-                                     ev.elapsed, var["combo"])
-
-                pad = max((len(v["name"]) for v in variations), default=0)
-                nm = ev.run_id.ljust(pad)
-                sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
-                log_path_str = log_path
-                resolved = len({_treatment_key(r[0]["combo"], r[0]["effective_options"])
-                                 for r in results if r[1]})
-
+            elif isinstance(ev, EvReconnectWorker):
+                ws = workers[ev.worker_id]
                 if ev.success:
-                    tag = f"{_GREEN}   OK{_RESET}"
-                elif has_singular and tk not in {_treatment_key(r[0]["combo"], r[0]["effective_options"]) for r in results if r[1]}:
-                    tag = f"{_YELLOW}PROBE{_RESET}"
+                    sweep_print(f"  {_GREEN}OK{_RESET}    Worker {ws.host} reconnected")
+                    # Send MsgReplay for each resuming run
+                    for rinfo in ev.resuming:
+                        ws.send_queue.put(encode(MsgReplay(
+                            run_id=rinfo["run_id"],
+                            log_seq=rinfo["log_seq"],
+                            metric_seq=rinfo["metric_seq"],
+                        )))
+                    # Re-queue orphaned runs that this worker was handling
+                    orphaned = [run_id for run_id, var in ws.in_flight.items()
+                                if run_id not in {r["run_id"] for r in ev.resuming}]
+                    for run_id in orphaned:
+                        var = ws.in_flight.pop(run_id, {})
+                        if var:
+                            rc = retry_counts.get(run_id, 0) + 1
+                            retry_counts[run_id] = rc
+                            if rc <= args.max_retries:
+                                pending.append(var)
+                            else:
+                                sweep_print(f"  {_RED}FAIL{_RESET}  {run_id}: max retries exceeded")
+                                results.append((var, False, 0.0,
+                                                os.path.join(output_dir, experiment, run_id, "training.log")))
+                                failed.append(var["combo"])
+                                _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                 else:
-                    tag = f"{_RED} FAIL{_RESET}"
-
-                gpu_label = (f"gpu{'s' if len(used_gpu_group) > 1 else ''} "
-                             f"{','.join(str(g) for g in used_gpu_group)}"
-                             if used_gpu_group else "")
-                loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
-                       if ws.host != "localhost" and gpu_label else gpu_label)
-                if sdesc:
-                    sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s [{resolved}/{expected} resolved]")
-                else:
-                    sweep_print(f"  {tag}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path_str}{_RESET} {ev.elapsed:.1f}s [{resolved}/{expected} resolved]")
-
-                # Sync artifacts after run completes
-                run_scratch = os.path.join(ws.scratch_dir, experiment, ev.run_id)
-                run_dir = os.path.join(output_dir, experiment, ev.run_id)
-                threading.Thread(
-                    target=_rsync_thread,
-                    args=(ws.host, run_scratch, run_dir, ev.run_id, event_queue,
-                          ws.password, ws.ssh_key),
-                    daemon=True,
-                ).start()
-
-            # Re-dispatch
-            pending = _dispatch_pending(
-                workers, pending, in_flight, failed, succeeded,
-                output_dir, experiment, exp_dir, token, command, extra, run_from,
-                gpus_per_run, has_singular,
-            )
-
-        elif isinstance(ev, EvArtifactSynced):
-            # Send MsgCleanup to the worker that ran this job
-            for ws in workers:
-                if ev.run_id in ws.in_flight and ws.status == "CONNECTED":
-                    ws.send_queue.put(encode(MsgCleanup(run_id=ev.run_id)))
-                    break
-
-        elif isinstance(ev, EvWorkerCleaned):
-            pass  # nothing to do
-
-        elif isinstance(ev, EvWorkerDisconnected):
-            ws = workers[ev.worker_id]
-            if ws.status == "CONNECTED":
-                sweep_print(f"  {_YELLOW}WARN{_RESET}  Worker {ws.host} disconnected; reconnecting...")
-                ws.status = "RECONNECTING"
-                # Mark in-flight runs as orphaned
-                for run_id in list(ws.in_flight.keys()):
-                    _update_sweep_status(exp_dir, run_id, "orphaned", 0.0,
-                                         ws.in_flight[run_id].get("combo", {}))
-                threading.Thread(
-                    target=_reconnect_thread,
-                    args=(ws, event_queue, token),
-                    daemon=True,
-                ).start()
-
-        elif isinstance(ev, EvReconnectWorker):
-            ws = workers[ev.worker_id]
-            if ev.success:
-                sweep_print(f"  {_GREEN}OK{_RESET}    Worker {ws.host} reconnected")
-                # Send MsgReplay for each resuming run
-                for rinfo in ev.resuming:
-                    ws.send_queue.put(encode(MsgReplay(
-                        run_id=rinfo["run_id"],
-                        log_seq=rinfo["log_seq"],
-                        metric_seq=rinfo["metric_seq"],
-                    )))
-                # Re-queue orphaned runs that this worker was handling
-                orphaned = [run_id for run_id, var in ws.in_flight.items()
-                            if run_id not in {r["run_id"] for r in ev.resuming}]
-                for run_id in orphaned:
-                    var = ws.in_flight.pop(run_id, {})
-                    if var:
+                    sweep_print(f"  {_RED}FAIL{_RESET}  Worker {ws.host} unreachable; re-queuing runs")
+                    for run_id, var in ws.in_flight.items():
                         rc = retry_counts.get(run_id, 0) + 1
                         retry_counts[run_id] = rc
                         if rc <= args.max_retries:
                             pending.append(var)
                         else:
-                            sweep_print(f"  {_RED}FAIL{_RESET}  {run_id}: max retries exceeded")
                             results.append((var, False, 0.0,
                                             os.path.join(output_dir, experiment, run_id, "training.log")))
                             failed.append(var["combo"])
                             _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
-            else:
-                sweep_print(f"  {_RED}FAIL{_RESET}  Worker {ws.host} unreachable; re-queuing runs")
-                for run_id, var in ws.in_flight.items():
-                    rc = retry_counts.get(run_id, 0) + 1
-                    retry_counts[run_id] = rc
-                    if rc <= args.max_retries:
-                        pending.append(var)
-                    else:
-                        results.append((var, False, 0.0,
-                                        os.path.join(output_dir, experiment, run_id, "training.log")))
-                        failed.append(var["combo"])
-                        _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
-                ws.in_flight.clear()
-                ws.busy_slots.clear()
+                    ws.in_flight.clear()
+                    ws.busy_slots.clear()
 
-            # Try dispatch now that slots may be free
-            if ev.success:
-                pending = _dispatch_pending(
-                    workers, pending, in_flight, failed, succeeded,
-                    output_dir, experiment, exp_dir, token, command, extra, run_from,
-                    gpus_per_run, has_singular,
-                )
+                # Try dispatch now that slots may be free
+                if ev.success:
+                    pending = _dispatch_pending(
+                        workers, pending, in_flight, failed, succeeded,
+                        output_dir, experiment, exp_dir, token, command, extra, run_from,
+                        gpus_per_run, has_singular,
+                    )
 
-        elif isinstance(ev, EvInteractiveCommand):
-            if ev.cmd == "status":
-                n_pending = len(pending)
-                n_inflight = len(in_flight)
-                n_done = len(results)
-                sweep_print(f"Status: {n_inflight} running, {n_pending} pending, {n_done} done")
-            elif ev.cmd == "pause":
-                sweep_print("Pause not yet implemented")
-            elif ev.cmd == "resume":
-                sweep_print("Resume not yet implemented")
+            elif isinstance(ev, EvInteractiveCommand):
+                if ev.cmd == "status":
+                    n_pending = len(pending)
+                    n_inflight = len(in_flight)
+                    n_done = len(results)
+                    sweep_print(f"Status: {n_inflight} running, {n_pending} pending, {n_done} done")
+                elif ev.cmd == "pause":
+                    sweep_print("Pause not yet implemented")
+                elif ev.cmd == "resume":
+                    sweep_print("Resume not yet implemented")
 
-    # Shut down all workers
-    for ws in workers:
-        if ws.status == "CONNECTED":
-            ws.send_queue.put(encode(MsgShutdown()))
-            ws.send_queue.put(None)  # drain and close write thread
+        # Shut down all workers
+        for ws in workers:
+            if ws.status == "CONNECTED":
+                ws.send_queue.put(encode(MsgShutdown()))
+                ws.send_queue.put(None)  # drain and close write thread
 
-    elapsed = time.time() - t0
-    has_failures = print_summary(results, skipped_count, elapsed)
-    sweep_print(f"\nOutput: {output_dir}")
-    if _log_file:
-        _log_file.close()
-        print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
+        elapsed = time.time() - t0
+        has_failures = print_summary(results, skipped_count, elapsed)
+        sweep_print(f"\nOutput: {output_dir}")
+        if _log_file:
+            _log_file.close()
+            print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
 
-    factory.on_sweep_end()
+        factory.on_sweep_end()
 
-    if has_failures:
-        sys.exit(1)
+        if has_failures:
+            sys.exit(1)
 
+
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()

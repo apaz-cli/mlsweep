@@ -1,6 +1,7 @@
 """TensorBoard writer."""
 
 import os
+import time
 from typing import Any
 
 from mlsweep._writers import RunWriter
@@ -13,13 +14,11 @@ class _StandaloneSummaryWriter:
         from tensorboard.summary.writer.event_file_writer import EventFileWriter
         import tensorboard.compat.proto.event_pb2 as event_pb2
         import tensorboard.compat.proto.summary_pb2 as summary_pb2
-        import time
 
         os.makedirs(log_dir, exist_ok=True)
         self._writer = EventFileWriter(log_dir)
         self._event_pb2 = event_pb2
         self._summary_pb2 = summary_pb2
-        self._time = time
 
     def add_scalar(self, tag: str, scalar_value: float, global_step: int = 0) -> None:
         summary = self._summary_pb2.Summary()
@@ -27,7 +26,7 @@ class _StandaloneSummaryWriter:
         v.tag = tag
         v.simple_value = float(scalar_value)
         event = self._event_pb2.Event(
-            summary=summary, step=global_step, wall_time=self._time.time()
+            summary=summary, step=global_step, wall_time=time.time()
         )
         self._writer.add_event(event)
 

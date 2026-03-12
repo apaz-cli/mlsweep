@@ -6,7 +6,9 @@ Extracted verbatim from run_sweep.py. No logic changes.
 import importlib.util
 import itertools
 import json
+import math
 import os
+import random
 import shlex
 import sys
 import threading
@@ -64,6 +66,23 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     run_from = getattr(mod, "RUN_FROM", None)
     if run_from is not None and not isinstance(run_from, str):
         raise ValueError(f"{path}: RUN_FROM must be a str, got {type(run_from).__name__}")
+    optimize = getattr(mod, "OPTIMIZE", None)
+    method = "grid"
+    if optimize is not None:
+        if not isinstance(optimize, dict):
+            raise ValueError(f"{path}: OPTIMIZE must be a dict")
+        method = optimize.get("method", "grid")
+        if method not in ("grid", "bayes"):
+            raise ValueError(f"{path}: OPTIMIZE method must be 'grid' or 'bayes'")
+        if method == "bayes":
+            for req in ("metric", "goal", "budget"):
+                if req not in optimize:
+                    raise ValueError(f"{path}: OPTIMIZE requires '{req}' when method='bayes'")
+            if optimize["goal"] not in ("minimize", "maximize"):
+                raise ValueError(f"{path}: OPTIMIZE goal must be 'minimize' or 'maximize'")
+            if not isinstance(optimize["budget"], int) or optimize["budget"] < 1:
+                raise ValueError(f"{path}: OPTIMIZE budget must be a positive int")
+
     return {
         "name": Path(path).stem,
         "options": mod.OPTIONS,
@@ -72,6 +91,8 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "extra_flags": getattr(mod, "EXTRA_FLAGS", []),
         "gpus_per_run": gpus_per_run,
         "run_from": run_from,
+        "method": method,
+        "optimize": optimize,
     }
 
 
@@ -83,17 +104,35 @@ def load_sweeps() -> dict[str, dict[str, Any]]:
     }
 
 
-def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | None = None) -> None:
+def _sample_distribution(dist: str, lo: float, hi: float, n: int) -> list[Any]:
+    """Sample n values from the specified distribution over [lo, hi]."""
+    if dist == "log_uniform":
+        log_lo, log_hi = math.log(lo), math.log(hi)
+        return [math.exp(random.uniform(log_lo, log_hi)) for _ in range(n)]
+    elif dist == "uniform":
+        return [random.uniform(lo, hi) for _ in range(n)]
+    else:  # int_uniform
+        return [random.randint(int(lo), int(hi)) for _ in range(n)]
+
+
+def validate_options(
+    options: dict[str, Any],
+    _ancestor_keys: frozenset[str] | None = None,
+    method: str = "grid",
+) -> None:
     """Validate and normalize OPTIONS dict.
 
     Each key in options must start with '.' to identify it as a dimension.
     Within a dim spec, dot-prefixed keys are subdimensions; non-dot keys are metadata.
 
-    Three dimension types (determined by content):
-      Value dim  — has 'values'; sweeps over that list with per-value flags.
-      Subdim     — no 'values', has dot-prefixed subdim keys; each subdim is a
-                   mutually-exclusive branch (the dim's implicit "values").
-      Fixed dim  — no 'values', no subdims; flags are always appended (one combo).
+    Four dimension types (determined by content):
+      Value dim       — has 'values'; sweeps over that list with per-value flags.
+      Subdim          — no 'values', has dot-prefixed subdim keys; each subdim is a
+                        mutually-exclusive branch (the dim's implicit "values").
+      Continuous dim  — has 'distribution'; samples from a continuous range.
+                        In grid mode, pre-samples N values ('samples' required).
+                        In bayes mode, optuna samples at runtime ('samples' forbidden).
+      Fixed dim       — no 'values', no subdims; flags are always appended (one combo).
 
     Synthesizes _values, _flags, _sub_opts_map on each dim spec for use by
     _expand_tree and related functions.
@@ -121,6 +160,57 @@ def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | N
         has_values = "values" in opt
         has_dict_flags = isinstance(flags, dict)
         has_subdims = bool(subdim_keys)
+        has_distribution = "distribution" in opt
+
+        if has_distribution and has_subdims:
+            raise ValueError(f"Dimension {key!r} cannot have both 'distribution' and subdimensions")
+        if has_distribution and has_values:
+            raise ValueError(f"Dimension {key!r} cannot have both 'distribution' and 'values'")
+
+        if has_distribution:
+            dist = opt["distribution"]
+            if dist not in ("uniform", "log_uniform", "int_uniform"):
+                raise ValueError(
+                    f"Dimension {key!r} distribution must be "
+                    f"'uniform', 'log_uniform', or 'int_uniform'"
+                )
+            if "min" not in opt or "max" not in opt:
+                raise ValueError(f"Dimension {key!r} with distribution requires 'min' and 'max'")
+            if float(opt["min"]) >= float(opt["max"]):
+                raise ValueError(f"Dimension {key!r}: min must be < max")
+
+            if method == "grid":
+                n_samples = opt.get("samples")
+                if not isinstance(n_samples, int) or n_samples < 1:
+                    raise ValueError(
+                        f"Dimension {key!r}: 'samples' (int > 0) required in grid mode"
+                    )
+                flags_spec = opt.get("flags")
+                if flags_spec is not None and not isinstance(flags_spec, str):
+                    raise ValueError(
+                        f"Dimension {key!r}: continuous dim flags must be a str"
+                    )
+                values = _sample_distribution(dist, float(opt["min"]), float(opt["max"]), n_samples)
+                if flags_spec is not None:
+                    flags_dict: dict[Any, list[str]] = {v: [flags_spec, str(v)] for v in values}
+                else:
+                    flags_dict = {v: [] for v in values}
+                opt["_values"] = values
+                opt["_flags"] = flags_dict
+                opt["_sub_opts_map"] = {}
+            else:  # bayes
+                if "samples" in opt:
+                    raise ValueError(f"Dimension {key!r}: 'samples' is not used in bayes mode")
+                flags_spec = opt.get("flags")
+                if flags_spec is not None and not isinstance(flags_spec, str):
+                    raise ValueError(
+                        f"Dimension {key!r}: continuous dim flags must be a str"
+                    )
+                opt["_type"] = "continuous"
+                opt["_values"] = []
+                opt["_flags"] = {}
+                opt["_sub_opts_map"] = {}
+            continue  # skip standard value/subdim/fixed processing
 
         if (has_values or has_dict_flags) and has_subdims:
             raise ValueError(
@@ -132,7 +222,7 @@ def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | N
             # VALUE DIM — values explicit, or inferred from flags dict keys
             values = opt["values"] if has_values else list(flags.keys())
             if flags is None:
-                flags_dict: dict[Any, list[str]] = {v: [] for v in values}
+                flags_dict = {v: [] for v in values}
             elif isinstance(flags, str):
                 flags_dict = {v: [flags, str(v)] for v in values}
             elif isinstance(flags, dict):
@@ -173,7 +263,7 @@ def validate_options(options: dict[str, Any], _ancestor_keys: frozenset[str] | N
                                 f"Subdim key {bk!r} (under {sdkey!r} of {key!r}) "
                                 f"collides with ancestor or sibling dim"
                             )
-                    validate_options(child_subdims, _ancestor_keys | current_keys)
+                    validate_options(child_subdims, _ancestor_keys | current_keys, method=method)
             opt["_values"] = subdim_values
             opt["_flags"] = flags_dict
             opt["_sub_opts_map"] = sub_opts_map
@@ -356,6 +446,26 @@ def count_expected(options: dict[str, Any]) -> int:
             subdim_sum = sum(count_expected(sub) for sub in sub_opts_map.values())
             n *= (n_vals - len(sub_opts_map)) + subdim_sum
     return n
+
+
+def extract_objective_metric(metrics_path: str, metric_name: str, goal: str) -> float | None:
+    """Return best value of metric_name from metrics.jsonl (min or max per goal)."""
+    best: float | None = None
+    try:
+        with open(metrics_path) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                    val = row.get(metric_name)
+                    if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                        v = float(val)
+                        if best is None or (goal == "minimize" and v < best) or (goal == "maximize" and v > best):
+                            best = v
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+    except OSError:
+        pass
+    return best
 
 
 # ── Skip logic ─────────────────────────────────────────────────────────────────

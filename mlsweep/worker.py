@@ -550,47 +550,51 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 
 def main() -> None:
-    global _scratch_dir, _remote_dir, _token, _device_override
+    try:
+        global _scratch_dir, _remote_dir, _token, _device_override
 
-    parser = argparse.ArgumentParser(description="mlsweep worker daemon")
-    parser.add_argument("--token", default="", help="Authentication token")
-    parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
-                        help="Base scratch directory for run buffers (default: /tmp/mlsweep)")
-    parser.add_argument("--remote-dir", default="",
-                        help="Project directory on this machine (cwd for training scripts)")
-    parser.add_argument("--devices", default=None,
-                        help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7")
-    args = parser.parse_args()
+        parser = argparse.ArgumentParser(description="mlsweep worker daemon")
+        parser.add_argument("--token", default="", help="Authentication token")
+        parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
+                            help="Base scratch directory for run buffers (default: /tmp/mlsweep)")
+        parser.add_argument("--remote-dir", default="",
+                            help="Project directory on this machine (cwd for training scripts)")
+        parser.add_argument("--devices", default=None,
+                            help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7")
+        args = parser.parse_args()
 
-    _scratch_dir = args.scratch_dir
-    _remote_dir = args.remote_dir or os.getcwd()
-    _token = args.token
-    if args.devices:
-        _device_override = [int(x) for x in args.devices.split(",")]
+        _scratch_dir = args.scratch_dir
+        _remote_dir = args.remote_dir or os.getcwd()
+        _token = args.token
+        if args.devices:
+            _device_override = [int(x) for x in args.devices.split(",")]
 
-    os.makedirs(_scratch_dir, exist_ok=True)
+        os.makedirs(_scratch_dir, exist_ok=True)
 
-    # Bind an ephemeral TCP port
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(("", 0))
-    port = server_sock.getsockname()[1]
-    server_sock.listen(10)
+        # Bind an ephemeral TCP port
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("", 0))
+        port = server_sock.getsockname()[1]
+        server_sock.listen(10)
 
-    # Ignore SIGHUP so brief SSH disconnects don't kill the worker
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # Ignore SIGHUP so brief SSH disconnects don't kill the worker
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-    # Print port so the controller can read it and connect
-    print(f"PORT={port}", flush=True)
+        # Print port so the controller can read it and connect
+        print(f"PORT={port}", flush=True)
 
-    # Start IPC thread for logger.py connections
-    sock_path = os.path.join(_scratch_dir, ".worker.sock")
-    ipc_t = threading.Thread(target=_ipc_thread, args=(sock_path,), daemon=True)
-    ipc_t.start()
+        # Start IPC thread for logger.py connections
+        sock_path = os.path.join(_scratch_dir, ".worker.sock")
+        ipc_t = threading.Thread(target=_ipc_thread, args=(sock_path,), daemon=True)
+        ipc_t.start()
 
-    # Enter accept loop (blocks until _shutdown_event is set)
-    _accept_loop(server_sock)
+        # Enter accept loop (blocks until _shutdown_event is set)
+        _accept_loop(server_sock)
 
+
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()

@@ -1,11 +1,11 @@
 #!/usr/bin/env mlsweep_run
 
-"""Sweep config for tests/_fake_train.py.
+"""Sweep config for tests/scripts/train.py.
 
 Launches runs for all combinations of learning rates and batch sizes.
 """
 
-COMMAND = "tests/train.py"
+COMMAND = ["python", "tests/scripts/train.py"]
 
 OPTIONS = {
     ".lr": {

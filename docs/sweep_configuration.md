@@ -318,6 +318,176 @@ These address different situations and are **not meant to be combined**:
 
 If you combine them, `singular` fires on the first success (the first value tried, if it works) and `monotonic` fires on the first failure — whichever comes first ends the search. In practice, `singular` alone is simpler and sufficient for the "find and commit" use case.
 
+## Bayesian Mode
+
+By default, mlsweep runs an exhaustive grid search over all combinations. Add an `OPTIMIZE` dict to your sweep file to use Bayesian optimization (TPE via optuna) instead, which intelligently samples the hyperparameter space to find good configs faster and supports continuous parameter ranges.
+
+```python
+OPTIMIZE = {
+    "method": "bayes",       # "grid" (default) or "bayes"
+    "metric": "val_loss",    # metric name logged via MLSweepLogger
+    "goal": "minimize",      # "minimize" or "maximize"
+    "budget": 50,            # number of successful lex evaluations to run
+    "n_initial": 5,          # random warm-up before TPE engages (default: max(5, n_params*2))
+}
+```
+
+Requires `optuna`: `pip install 'mlsweep[bayes]'`
+
+### `OPTIMIZE` fields
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `method` | no | `"grid"` (default) or `"bayes"` |
+| `metric` | yes (bayes) | Metric name to optimize (must be logged via `MLSweepLogger`) |
+| `goal` | yes (bayes) | `"minimize"` or `"maximize"` |
+| `budget` | yes (bayes) | Number of successful lex evaluations to run |
+| `n_initial` | no | Random warm-up trials before TPE engages. Default: `max(5, n_params * 2)` |
+
+### Continuous dimensions
+
+In bayes mode, dimensions can be sampled from a continuous range instead of a fixed list:
+
+```python
+OPTIONS = {
+    ".lr": {
+        "distribution": "log_uniform",  # "uniform" | "log_uniform" | "int_uniform"
+        "min": 1e-5,
+        "max": 1e-1,
+        "flags": "--optimizer.lr",
+        "name": "lr",
+    },
+    ".dropout": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.5,
+        "flags": "--model.dropout",
+        "name": "drop",
+    },
+    ".num_layers": {
+        "distribution": "int_uniform",
+        "min": 2,
+        "max": 8,
+        "flags": "--model.num_layers",
+        "name": "layers",
+    },
+}
+```
+
+| Distribution | Optuna call | Typical use |
+|---|---|---|
+| `"log_uniform"` | `suggest_float(log=True)` | Learning rate, weight decay |
+| `"uniform"` | `suggest_float(log=False)` | Dropout, clip norm |
+| `"int_uniform"` | `suggest_int()` | Integer params |
+
+**Grid mode with continuous dims:** Add `"samples": N` to pre-sample N values at load time. The dimension then behaves like a discrete value dim. The `"samples"` key is forbidden in bayes mode.
+
+```python
+# Grid mode — pre-samples 8 random LR values at load time:
+".lr": {
+    "distribution": "log_uniform",
+    "min": 1e-5,
+    "max": 1e-1,
+    "samples": 8,
+    "flags": "--optimizer.lr",
+    "name": "lr",
+}
+```
+
+### Discrete and subdim dimensions in bayes mode
+
+Existing discrete dims and subdims work unchanged in bayes mode — optuna uses categorical sampling for them:
+
+```python
+OPTIONS = {
+    ".lr": {"distribution": "log_uniform", "min": 1e-5, "max": 1e-1, "flags": "--lr", "name": "lr"},
+    ".optimizer": {
+        "name": "opt",
+        ".adam": {"flags": ["--optimizer", "adam"]},
+        ".muon": {
+            "flags": ["--optimizer", "muon"],
+            ".lr_scale": {"values": [0.1, 1.0, 10.0], "flags": "--lr_scale", "name": "lrs"},
+        },
+    },
+}
+```
+
+Subdims become conditional optuna parameters — when `muon` is selected, `lr_scale` is sampled too.
+
+### Singular dims in bayes mode
+
+Singular dims (hardware constraints like batch size) work identically in bayes mode. The optimizer only sees non-singular dim values; for each optimizer suggestion, the full singular probe sequence is generated into `pending`. The existing singular locking and deferral logic runs completely unchanged.
+
+```python
+OPTIMIZE = {"method": "bayes", "metric": "val_loss", "goal": "minimize", "budget": 30}
+
+OPTIONS = {
+    ".batch_size": {
+        "values": [64, 32, 16, 8],
+        "flags": "--training.batch_size",
+        "name": "bs",
+        "singular": True,  # finds largest that fits; invisible to optimizer
+    },
+    ".lr": {"distribution": "log_uniform", "min": 1e-5, "max": 1e-1, "flags": "--lr", "name": "lr"},
+}
+```
+
+### Run naming in bayes mode
+
+Bayes runs are named `{sweep_name}_bayes_{N:04d}` — globally sequential across all dispatched runs including singular probes. Combo values are stored in `sweep_status.json` and `sweep_manifest.json` as usual.
+
+### Full example
+
+```python
+#!/usr/bin/env mlsweep_run
+
+COMMAND = ["python", "train.py"]
+
+OPTIMIZE = {
+    "method": "bayes",
+    "metric": "val_loss",
+    "goal": "minimize",
+    "budget": 40,
+    "n_initial": 8,
+}
+
+OPTIONS = {
+    # Singular dim: finds largest batch size that fits (invisible to optimizer)
+    ".batch_size": {
+        "values": [128, 64, 32, 16],
+        "flags": "--training.batch_size",
+        "name": None,
+        "singular": True,
+    },
+    # Continuous dims: optimizer samples from these ranges
+    ".lr": {
+        "distribution": "log_uniform",
+        "min": 1e-5,
+        "max": 1e-1,
+        "flags": "--optimizer.lr",
+        "name": "lr",
+    },
+    ".wd": {
+        "distribution": "log_uniform",
+        "min": 1e-6,
+        "max": 1e-2,
+        "flags": "--optimizer.weight_decay",
+        "name": "wd",
+    },
+    # Discrete dim: categorical sampling
+    ".warmup_steps": {
+        "values": [100, 500, 1000, 2000],
+        "flags": "--scheduler.warmup_steps",
+        "name": "wu",
+    },
+}
+```
+
+Run with:
+```bash
+mlsweep_run sweeps/bayes_sweep.py -g 4
+```
+
 ## Run Naming
 
 Each run is given a unique name constructed from its dimension values:

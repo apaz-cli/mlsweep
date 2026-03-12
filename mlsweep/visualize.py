@@ -1552,65 +1552,69 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("experiment", nargs="?",
-                        help="Experiment name to open (default: newest)")
-    parser.add_argument("--dir", default=None, metavar="PATH",
-                        help="Path to sweeps directory (default: ./outputs/sweeps)")
-    parser.add_argument("--port", type=int, default=43801)
-    parser.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS",
-                        help="File-watcher poll interval in seconds (default: 1)")
-    parser.add_argument("--open-browser", action="store_true",
-                        help="Open the browser automatically")
-    parser.add_argument(
-        "--version", action="version",
-        version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
-    args = parser.parse_args()
-
-    global _poll_interval
-    output_dir = args.dir or os.path.join(os.getcwd(), "outputs", "sweeps")
-    Handler.exp_source = output_dir
-    _poll_interval = args.poll_interval
-
-    experiments = list_experiments(output_dir)
-    if not experiments:
-        sys.exit(
-            f"No experiments found in: {output_dir}\n"
-            "  Run a sweep with mlsweep_run first."
-        )
-
-    default_exp = args.experiment or experiments[0]
-    if default_exp not in experiments:
-        sys.exit(f"Experiment not found: {default_exp}")
-
-    Handler._default = default_exp
-
-    # Initial scan so SSE init events have data on first connect.
-    _scan(output_dir)
-
-    # Background watcher: polls files every 1s and pushes SSE events.
-    watcher = threading.Thread(target=_watch_loop, args=(output_dir,), daemon=True)
-    watcher.start()
-
-    url = f"http://localhost:{args.port}"
-    print(f"Sweep visualizer")
-    print(f"  Source:  {output_dir}")
-    print(f"  Browser: {url}  (Ctrl+C to stop)")
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            public_ip = s.getsockname()[0]
-        if public_ip != "127.0.0.1":
-            print(f"           http://{public_ip}:{args.port}")
-    except OSError:
-        pass
+        parser = argparse.ArgumentParser(description=__doc__,
+                                         formatter_class=argparse.RawDescriptionHelpFormatter)
+        parser.add_argument("experiment", nargs="?",
+                            help="Experiment name to open (default: newest)")
+        parser.add_argument("--dir", default=None, metavar="PATH",
+                            help="Path to sweeps directory (default: ./outputs/sweeps)")
+        parser.add_argument("--port", type=int, default=43801)
+        parser.add_argument("--poll-interval", type=float, default=1.0, metavar="SECONDS",
+                            help="File-watcher poll interval in seconds (default: 1)")
+        parser.add_argument("--open-browser", action="store_true",
+                            help="Open the browser automatically")
+        parser.add_argument(
+            "--version", action="version",
+            version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
+        args = parser.parse_args()
 
-    if args.open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        global _poll_interval
+        output_dir = args.dir or os.path.join(os.getcwd(), "outputs", "sweeps")
+        Handler.exp_source = output_dir
+        _poll_interval = args.poll_interval
 
-    ThreadingHTTPServer(("", args.port), Handler).serve_forever()
+        experiments = list_experiments(output_dir)
+        if not experiments:
+            sys.exit(
+                f"No experiments found in: {output_dir}\n"
+                "  Run a sweep with mlsweep_run first."
+            )
 
+        default_exp = args.experiment or experiments[0]
+        if default_exp not in experiments:
+            sys.exit(f"Experiment not found: {default_exp}")
+
+        Handler._default = default_exp
+
+        # Initial scan so SSE init events have data on first connect.
+        _scan(output_dir)
+
+        # Background watcher: polls files every 1s and pushes SSE events.
+        watcher = threading.Thread(target=_watch_loop, args=(output_dir,), daemon=True)
+        watcher.start()
+
+        url = f"http://localhost:{args.port}"
+        print(f"Sweep visualizer")
+        print(f"  Source:  {output_dir}")
+        print(f"  Browser: {url}  (Ctrl+C to stop)")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                public_ip = s.getsockname()[0]
+            if public_ip != "127.0.0.1":
+                print(f"           http://{public_ip}:{args.port}")
+        except OSError:
+            pass
+
+        if args.open_browser:
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+        ThreadingHTTPServer(("", args.port), Handler).serve_forever()
+
+
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
