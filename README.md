@@ -89,13 +89,13 @@ OPTIMIZE = {
 }
 
 OPTIONS = {
-    # Discrete dim — optuna uses categorical sampling
+    # Discrete dim
     ".optimizer": {
         "name": "opt",
         ".adam": {"flags": ["--optimizer", "adam"]},
         ".muon": {"flags": ["--optimizer", "muon"]},
     },
-    # Continuous dims — optuna samples from these ranges
+    # Continuous dims
     ".lr": {
         "distribution": "log_uniform",
         "min": 1e-5,
@@ -113,7 +113,7 @@ OPTIONS = {
 }
 ```
 
-Requires optuna: `pip install 'mlsweep[bayes]'`
+Requires `pip install 'mlsweep[bayes]'` (should be installed if you install `'mlsweep[all]'`).
 
 Run the same way as any other sweep:
 
@@ -192,6 +192,48 @@ mlsweep_viz experiment_name
 
 This will prompt you to open up a browser (or pass --open-browser to do so automatically) to see the sweep visualizer.
 It will watch your experiment folder and update the metrics viewer in real time.
+
+### Using with W&B
+
+mlsweep can log all runs to Weights & Biases with no changes to your training script. The controller owns the W&B session — your training script only calls `MLSweepLogger` as usual.
+
+Install the extra:
+
+```sh
+pip install 'mlsweep[wandb]'
+```
+
+Then pass `--wandb-project` when launching:
+
+```sh
+export WANDB_API_KEY=your_key_here
+mlsweep_run sweeps/my_sweep.py -g 4 --wandb-project my-project
+mlsweep_run sweeps/my_sweep.py -g 4 --wandb-project my-project --wandb-entity my-team
+```
+
+Each run appears in W&B under the project, grouped by experiment name, with its hyperparameter combo stored as the run config.
+
+### Using with TensorBoard
+
+Same idea — no changes to your training script needed.
+
+Install the extra (or use an existing torch/tensorboardX install):
+
+```sh
+pip install 'mlsweep[tensorboard]'
+```
+
+Then pass `--tensorboard-dir` when launching:
+
+```sh
+mlsweep_run sweeps/my_sweep.py -g 4 --tensorboard-dir ./tb_logs
+```
+
+Logs are written to `<tensorboard-dir>/<experiment>/<run>/`. Point TensorBoard at the top-level dir to compare all runs:
+
+```sh
+tensorboard --logdir ./tb_logs
+```
 
 ## Troubleshooting
 
