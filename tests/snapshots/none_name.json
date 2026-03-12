@@ -1,0 +1,79 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".seed": {
+      "values": [
+        1,
+        2
+      ],
+      "flags": "--seed",
+      "name": null
+    },
+    ".lr": {
+      "values": [
+        0.0001,
+        0.001
+      ],
+      "flags": "--lr",
+      "name": "lr"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_lr0.0001",
+    "overrides": [
+      "--seed",
+      "1",
+      "--lr",
+      "0.0001"
+    ],
+    "combo": {
+      "seed": 1,
+      "lr": 0.0001
+    }
+  },
+  {
+    "name": "s_lr0.001",
+    "overrides": [
+      "--seed",
+      "1",
+      "--lr",
+      "0.001"
+    ],
+    "combo": {
+      "seed": 1,
+      "lr": 0.001
+    }
+  },
+  {
+    "name": "s_lr0.0001",
+    "overrides": [
+      "--seed",
+      "2",
+      "--lr",
+      "0.0001"
+    ],
+    "combo": {
+      "seed": 2,
+      "lr": 0.0001
+    }
+  },
+  {
+    "name": "s_lr0.001",
+    "overrides": [
+      "--seed",
+      "2",
+      "--lr",
+      "0.001"
+    ],
+    "combo": {
+      "seed": 2,
+      "lr": 0.001
+    }
+  }
+]

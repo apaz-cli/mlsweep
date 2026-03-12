@@ -1,0 +1,170 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".bs": {
+      "values": [
+        64,
+        32
+      ],
+      "flags": "--bs",
+      "name": "bs",
+      "singular": true
+    },
+    ".ac": {
+      "flags": {
+        "none": [
+          "--ac",
+          "none"
+        ],
+        "full": [
+          "--ac",
+          "full"
+        ]
+      },
+      "name": "ac",
+      "singular": true
+    },
+    ".lr": {
+      "values": [
+        0.001,
+        0.0001
+      ],
+      "flags": "--lr",
+      "name": "lr"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_lr0.001_bs64_acnone",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--bs",
+      "64",
+      "--ac",
+      "none"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "bs": 64,
+      "ac": "none"
+    }
+  },
+  {
+    "name": "s_lr0.0001_bs64_acnone",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--bs",
+      "64",
+      "--ac",
+      "none"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "bs": 64,
+      "ac": "none"
+    }
+  },
+  {
+    "name": "s_lr0.001_bs64_acfull",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--bs",
+      "64",
+      "--ac",
+      "full"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "bs": 64,
+      "ac": "full"
+    }
+  },
+  {
+    "name": "s_lr0.0001_bs64_acfull",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--bs",
+      "64",
+      "--ac",
+      "full"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "bs": 64,
+      "ac": "full"
+    }
+  },
+  {
+    "name": "s_lr0.001_bs32_acnone",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--bs",
+      "32",
+      "--ac",
+      "none"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "bs": 32,
+      "ac": "none"
+    }
+  },
+  {
+    "name": "s_lr0.0001_bs32_acnone",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--bs",
+      "32",
+      "--ac",
+      "none"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "bs": 32,
+      "ac": "none"
+    }
+  },
+  {
+    "name": "s_lr0.001_bs32_acfull",
+    "overrides": [
+      "--lr",
+      "0.001",
+      "--bs",
+      "32",
+      "--ac",
+      "full"
+    ],
+    "combo": {
+      "lr": 0.001,
+      "bs": 32,
+      "ac": "full"
+    }
+  },
+  {
+    "name": "s_lr0.0001_bs32_acfull",
+    "overrides": [
+      "--lr",
+      "0.0001",
+      "--bs",
+      "32",
+      "--ac",
+      "full"
+    ],
+    "combo": {
+      "lr": 0.0001,
+      "bs": 32,
+      "ac": "full"
+    }
+  }
+]

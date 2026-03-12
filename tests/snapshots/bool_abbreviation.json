@@ -1,0 +1,39 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".amp": {
+      "values": [
+        true,
+        false
+      ],
+      "flags": "--amp",
+      "name": "amp"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_ampT",
+    "overrides": [
+      "--amp",
+      "True"
+    ],
+    "combo": {
+      "amp": true
+    }
+  },
+  {
+    "name": "s_ampF",
+    "overrides": [
+      "--amp",
+      "False"
+    ],
+    "combo": {
+      "amp": false
+    }
+  }
+]

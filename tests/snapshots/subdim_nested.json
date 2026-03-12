@@ -1,0 +1,132 @@
+{
+  "sweep_name": "s",
+  "options": {
+    ".opt": {
+      "name": "opt",
+      ".adam": {
+        "flags": [
+          "--optimizer",
+          "adam"
+        ]
+      },
+      ".muon": {
+        "flags": [
+          "--optimizer",
+          "muon"
+        ],
+        ".lr_scale": {
+          "values": [
+            0.1,
+            1.0
+          ],
+          "flags": "--lr-scale",
+          "name": "lrs"
+        }
+      }
+    },
+    ".bs": {
+      "values": [
+        32,
+        64
+      ],
+      "flags": "--bs",
+      "name": "bs"
+    }
+  },
+  "extra_flags": []
+}
+
+###############
+
+[
+  {
+    "name": "s_optadam_bs32",
+    "overrides": [
+      "--optimizer",
+      "adam",
+      "--bs",
+      "32"
+    ],
+    "combo": {
+      "opt": "adam",
+      "bs": 32
+    }
+  },
+  {
+    "name": "s_optadam_bs64",
+    "overrides": [
+      "--optimizer",
+      "adam",
+      "--bs",
+      "64"
+    ],
+    "combo": {
+      "opt": "adam",
+      "bs": 64
+    }
+  },
+  {
+    "name": "s_optmuon.lrs0.1_bs32",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--bs",
+      "32",
+      "--lr-scale",
+      "0.1"
+    ],
+    "combo": {
+      "opt": "muon",
+      "bs": 32,
+      "lr_scale": 0.1
+    }
+  },
+  {
+    "name": "s_optmuon.lrs1.0_bs32",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--bs",
+      "32",
+      "--lr-scale",
+      "1.0"
+    ],
+    "combo": {
+      "opt": "muon",
+      "bs": 32,
+      "lr_scale": 1.0
+    }
+  },
+  {
+    "name": "s_optmuon.lrs0.1_bs64",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--bs",
+      "64",
+      "--lr-scale",
+      "0.1"
+    ],
+    "combo": {
+      "opt": "muon",
+      "bs": 64,
+      "lr_scale": 0.1
+    }
+  },
+  {
+    "name": "s_optmuon.lrs1.0_bs64",
+    "overrides": [
+      "--optimizer",
+      "muon",
+      "--bs",
+      "64",
+      "--lr-scale",
+      "1.0"
+    ],
+    "combo": {
+      "opt": "muon",
+      "bs": 64,
+      "lr_scale": 1.0
+    }
+  }
+]
