@@ -6,7 +6,7 @@ The project contains a controller which manages scheduling jobs across workers, 
 
 The main feature of mlsweep is not the logger, but the sweep configuration file. The good stuff. The thing that I've been missing all my machine learning life, and the reason I wrote this library.
 
-`mlsweep` does pretty much everything that wandb does. If you're missing anything, let me know.
+`mlsweep` does pretty much everything that wandb does. If you're missing anything, let me know on [Discord](https://discord.gg/w2K2JWJGUb) or [Twitter](https://twitter.com/apaz_cli).
 
 ![Viewer in progress](docs/mlsweep_viz.png)
 
@@ -14,7 +14,7 @@ But first, let's install it, and add the logging.
 
 ## Setup
 
-```bash
+```sh
 git clone <your-project>
 cd <your-project>
 python -m venv .venv
@@ -117,7 +117,7 @@ Requires optuna: `pip install 'mlsweep[bayes]'`
 
 Run the same way as any other sweep:
 
-```bash
+```sh
 mlsweep_run sweeps/bayes_sweep.py -g 4
 ```
 
@@ -127,7 +127,7 @@ See [sweep_configuration.md](docs/sweep_configuration.md) for continuous ranges,
 
 ### Local
 
-```bash
+```sh
 mlsweep_run sweeps/my_sweep.py             # 1 GPU
 mlsweep_run sweeps/my_sweep.py -g 4        # 4 GPUs in parallel
 mlsweep_run sweeps/my_sweep.py -g          # all visible GPUs
@@ -138,7 +138,7 @@ mlsweep_run sweeps/my_sweep.py -g 4 -j 5   # 5 jobs per GPU (20 total)
 
 #### 1. Install mlsweep on each remote machine
 
-```bash
+```sh
 ssh user@host -i path/to/key
 cd path/to/project/
 pip install mlsweep
@@ -176,7 +176,7 @@ jobs = 2
 
 #### 3. Run
 
-```bash
+```sh
 mlsweep_run sweeps/my_sweep.py --workers workers.toml
 ```
 
@@ -195,4 +195,4 @@ It will watch your experiment folder and update the metrics viewer in real time.
 
 ## Troubleshooting
 
-If the error messages are bad or the docs are bad or you feel confused feel free to hit me up on discord at @apaz or twitter/x at @apaz_cli.
+If the error messages are bad or the docs are bad or you feel confused feel free to hit me up on [Discord](https://discord.gg/w2K2JWJGUb) or [Twitter](https://twitter.com/apaz_cli).

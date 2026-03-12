@@ -26,10 +26,10 @@ def test_value_dim_dict_flags_infers_values():
     assert opts[".ac"]["_flags"] == {"none": ["--ac", "none"], "full": ["--ac", "full"]}
 
 
-def test_value_dim_none_flags():
-    opts = {".seed": {"values": [1, 2, 3], "flags": None, "name": "seed"}}
-    validate_options(opts)
-    assert opts[".seed"]["_flags"] == {1: [], 2: [], 3: []}
+def test_value_dim_none_flags_rejected():
+    # flags=None is not supported; use name=None to suppress the dim from the run name instead.
+    with pytest.raises(ValueError, match="flags=None is not supported"):
+        validate_options({".seed": {"values": [1, 2, 3], "flags": None, "name": "seed"}})
 
 
 def test_fixed_dim():

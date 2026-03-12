@@ -726,6 +726,7 @@ def _dispatch_pending(
     run_from: str | None,
     gpus_per_run: int,
     has_singular: bool,
+    wandb_env: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Try to assign pending variations to free slots. Returns still-pending list."""
     # Build set of treatment keys currently in-flight (for deferral)
@@ -771,7 +772,7 @@ def _dispatch_pending(
                     env: dict[str, str] = {}
                     if tag_str:
                         env["EXP_TAGS"] = tag_str
-                    env.update(_wandb_env)
+                    env.update(wandb_env)
 
                     run_msg = MsgRun(
                         run_id=run_id,
@@ -1184,7 +1185,7 @@ def main() -> None:
         pending = _dispatch_pending(
             workers, pending, in_flight, failed, succeeded,
             output_dir, experiment, exp_dir, token, command, extra, run_from,
-            gpus_per_run, has_singular,
+            gpus_per_run, has_singular, _wandb_env,
         )
 
         while pending or in_flight:
@@ -1325,7 +1326,7 @@ def main() -> None:
                 pending = _dispatch_pending(
                     workers, pending, in_flight, failed, succeeded,
                     output_dir, experiment, exp_dir, token, command, extra, run_from,
-                    gpus_per_run, has_singular,
+                    gpus_per_run, has_singular, _wandb_env,
                 )
 
             elif isinstance(ev, EvArtifactSynced):
