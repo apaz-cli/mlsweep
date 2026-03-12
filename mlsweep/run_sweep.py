@@ -1163,13 +1163,7 @@ def main() -> None:
 
         if method == "bayes":
             assert optimizer is not None
-            n_lex_dims = sum(
-                1 for v in options.values()
-                if not v.get("singular") and v.get("_values") != [None]
-            )
-            initial_n = optimize_cfg.get("n_initial") or max(5, 2 * n_lex_dims)
-            initial_n = min(initial_n, optimize_cfg["budget"])
-            initial_vars = optimizer.suggest(n=initial_n)
+            initial_vars = optimizer.suggest(n=optimizer.n_initial)
             variations.extend(initial_vars)
             pending: list[dict[str, Any]] = list(initial_vars)
         else:

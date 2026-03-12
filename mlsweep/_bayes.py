@@ -185,10 +185,16 @@ class BayesianOptimizer:
         self._extra_flags: list[str] = list(extra_flags or [])
         self._lex_options = {k: v for k, v in options.items() if not v.get("singular")}
         self._singular_options = {k: v for k, v in options.items() if v.get("singular")}
+        n_lex_dims = sum(
+            1 for v in self._lex_options.values()
+            if v.get("_values") != [None]
+        )
+        n_initial = optimize_cfg.get("n_initial") or max(8, 2 * n_lex_dims)
+        self.n_initial: int = min(n_initial, self._budget)
         direction = "minimize" if self._goal == "minimize" else "maximize"
         self._study: Any = optuna.create_study(
             direction=direction,
-            sampler=TPESampler(multivariate=True, group=True),
+            sampler=TPESampler(multivariate=True, group=True, n_startup_trials=self.n_initial),
         )
         self._lex_key_to_trial: dict[tuple[Any, ...], Any] = {}
         self._told: int = 0

@@ -328,7 +328,7 @@ OPTIMIZE = {
     "metric": "val_loss",    # metric name logged via MLSweepLogger
     "goal": "minimize",      # "minimize" or "maximize"
     "budget": 50,            # number of successful lex evaluations to run
-    "n_initial": 5,          # random warm-up before TPE engages (default: max(5, n_params*2))
+    "n_initial": 5,          # combos to queue upfront before the event loop starts (default: max(5, n_params*2))
 }
 ```
 
@@ -342,7 +342,7 @@ Requires `optuna`: `pip install 'mlsweep[bayes]'`
 | `metric` | yes (bayes) | Metric name to optimize (must be logged via `MLSweepLogger`) |
 | `goal` | yes (bayes) | `"minimize"` or `"maximize"` |
 | `budget` | yes (bayes) | Number of successful lex evaluations to run |
-| `n_initial` | no | Random warm-up trials before TPE engages. Default: `max(5, n_params * 2)` |
+| `n_initial` | no | Number of combos to suggest and queue upfront before the event loop starts. Default: `max(8, n_params * 2)`. These runs count toward `budget`. |
 
 ### Continuous dimensions
 
