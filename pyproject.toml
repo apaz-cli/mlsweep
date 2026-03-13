@@ -7,8 +7,8 @@ name = "mlsweep"
 version = "1.0.0"
 description = "A flexible hyperparameter sweep scheduler for distributed ML training"
 readme = "README.md"
-license = { file = "LICENSE" }
-authors = [{ name = "", email = "" }]
+license = "Apache-2.0"
+authors = [{ name = "Aaron Pazdera", email = "aarpazdera@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "tomli >= 2.0; python_version < '3.11'",

@@ -835,9 +835,9 @@ OPTIONS = {
 
 With 7 batch sizes and 3 learning rates this generates 21 total variations, but expects only **3 runs** (one successful batch size per learning rate) in the best case.
 
-### Optimizer × Batch Size Sweep with Subdim
+### Sweep with Subdims
 
-Muon has an additional `lr_scale` subdim that doesn't apply to Adam. Using a subdim gives 8 runs instead of 12 with a flat `EXCLUDE`:
+Adam has two subdims (`beta1`, `beta2`); Muon has one (`lr_scale`). The branches don't need to be symmetric. Using subdims gives 24 runs instead of 108 with a flat `EXCLUDE`:
 
 ```python
 #!/usr/bin/env mlsweep_run
@@ -849,6 +849,16 @@ OPTIONS = {
         "name": "opt",
         ".adam": {
             "flags": ["--optimizer", "adam"],
+            ".beta1": {
+                "values": [0.85, 0.9, 0.95],
+                "flags": "--optimizer.beta1",
+                "name": "b1",
+            },
+            ".beta2": {
+                "values": [0.9, 0.95, 0.999],
+                "flags": "--optimizer.beta2",
+                "name": "b2",
+            },
         },
         ".muon": {
             "flags": ["--optimizer", "muon"],
@@ -868,7 +878,7 @@ OPTIONS = {
 ```
 
 Produces:
-- `sweep_optadam_bs32`, `sweep_optadam_bs64` (2 runs)
+- `sweep_optadam.b10.85.b20.9_bs32`, `sweep_optadam.b10.85.b20.9_bs64`, ... (18 runs)
 - `sweep_optmuon.lrs0.1_bs32`, `sweep_optmuon.lrs0.1_bs64`, ... (6 runs)
 
 ### Multi-GPU Runs
