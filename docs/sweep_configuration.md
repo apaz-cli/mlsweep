@@ -12,14 +12,15 @@ mlsweep_run sweeps/my_sweep.py [options]
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, and `RUN_FROM`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, and `RUN_FROM`:
 
 ```python
 COMMAND = ["python", "train.py"]
 OPTIONS = { ... }
 
 # Optional
-GPUS_PER_RUN = 1  # (default: 1)
+GPUS_PER_RUN = 1   # (default: 1) GPUs per run on each node
+NODES_PER_RUN = 1  # (default: 1) worker nodes allocated per run
 RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
 EXTRA_FLAGS = ["--seed", "42"]
 
@@ -209,7 +210,7 @@ A fixed dim has no values to vary, so `flags` is a single constant list of token
 
 ### `GPUS_PER_RUN`
 
-An optional positive integer specifying how many GPUs to allocate per run. Defaults to `1`.
+An optional positive integer specifying how many GPUs to allocate per run on each node. Defaults to `1`.
 
 ```python
 GPUS_PER_RUN = 4
@@ -222,6 +223,62 @@ The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_P
 GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
 
 See [Multi-GPU Runs (torchrun)](#multi-gpu-runs-torchrun) below for a complete example.
+
+### `NODES_PER_RUN`
+
+An optional positive integer specifying how many worker nodes to allocate for each run. Defaults to `1`.
+
+```python
+NODES_PER_RUN = 2
+```
+
+When `NODES_PER_RUN > 1`, the runner reserves one slot (of `GPUS_PER_RUN` GPUs) from each of N distinct workers and launches the run command on all of them simultaneously. The run is treated as complete only when all N nodes have reported back; success requires all nodes to succeed.
+
+The following environment variables are injected into each node's subprocess:
+
+| Variable | Value |
+|----------|-------|
+| `MLSWEEP_NNODES` | Total number of nodes for this run (equals `NODES_PER_RUN`) |
+| `MLSWEEP_NODE_RANK` | This node's rank (0-based) |
+| `MLSWEEP_MASTER_ADDR` | Hostname of the rank-0 worker (SSH host with `user@` prefix stripped) |
+| `MLSWEEP_MASTER_PORT` | Port for the distributed rendezvous (cycles through 29500–29599) |
+
+Your training command can use these to build the `torchrun` invocation directly:
+
+```python
+NODES_PER_RUN = 2
+GPUS_PER_RUN = 8
+
+COMMAND = [
+    "bash", "-c",
+    "torchrun "
+    "--nproc_per_node $MLSWEEP_NNODES "  # intentional: env var expanded by shell
+    "--nnodes $MLSWEEP_NNODES "
+    "--node_rank $MLSWEEP_NODE_RANK "
+    "--master_addr $MLSWEEP_MASTER_ADDR "
+    "--master_port $MLSWEEP_MASTER_PORT "
+    "-m torchtitan.train \"$@\"",
+    "--",  # $0 for bash -c
+]
+```
+
+Or more readably:
+
+```python
+NODES_PER_RUN = 2
+GPUS_PER_RUN = 8
+COMMAND = ["bash", "-c", """
+    torchrun \
+      --nproc_per_node $GPUS_PER_NODE \
+      --nnodes $MLSWEEP_NNODES \
+      --node_rank $MLSWEEP_NODE_RANK \
+      --master_addr $MLSWEEP_MASTER_ADDR \
+      --master_port $MLSWEEP_MASTER_PORT \
+      -m torchtitan.train "$@"
+""", "--"]
+```
+
+**Requirements:** `NODES_PER_RUN > 1` requires `--workers` with at least `NODES_PER_RUN` connected worker entries. Logs and metrics are streamed from all nodes but only artifacts from rank 0's scratch directory are rsynced to the output directory. If your training script writes artifacts on all ranks, use a shared filesystem or handle aggregation in the script itself.
 
 ### `RUN_FROM`
 
@@ -639,6 +696,10 @@ The following environment variables are set for each run:
 | `MLSWEEP_WORKER_SOCKET` | Unix socket path for `MLSweepLogger` communication with the worker daemon. |
 | `CUDA_VISIBLE_DEVICES` | Comma-separated GPU indices for this run (e.g. `0` or `0,1,2,3` with `GPUS_PER_RUN=4`). |
 | `HIP_VISIBLE_DEVICES` | Same as above (for AMD ROCm compatibility). |
+| `MLSWEEP_NNODES` | Total node count for this run. Set only when `NODES_PER_RUN > 1`. |
+| `MLSWEEP_NODE_RANK` | This node's rank (0-based). Set only when `NODES_PER_RUN > 1`. |
+| `MLSWEEP_MASTER_ADDR` | Rank-0 worker hostname. Set only when `NODES_PER_RUN > 1`. |
+| `MLSWEEP_MASTER_PORT` | Rendezvous port. Set only when `NODES_PER_RUN > 1`. |
 
 Your training script can use these to write outputs to the right place and log metrics.
 

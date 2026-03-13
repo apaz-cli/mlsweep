@@ -70,7 +70,7 @@ Running this produces 9 runs named `my_sweep_lr1e-4_bs32`, `my_sweep_lr1e-4_bs64
 
 Each run receives its flags appended to `COMMAND`: `python train.py --optimizer.lr 0.0001 --training.batch_size 32`.
 
-See [sweep_configuration.md](docs/sweep_configuration.md) for the full format: subdimensions, monotonic/singular skipping, `EXCLUDE`, `GPUS_PER_RUN` for training with `torchrun`, and more.
+See [sweep_configuration.md](docs/sweep_configuration.md) for the full format: subdimensions, monotonic/singular skipping, `EXCLUDE`, `GPUS_PER_RUN` for training with `torchrun`, and more. For end-to-end examples with real frameworks (Prime-RL, TorchTitan), see [examples.md](docs/examples.md).
 
 ## Bayesian optimization
 

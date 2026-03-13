@@ -63,6 +63,9 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     gpus_per_run = getattr(mod, "GPUS_PER_RUN", 1)
     if not isinstance(gpus_per_run, int) or gpus_per_run < 1:
         raise ValueError(f"{path}: GPUS_PER_RUN must be a positive integer, got {gpus_per_run!r}")
+    nodes_per_run = getattr(mod, "NODES_PER_RUN", 1)
+    if not isinstance(nodes_per_run, int) or nodes_per_run < 1:
+        raise ValueError(f"{path}: NODES_PER_RUN must be a positive integer, got {nodes_per_run!r}")
     run_from = getattr(mod, "RUN_FROM", None)
     if run_from is not None and not isinstance(run_from, str):
         raise ValueError(f"{path}: RUN_FROM must be a str, got {type(run_from).__name__}")
@@ -90,6 +93,7 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "exclude": getattr(mod, "EXCLUDE", None),
         "extra_flags": getattr(mod, "EXTRA_FLAGS", []),
         "gpus_per_run": gpus_per_run,
+        "nodes_per_run": nodes_per_run,
         "run_from": run_from,
         "method": method,
         "optimize": optimize,

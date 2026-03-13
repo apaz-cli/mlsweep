@@ -727,8 +727,17 @@ def _dispatch_pending(
     gpus_per_run: int,
     has_singular: bool,
     wandb_env: dict[str, str],
+    nodes_per_run: int = 1,
+    multinode_state: dict[str, Any] | None = None,
+    next_port: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Try to assign pending variations to free slots. Returns still-pending list."""
+    _MASTER_PORT_BASE = 29500
+    if multinode_state is None:
+        multinode_state = {}
+    if next_port is None:
+        next_port = [0]
+
     # Build set of treatment keys currently in-flight (for deferral)
     inflight_treatments: set[tuple[Any, ...]] = set()
     for run_id, var in in_flight.items():
@@ -752,64 +761,139 @@ def _dispatch_pending(
             deferred.append(var)
             continue
 
-        # Find a free slot on any CONNECTED worker
-        slot_found = False
-        for ws in workers:
-            if ws.status != "CONNECTED":
-                continue
-            for slot_idx, gpu_group in enumerate(ws.slots):
-                if slot_idx not in ws.busy_slots:
-                    # Dispatch this run
-                    ws.busy_slots.add(slot_idx)
-                    run_id = var["name"]
-                    in_flight[run_id] = var
+        if nodes_per_run == 1:
+            # Find a free slot on any CONNECTED worker
+            slot_found = False
+            for ws in workers:
+                if ws.status != "CONNECTED":
+                    continue
+                for slot_idx, gpu_group in enumerate(ws.slots):
+                    if slot_idx not in ws.busy_slots:
+                        # Dispatch this run
+                        ws.busy_slots.add(slot_idx)
+                        run_id = var["name"]
+                        in_flight[run_id] = var
 
-                    run_dir = os.path.join(output_dir, experiment, run_id)
-                    os.makedirs(run_dir, exist_ok=True)
+                        run_dir = os.path.join(output_dir, experiment, run_id)
+                        os.makedirs(run_dir, exist_ok=True)
 
-                    run_scratch = os.path.join(ws.scratch_dir, experiment, run_id)
-                    tag_str = ",".join(f"{k}={v}" for k, v in var["combo"].items() if v is not None)
-                    env: dict[str, str] = {}
-                    if tag_str:
-                        env["EXP_TAGS"] = tag_str
-                    env.update(wandb_env)
+                        run_scratch = os.path.join(ws.scratch_dir, experiment, run_id)
+                        tag_str = ",".join(f"{k}={v}" for k, v in var["combo"].items() if v is not None)
+                        env: dict[str, str] = {}
+                        if tag_str:
+                            env["EXP_TAGS"] = tag_str
+                        env.update(wandb_env)
 
-                    run_msg = MsgRun(
-                        run_id=run_id,
-                        experiment=experiment,
-                        command=list(command) + var["overrides"] + list(extra),
-                        env=env,
-                        gpu_ids=gpu_group,
-                        remote_dir=ws.remote_dir,
-                        scratch=run_scratch,
-                        run_from=run_from,
-                    )
-                    ws.send_queue.put(encode(run_msg))
-                    ws.in_flight[run_id] = var
-                    ws.run_slots[run_id] = slot_idx
+                        run_msg = MsgRun(
+                            run_id=run_id,
+                            experiment=experiment,
+                            command=list(command) + var["overrides"] + list(extra),
+                            env=env,
+                            gpu_ids=gpu_group,
+                            remote_dir=ws.remote_dir,
+                            scratch=run_scratch,
+                            run_from=run_from,
+                        )
+                        ws.send_queue.put(encode(run_msg))
+                        ws.in_flight[run_id] = var
+                        ws.run_slots[run_id] = slot_idx
 
-                    _append_manifest_run(exp_dir, var)
+                        _append_manifest_run(exp_dir, var)
 
-                    # Print dispatch line
-                    nm = run_id.ljust(max(len(v["name"]) for v in remaining + deferred + list(in_flight.values())) if remaining or deferred or in_flight else len(run_id))
-                    sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
-                    gpu_label = f"gpu{'s' if len(gpu_group) > 1 else ''} {','.join(str(g) for g in gpu_group)}"
-                    loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
-                           if ws.host != "localhost" else gpu_label)
-                    log_path = os.path.join(run_dir, "training.log")
-                    if sdesc:
-                        sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path}{_RESET}")
-                    else:
-                        sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path}{_RESET}")
+                        # Print dispatch line
+                        nm = run_id.ljust(max(len(v["name"]) for v in remaining + deferred + list(in_flight.values())) if remaining or deferred or in_flight else len(run_id))
+                        sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
+                        gpu_label = f"gpu{'s' if len(gpu_group) > 1 else ''} {','.join(str(g) for g in gpu_group)}"
+                        loc = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
+                               if ws.host != "localhost" else gpu_label)
+                        log_path = os.path.join(run_dir, "training.log")
+                        if sdesc:
+                            sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path}{_RESET}")
+                        else:
+                            sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path}{_RESET}")
 
-                    inflight_treatments.add(tk)
-                    slot_found = True
+                        inflight_treatments.add(tk)
+                        slot_found = True
+                        break
+                if slot_found:
                     break
-            if slot_found:
-                break
 
-        if not slot_found:
-            deferred.append(var)
+            if not slot_found:
+                deferred.append(var)
+
+        else:
+            # Multi-node: collect one free slot per worker (distinct machines)
+            free: list[tuple[WorkerState, int, list[int]]] = []
+            for ws in workers:
+                if ws.status != "CONNECTED":
+                    continue
+                for slot_idx, gpu_group in enumerate(ws.slots):
+                    if slot_idx not in ws.busy_slots:
+                        free.append((ws, slot_idx, gpu_group))
+                        break  # one slot per worker
+
+            if len(free) < nodes_per_run:
+                deferred.append(var)
+                continue
+
+            assigned = free[:nodes_per_run]
+            master_host = assigned[0][0].host.split("@")[-1]
+            master_port = _MASTER_PORT_BASE + (next_port[0] % 100)
+            next_port[0] += 1
+
+            run_id = var["name"]
+            in_flight[run_id] = var
+            multinode_state[run_id] = {"pending": nodes_per_run, "success": True, "elapsed": 0.0}
+
+            run_dir = os.path.join(output_dir, experiment, run_id)
+            os.makedirs(run_dir, exist_ok=True)
+
+            _append_manifest_run(exp_dir, var)
+            inflight_treatments.add(tk)
+
+            tag_str = ",".join(f"{k}={v}" for k, v in var["combo"].items() if v is not None)
+            var_env: dict[str, str] = {}
+            if tag_str:
+                var_env["EXP_TAGS"] = tag_str
+            var_env.update(wandb_env)
+
+            loc_parts = []
+            for node_rank, (ws, slot_idx, gpu_group) in enumerate(assigned):
+                ws.busy_slots.add(slot_idx)
+                run_scratch = os.path.join(ws.scratch_dir, experiment, run_id)
+                node_env = {
+                    **var_env,
+                    "MLSWEEP_NNODES": str(nodes_per_run),
+                    "MLSWEEP_NODE_RANK": str(node_rank),
+                    "MLSWEEP_MASTER_ADDR": master_host,
+                    "MLSWEEP_MASTER_PORT": str(master_port),
+                }
+                run_msg = MsgRun(
+                    run_id=run_id,
+                    experiment=experiment,
+                    command=list(command) + var["overrides"] + list(extra),
+                    env=node_env,
+                    gpu_ids=gpu_group,
+                    remote_dir=ws.remote_dir,
+                    scratch=run_scratch,
+                    run_from=run_from,
+                )
+                ws.send_queue.put(encode(run_msg))
+                ws.in_flight[run_id] = var
+                ws.run_slots[run_id] = slot_idx
+                gpu_label = f"gpu{'s' if len(gpu_group) > 1 else ''} {','.join(str(g) for g in gpu_group)}"
+                loc_part = (f"{_MAGENTA}{ws.host}{_RESET} {gpu_label}"
+                            if ws.host != "localhost" else gpu_label)
+                loc_parts.append(f"[{loc_part}]")
+
+            nm = run_id.ljust(max(len(v["name"]) for v in remaining + deferred + list(in_flight.values())) if remaining or deferred or in_flight else len(run_id))
+            sdesc = _singular_desc(var["combo"], opts) if has_singular else ""
+            loc = " ".join(loc_parts)
+            log_path = os.path.join(run_dir, "training.log")
+            if sdesc:
+                sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} ({sdesc}) {loc} {_BLUE}{log_path}{_RESET}")
+            else:
+                sweep_print(f"  {_CYAN}START{_RESET}  {_GREEN}{nm}{_RESET} {loc} {_BLUE}{log_path}{_RESET}")
 
     return deferred
 
@@ -891,6 +975,7 @@ def main() -> None:
             info["name"], info["options"], info["command"],
             info["exclude"], info["extra_flags"])
         gpus_per_run = info.get("gpus_per_run", 1)
+        nodes_per_run = info.get("nodes_per_run", 1)
         run_from = info.get("run_from")
         method: str = info.get("method", "grid")
         optimize_cfg: dict[str, Any] = info.get("optimize") or {}
@@ -1172,6 +1257,9 @@ def main() -> None:
 
         told_treatments: set[tuple[Any, ...]] = set()
         in_flight: dict[str, dict[str, Any]] = {}   # run_id → var
+        _MASTER_PORT_BASE = 29500
+        next_port: list[int] = [0]
+        multinode_state: dict[str, dict[str, Any]] = {}  # run_id → {pending, success, elapsed}
         results: list[tuple[Any, ...]] = []          # (var, success, elapsed, log_file)
         failed: list[dict[str, Any]] = []
         succeeded: list[dict[str, Any]] = []
@@ -1186,6 +1274,7 @@ def main() -> None:
             workers, pending, in_flight, failed, succeeded,
             output_dir, experiment, exp_dir, token, command, extra, run_from,
             gpus_per_run, has_singular, _wandb_env,
+            nodes_per_run, multinode_state, next_port,
         )
 
         while pending or in_flight:
@@ -1197,7 +1286,8 @@ def main() -> None:
                     pending = _dispatch_pending(
                         workers, pending, in_flight, failed, succeeded,
                         output_dir, experiment, exp_dir, token, command, extra, run_from,
-                        gpus_per_run, has_singular,
+                        gpus_per_run, has_singular, _wandb_env,
+                        nodes_per_run, multinode_state, next_port,
                     )
                 continue
 
@@ -1246,6 +1336,34 @@ def main() -> None:
                     used_gpu_group = ws.slots[used_slot_idx] if used_slot_idx < len(ws.slots) else []
                 else:
                     used_gpu_group = []
+
+                # Multi-node aggregation: wait for all nodes to complete
+                if ev.run_id in multinode_state:
+                    ms = multinode_state[ev.run_id]
+                    ms["pending"] -= 1
+                    ms["elapsed"] = max(ms["elapsed"], ev.elapsed)
+                    if not ev.success:
+                        ms["success"] = False
+                    if ms["pending"] > 0:
+                        # Not all nodes done yet — put var back and re-dispatch freed slot
+                        if var:
+                            in_flight[ev.run_id] = var
+                        pending = _dispatch_pending(
+                            workers, pending, in_flight, failed, succeeded,
+                            output_dir, experiment, exp_dir, token, command, extra, run_from,
+                            gpus_per_run, has_singular, _wandb_env,
+                            nodes_per_run, multinode_state, next_port,
+                        )
+                        continue
+                    # All nodes done — use aggregated values for result recording
+                    del multinode_state[ev.run_id]
+                    ev = EvRunResult(
+                        worker_id=ev.worker_id,
+                        run_id=ev.run_id,
+                        success=ms["success"],
+                        elapsed=ms["elapsed"],
+                        exit_code=ev.exit_code,
+                    )
 
                 # Close log file handle and finish metric writer
                 _log_fh = log_handles.pop(ev.run_id, None)
@@ -1327,6 +1445,7 @@ def main() -> None:
                     workers, pending, in_flight, failed, succeeded,
                     output_dir, experiment, exp_dir, token, command, extra, run_from,
                     gpus_per_run, has_singular, _wandb_env,
+                    nodes_per_run, multinode_state, next_port,
                 )
 
             elif isinstance(ev, EvArtifactSynced):
@@ -1401,7 +1520,8 @@ def main() -> None:
                     pending = _dispatch_pending(
                         workers, pending, in_flight, failed, succeeded,
                         output_dir, experiment, exp_dir, token, command, extra, run_from,
-                        gpus_per_run, has_singular,
+                        gpus_per_run, has_singular, _wandb_env,
+                        nodes_per_run, multinode_state, next_port,
                     )
 
             elif isinstance(ev, EvInteractiveCommand):
