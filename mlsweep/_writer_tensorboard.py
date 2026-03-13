@@ -37,13 +37,13 @@ class _StandaloneSummaryWriter:
 
 def _import_summary_writer() -> Any:
     try:
-        from torch.utils.tensorboard import SummaryWriter
-        return SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter as _TorchSW
+        return _TorchSW
     except ImportError:
         pass
     try:
-        from tensorboardX import SummaryWriter
-        return SummaryWriter
+        from tensorboardX import SummaryWriter as _TbxSW
+        return _TbxSW
     except ImportError:
         pass
     try:

@@ -121,6 +121,43 @@ def test_dry_run_creates_no_output(tmp_path):
     assert "python" in result.stdout
 
 
+def test_torchrun_rank_zero_logging(tmp_path):
+    pytest.importorskip("torch")
+
+    result = _run("tests/sweeps/torchrun_sweep.py", tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    status = _status(tmp_path)
+    assert len(status) == 1
+    assert all(s["status"] == "ok" for s in status.values())
+
+    exp_dir = _exp_dir(tmp_path)
+    for run_name in status:
+        metrics_path = exp_dir / run_name / "metrics.jsonl"
+        rows = [json.loads(l) for l in metrics_path.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1, f"expected 1 metrics row from rank 0, got {len(rows)}"
+        assert rows[0].get("world_size") == 2.0
+
+
+def test_set_dist_env(tmp_path):
+    pytest.importorskip("torch")
+
+    result = _run("tests/sweeps/set_dist_env_sweep.py", tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    status = _status(tmp_path)
+    assert len(status) == 1
+    assert all(s["status"] == "ok" for s in status.values())
+
+    exp_dir = _exp_dir(tmp_path)
+    for run_name in status:
+        metrics_path = exp_dir / run_name / "metrics.jsonl"
+        rows = [json.loads(l) for l in metrics_path.read_text().splitlines() if l.strip()]
+        # Only rank 0 logs; world_size == GPUS_PER_RUN == 2
+        assert len(rows) == 1, f"expected 1 metrics row from rank 0, got {len(rows)}"
+        assert rows[0].get("world_size") == 2.0
+
+
 @pytest.mark.skipif(_gpu_count() < 2, reason="requires at least 2 GPUs")
 def test_gpus_per_run(tmp_path):
     result = _run("tests/sweeps/multigpu_sweep.py", tmp_path, "-g", "2")

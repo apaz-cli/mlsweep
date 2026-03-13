@@ -100,6 +100,7 @@ class MsgRun:
     remote_dir: str
     scratch: str
     run_from: str | None = None
+    set_dist_env: bool = False
     t: str = "run"
 
 

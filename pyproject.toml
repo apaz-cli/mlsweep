@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mlsweep"
 version = "1.0.0"
+description = "A flexible hyperparameter sweep scheduler for distributed ML training"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "", email = "" }]
 requires-python = ">=3.10"
 dependencies = [
     "tomli >= 2.0; python_version < '3.11'",
@@ -15,6 +19,7 @@ wandb = ["wandb"]
 tensorboard = ["tensorboard"]
 bayes = ["optuna>=3.0"]
 all = ["wandb", "tensorboard", "optuna>=3.0"]
+test = ["torch", "pytest"]
 
 [project.scripts]
 mlsweep_run = "mlsweep.run_sweep:main"

@@ -13,7 +13,9 @@ Usage::
     logger.log({"loss": 0.5})   # step auto-increments; logger.step becomes 1
     logger.close()
 
-All methods are silent no-ops when ``MLSWEEP_WORKER_SOCKET`` is not set.
+All methods are silent no-ops when ``MLSWEEP_WORKER_SOCKET`` is not set, or when
+``MLSWEEP_GPU_RANK`` / ``MLSWEEP_NODE_RANK`` indicate a non-lead rank (see
+``rank_zero_only`` parameter).
 """
 
 import json
@@ -40,6 +42,7 @@ class MLSweepLogger:
         *,
         hparams: dict[str, Any] | None = None,
         run_name: str | None = None,
+        rank_zero_only: bool = True,
     ) -> None:
         """Create a logger.
 
@@ -48,9 +51,19 @@ class MLSweepLogger:
                      in the worker protocol; reserved for future use).
             run_name: Override for the run name.  Defaults to
                       ``MLSWEEP_RUN_NAME`` env var.
+            rank_zero_only: When ``True`` (default), all operations are no-ops
+                            unless both ``MLSWEEP_GPU_RANK`` and
+                            ``MLSWEEP_NODE_RANK`` are unset or ``"0"``.  Set to
+                            ``False`` to log from every rank.
         """
         self._run_id: str = run_name or os.environ.get("MLSWEEP_RUN_NAME", "")
-        self._sock_path: str | None = os.environ.get("MLSWEEP_WORKER_SOCKET")
+        _is_lead = (
+            os.environ.get("MLSWEEP_GPU_RANK", "0") == "0"
+            and os.environ.get("MLSWEEP_NODE_RANK", "0") == "0"
+        )
+        self._sock_path: str | None = (
+            os.environ.get("MLSWEEP_WORKER_SOCKET") if (not rank_zero_only or _is_lead) else None
+        )
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self.step: int = 0

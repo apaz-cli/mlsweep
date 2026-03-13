@@ -730,6 +730,7 @@ def _dispatch_pending(
     nodes_per_run: int = 1,
     multinode_state: dict[str, Any] | None = None,
     next_port: list[int] | None = None,
+    set_dist_env: bool = False,
 ) -> list[dict[str, Any]]:
     """Try to assign pending variations to free slots. Returns still-pending list."""
     _MASTER_PORT_BASE = 29500
@@ -793,6 +794,7 @@ def _dispatch_pending(
                             remote_dir=ws.remote_dir,
                             scratch=run_scratch,
                             run_from=run_from,
+                            set_dist_env=set_dist_env,
                         )
                         ws.send_queue.put(encode(run_msg))
                         ws.in_flight[run_id] = var
@@ -877,6 +879,7 @@ def _dispatch_pending(
                     remote_dir=ws.remote_dir,
                     scratch=run_scratch,
                     run_from=run_from,
+                    set_dist_env=set_dist_env,
                 )
                 ws.send_queue.put(encode(run_msg))
                 ws.in_flight[run_id] = var
@@ -977,6 +980,7 @@ def main() -> None:
         gpus_per_run = info.get("gpus_per_run", 1)
         nodes_per_run = info.get("nodes_per_run", 1)
         run_from = info.get("run_from")
+        set_dist_env: bool = info.get("set_dist_env", False)
         method: str = info.get("method", "grid")
         optimize_cfg: dict[str, Any] = info.get("optimize") or {}
         validate_options(options, method=method)
@@ -1275,6 +1279,7 @@ def main() -> None:
             output_dir, experiment, exp_dir, token, command, extra, run_from,
             gpus_per_run, has_singular, _wandb_env,
             nodes_per_run, multinode_state, next_port,
+            set_dist_env,
         )
 
         while pending or in_flight:
@@ -1288,6 +1293,7 @@ def main() -> None:
                         output_dir, experiment, exp_dir, token, command, extra, run_from,
                         gpus_per_run, has_singular, _wandb_env,
                         nodes_per_run, multinode_state, next_port,
+                        set_dist_env,
                     )
                 continue
 
@@ -1353,6 +1359,7 @@ def main() -> None:
                             output_dir, experiment, exp_dir, token, command, extra, run_from,
                             gpus_per_run, has_singular, _wandb_env,
                             nodes_per_run, multinode_state, next_port,
+                            set_dist_env,
                         )
                         continue
                     # All nodes done — use aggregated values for result recording
@@ -1446,6 +1453,7 @@ def main() -> None:
                     output_dir, experiment, exp_dir, token, command, extra, run_from,
                     gpus_per_run, has_singular, _wandb_env,
                     nodes_per_run, multinode_state, next_port,
+                    set_dist_env,
                 )
 
             elif isinstance(ev, EvArtifactSynced):
@@ -1522,6 +1530,7 @@ def main() -> None:
                         output_dir, experiment, exp_dir, token, command, extra, run_from,
                         gpus_per_run, has_singular, _wandb_env,
                         nodes_per_run, multinode_state, next_port,
+                        set_dist_env,
                     )
 
             elif isinstance(ev, EvInteractiveCommand):

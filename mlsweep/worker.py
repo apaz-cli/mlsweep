@@ -27,6 +27,7 @@ Startup behaviour:
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import queue
@@ -63,7 +64,7 @@ from mlsweep._topology import _gpu_topology, _visible_devices
 @dataclasses.dataclass
 class RunState:
     run_id: str
-    pid: int
+    pids: list[int]         # per-GPU PIDs; pids[0] is rank-0
     scratch_path: str       # {scratch_dir}/{experiment}/{run_id}/
     gpu_ids: list[int]
     experiment: str
@@ -185,7 +186,7 @@ def _read_thread(conn: ConnState) -> None:
                 "run_id": rs.run_id,
                 "log_seq": rs.log_seq,
                 "metric_seq": rs.metric_seq,
-                "pid": rs.pid,
+                "pid": rs.pids[0],
             }
             for rs in _in_flight.values()
         ]
@@ -234,7 +235,7 @@ def _handle_msg(msg: Any, conn: ConnState) -> None:
 
 
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:
-    """Spawn a training subprocess for the given run."""
+    """Spawn one training subprocess per GPU in the run's GPU group."""
     scratch_path = os.path.join(_scratch_dir, msg.experiment, msg.run_id)
     log_path = os.path.join(scratch_path, "training.log")
     metrics_path = os.path.join(scratch_path, "metrics.jsonl")
@@ -245,33 +246,68 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     open(log_path, "w").close()
     open(metrics_path, "w").close()
 
-    # Build env
+    # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)
-    env = {**os.environ, **msg.env}
-    env["CUDA_VISIBLE_DEVICES"] = device_str
-    env["HIP_VISIBLE_DEVICES"] = device_str
-    env["MLSWEEP_RUN_DIR"] = artifacts_path
-    env["MLSWEEP_RUN_NAME"] = msg.run_id
-    env["EXP_EXPERIMENT"] = msg.experiment
-    env["MLSWEEP_WORKER_SOCKET"] = os.path.join(_scratch_dir, ".worker.sock")
-    env.pop("EXP_SERVER", None)
+    base_env = {**os.environ, **msg.env}
+    base_env["CUDA_VISIBLE_DEVICES"] = device_str
+    base_env["HIP_VISIBLE_DEVICES"] = device_str
+    base_env["MLSWEEP_RUN_DIR"] = artifacts_path
+    base_env["MLSWEEP_RUN_NAME"] = msg.run_id
+    base_env["EXP_EXPERIMENT"] = msg.experiment
+    base_env["MLSWEEP_WORKER_SOCKET"] = os.path.join(_scratch_dir, ".worker.sock")
+    base_env.pop("EXP_SERVER", None)
 
     # Compute cwd
     remote_dir = msg.remote_dir or _remote_dir
-    if msg.run_from:
-        cwd = os.path.join(remote_dir, msg.run_from)
-    else:
-        cwd = remote_dir
+    cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
 
+    # Pre-compute dist env values if SET_DIST_ENV is requested
+    _dist_base: dict[str, str] = {}
+    _dist_node_rank = 0
+    _dist_gpus_per_node = len(msg.gpu_ids)
+    if msg.set_dist_env:
+        nnodes = int(base_env.get("MLSWEEP_NNODES", "1"))
+        _dist_node_rank = int(base_env.get("MLSWEEP_NODE_RANK", "0"))
+        world_size = nnodes * _dist_gpus_per_node
+        if nnodes > 1:
+            master_addr = base_env["MLSWEEP_MASTER_ADDR"]
+            master_port = base_env["MLSWEEP_MASTER_PORT"]
+        else:
+            master_addr = "localhost"
+            master_port = str(
+                20000 + int(hashlib.md5(msg.run_id.encode()).hexdigest()[:4], 16) % 10000
+            )
+        _dist_base = {
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": master_addr,
+            "MASTER_PORT": master_port,
+        }
+
+    # Spawn one process per GPU rank; only rank 0's stdout is captured
+    procs: list[subprocess.Popen[bytes]] = []
+    pids: list[int] = []
     try:
-        proc = subprocess.Popen(
-            msg.command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            cwd=cwd,
-        )
-    except OSError as e:
+        for rank in range(len(msg.gpu_ids)):
+            rank_env = {**base_env, "MLSWEEP_GPU_RANK": str(rank)}
+            if msg.set_dist_env:
+                rank_env["RANK"] = str(_dist_node_rank * _dist_gpus_per_node + rank)
+                rank_env["LOCAL_RANK"] = str(rank)
+                rank_env.update(_dist_base)
+            proc = subprocess.Popen(
+                msg.command,
+                stdout=subprocess.PIPE if rank == 0 else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if rank == 0 else subprocess.DEVNULL,
+                env=rank_env,
+                cwd=cwd,
+            )
+            procs.append(proc)
+            pids.append(proc.pid)
+    except OSError:
+        for p in procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
         conn.send_queue.put(encode(MsgResult(
             run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1
         )))
@@ -280,7 +316,7 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     with _lock:
         state = RunState(
             run_id=msg.run_id,
-            pid=proc.pid,
+            pids=pids,
             scratch_path=scratch_path,
             gpu_ids=list(msg.gpu_ids),
             experiment=msg.experiment,
@@ -288,11 +324,11 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
         _in_flight[msg.run_id] = state
         _busy_gpus.update(msg.gpu_ids)
 
-    conn.send_queue.put(encode(MsgStarted(run_id=msg.run_id, pid=proc.pid)))
+    conn.send_queue.put(encode(MsgStarted(run_id=msg.run_id, pid=pids[0])))
 
     t = threading.Thread(
         target=_run_thread,
-        args=(proc, state, log_path, conn),
+        args=(procs, state, log_path, conn),
         daemon=True,
         name=f"run-{msg.run_id}",
     )
@@ -300,17 +336,18 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
 
 
 def _run_thread(
-    proc: "subprocess.Popen[bytes]",
+    procs: "list[subprocess.Popen[bytes]]",
     state: RunState,
     log_path: str,
     conn: ConnState,
 ) -> None:
-    """Monitor a training subprocess: stream logs, send MsgResult on exit."""
+    """Monitor all per-GPU subprocesses: stream rank-0 logs, send MsgResult when all exit."""
     t0 = time.time()
 
+    # Stream rank-0 stdout to the log
     with open(log_path, "a", buffering=1) as log_fh:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
+        assert procs[0].stdout is not None
+        for raw_line in procs[0].stdout:
             line_str = raw_line.decode("utf-8", errors="replace")
             with state.log_lock:
                 log_fh.write(line_str)
@@ -323,8 +360,10 @@ def _run_thread(
                     data=line_str,
                 )))
 
-    rc = proc.wait()
+    # Wait for all ranks to finish
+    rcs = [procs[0].wait()] + [p.wait() for p in procs[1:]]
     elapsed = time.time() - t0
+    exit_code = next((rc for rc in rcs if rc != 0), 0)
 
     with _lock:
         _in_flight.pop(state.run_id, None)
@@ -333,9 +372,9 @@ def _run_thread(
     if not conn.closed:
         conn.send_queue.put(encode(MsgResult(
             run_id=state.run_id,
-            success=(rc == 0),
+            success=(exit_code == 0),
             elapsed=elapsed,
-            exit_code=rc,
+            exit_code=exit_code,
         )))
 
 
@@ -346,14 +385,15 @@ def _handle_cleanup(msg: MsgCleanup, conn: ConnState) -> None:
 
 
 def _handle_cancel(msg: MsgCancel) -> None:
-    """SIGTERM the running process."""
+    """SIGTERM all per-GPU processes for the run."""
     with _lock:
         state = _in_flight.get(msg.run_id)
     if state is not None:
-        try:
-            os.kill(state.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        for pid in state.pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def _handle_replay(msg: MsgReplay, conn: ConnState) -> None:

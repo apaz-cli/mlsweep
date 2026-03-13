@@ -12,15 +12,16 @@ mlsweep_run sweeps/my_sweep.py [options]
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, and `RUN_FROM`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, and `RUN_FROM`:
 
 ```python
 COMMAND = ["python", "train.py"]
 OPTIONS = { ... }
 
 # Optional
-GPUS_PER_RUN = 1   # (default: 1) GPUs per run on each node
-NODES_PER_RUN = 1  # (default: 1) worker nodes allocated per run
+GPUS_PER_RUN = 1      # (default: 1) GPUs per run on each node
+NODES_PER_RUN = 1     # (default: 1) worker nodes allocated per run
+SET_DIST_ENV = False  # (default: False) auto-set standard dist env vars
 RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
 EXTRA_FLAGS = ["--seed", "42"]
 
@@ -216,13 +217,13 @@ An optional positive integer specifying how many GPUs to allocate per run on eac
 GPUS_PER_RUN = 4
 ```
 
-When set, the runner divides the available GPUs into non-overlapping groups of `GPUS_PER_RUN` and assigns one group per concurrent run. `CUDA_VISIBLE_DEVICES` is set to all GPUs in the group (e.g. `0,1,2,3`).
+When set, the runner divides the available GPUs into non-overlapping groups of `GPUS_PER_RUN` and assigns one group per concurrent run.  For each run, mlsweep spawns `GPUS_PER_RUN` copies of `COMMAND` — one per GPU — and sets `CUDA_VISIBLE_DEVICES` to the full group and `MLSWEEP_GPU_RANK` to each process's 0-based local rank.  Your training script uses `MLSWEEP_GPU_RANK` as its device index and distributed rank.
 
 The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_PER_RUN=4` and `-g 8`, you get 2 parallel slots (2 concurrent runs). `-g 0` uses all visible GPUs, divided into as many slots as fit.
 
 GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
 
-See [Multi-GPU Runs (torchrun)](#multi-gpu-runs-torchrun) below for a complete example.
+See [Multi-GPU Runs](#multi-gpu-runs) below for a complete example.
 
 ### `NODES_PER_RUN`
 
@@ -279,6 +280,38 @@ COMMAND = ["bash", "-c", """
 ```
 
 **Requirements:** `NODES_PER_RUN > 1` requires `--workers` with at least `NODES_PER_RUN` connected worker entries. Logs and metrics are streamed from all nodes but only artifacts from rank 0's scratch directory are rsynced to the output directory. If your training script writes artifacts on all ranks, use a shared filesystem or handle aggregation in the script itself.
+
+### `SET_DIST_ENV`
+
+An optional boolean (default `False`). When `True`, mlsweep automatically sets the standard distributed training environment variables for each spawned process, derived from the `MLSWEEP_*` vars:
+
+| Variable | Single-node value | Multi-node value |
+|----------|------------------|-----------------|
+| `RANK` | `MLSWEEP_GPU_RANK` (== global rank for single-node) | `MLSWEEP_NODE_RANK * GPUS_PER_RUN + MLSWEEP_GPU_RANK` |
+| `LOCAL_RANK` | `MLSWEEP_GPU_RANK` | `MLSWEEP_GPU_RANK` |
+| `WORLD_SIZE` | `GPUS_PER_RUN` | `MLSWEEP_NNODES * GPUS_PER_RUN` |
+| `MASTER_ADDR` | `localhost` | `MLSWEEP_MASTER_ADDR` |
+| `MASTER_PORT` | hash of run name (range 20000–29999) | `MLSWEEP_MASTER_PORT` |
+
+The hash-derived `MASTER_PORT` for single-node runs ensures that concurrent runs on the same machine each get a distinct port automatically.
+
+`SET_DIST_ENV = True` is the easiest way to use frameworks that expect standard PyTorch distributed env vars (e.g. TorchTitan, torchrun-launched scripts) without writing a `bash -c` wrapper in `COMMAND`.
+
+```python
+#!/usr/bin/env mlsweep_run
+
+COMMAND = ["python", "-m", "torchtitan.train", "--module", "llama3", "--config", "llama3_8b"]
+GPUS_PER_RUN = 8
+SET_DIST_ENV = True
+
+OPTIONS = {
+    ".lr": {
+        "values": [3e-4, 8e-4, 2e-3],
+        "flags": "--optimizer.lr",
+        "name": "lr",
+    },
+}
+```
 
 ### `RUN_FROM`
 
@@ -685,23 +718,27 @@ The context manager calls `close()` on exit. Without it, call `logger.close()` m
 
 ## Environment Variables
 
-The following environment variables are set for each run:
+The worker inherits the shell environment and adds the following variables before launching each `COMMAND` process:
 
-| Variable | Value |
-|----------|-------|
-| `MLSWEEP_RUN_DIR` | Path to `artifacts/` inside the run's scratch directory. Write checkpoints here; they are rsynced to the output dir at the end of the run. |
-| `MLSWEEP_RUN_NAME` | The run's unique name (e.g. `my_sweep_lr1e-3_bs32`). |
-| `EXP_EXPERIMENT` | The experiment name. |
-| `EXP_TAGS` | Comma-separated `key=value` pairs for this run's combo (e.g. `lr=0.001,bs=32`). |
-| `MLSWEEP_WORKER_SOCKET` | Unix socket path for `MLSweepLogger` communication with the worker daemon. |
-| `CUDA_VISIBLE_DEVICES` | Comma-separated GPU indices for this run (e.g. `0` or `0,1,2,3` with `GPUS_PER_RUN=4`). |
-| `HIP_VISIBLE_DEVICES` | Same as above (for AMD ROCm compatibility). |
-| `MLSWEEP_NNODES` | Total node count for this run. Set only when `NODES_PER_RUN > 1`. |
-| `MLSWEEP_NODE_RANK` | This node's rank (0-based). Set only when `NODES_PER_RUN > 1`. |
-| `MLSWEEP_MASTER_ADDR` | Rank-0 worker hostname. Set only when `NODES_PER_RUN > 1`. |
-| `MLSWEEP_MASTER_PORT` | Rendezvous port. Set only when `NODES_PER_RUN > 1`. |
-
-Your training script can use these to write outputs to the right place and log metrics.
+| Variable | Always set? | Value |
+|----------|-------------|-------|
+| `MLSWEEP_RUN_DIR` | yes | Path to `artifacts/` inside the run's scratch directory. Write checkpoints here; they are rsynced to the output dir at the end of the run. |
+| `MLSWEEP_RUN_NAME` | yes | The run's unique name (e.g. `my_sweep_lr1e-3_bs32`). |
+| `EXP_EXPERIMENT` | yes | The experiment name. |
+| `EXP_TAGS` | when non-empty | Comma-separated `key=value` pairs for this run's combo (e.g. `lr=0.001,bs=32`). |
+| `MLSWEEP_WORKER_SOCKET` | yes | Unix socket path for `MLSweepLogger` communication with the worker daemon. |
+| `CUDA_VISIBLE_DEVICES` | yes | Comma-separated GPU indices assigned to this run (e.g. `0,1,2,3` with `GPUS_PER_RUN=4`). Same for every process in the group. |
+| `HIP_VISIBLE_DEVICES` | yes | Same as `CUDA_VISIBLE_DEVICES` (for AMD ROCm compatibility). |
+| `MLSWEEP_GPU_RANK` | yes | This process's 0-based local GPU rank within the group (0 to `GPUS_PER_RUN-1`). Use this as the device index and local distributed rank in your training script. `MLSweepLogger` logs only from rank 0 by default. |
+| `MLSWEEP_NNODES` | multi-node only | Total node count for this run (`NODES_PER_RUN`). |
+| `MLSWEEP_NODE_RANK` | multi-node only | This node's rank (0-based). |
+| `MLSWEEP_MASTER_ADDR` | multi-node only | Rank-0 worker hostname. |
+| `MLSWEEP_MASTER_PORT` | multi-node only | Port for the distributed rendezvous (cycles through 29500–29599). |
+| `RANK` | when `SET_DIST_ENV=True` | Global distributed rank for this process. |
+| `LOCAL_RANK` | when `SET_DIST_ENV=True` | Local rank (same as `MLSWEEP_GPU_RANK`). |
+| `WORLD_SIZE` | when `SET_DIST_ENV=True` | Total number of processes across all nodes. |
+| `MASTER_ADDR` | when `SET_DIST_ENV=True` | Rendezvous address (`localhost` for single-node). |
+| `MASTER_PORT` | when `SET_DIST_ENV=True` | Rendezvous port (hash-derived for single-node; `MLSWEEP_MASTER_PORT` for multi-node). |
 
 ## Output Structure
 
@@ -834,15 +871,15 @@ Produces:
 - `sweep_optadam_bs32`, `sweep_optadam_bs64` (2 runs)
 - `sweep_optmuon.lrs0.1_bs32`, `sweep_optmuon.lrs0.1_bs64`, ... (6 runs)
 
-### Multi-GPU Runs (torchrun)
+### Multi-GPU Runs
 
-Use `GPUS_PER_RUN` together with `torchrun` (or any other multi-process launcher) in `COMMAND` to run each sweep variation across multiple GPUs:
+Set `GPUS_PER_RUN` to the number of GPUs each run needs.  mlsweep spawns one copy of `COMMAND` per GPU, passing each process its rank via `MLSWEEP_GPU_RANK` (0-based):
 
 ```python
 #!/usr/bin/env mlsweep_run
 
-COMMAND = ["torchrun", "--nproc_per_node", "4", "train.py"]
-GPUS_PER_RUN = 4  # allocate 4 GPUs per run
+COMMAND = ["python", "train.py"]
+GPUS_PER_RUN = 4
 
 OPTIONS = {
     ".learning_rate": {
@@ -853,13 +890,24 @@ OPTIONS = {
 }
 ```
 
+In `train.py`, use `MLSWEEP_GPU_RANK` as the local rank:
+
+```python
+import os
+import torch
+
+local_rank = int(os.environ["MLSWEEP_GPU_RANK"])
+device = torch.device(f"cuda:{local_rank}")
+# pass local_rank as rank when initialising your process group
+```
+
 Run with 8 GPUs to get 2 parallel 4-GPU jobs:
 
 ```bash
-mlsweep_run sweeps/torchrun_sweep.py -g 8
+mlsweep_run sweeps/my_sweep.py -g 8
 ```
 
-The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second. GPU groups are chosen to maximise NVLink connectivity.
+The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second; GPU groups are chosen to maximise NVLink connectivity.  `MLSweepLogger` is a no-op on all ranks except `MLSWEEP_GPU_RANK=0`.
 
 ## Troubleshooting
 

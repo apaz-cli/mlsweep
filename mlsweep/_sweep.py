@@ -69,6 +69,9 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     run_from = getattr(mod, "RUN_FROM", None)
     if run_from is not None and not isinstance(run_from, str):
         raise ValueError(f"{path}: RUN_FROM must be a str, got {type(run_from).__name__}")
+    set_dist_env = getattr(mod, "SET_DIST_ENV", False)
+    if not isinstance(set_dist_env, bool):
+        raise ValueError(f"{path}: SET_DIST_ENV must be a bool, got {type(set_dist_env).__name__}")
     optimize = getattr(mod, "OPTIMIZE", None)
     method = "grid"
     if optimize is not None:
@@ -95,6 +98,7 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "gpus_per_run": gpus_per_run,
         "nodes_per_run": nodes_per_run,
         "run_from": run_from,
+        "set_dist_env": set_dist_env,
         "method": method,
         "optimize": optimize,
     }
