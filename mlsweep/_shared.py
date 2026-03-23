@@ -78,8 +78,8 @@ def _detect_sub_dims(
 
 # ── Protocol messages ──────────────────────────────────────────────────────────
 # One JSON object per line over TCP, terminated by \n.  All messages have a "t" field.
-# Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","bye","shutdown"}.
-# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned"}.
+# Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","bye","shutdown","ping"}.
+# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong"}.
 
 # ── Controller → Worker ────────────────────────────────────────────────────────
 
@@ -127,6 +127,11 @@ class MsgReplay:
 @dataclass
 class MsgShutdown:
     t: str = "shutdown"
+
+
+@dataclass
+class MsgPing:
+    t: str = "ping"
 
 
 # ── Worker → Controller ────────────────────────────────────────────────────────
@@ -184,6 +189,11 @@ class MsgCleaned:
     t: str = "cleaned"
 
 
+@dataclass
+class MsgPong:
+    t: str = "pong"
+
+
 _MSG_TYPES: dict[str, type] = {
     "hello": MsgHello,
     "run": MsgRun,
@@ -191,6 +201,7 @@ _MSG_TYPES: dict[str, type] = {
     "cleanup": MsgCleanup,
     "replay": MsgReplay,
     "shutdown": MsgShutdown,
+    "ping": MsgPing,
     "whello": MsgWorkerHello,
     "started": MsgStarted,
     "log": MsgLog,
@@ -198,6 +209,7 @@ _MSG_TYPES: dict[str, type] = {
     "syncreq": MsgSyncReq,
     "result": MsgResult,
     "cleaned": MsgCleaned,
+    "pong": MsgPong,
 }
 
 
