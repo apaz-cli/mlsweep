@@ -3,6 +3,7 @@
 import json
 import subprocess
 from dataclasses import asdict, dataclass, field
+from secrets import token_hex as _token_hex
 from typing import Any
 
 
@@ -92,15 +93,24 @@ class MsgHello:
 
 @dataclass
 class MsgRun:
-    run_id: str
-    experiment: str
     command: list[str]
-    env: dict[str, str]
-    gpu_ids: list[int]
-    remote_dir: str
-    scratch: str
+    run_id: str = field(default_factory=lambda: _token_hex(8))
+    experiment: str = "pool"
+    env: dict[str, str] = field(default_factory=dict)
+    gpu_ids: list[int] = field(default_factory=list)
+    # Filled by WorkerPool from WorkerConfig; set explicitly only when
+    # sending MsgRun directly to a worker without a pool.
+    remote_dir: str = ""
+    scratch: str = ""
     run_from: str | None = None
     set_dist_env: bool = False
+    files: dict[str, str] = field(default_factory=dict)
+    # {workspace-relative path: text content}. Worker creates an isolated
+    # workspace, hard-links from remote_dir, then writes these files.
+    # Sets MLSWEEP_WORKSPACE; cwd becomes workspace instead of remote_dir.
+    return_files: list[str] = field(default_factory=list)
+    # Workspace-relative paths copied into artifacts/ after the run,
+    # before the normal artifact rsync.
     t: str = "run"
 
 

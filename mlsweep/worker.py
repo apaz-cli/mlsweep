@@ -27,16 +27,19 @@ Startup behaviour:
 
 import argparse
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
 import queue
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, IO
 
 from mlsweep._shared import (
@@ -246,6 +249,28 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     open(log_path, "w").close()
     open(metrics_path, "w").close()
 
+    # Workspace creation from file payload
+    if msg.files:
+        workspace = os.path.join(scratch_path, "workspace")
+        base_dir = msg.remote_dir or _remote_dir
+        if base_dir and os.path.isdir(base_dir):
+            # Hard-link copy: large staged files cost no extra disk space
+            subprocess.run(
+                ["rsync", "-a", "--link-dest", base_dir + "/", base_dir + "/", workspace + "/"],
+                check=True,
+            )
+        else:
+            os.makedirs(workspace, exist_ok=True)
+        for rel_path, content in msg.files.items():
+            abs_path = os.path.join(workspace, rel_path)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            Path(abs_path).write_text(content, encoding="utf-8")
+        cwd = workspace
+    else:
+        workspace = None
+        remote_dir = msg.remote_dir or _remote_dir
+        cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
+
     # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)
     base_env = {**os.environ, **msg.env}
@@ -255,11 +280,9 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     base_env["MLSWEEP_RUN_NAME"] = msg.run_id
     base_env["EXP_EXPERIMENT"] = msg.experiment
     base_env["MLSWEEP_WORKER_SOCKET"] = os.path.join(_scratch_dir, ".worker.sock")
+    if workspace is not None:
+        base_env["MLSWEEP_WORKSPACE"] = workspace
     base_env.pop("EXP_SERVER", None)
-
-    # Compute cwd
-    remote_dir = msg.remote_dir or _remote_dir
-    cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
 
     # Pre-compute dist env values if SET_DIST_ENV is requested
     _dist_base: dict[str, str] = {}
@@ -283,11 +306,12 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
             "MASTER_PORT": master_port,
         }
 
-    # Spawn one process per GPU rank; only rank 0's stdout is captured
+    # Spawn one process per GPU rank (or one process for CPU-only runs)
+    n_ranks = max(1, len(msg.gpu_ids))
     procs: list[subprocess.Popen[bytes]] = []
     pids: list[int] = []
     try:
-        for rank in range(len(msg.gpu_ids)):
+        for rank in range(n_ranks):
             rank_env = {**base_env, "MLSWEEP_GPU_RANK": str(rank)}
             if msg.set_dist_env:
                 rank_env["RANK"] = str(_dist_node_rank * _dist_gpus_per_node + rank)
@@ -328,7 +352,7 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
 
     t = threading.Thread(
         target=_run_thread,
-        args=(procs, state, log_path, conn),
+        args=(procs, state, log_path, artifacts_path, workspace or cwd, msg.return_files, conn),
         daemon=True,
         name=f"run-{msg.run_id}",
     )
@@ -339,6 +363,9 @@ def _run_thread(
     procs: "list[subprocess.Popen[bytes]]",
     state: RunState,
     log_path: str,
+    artifacts_path: str,
+    run_dir: str,
+    return_files: list[str],
     conn: ConnState,
 ) -> None:
     """Monitor all per-GPU subprocesses: stream rank-0 logs, send MsgResult when all exit."""
@@ -364,6 +391,16 @@ def _run_thread(
     rcs = [procs[0].wait()] + [p.wait() for p in procs[1:]]
     elapsed = time.time() - t0
     exit_code = next((rc for rc in rcs if rc != 0), 0)
+
+    # Copy return_files into artifacts/ before rsync.
+    # run_dir is the workspace (when files={...}) or the cwd (when files={}).
+    if return_files:
+        for rel_path in return_files:
+            src = os.path.join(run_dir, rel_path)
+            if os.path.isfile(src):
+                dst = os.path.join(artifacts_path, rel_path)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
 
     with _lock:
         _in_flight.pop(state.run_id, None)
@@ -601,6 +638,8 @@ def main() -> None:
                             help="Project directory on this machine (cwd for training scripts)")
         parser.add_argument("--devices", default=None,
                             help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7")
+        parser.add_argument("--port", type=int, default=7890,
+                            help="TCP port to bind (0 = ephemeral, default: 7890)")
         args = parser.parse_args()
 
         _scratch_dir = args.scratch_dir
@@ -611,12 +650,39 @@ def main() -> None:
 
         os.makedirs(_scratch_dir, exist_ok=True)
 
-        # Bind an ephemeral TCP port
+        # For a fixed port, use an flock to prevent two workers from racing to
+        # bind the same port.  The lock file is a pure synchronization token —
+        # no data is stored in it.
+        #
+        #   Winner:  LOCK_EX | LOCK_NB → bind → listen → downgrade to LOCK_SH.
+        #   Loser:   fail LOCK_EX | LOCK_NB → block on LOCK_SH (unblocks only
+        #            after winner downgrades, i.e. is already listening) →
+        #            print PORT={args.port} and exit.
+        #
+        # The controller always sees a normal "PORT=N" line and needs no
+        # special handling.  The winner holds LOCK_SH for its lifetime so
+        # late arrivals also wait correctly.
+        _lock_file = None
+        if args.port != 0:
+            lock_path = f"/tmp/.mlsweep_worker_port_{args.port}.lock"
+            _lock_file = open(lock_path, "w")
+            try:
+                fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fcntl.flock(_lock_file, fcntl.LOCK_SH)  # blocks until winner is listening
+                print(f"PORT={args.port}", flush=True)
+                sys.exit(0)
+
+        # Bind TCP port (fixed or ephemeral)
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(("", 0))
+        server_sock.bind(("", args.port))
         port = server_sock.getsockname()[1]
         server_sock.listen(10)
+
+        # Downgrade to LOCK_SH — unblocks any losers waiting to relay the port.
+        if _lock_file is not None:
+            fcntl.flock(_lock_file, fcntl.LOCK_SH)
 
         # Ignore SIGHUP so brief SSH disconnects don't kill the worker
         signal.signal(signal.SIGHUP, signal.SIG_IGN)

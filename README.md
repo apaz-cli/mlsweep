@@ -166,6 +166,7 @@ jobs = 2
 | `devices`    | no       | Specific GPU IDs to use |
 | `gpus`       | no       | Total GPU count -g (default: all visible) |
 | `jobs`       | no       | Concurrent jobs per GPU slot -j (default: 1) |
+| `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). Fixed port lets multiple controllers share the same worker — e.g. `mlsweep_run` and `WorkerPool` on the same machine queue jobs to the same worker. |
 
 **`venv` accepts any of:**
 - Project root containing `.venv/` or `venv/`
@@ -234,6 +235,38 @@ Logs are written to `<tensorboard-dir>/<experiment>/<run>/`. Point TensorBoard a
 ```sh
 tensorboard --logdir ./tb_logs
 ```
+
+## Programmatic API
+
+For use cases where you want to submit jobs dynamically to run on a machine and get back results,
+you can use `WorkerPool` from `mlsweep.pool`. It uses the same worker backend as
+`mlsweep_run` (`mlsweep_worker`), but does not assume you're using the mlsweep logger. You can
+use it like slurm, to just launch jobs on a cluster. Also supports sending file payloads to
+workers and getting modified files back.
+
+```python
+from mlsweep.pool import WorkerPool, WorkerConfig
+from mlsweep._shared import MsgRun
+
+with WorkerPool([WorkerConfig(host="user@gpu-box", remote_dir="/home/user/project",
+                              devices=[0, 1, 2, 3])]) as pool:
+    result = pool.run(MsgRun(
+        command=["python", "train.py"],
+        files={"train.py": source_code},
+        return_files=["train.py"],
+    ))
+    print(result.stdout)
+    modified = result.files["train.py"]
+```
+
+`run_id`, `gpu_ids`, `remote_dir`, and `scratch` are filled in automatically by the pool. See [docs/pool.md](docs/pool.md) for the full reference.
+
+## Known Issues
+
+In the future we will have better handling for scheduling jobs on multiple workers.
+There should be an extra layer that manages said workers, right now there is not, it
+is just done in `mlsweep_run` and the `WorkerPool` API with nothing to ensure mutual exclusion
+on GPUs.
 
 ## Troubleshooting
 

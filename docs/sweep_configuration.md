@@ -688,6 +688,7 @@ venv = "/home/user/myproject/.venv"
 | `ssh_key` | string | Path to SSH identity file (passed as `-i`) |
 | `pass` | string | SSH password. Requires `sshpass` to be installed. Falls back to `MLSWEEP_SSH_PASS` env var if omitted. |
 | `venv` | string | Path used to locate the `mlsweep_worker` binary. Defaults to `remote_dir`. Accepts a project root (tries `venv/`, `.venv/`), a venv root, a `bin/` dir, an `activate` script, or a python binary — all resolved to the same `bin/` directory. |
+| `port` | int | TCP port the worker listens on (default: 7890; `0` = ephemeral). With a fixed port, if a worker is already listening on that port it is reused rather than launched — this lets `mlsweep_run` and `WorkerPool` share the same worker process and queue jobs against the same GPU slots. Workers started without `--token` accept connections from any controller. |
 
 The `-g` and `-j` flags cannot be passed on the command line when `--workers` is specified — use the per-machine entries in the workers file instead.
 
@@ -730,6 +731,7 @@ The worker inherits the shell environment and adds the following variables befor
 | `CUDA_VISIBLE_DEVICES` | yes | Comma-separated GPU indices assigned to this run (e.g. `0,1,2,3` with `GPUS_PER_RUN=4`). Same for every process in the group. |
 | `HIP_VISIBLE_DEVICES` | yes | Same as `CUDA_VISIBLE_DEVICES` (for AMD ROCm compatibility). |
 | `MLSWEEP_GPU_RANK` | yes | This process's 0-based local GPU rank within the group (0 to `GPUS_PER_RUN-1`). Use this as the device index and local distributed rank in your training script. `MLSweepLogger` logs only from rank 0 by default. |
+| `MLSWEEP_WORKSPACE` | when `MsgRun.files` is non-empty | Path to the per-run isolated workspace. Set when a file payload was sent with the run (programmatic API only); the command's cwd is also changed to this directory. |
 | `MLSWEEP_NNODES` | multi-node only | Total node count for this run (`NODES_PER_RUN`). |
 | `MLSWEEP_NODE_RANK` | multi-node only | This node's rank (0-based). |
 | `MLSWEEP_MASTER_ADDR` | multi-node only | Rank-0 worker hostname. |

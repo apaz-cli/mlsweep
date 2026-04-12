@@ -120,7 +120,7 @@ class WorkerState:
 
 def _parse_workers(
     path: str,
-) -> list[tuple[str, str, int | None, int | None, list[int] | None, str | None, str | None, str | None]]:
+) -> list[tuple[str, str, int | None, int | None, list[int] | None, str | None, str | None, str | None, int]]:
     """Parse a TOML workers file.
 
     Each [[workers]] entry requires 'host' and 'remote_dir'. Optional fields:
@@ -130,8 +130,9 @@ def _parse_workers(
       pass     (str)       SSH password; falls back to MLSWEEP_SSH_PASS env var
       ssh_key  (str)       path to SSH identity file (passed as -i)
       venv     (str)       path to venv (or project root); activate is sourced before running
+      port     (int)       worker TCP port (default: 7890; 0 = ephemeral)
 
-    Returns [(host, remote_dir, gpus, jobs, devices, password, ssh_key, venv)].
+    Returns [(host, remote_dir, gpus, jobs, devices, password, ssh_key, venv, port)].
     """
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -148,7 +149,8 @@ def _parse_workers(
         password: str | None = entry.get("pass") or global_pass
         ssh_key: str | None = entry.get("ssh_key")
         venv: str | None = entry.get("venv") or remote_dir
-        result.append((host, remote_dir, gpus, jobs, devices, password, ssh_key, venv))
+        port: int = entry.get("port", 7890)
+        result.append((host, remote_dir, gpus, jobs, devices, password, ssh_key, venv, port))
     return result
 
 
@@ -514,13 +516,26 @@ def _start_worker(
     password: str | None = None,
     ssh_key: str | None = None,
     venv: str | None = None,
+    port: int = 7890,
 ) -> tuple[socket.socket, int]:
-    """SSH to start (or re-use) a worker daemon and return (socket, port).
+    """Connect to an existing worker or start a fresh one; return (socket, port).
 
-    For local mode, host should be "localhost" and we use subprocess directly.
+    When ``port != 0``, first tries to connect to a worker already listening on
+    that port.  If the connection fails, launches a fresh worker.  Workers
+    started without ``--token`` (shared workers) accept any connection.
     """
+    connect_host = "localhost" if host == "localhost" else host.split("@")[-1]
     devices_args = ["--devices", ",".join(str(d) for d in devices)] if devices else []
     key_args = ["-i", ssh_key] if ssh_key else []
+
+    # Try to reuse an existing worker at the fixed port
+    if port != 0:
+        try:
+            sock = socket.create_connection((connect_host, port), timeout=2)
+            return sock, port
+        except OSError:
+            pass
+
     if host == "localhost":
         proc = subprocess.Popen(
             [
@@ -528,6 +543,7 @@ def _start_worker(
                 "--token", token,
                 "--remote-dir", remote_dir,
                 "--scratch-dir", scratch_dir,
+                "--port", str(port),
                 *devices_args,
             ],
             stdout=subprocess.PIPE,
@@ -538,6 +554,7 @@ def _start_worker(
         worker_args = [
             "--token", token,
             "--remote-dir", remote_dir,
+            "--port", str(port),
             *devices_args,
         ]
         shell_cmd = _worker_shell_cmd(_worker_candidates(venv), worker_args)
@@ -606,9 +623,9 @@ def _connect_workers(
 
     workers: list[WorkerState] = []
 
-    for worker_id, (host, remote_dir, w_gpus, w_jobs, w_devices, w_pass, w_key, w_venv) in enumerate(worker_configs):
+    for worker_id, (host, remote_dir, w_gpus, w_jobs, w_devices, w_pass, w_key, w_venv, w_port) in enumerate(worker_configs):
         try:
-            sock, port = _start_worker(host, remote_dir, token, scratch_dir, w_devices, w_pass, w_key, w_venv)
+            sock, port = _start_worker(host, remote_dir, token, scratch_dir, w_devices, w_pass, w_key, w_venv, w_port)
         except Exception as e:
             sweep_print(f"  {_RED}WARN{_RESET}  Cannot start worker on {host}: {e}")
             continue
