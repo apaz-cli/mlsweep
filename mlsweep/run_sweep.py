@@ -547,7 +547,7 @@ def _start_worker(
     password: str | None = None,
     ssh_key: str | None = None,
     venv: str | None = None,
-    port: int = 7890,
+    port: int | None = None,
 ) -> tuple[socket.socket, int]:
     """Connect to an existing worker or start a fresh one; return (socket, port).
 
@@ -559,11 +559,13 @@ def _start_worker(
     devices_args = ["--devices", ",".join(str(d) for d in devices)] if devices else []
     key_args = ["-i", ssh_key] if ssh_key else []
 
+    bind_port = port if port is not None else 0
+
     # Try to reuse an existing worker at the fixed port
-    if port != 0:
+    if bind_port != 0:
         try:
-            sock = socket.create_connection((connect_host, port), timeout=2)
-            return sock, port
+            sock = socket.create_connection((connect_host, bind_port), timeout=2)
+            return sock, bind_port
         except OSError:
             pass
 
@@ -574,7 +576,7 @@ def _start_worker(
                 "--token", token,
                 "--remote-dir", remote_dir,
                 "--scratch-dir", scratch_dir,
-                "--port", str(port),
+                "--port", str(bind_port),
                 *devices_args,
             ],
             stdout=subprocess.PIPE,
@@ -585,7 +587,7 @@ def _start_worker(
         worker_args = [
             "--token", token,
             "--remote-dir", remote_dir,
-            "--port", str(port),
+            "--port", str(bind_port),
             *devices_args,
         ]
         shell_cmd = _worker_shell_cmd(_worker_candidates(venv), worker_args)
@@ -650,7 +652,7 @@ def _connect_workers(
         worker_configs = _parse_workers(workers_file)
     else:
         # Local mode
-        worker_configs = [("localhost", _PROJECT_ROOT, max_gpus, jobs_per_slot, None, None, None, None)]
+        worker_configs = [("localhost", _PROJECT_ROOT, max_gpus, jobs_per_slot, None, None, None, None, None)]
 
     workers: list[WorkerState] = []
 
