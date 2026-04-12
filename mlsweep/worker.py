@@ -49,6 +49,8 @@ from mlsweep._shared import (
     MsgHello,
     MsgLog,
     MsgMetric,
+    MsgPing,
+    MsgPong,
     MsgReplay,
     MsgResult,
     MsgRun,
@@ -235,6 +237,9 @@ def _handle_msg(msg: Any, conn: ConnState) -> None:
         _handle_replay(msg, conn)
     elif isinstance(msg, MsgShutdown):
         _shutdown_event.set()
+    elif isinstance(msg, MsgPing):
+        if not conn.closed:
+            conn.send_queue.put(encode(MsgPong()))
 
 
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:

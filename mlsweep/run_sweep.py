@@ -32,6 +32,8 @@ from mlsweep._parsync import parsync_bin
 from mlsweep._shared import (
     MsgCleanup,
     MsgHello,
+    MsgPing,
+    MsgPong,
     MsgReplay,
     MsgRun,
     MsgShutdown,
@@ -242,6 +244,11 @@ def _worker_write_thread(ws: WorkerState) -> None:
         try:
             ws.sock.sendall(item)  # type: ignore[attr-defined]
         except OSError:
+            # Close the socket so the read thread's recv() returns and detects the disconnect.
+            try:
+                ws.sock.close()  # type: ignore[attr-defined]
+            except OSError:
+                pass
             break
 
 
@@ -329,6 +336,8 @@ def _worker_read_thread(
             ))
         elif isinstance(msg, MsgCleaned):
             event_queue.put(EvWorkerCleaned(run_id=msg.run_id))
+        elif isinstance(msg, MsgPong):
+            pass  # heartbeat reply; nothing to do
 
     event_queue.put(EvWorkerDisconnected(ws.worker_id))
 
@@ -366,12 +375,15 @@ def _reconnect_thread(
             event_queue.put(EvReconnectWorker(
                 worker_id=ws.worker_id, success=True, resuming=msg.resuming
             ))
-            # Restart read/write threads
+            # Restart read/write/heartbeat threads
             threading.Thread(
                 target=_worker_write_thread, args=(ws,), daemon=True
             ).start()
             threading.Thread(
                 target=_worker_read_thread, args=(ws, sock, event_queue), daemon=True
+            ).start()
+            threading.Thread(
+                target=_heartbeat_thread, args=(ws, ws.send_queue), daemon=True
             ).start()
             return
         except (OSError, ValueError, json.JSONDecodeError):
@@ -379,6 +391,25 @@ def _reconnect_thread(
 
     ws.status = "DEAD"
     event_queue.put(EvReconnectWorker(worker_id=ws.worker_id, success=False, resuming=[]))
+
+
+# ── Heartbeat thread ───────────────────────────────────────────────────────────
+
+
+def _heartbeat_thread(
+    ws: WorkerState,
+    send_queue: "queue.Queue[bytes | None]",
+    interval: float = 10.0,
+) -> None:
+    """Send MsgPing every `interval` seconds to keep the TCP connection alive."""
+    while True:
+        time.sleep(interval)
+        # Stop if this send_queue has been replaced (reconnect created a new one)
+        if ws.send_queue is not send_queue:
+            break
+        if ws.status == "DEAD":
+            break
+        send_queue.put(encode(MsgPing()))
 
 
 # ── Sync thread ────────────────────────────────────────────────────────────────
@@ -652,12 +683,15 @@ def _connect_workers(
 
         sock.sendall(encode(MsgHello(token=token, controller_id="controller")))
 
-        # Start read/write threads
+        # Start read/write/heartbeat threads
         threading.Thread(
             target=_worker_write_thread, args=(ws,), daemon=True
         ).start()
         threading.Thread(
             target=_worker_read_thread, args=(ws, sock, event_queue), daemon=True
+        ).start()
+        threading.Thread(
+            target=_heartbeat_thread, args=(ws, ws.send_queue), daemon=True
         ).start()
 
         workers.append(ws)
