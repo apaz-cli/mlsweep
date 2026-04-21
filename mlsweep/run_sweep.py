@@ -853,6 +853,7 @@ def _dispatch_pending(
                         ws.in_flight[run_id] = var
                         ws.run_slots[run_id] = slot_idx
 
+                        _update_sweep_status(exp_dir, run_id, "in-progress", 0.0, var["combo"])
                         _append_manifest_run(exp_dir, var)
 
                         # Print dispatch line
@@ -903,6 +904,7 @@ def _dispatch_pending(
             run_dir = os.path.join(output_dir, experiment, run_id)
             os.makedirs(run_dir, exist_ok=True)
 
+            _update_sweep_status(exp_dir, run_id, "in-progress", 0.0, var["combo"])
             _append_manifest_run(exp_dir, var)
             inflight_treatments.add(tk)
 
@@ -1097,14 +1099,19 @@ def main() -> None:
             all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
             expected = count_expected(options)
 
-            # Resume: skip variations already completed
+            # Resume: skip variations that completed (ok) or permanently failed.
+            # "in-progress" runs are intentionally NOT skipped — they were dispatched
+            # but never reported back, meaning the session died mid-run. The original
+            # process cannot be reconnected to (token mismatch), so re-run from scratch.
             resumed_count = 0
+            prior_status: dict[str, Any] = {}
             if args.resume:
                 prior_status = _load_sweep_status(exp_dir)
                 if prior_status:
-                    completed = {name for name, s in prior_status.items() if s.get("status") == "ok"}
+                    skip_names = {name for name, s in prior_status.items()
+                                  if s.get("status") in ("ok", "failed")}
                     original_n = len(all_variations)
-                    all_variations = [v for v in all_variations if v["name"] not in completed]
+                    all_variations = [v for v in all_variations if v["name"] not in skip_names]
                     resumed_count = original_n - len(all_variations)
                     if resumed_count:
                         sweep_print(f"Resume: skipping {resumed_count} already-completed runs")
@@ -1318,8 +1325,11 @@ def main() -> None:
         next_port: list[int] = [0]
         multinode_state: dict[str, dict[str, Any]] = {}  # run_id → {pending, success, elapsed}
         results: list[tuple[Any, ...]] = []          # (var, success, elapsed, log_file)
-        failed: list[dict[str, Any]] = []
-        succeeded: list[dict[str, Any]] = []
+        # Seed from prior run so monotonic/singular skip logic carries over on --resume
+        failed: list[dict[str, Any]] = [s["combo"] for s in prior_status.values()
+                                         if s.get("status") == "failed" and "combo" in s]
+        succeeded: list[dict[str, Any]] = [s["combo"] for s in prior_status.values()
+                                            if s.get("status") == "ok" and "combo" in s]
         skipped_count = 0
         retry_counts: dict[str, int] = {}           # run_id → retry count
         log_handles: dict[str, IO[str]] = {}        # run_id → training.log file handle
@@ -1524,10 +1534,6 @@ def main() -> None:
                 if ws.status == "CONNECTED":
                     sweep_print(f"  {_YELLOW}WARN{_RESET}  Worker {ws.host} disconnected; reconnecting...")
                     ws.status = "RECONNECTING"
-                    # Mark in-flight runs as orphaned
-                    for run_id in list(ws.in_flight.keys()):
-                        _update_sweep_status(exp_dir, run_id, "orphaned", 0.0,
-                                             ws.in_flight[run_id].get("combo", {}))
                     threading.Thread(
                         target=_reconnect_thread,
                         args=(ws, event_queue, token),
@@ -1545,7 +1551,10 @@ def main() -> None:
                             log_seq=rinfo["log_seq"],
                             metric_seq=rinfo["metric_seq"],
                         )))
-                    # Re-queue orphaned runs that this worker was handling
+                    # Re-queue orphaned runs that this worker was handling but whose
+                    # original process is no longer running (not in ev.resuming).
+                    # Mark failed on disk immediately so that if this session crashes
+                    # before they complete, --resume won't retry them indefinitely.
                     orphaned = [run_id for run_id, var in ws.in_flight.items()
                                 if run_id not in {r["run_id"] for r in ev.resuming}]
                     for run_id in orphaned:
@@ -1554,25 +1563,29 @@ def main() -> None:
                             rc = retry_counts.get(run_id, 0) + 1
                             retry_counts[run_id] = rc
                             if rc <= args.max_retries:
+                                # Still retrying — keep "in-progress" on disk so a crash
+                                # during the retry causes --resume to re-queue it.
                                 pending.append(var)
                             else:
                                 sweep_print(f"  {_RED}FAIL{_RESET}  {run_id}: max retries exceeded")
+                                _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                                 results.append((var, False, 0.0,
                                                 os.path.join(output_dir, experiment, run_id, "training.log")))
                                 failed.append(var["combo"])
-                                _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                 else:
                     sweep_print(f"  {_RED}FAIL{_RESET}  Worker {ws.host} unreachable; re-queuing runs")
                     for run_id, var in ws.in_flight.items():
                         rc = retry_counts.get(run_id, 0) + 1
                         retry_counts[run_id] = rc
                         if rc <= args.max_retries:
+                            # Still retrying — keep "in-progress" on disk so a crash
+                            # during the retry causes --resume to re-queue it.
                             pending.append(var)
                         else:
+                            _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                             results.append((var, False, 0.0,
                                             os.path.join(output_dir, experiment, run_id, "training.log")))
                             failed.append(var["combo"])
-                            _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                     ws.in_flight.clear()
                     ws.busy_slots.clear()
 
