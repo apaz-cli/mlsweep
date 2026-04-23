@@ -26,6 +26,7 @@ mlsweep_run = "mlsweep.run_sweep:main"
 mlsweep_viz = "mlsweep.visualize:main"
 mlsweep_worker = "mlsweep.worker:main"
 mlsweep_export = "mlsweep.export_cmd:main"
+mlsweep_ui = "mlsweep.ui_server:main"
 
 [tool.setuptools.packages.find]
 where = [""]
