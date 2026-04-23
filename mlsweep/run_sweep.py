@@ -63,6 +63,7 @@ from mlsweep._sweep import (
 )
 from mlsweep._topology import _best_gpu_groups, _visible_devices
 from mlsweep._shared import _git_root
+from mlsweep.controller_ui import ControllerUI
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -1000,6 +1001,8 @@ def main() -> None:
                             help="Human-readable note stored in sweep_manifest.json")
         parser.add_argument("--max-retries", type=int, default=2,
                             help="Max retries for orphaned runs (default: 2)")
+        parser.add_argument("--ui-port", type=int, default=43802,
+                            help="Port for the web controller UI (default: 43802; 0 to disable)")
         parser.add_argument("--scratch-dir", default="/tmp/mlsweep",
                             help="Worker scratch directory (default: /tmp/mlsweep)")
         parser.add_argument("--wandb-project", default=None,
@@ -1083,6 +1086,9 @@ def main() -> None:
         exp_dir = os.path.join(output_dir, experiment)
         os.makedirs(exp_dir, exist_ok=True)
 
+        ui = ControllerUI()
+        ui.update(experiment=experiment, exp_dir=exp_dir, output_dir=output_dir, method=method)
+
         if not args.dry_run:
             _log_file = open(os.path.join(exp_dir, "sweep.log"), "w")
 
@@ -1118,6 +1124,8 @@ def main() -> None:
 
             variations = all_variations
             n = len(variations)
+
+        ui.update(total_expected=expected)
 
         # Header
         sweep_print(f"Command: {' '.join(command)}")
@@ -1191,6 +1199,30 @@ def main() -> None:
         if not args.dry_run and not args.validate:
             sweep_print(f"Sweep log: {os.path.join(exp_dir, 'sweep.log')}")
         sweep_print(f"Output: {output_dir}\n")
+
+        # Start web UI (optional)
+        if args.ui_port != 0:
+            _ui_result = ui.start(args.ui_port)
+            if _ui_result:
+                _ui_server, _ui_actual_port = _ui_result
+                _ui_url = f"http://localhost:{_ui_actual_port}"
+                sweep_print(f"Controller UI: {_ui_url}")
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+                        _s.connect(("8.8.8.8", 80))
+                        _public_ip = _s.getsockname()[0]
+                    if _public_ip != "127.0.0.1":
+                        sweep_print(f"               http://{_public_ip}:{_ui_actual_port}")
+                except OSError:
+                    pass
+                sweep_print("")
+            else:
+                sweep_print(f"  {_YELLOW}WARN{_RESET}  Could not bind controller UI to port {args.ui_port}\n")
+
+        # Initialize pending jobs in UI state (grid mode — bayes adds them dynamically)
+        if method != "bayes":
+            for _var in variations:
+                ui.update_job(_var["name"], status="pending", combo=_var["combo"])
 
         # Generate auth token
         token = secrets.token_hex(16)
@@ -1276,6 +1308,8 @@ def main() -> None:
                 ws.slots = [grp for grp in base_slots for _ in range(ws.jobs_per_slot)]
                 ws.status = "CONNECTED"
                 connected_count += 1
+                ui.update_worker(ev.worker_id, host=ws.host, status="CONNECTED",
+                                 gpus=ws.gpus, slots_total=len(ws.slots), slots_busy=0)
 
                 phys_slots = n_slots
                 total_jobs = len(ws.slots)  # already expanded by jobs_per_slot
@@ -1286,6 +1320,7 @@ def main() -> None:
                 ws = workers[ev.worker_id]
                 ws.status = "DEAD"
                 connected_count += 1
+                ui.update_worker(ev.worker_id, status="DEAD")
                 sweep_print(f"  {_RED}FAIL{_RESET}  {ws.host}: failed to connect")
 
         active_workers = [ws for ws in workers if ws.status == "CONNECTED"]
@@ -1316,6 +1351,8 @@ def main() -> None:
             initial_vars = optimizer.suggest(n=optimizer.n_initial)
             variations.extend(initial_vars)
             pending: list[dict[str, Any]] = list(initial_vars)
+            for _iv in initial_vars:
+                ui.update_job(_iv["name"], status="pending", combo=_iv["combo"])
         else:
             pending = list(variations)
 
@@ -1349,6 +1386,13 @@ def main() -> None:
             try:
                 ev = event_queue.get(timeout=0.5)
             except queue.Empty:
+                # Process cancel requests from the web UI
+                for _cancel_id in ui.pop_cancel_requests():
+                    for _ws_c in workers:
+                        if _cancel_id in _ws_c.in_flight and _ws_c.status == "CONNECTED":
+                            _ws_c.send_queue.put(encode(MsgCancel(run_id=_cancel_id)))
+                            sweep_print(f"  {_YELLOW}CNCL{_RESET}  {_cancel_id} (cancelled via web UI)")
+                            break
                 # Re-try dispatch in case a slot freed up
                 if pending:
                     pending = _dispatch_pending(
@@ -1368,6 +1412,12 @@ def main() -> None:
                 _var = in_flight.get(ev.run_id)
                 _combo: dict[str, Any] = _var.get("combo", {}) if _var is not None else {}
                 run_writers[ev.run_id] = factory.make(ev.run_id, _combo, run_dir)
+                _ws_s = workers[ev.worker_id]
+                _slot_s = _ws_s.run_slots.get(ev.run_id, 0)
+                _gpus_s = _ws_s.slots[_slot_s] if _slot_s < len(_ws_s.slots) else []
+                ui.update_job(ev.run_id, status="running", pid=ev.pid, started_at=time.time(),
+                              worker_host=_ws_s.host, gpu_ids=_gpus_s)
+                ui.update_worker(ev.worker_id, slots_busy=len(_ws_s.busy_slots))
 
             elif isinstance(ev, EvLogLine):
                 _log_fh = log_handles.get(ev.run_id)
@@ -1405,6 +1455,7 @@ def main() -> None:
                     used_gpu_group = ws.slots[used_slot_idx] if used_slot_idx < len(ws.slots) else []
                 else:
                     used_gpu_group = []
+                ui.update_worker(ev.worker_id, slots_busy=len(ws.busy_slots))
 
                 # Multi-node aggregation: wait for all nodes to complete
                 if ev.run_id in multinode_state:
@@ -1457,6 +1508,8 @@ def main() -> None:
                     _update_sweep_status(exp_dir, ev.run_id,
                                          "ok" if ev.success else "failed",
                                          ev.elapsed, var["combo"])
+                    ui.update_job(ev.run_id, status="ok" if ev.success else "failed",
+                                  elapsed=ev.elapsed)
 
                     # Bayes: report result to optimizer and queue next suggestion
                     if optimizer is not None and ev.success and tk not in told_treatments:
@@ -1468,6 +1521,8 @@ def main() -> None:
                             new_vars = optimizer.suggest(n=1)
                             pending.extend(new_vars)
                             variations.extend(new_vars)
+                            for _nv in new_vars:
+                                ui.update_job(_nv["name"], status="pending", combo=_nv["combo"])
 
                     pad = max((len(v["name"]) for v in variations), default=0)
                     nm = ev.run_id.ljust(pad)
@@ -1534,6 +1589,7 @@ def main() -> None:
                 if ws.status == "CONNECTED":
                     sweep_print(f"  {_YELLOW}WARN{_RESET}  Worker {ws.host} disconnected; reconnecting...")
                     ws.status = "RECONNECTING"
+                    ui.update_worker(ev.worker_id, status="RECONNECTING")
                     threading.Thread(
                         target=_reconnect_thread,
                         args=(ws, event_queue, token),
@@ -1543,6 +1599,8 @@ def main() -> None:
             elif isinstance(ev, EvReconnectWorker):
                 ws = workers[ev.worker_id]
                 if ev.success:
+                    ui.update_worker(ev.worker_id, status="CONNECTED",
+                                     slots_busy=len(ws.busy_slots))
                     sweep_print(f"  {_GREEN}OK{_RESET}    Worker {ws.host} reconnected")
                     # Send MsgReplay for each resuming run
                     for rinfo in ev.resuming:
@@ -1573,6 +1631,7 @@ def main() -> None:
                                                 os.path.join(output_dir, experiment, run_id, "training.log")))
                                 failed.append(var["combo"])
                 else:
+                    ui.update_worker(ev.worker_id, status="DEAD", slots_busy=0)
                     sweep_print(f"  {_RED}FAIL{_RESET}  Worker {ws.host} unreachable; re-queuing runs")
                     for run_id, var in ws.in_flight.items():
                         rc = retry_counts.get(run_id, 0) + 1
@@ -1581,11 +1640,13 @@ def main() -> None:
                             # Still retrying — keep "in-progress" on disk so a crash
                             # during the retry causes --resume to re-queue it.
                             pending.append(var)
+                            ui.update_job(run_id, status="pending")
                         else:
                             _update_sweep_status(exp_dir, run_id, "failed", 0.0, var["combo"])
                             results.append((var, False, 0.0,
                                             os.path.join(output_dir, experiment, run_id, "training.log")))
                             failed.append(var["combo"])
+                            ui.update_job(run_id, status="failed", elapsed=0.0)
                     ws.in_flight.clear()
                     ws.busy_slots.clear()
 
