@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>mlsweep — Experiments</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
+  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+  --plot-bg: white; --plot-grid: #eee; --plot-text: #444;
+  --swatch-border: rgba(0,0,0,0.15);
+}
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
+  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa;
+  --swatch-border: rgba(255,255,255,0.15);
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; }
+
+/* Nav */
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-title { font-size: 13px; font-weight: 700; color: var(--text-strong); margin-right: 10px; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+/* Content */
+#content { flex: 1; overflow-y: auto; padding: 18px 24px; }
+
+h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom: 14px; }
+
+/* Status badges */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+.badge-pending  { background: #44444466; color: var(--text-dim); }
+.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
+.badge-running  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-done     { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
+.badge-failed   { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-xfailed  { background: #e07b0022; color: #c87000; border: 1px solid #e07b0044; }
+.badge-cancelled { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+[data-theme=dark] .badge-xfailed { color: #e8a030; border-color: #e8a03044; background: #e8a03022; }
+[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
+
+/* Experiments table */
+.exp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.exp-table th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+.exp-row td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.exp-row:hover td { background: var(--btn-hover); }
+.exp-row.expanded td { background: var(--btn-hover); }
+.exp-toggle { cursor: pointer; font-size: 11px; color: var(--text-dim); user-select: none; margin-right: 6px; }
+.exp-name-cell { display: flex; align-items: center; }
+.exp-name { font-weight: 600; color: var(--text-strong); }
+.exp-note { font-size: 11px; color: var(--text-muted); font-style: italic; margin-left: 8px; }
+.exp-actions { display: flex; gap: 6px; align-items: center; }
+.btn-link { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.btn-link:hover { background: var(--btn-hover); }
+.btn-delete { color: #c0392b; border-color: #c0392b44; }
+.btn-delete:hover { background: #c0392b18; }
+
+/* Jobs sub-table */
+.jobs-row td { padding: 0; }
+.jobs-container { padding: 6px 20px 12px 40px; background: var(--bg); border-bottom: 1px solid var(--border); }
+.jobs-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.jobs-table th { text-align: left; padding: 4px 8px; color: var(--text-dim); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); }
+.jobs-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.jobs-table tr:last-child td { border-bottom: none; }
+.mono { font-family: monospace; font-size: 10px; }
+.combo-cell { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+
+.count-cell { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+#empty-msg { color: var(--text-muted); font-size: 13px; margin-top: 40px; text-align: center; }
+#error-msg { color: #d62728; font-size: 12px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-link active" id="nav-experiments" href="#">Experiments</a>
+  <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link" id="nav-system" href="#">System</a>
+  <span class="nav-spacer"></span>
+  <button id="theme-toggle" title="Toggle theme">☀</button>
+</nav>
+<div id="content">
+  <h2>Experiments</h2>
+  <div id="error-msg" style="display:none"></div>
+  <div id="empty-msg" style="display:none">No experiments found.</div>
+  <table class="exp-table" id="exp-table">
+    <thead>
+      <tr>
+        <th style="width:28%">Name</th>
+        <th style="width:8%">Status</th>
+        <th style="width:6%;text-align:right">Done</th>
+        <th style="width:6%;text-align:right">Failed</th>
+        <th style="width:6%;text-align:right">XFailed</th>
+        <th style="width:6%;text-align:right">Running</th>
+        <th style="width:6%;text-align:right">Total</th>
+        <th style="width:12%">Submitted</th>
+        <th style="width:22%">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="exp-tbody"></tbody>
+  </table>
+</div>
+
+<script>
+// ── Token handling ────────────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
+if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+
+function apiFetch(path, opts = {}) {
+  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+}
+function pageHref(page) {
+  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
+}
+
+// ── Nav links ─────────────────────────────────────────────────────────────────
+document.getElementById("nav-results").href = pageHref("results.html");
+document.getElementById("nav-system").href  = pageHref("system.html");
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+(function() {
+  const btn  = document.getElementById("theme-toggle");
+  const root = document.documentElement;
+  function applyTheme(dark) {
+    dark ? root.setAttribute("data-theme","dark") : root.removeAttribute("data-theme");
+    btn.textContent = dark ? "☀" : "☾";
+  }
+  applyTheme(localStorage.getItem("theme") !== "light");
+  btn.addEventListener("click", () => {
+    const dark = root.getAttribute("data-theme") !== "dark";
+    localStorage.setItem("theme", dark ? "dark" : "light");
+    applyTheme(dark);
+  });
+})();
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const expandedExps = new Set();
+const jobsCache = {};  // experiment_id → [jobs]
+let experiments = [];
+
+// ── Status badge ──────────────────────────────────────────────────────────────
+function badge(status) {
+  return `<span class="badge badge-${status}">${status}</span>`;
+}
+
+// ── Relative time ─────────────────────────────────────────────────────────────
+function relTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso), now = Date.now(), diff = now - d.getTime();
+  if (diff < 60e3) return "just now";
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
+  return Math.floor(diff / 86400e3) + "d ago";
+}
+
+function fmtElapsed(s) {
+  if (s == null) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
+}
+
+
+async function deleteExperiment(expId) {
+  if (!confirm(`Delete experiment "${expId}" and all its jobs?`)) return;
+  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
+  if (r.ok) {
+    document.getElementById(`exp-row-${expId}`)?.remove();
+    document.getElementById(`jobs-row-${expId}`)?.remove();
+    experiments = experiments.filter(e => e.experiment_id !== expId);
+  } else {
+    alert(`Delete failed: ${r.status}`);
+  }
+}
+
+// ── Render jobs sub-table ─────────────────────────────────────────────────────
+function renderJobs(expId) {
+  const jobs = jobsCache[expId] || [];
+  const rows = jobs.map(j => {
+    const comboObj = j.combo ? (typeof j.combo === "string" ? (() => { try { return JSON.parse(j.combo); } catch { return {}; } })() : j.combo) : {};
+    const comboStr = Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" ");
+    return `<tr>
+      <td class="mono">${j.run_id}</td>
+      <td>${badge(j.status)}</td>
+      <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
+      <td>${fmtElapsed(j.elapsed)}</td>
+      <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="jobs-container">
+    <table class="jobs-table">
+      <thead><tr><th>Run ID</th><th>Status</th><th>Worker</th><th>Elapsed</th><th>Combo</th></tr></thead>
+      <tbody>${rows || "<tr><td colspan=5 style='color:var(--text-muted)'>No jobs</td></tr>"}</tbody>
+    </table>
+  </div>`;
+}
+
+// ── Toggle expand ──────────────────────────────────────────────────────────────
+async function toggleExpand(expId) {
+  const jobsRow = document.getElementById(`jobs-row-${expId}`);
+  const expRow  = document.getElementById(`exp-row-${expId}`);
+  const toggle  = expRow ? expRow.querySelector(".exp-toggle") : null;
+
+  if (expandedExps.has(expId)) {
+    expandedExps.delete(expId);
+    if (jobsRow) jobsRow.style.display = "none";
+    if (toggle) toggle.textContent = "▶";
+    expRow && expRow.classList.remove("expanded");
+    return;
+  }
+
+  expandedExps.add(expId);
+  if (toggle) toggle.textContent = "▼";
+  expRow && expRow.classList.add("expanded");
+
+  if (!jobsCache[expId]) {
+    try {
+      const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
+      jobsCache[expId] = await r.json();
+    } catch {
+      jobsCache[expId] = [];
+    }
+  }
+
+  if (jobsRow) {
+    jobsRow.style.display = "";
+    jobsRow.querySelector("td").innerHTML = renderJobs(expId);
+  }
+}
+
+// ── Refresh jobs for expanded experiments ─────────────────────────────────────
+async function refreshExpandedJobs() {
+  for (const expId of expandedExps) {
+    try {
+      const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
+      jobsCache[expId] = await r.json();
+      const jobsRow = document.getElementById(`jobs-row-${expId}`);
+      if (jobsRow && jobsRow.style.display !== "none") {
+        jobsRow.querySelector("td").innerHTML = renderJobs(expId);
+      }
+    } catch {}
+  }
+}
+
+// ── Render experiments table ──────────────────────────────────────────────────
+function renderExperiments(exps) {
+  const tbody = document.getElementById("exp-tbody");
+  const emptyMsg = document.getElementById("empty-msg");
+  const table = document.getElementById("exp-table");
+
+  if (exps.length === 0) {
+    table.style.display = "none";
+    emptyMsg.style.display = "";
+    return;
+  }
+  table.style.display = "";
+  emptyMsg.style.display = "none";
+
+  // Keep track of which rows already exist to avoid full re-render.
+  const existingIds = new Set(
+    [...tbody.querySelectorAll(".exp-row")].map(r => r.dataset.expId)
+  );
+  const newIds = new Set(exps.map(e => e.experiment_id));
+
+  // Remove stale rows.
+  for (const id of existingIds) {
+    if (!newIds.has(id)) {
+      document.getElementById(`exp-row-${id}`)?.remove();
+      document.getElementById(`jobs-row-${id}`)?.remove();
+    }
+  }
+
+  // Insert/update rows.
+  exps.forEach((exp, idx) => {
+    const expId = exp.experiment_id;
+    const existingRow = document.getElementById(`exp-row-${expId}`);
+    const isExpanded = expandedExps.has(expId);
+
+    const c = exp.job_counts || {};
+    const running = (c.running || 0) + (c.dispatched || 0);
+    const total = c.total || exp.expected_jobs || 0;
+    const html = `<td>
+        <div class="exp-name-cell">
+          <span class="exp-toggle" onclick="toggleExpand('${expId}')">${isExpanded ? "▼" : "▶"}</span>
+          <span class="exp-name" onclick="toggleExpand('${expId}')" style="cursor:pointer">${exp.name || expId}</span>
+          ${exp.note ? `<span class="exp-note">${exp.note}</span>` : ""}
+        </div>
+      </td>
+      <td>${badge(exp.status || "unknown")}</td>
+      <td class="count-cell">${c.done || 0}</td>
+      <td class="count-cell">${c.failed ? `<span style="color:#d62728">${c.failed}</span>` : "—"}</td>
+      <td class="count-cell">${c.xfailed ? `<span style="color:#c87000">${c.xfailed}</span>` : "—"}</td>
+      <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : "—"}</td>
+      <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
+      <td>${relTime(exp.submit_time)}</td>
+      <td class="exp-actions">
+        <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
+        <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
+      </td>`;
+
+    if (existingRow) {
+      existingRow.innerHTML = html;
+      existingRow.classList.toggle("expanded", isExpanded);
+    } else {
+      // Insert new row at correct position.
+      const tr = document.createElement("tr");
+      tr.className = "exp-row";
+      tr.id = `exp-row-${expId}`;
+      tr.dataset.expId = expId;
+      tr.innerHTML = html;
+
+      const jobsTr = document.createElement("tr");
+      jobsTr.className = "jobs-row";
+      jobsTr.id = `jobs-row-${expId}`;
+      jobsTr.style.display = isExpanded ? "" : "none";
+      jobsTr.innerHTML = `<td colspan="9"></td>`;
+
+      // Insert at idx*2 position (each exp takes 2 rows).
+      const allRows = tbody.querySelectorAll(".exp-row");
+      if (idx < allRows.length) {
+        tbody.insertBefore(jobsTr, allRows[idx]);
+        tbody.insertBefore(tr, jobsTr);
+      } else {
+        tbody.appendChild(tr);
+        tbody.appendChild(jobsTr);
+      }
+    }
+
+    // Update jobs row content if expanded.
+    if (isExpanded) {
+      const jobsRow = document.getElementById(`jobs-row-${expId}`);
+      if (jobsRow && jobsCache[expId]) {
+        jobsRow.querySelector("td").innerHTML = renderJobs(expId);
+      }
+    }
+  });
+}
+
+// ── Fetch and refresh ─────────────────────────────────────────────────────────
+async function fetchExperiments() {
+  try {
+    const r = await apiFetch("/api/experiments");
+    if (!r.ok) {
+      document.getElementById("error-msg").textContent = `API error: ${r.status}`;
+      document.getElementById("error-msg").style.display = "";
+      return;
+    }
+    experiments = await r.json();
+    document.getElementById("error-msg").style.display = "none";
+    renderExperiments(experiments);
+  } catch (e) {
+    document.getElementById("error-msg").textContent = `Failed to fetch: ${e}`;
+    document.getElementById("error-msg").style.display = "";
+  }
+}
+
+fetchExperiments();
+setInterval(fetchExperiments, 5000);
+setInterval(refreshExpandedJobs, 10000);
+</script>
+</body>
+</html>

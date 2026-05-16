@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>mlsweep — System</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
+  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+  --plot-bg: white; --plot-grid: #eee; --plot-text: #444;
+  --swatch-border: rgba(0,0,0,0.15);
+}
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
+  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa;
+  --swatch-border: rgba(255,255,255,0.15);
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; }
+
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-title { font-size: 13px; font-weight: 700; color: var(--text-strong); margin-right: 10px; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+#content { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 24px; }
+
+h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
+h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+
+/* Status badges */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+.badge-connected  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-offline    { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+.badge-dead       { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-running    { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
+[data-theme=dark] .badge-connected { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-running   { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+
+/* Workers grid */
+.workers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.worker-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.worker-header { display: flex; justify-content: space-between; align-items: center; }
+.worker-host { font-size: 13px; font-weight: 600; color: var(--text-strong); font-family: monospace; }
+.worker-detail { font-size: 11px; color: var(--text-muted); }
+.worker-detail span { color: var(--text-dim); }
+
+.gpus-section { display: flex; flex-direction: column; gap: 4px; }
+.gpu-row { display: flex; align-items: center; gap: 6px; }
+.gpu-label { font-size: 10px; color: var(--text-dim); min-width: 36px; font-family: monospace; }
+.gpu-count { font-size: 10px; color: var(--text-dim); }
+
+/* In-flight jobs table */
+.jobs-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.jobs-table th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+.jobs-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.mono { font-family: monospace; font-size: 11px; }
+.no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
+  <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link active" id="nav-system" href="#">System</a>
+  <span class="nav-spacer"></span>
+  <button id="theme-toggle" title="Toggle theme">☀</button>
+</nav>
+<div id="content">
+  <div>
+    <h2>System Status</h2>
+    <h3>Workers</h3>
+    <div id="workers-grid" class="workers-grid">
+      <div class="no-data">Loading…</div>
+    </div>
+  </div>
+  <div>
+    <h3>In-Flight Jobs</h3>
+    <table class="jobs-table">
+      <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th></tr></thead>
+      <tbody id="inflight-tbody"><tr><td colspan="6" class="no-data">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// ── Token handling ────────────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
+if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+
+function apiFetch(path, opts = {}) {
+  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+}
+function pageHref(page) {
+  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
+}
+
+document.getElementById("nav-experiments").href = pageHref("experiments.html");
+document.getElementById("nav-results").href    = pageHref("results.html");
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+(function() {
+  const btn  = document.getElementById("theme-toggle");
+  const root = document.documentElement;
+  function applyTheme(dark) {
+    dark ? root.setAttribute("data-theme","dark") : root.removeAttribute("data-theme");
+    btn.textContent = dark ? "☀" : "☾";
+  }
+  applyTheme(localStorage.getItem("theme") !== "light");
+  btn.addEventListener("click", () => {
+    const dark = root.getAttribute("data-theme") !== "dark";
+    localStorage.setItem("theme", dark ? "dark" : "light");
+    applyTheme(dark);
+  });
+})();
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function badge(cls, label) {
+  return `<span class="badge badge-${cls}">${label}</span>`;
+}
+
+function relTime(iso) {
+  if (!iso) return "—";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60e3) return "just now";
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
+  return Math.floor(diff / 86400e3) + "d ago";
+}
+
+function fmtElapsed(s) {
+  if (s == null) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
+}
+
+// ── Render workers ─────────────────────────────────────────────────────────────
+function renderWorkers(workers) {
+  const grid = document.getElementById("workers-grid");
+  if (!workers.length) {
+    grid.innerHTML = `<div class="no-data">No workers connected.</div>`;
+    return;
+  }
+
+  grid.innerHTML = workers.map(w => {
+    const gpus = w.gpus || [];
+    const occ  = w.gpu_occupancy || {};
+    const status = w.status || "offline";
+
+    const gpuRows = gpus.map(gid => {
+      const used = occ[gid] || occ[String(gid)] || 0;
+      return `<div class="gpu-row">
+        <span class="gpu-label">GPU ${gid}</span>
+        <span class="gpu-count">${used} running</span>
+      </div>`;
+    }).join("");
+
+    return `<div class="worker-card">
+      <div class="worker-header">
+        <span class="worker-host">${w.host}${w.port ? `:${w.port}` : ""}</span>
+        ${badge(status, status)}
+      </div>
+      ${gpuRows ? `<div class="gpus-section">${gpuRows}</div>` : ""}
+      <div class="worker-detail">
+        ${w.scratch_dir ? `<div><span>scratch</span> ${w.scratch_dir}</div>` : ""}
+        ${w.last_seen ? `<div><span>last seen</span> ${relTime(w.last_seen)}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// ── Render in-flight jobs ──────────────────────────────────────────────────────
+function renderInFlight(jobs) {
+  const tbody = document.getElementById("inflight-tbody");
+  if (!jobs.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="no-data">No jobs currently running.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = jobs.map(j => `<tr>
+    <td class="mono">${j.run_id.slice(0,20)}</td>
+    <td class="mono">${j.experiment_id || "—"}</td>
+    <td>${badge(j.status, j.status)}</td>
+    <td class="mono">${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
+    <td class="mono">${j.dispatched_gpu_ids ? JSON.parse(j.dispatched_gpu_ids || "[]").join(",") : "—"}</td>
+    <td>${fmtElapsed(j.elapsed)}</td>
+  </tr>`).join("");
+}
+
+// ── Poll ──────────────────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const [wRes, jRes] = await Promise.all([
+      apiFetch("/api/workers"),
+      apiFetch("/api/jobs?status=running"),
+    ]);
+    const workers = wRes.ok ? await wRes.json() : [];
+    const jobs    = jRes.ok ? await jRes.json() : [];
+    renderWorkers(workers);
+    renderInFlight(jobs);
+  } catch (e) {
+    console.error("refresh error:", e);
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

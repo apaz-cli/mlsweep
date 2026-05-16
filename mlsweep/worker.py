@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import socket
@@ -41,6 +42,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, IO
+from urllib.request import urlopen
 
 from mlsweep._shared import (
     MsgCancel,
@@ -61,7 +63,7 @@ from mlsweep._shared import (
     decode,
     encode,
 )
-from mlsweep._topology import _gpu_topology, _visible_devices
+from mlsweep._topology import _gpu_topology, visible_devices
 
 # ── Run state ──────────────────────────────────────────────────────────────────
 
@@ -101,6 +103,33 @@ _scratch_dir: str = "/tmp/mlsweep"
 _remote_dir: str = ""
 _token: str = ""
 _device_override: list[int] | None = None  # None = use all visible
+_ipc_sock_path: str = "/tmp/mlsweep/.worker.sock"  # set to port-specific path at startup
+
+
+# ── Artifact download serialisation ──────────────────────────────────────────
+
+_artifact_locks: dict[str, threading.Lock] = {}
+_artifact_lock_refs: dict[str, int] = {}
+
+def _artifact_lock_for(artifact_id: str) -> threading.Lock:
+    """Return a per-artifact lock so concurrent runs do not clobber downloads."""
+    with _lock:
+        lock = _artifact_locks.get(artifact_id)
+        if lock is None:
+            lock = threading.Lock()
+            _artifact_locks[artifact_id] = lock
+            _artifact_lock_refs[artifact_id] = 0
+        _artifact_lock_refs[artifact_id] += 1
+        return lock
+
+def _artifact_lock_done(artifact_id: str) -> None:
+    with _lock:
+        refs = _artifact_lock_refs.get(artifact_id, 0)
+        if refs <= 1:
+            _artifact_locks.pop(artifact_id, None)
+            _artifact_lock_refs.pop(artifact_id, None)
+        else:
+            _artifact_lock_refs[artifact_id] = refs - 1
 
 
 # ── Wire I/O helpers ───────────────────────────────────────────────────────────
@@ -178,7 +207,7 @@ def _read_thread(conn: ConnState) -> None:
         return
 
     # Build and send MsgWorkerHello
-    gpus = _visible_devices()
+    gpus = visible_devices()
     if _device_override is not None:
         gpus = [g for g in _device_override if g in gpus]
     topo_internal = _gpu_topology()
@@ -242,8 +271,30 @@ def _handle_msg(msg: Any, conn: ConnState) -> None:
             conn.send_queue.put(encode(MsgPong()))
 
 
+def _download_file(url: str, dest: str, timeout: int = 300) -> None:
+    """Download a file from *url* to *dest* via HTTP GET."""
+    with urlopen(url, timeout=timeout) as resp:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     """Spawn one training subprocess per GPU in the run's GPU group."""
+    try:
+        _handle_run_inner(msg, conn)
+    except Exception as exc:
+        print(f"[worker] ERROR in run {msg.run_id}: {exc}", file=sys.stderr, flush=True)
+        if not conn.closed:
+            conn.send_queue.put(encode(MsgResult(
+                run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1
+            )))
+
+
+def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
     scratch_path = os.path.join(_scratch_dir, msg.experiment, msg.run_id)
     log_path = os.path.join(scratch_path, "training.log")
     metrics_path = os.path.join(scratch_path, "metrics.jsonl")
@@ -257,15 +308,7 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     # Workspace creation from file payload
     if msg.files:
         workspace = os.path.join(scratch_path, "workspace")
-        base_dir = msg.remote_dir or _remote_dir
-        if base_dir and os.path.isdir(base_dir):
-            # Hard-link copy: large staged files cost no extra disk space
-            subprocess.run(
-                ["rsync", "-a", "--link-dest", base_dir + "/", base_dir + "/", workspace + "/"],
-                check=True,
-            )
-        else:
-            os.makedirs(workspace, exist_ok=True)
+        os.makedirs(workspace, exist_ok=True)
         for rel_path, content in msg.files.items():
             abs_path = os.path.join(workspace, rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -276,6 +319,45 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
         remote_dir = msg.remote_dir or _remote_dir
         cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
 
+    # ── Artifact download & extraction ───────────────────────────────────────
+    if msg.artifact_id and msg.artifact_url:
+        with _artifact_lock_for(msg.artifact_id):
+            if workspace is None:
+                workspace = os.path.join(scratch_path, "workspace")
+                os.makedirs(workspace, exist_ok=True)
+            tarball_url = msg.artifact_url
+            tarball_path = os.path.join(scratch_path, "artifact.tar.gz")
+            _download_file(tarball_url, tarball_path)
+            try:
+                subprocess.run(
+                    ["tar", "-xzf", tarball_path, "-C", workspace],
+                    check=True,
+                )
+            finally:
+                try:
+                    os.unlink(tarball_path)
+                except OSError:
+                    pass
+            cwd = workspace
+        _artifact_lock_done(msg.artifact_id)
+
+    # ── Optional setup command ───────────────────────────────────────────────
+    if msg.setup_command:
+        if workspace is None:
+            workspace = os.path.join(scratch_path, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            cwd = workspace
+        # Resolve setup_command: accept list[str] (preferred) or str (legacy)
+        cmd = msg.setup_command
+        if isinstance(cmd, str) and cmd:
+            cmd = shlex.split(cmd)
+        subprocess.run(
+            cmd,
+            shell=False,
+            cwd=workspace,
+            check=True,
+        )
+
     # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)
     base_env = {**os.environ, **msg.env}
@@ -284,9 +366,11 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     base_env["MLSWEEP_RUN_DIR"] = artifacts_path
     base_env["MLSWEEP_RUN_NAME"] = msg.run_id
     base_env["EXP_EXPERIMENT"] = msg.experiment
-    base_env["MLSWEEP_WORKER_SOCKET"] = os.path.join(_scratch_dir, ".worker.sock")
+    base_env["MLSWEEP_WORKER_SOCKET"] = _ipc_sock_path
     if workspace is not None:
         base_env["MLSWEEP_WORKSPACE"] = workspace
+        existing = base_env.get("PYTHONPATH", "")
+        base_env["PYTHONPATH"] = workspace + (os.pathsep + existing if existing else "")
     base_env.pop("EXP_SERVER", None)
 
     # Pre-compute dist env values if SET_DIST_ENV is requested
@@ -410,6 +494,14 @@ def _run_thread(
     with _lock:
         _in_flight.pop(state.run_id, None)
         _busy_gpus.difference_update(state.gpu_ids)
+
+    # Free the workspace (large extracted artifact copy); keep logs and output artifacts.
+    workspace_dir = os.path.join(state.scratch_path, "workspace")
+    if os.path.isdir(workspace_dir):
+        try:
+            shutil.rmtree(workspace_dir)
+        except OSError:
+            pass
 
     if not conn.closed:
         conn.send_queue.put(encode(MsgResult(
@@ -695,9 +787,12 @@ def main() -> None:
         # Print port so the controller can read it and connect
         print(f"PORT={port}", flush=True)
 
-        # Start IPC thread for logger.py connections
-        sock_path = os.path.join(_scratch_dir, ".worker.sock")
-        ipc_t = threading.Thread(target=_ipc_thread, args=(sock_path,), daemon=True)
+        # Start IPC thread for logger.py connections.
+        # Use a port-specific socket name so multiple workers on the same host
+        # (e.g., concurrent test workers) don't clobber each other's sockets.
+        global _ipc_sock_path
+        _ipc_sock_path = os.path.join(_scratch_dir, f".worker-{port}.sock")
+        ipc_t = threading.Thread(target=_ipc_thread, args=(_ipc_sock_path,), daemon=True)
         ipc_t.start()
 
         # Enter accept loop (blocks until _shutdown_event is set)

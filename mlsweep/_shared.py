@@ -106,11 +106,19 @@ class MsgRun:
     set_dist_env: bool = False
     files: dict[str, str] = field(default_factory=dict)
     # {workspace-relative path: text content}. Worker creates an isolated
-    # workspace, hard-links from remote_dir, then writes these files.
+    # workspace directory and writes these files into it.
     # Sets MLSWEEP_WORKSPACE; cwd becomes workspace instead of remote_dir.
     return_files: list[str] = field(default_factory=list)
     # Workspace-relative paths copied into artifacts/ after the run,
     # before the normal artifact rsync.
+    artifact_id: str = ""
+    # Opaque identifier for the artifact tarball (used as download subpath).
+    artifact_url: str = ""
+    # Base URL of the artifact manager (e.g. "http://host:port").
+    # Worker fetches {artifact_url}/{artifact_id}.tar.gz if both are set.
+    setup_command: list[str] = field(default_factory=list)
+    # Command list executed in the workspace after artifact extraction
+    # and before training. Run without shell for safety.
     t: str = "run"
 
 

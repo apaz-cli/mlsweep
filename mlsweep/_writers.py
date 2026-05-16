@@ -1,7 +1,6 @@
 """RunWriter protocol and built-in writer implementations."""
 
 import json
-import os
 from typing import Any, IO, Protocol
 
 
@@ -29,18 +28,6 @@ class MlsweepRunWriter:
 
     def on_finish(self, status: str, elapsed: float) -> None:
         self._fh.close()
-
-
-class MlsweepWriterFactory:
-    def on_sweep_start(self, experiment: str, dims: list[str], runs: list[str]) -> None:
-        pass
-
-    def make(self, run_id: str, combo: dict[str, Any], output_run_dir: str) -> RunWriter:
-        path = os.path.join(output_run_dir, "metrics.jsonl")
-        return MlsweepRunWriter(path)
-
-    def on_sweep_end(self) -> None:
-        pass
 
 
 # ── MultiWriter ────────────────────────────────────────────────────────────────

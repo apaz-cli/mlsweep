@@ -106,6 +106,12 @@ def test_continuous_int_uniform():
         assert 2 <= v <= 8
 
 
+def test_singular_flag_preserved():
+    opts = {".bs": {"values": [64, 32], "flags": "--bs", "singular": True}}
+    validate_options(opts)
+    assert opts[".bs"].get("singular") is True
+
+
 def test_monotonic_decreasing_reverses():
     opts = {".bs": {"values": [64, 32, 16, 8], "flags": "--bs", "monotonic": "decreasing"}}
     validate_options(opts)
@@ -116,12 +122,6 @@ def test_monotonic_increasing_preserves():
     opts = {".bs": {"values": [8, 16, 32, 64], "flags": "--bs", "monotonic": "increasing"}}
     validate_options(opts)
     assert opts[".bs"]["_values"] == [8, 16, 32, 64]
-
-
-def test_singular_flag_preserved():
-    opts = {".bs": {"values": [64, 32], "flags": "--bs", "singular": True}}
-    validate_options(opts)
-    assert opts[".bs"].get("singular") is True
 
 
 # ── Error cases ─────────────────────────────────────────────────────────────────

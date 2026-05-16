@@ -113,8 +113,6 @@ OPTIONS = {
 }
 ```
 
-Requires `pip install 'mlsweep[bayes]'` (should be installed if you install `'mlsweep[all]'`).
-
 Run the same way as any other sweep:
 
 ```sh

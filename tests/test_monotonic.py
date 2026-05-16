@@ -72,7 +72,6 @@ def test_decreasing_no_skip_without_fail():
 
 
 def test_increasing_does_not_skip_before_failure():
-    # Values before the failing index are not skipped
     opts = _opts("increasing", [8, 16, 32, 64])
     validate_options(opts)
     stripped = {k[1:]: v for k, v in opts.items()}
@@ -81,28 +80,11 @@ def test_increasing_does_not_skip_before_failure():
 
 
 def test_decreasing_does_not_skip_before_failure():
-    # _values = [8, 16, 32, 64]; values with lower index than failure are not skipped
     opts = _opts("decreasing", [64, 32, 16, 8])
     validate_options(opts)
     stripped = {k[1:]: v for k, v in opts.items()}
     assert not should_skip(_combo(8),  [_combo(32)], [], stripped)
     assert not should_skip(_combo(16), [_combo(32)], [], stripped)
-
-
-def test_decreasing_trial_order_in_variations():
-    opts = {".bs": {"values": [64, 32, 16, 8], "flags": "--bs", "monotonic": "decreasing"}}
-    validate_options(opts)
-    vars_ = generate_variations("s", opts)
-    names = [v["name"] for v in vars_]
-    assert names == ["s_bs8", "s_bs16", "s_bs32", "s_bs64"]
-
-
-def test_increasing_trial_order_in_variations():
-    opts = {".bs": {"values": [8, 16, 32, 64], "flags": "--bs", "monotonic": "increasing"}}
-    validate_options(opts)
-    vars_ = generate_variations("s", opts)
-    names = [v["name"] for v in vars_]
-    assert names == ["s_bs8", "s_bs16", "s_bs32", "s_bs64"]
 
 
 def test_skip_only_fires_when_other_dims_match():
@@ -128,3 +110,19 @@ def test_decreasing_skip_only_fires_when_other_dims_match():
     failed = [{"bs": 32, "lr": 1e-3}]
     assert     should_skip({"bs": 64, "lr": 1e-3}, failed, [], stripped)
     assert not should_skip({"bs": 64, "lr": 1e-4}, failed, [], stripped)
+
+
+def test_decreasing_trial_order_in_variations():
+    opts = {".bs": {"values": [64, 32, 16, 8], "flags": "--bs", "monotonic": "decreasing"}}
+    validate_options(opts)
+    vars_ = generate_variations("s", opts)
+    names = [v["name"] for v in vars_]
+    assert names == ["s_bs8", "s_bs16", "s_bs32", "s_bs64"]
+
+
+def test_increasing_trial_order_in_variations():
+    opts = {".bs": {"values": [8, 16, 32, 64], "flags": "--bs", "monotonic": "increasing"}}
+    validate_options(opts)
+    vars_ = generate_variations("s", opts)
+    names = [v["name"] for v in vars_]
+    assert names == ["s_bs8", "s_bs16", "s_bs32", "s_bs64"]

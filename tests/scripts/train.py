@@ -6,13 +6,12 @@ metrics via MLSweepLogger. Reads run dir/name/experiment from the env
 vars set by mlsweep_run; falls back to sensible defaults for standalone use.
 """
 
-import os
 import argparse
 import math
+import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from mlsweep.logger import MLSweepLogger
 
 

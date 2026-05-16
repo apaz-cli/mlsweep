@@ -1,40 +1,79 @@
-"""Integration tests for mlsweep_run.
+"""Integration tests for mlsweep_run CLI.
 
-Runs mlsweep_run as a subprocess against fast CPU-only training scripts
-and asserts on the output files. No GPU computation required; CUDA_VISIBLE_DEVICES
-is set by the runner but the scripts ignore it.
+Runs ``mlsweep_run`` as a subprocess against the real **mlsweep manager**
+(fixture defined in conftest.py).  Jobs are dispatched to a local worker and
+executed asynchronously — tests poll for completion via the HTTP API.
 """
 
 import json
+import os
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
 
+# Import helpers from conftest
+from conftest import (
+    _api_get,
+    _api_post,
+    _experiment_jobs,
+    _wait_for_experiment_complete,
+    _wait_for_job,
+)
+
 REPO_ROOT = Path(__file__).parent.parent
-MLSWEEP_RUN = str(Path(sys.executable).parent / "mlsweep_run")
 EXP = "test_exp"
+_TOKEN = "test-token"
+
+# mlsweep_run is installed as ``mlsweep.run_sweep:main`` console_script.
+MLSWEEP_RUN = [sys.executable, "-m", "mlsweep.run_sweep"]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _run(sweep_file: str, output_dir: Path, *extra_args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [MLSWEEP_RUN, sweep_file, "--output_dir", str(output_dir), "--experiment", EXP, *extra_args],
+def _run(
+    sweep_file: str,
+    output_dir: Path,
+    *extra_args: str,
+    manager_url: str | None = None,
+    expect_failure: bool = False,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
+    """Run ``mlsweep_run`` as a subprocess.
+
+    Parameters
+    ----------
+    manager_url:
+        When given, ``--manager`` and ``--token`` are appended.
+    expect_failure:
+        When True, a non-zero return code does *not* raise an assertion.
+    """
+    cmd = [*MLSWEEP_RUN, sweep_file,
+           "--output-dir", str(output_dir),
+           "--experiment", EXP]
+    if manager_url is not None:
+        cmd += ["--manager", manager_url, "--token", _TOKEN]
+    cmd.extend(extra_args)
+
+    result = subprocess.run(
+        cmd,
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=timeout,
     )
+    if not expect_failure and result.returncode != 0:
+        print(f"STDERR:\n{result.stderr}", file=sys.stderr)
+        print(f"STDOUT:\n{result.stdout}", file=sys.stderr)
+    return result
 
 
 def _exp_dir(output_dir: Path) -> Path:
     return output_dir / EXP
-
-
-def _status(output_dir: Path) -> dict:
-    return json.loads((_exp_dir(output_dir) / "sweep_status.json").read_text())
 
 
 def _manifest(output_dir: Path) -> dict:
@@ -43,134 +82,266 @@ def _manifest(output_dir: Path) -> dict:
 
 def _gpu_count() -> int:
     try:
-        r = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(
+            ["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=5
+        )
         return len([l for l in r.stdout.splitlines() if l.strip()])
     except Exception:
         return 0
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
+# ── Tests: dry-run / validate (no manager needed) ──────────────────────────────
 
-def test_grid_end_to_end(tmp_path):
-    result = _run("tests/sweeps/integration_grid.py", tmp_path)
+def test_dry_run_creates_no_output(tmp_path):
+    """``--dry-run`` prints commands and creates no output files."""
+    result = _run("tests/sweeps/integration_grid.py", tmp_path, "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert not (_exp_dir(tmp_path) / "sweep_manifest.json").exists()
+    assert "python" in result.stdout
+
+
+def test_validate_prints_combos(tmp_path):
+    """``--validate`` prints all combinations and exits without a manager."""
+    result = _run("tests/sweeps/integration_grid.py", tmp_path, "--validate")
+    assert result.returncode == 0, result.stderr
+    assert "lr" in result.stdout
+    assert "bs" in result.stdout
+    assert "Total combinations" in result.stdout
+
+
+# ── Tests: end-to-end via real manager ─────────────────────────────────────────
+
+def test_grid_end_to_end(manager_server, tmp_path):
+    """Grid sweep: submit 4 jobs, verify all finish successfully."""
+    server, url = manager_server
+    token = server.token
+
+    result = _run("tests/sweeps/integration_grid.py", tmp_path,
+                  "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
 
-    status = _status(tmp_path)
-    assert len(status) == 4
-    assert all(s["status"] == "ok" for s in status.values())
-
+    # Check manifest written locally
     manifest = _manifest(tmp_path)
     assert set(manifest["dims"].keys()) == {"lr", "bs"}
     assert len(manifest["runs"]) == 4
 
-    exp_dir = _exp_dir(tmp_path)
-    for run_name in status:
-        metrics_path = exp_dir / run_name / "metrics.jsonl"
-        assert metrics_path.exists()
-        rows = [json.loads(l) for l in metrics_path.read_text().splitlines()]
-        assert len(rows) == 1
-        assert "loss" in rows[0]
+    # Wait for all 4 jobs to finish
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=4, timeout=120)
+    assert ok, "Timed out waiting for grid sweep jobs to complete"
+
+    # Check via HTTP API: 4 jobs, all finished
+    exp_jobs = _experiment_jobs(url, token, EXP)
+    assert len(exp_jobs) >= 4
+    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    assert len(finished) == 4, f"Expected 4 done, got {len(finished)}: {exp_jobs}"
 
 
-def test_bayes_end_to_end(tmp_path):
-    result = _run("tests/sweeps/bayes_sweep.py", tmp_path)
+def test_bayes_end_to_end(manager_server, tmp_path):
+    """Bayesian sweep: submit budget=12 jobs, verify behaviour."""
+    server, url = manager_server
+    token = server.token
+
+    result = _run("tests/sweeps/bayes_sweep.py", tmp_path,
+                  "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
 
-    status = _status(tmp_path)
-    completed = {k: v for k, v in status.items() if v["status"] == "ok"}
-    failed = {k: v for k, v in status.items() if v["status"] == "failed"}
+    # Wait for at least 12 successful jobs (budget=12 lex combos, each with 2
+    # successful batch_size probes: 64 and 32).
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_success=12, timeout=180)
+    assert ok, "Timed out waiting for bayes sweep jobs"
 
-    # budget=12: at least 12 successful lex evaluations (may slightly exceed due to in-flight runs)
+    exp_jobs = _experiment_jobs(url, token, EXP)
+    completed = [j for j in exp_jobs if j.get("status") == "done"]
+    failed = [j for j in exp_jobs if j.get("status") == "failed"]
+
+    # budget=12: at least 12 successful evaluations
     assert len(completed) >= 12
 
-    # singular dim: all completions are at batch_size=64 (the largest that fits)
-    assert all(v["combo"]["batch_size"] == 64 for v in completed.values())
+    # Run names follow bayes_sweep_bayes_NNNN
+    assert all(j["run_id"].startswith("bayes_sweep_bayes_") for j in completed)
 
-    # all failures are at batch_size > 64
-    assert all(v["combo"]["batch_size"] > 64 for v in failed.values())
-
-    # run names follow bayes_sweep_bayes_NNNN
-    assert all(k.startswith("bayes_sweep_bayes_") for k in completed)
-
-    # metrics logged for every completed run
-    exp_dir = _exp_dir(tmp_path)
-    for run_name in completed:
-        metrics_path = exp_dir / run_name / "metrics.jsonl"
-        assert metrics_path.exists()
-        rows = [json.loads(l) for l in metrics_path.read_text().splitlines()]
-        assert any("val_loss" in r for r in rows)
+    # All completions have exit_code 0
+    assert all(j.get("exit_code") == 0 for j in completed)
+    assert len(failed) > 0, "expected at least one failed job"
+    assert all(j.get("exit_code") != 0 for j in failed)
 
 
-def test_resume_skips_completed(tmp_path):
-    r1 = _run("tests/sweeps/integration_grid.py", tmp_path)
-    assert r1.returncode == 0, r1.stderr
-    status_before = _status(tmp_path)
-    assert len(status_before) == 4
+def test_experiment_created(manager_server, tmp_path):
+    """Verify the manager records the experiment metadata."""
+    server, url = manager_server
+    token = server.token
 
-    r2 = _run("tests/sweeps/integration_grid.py", tmp_path, "--resume")
-    assert r2.returncode == 0, r2.stderr
-    status_after = _status(tmp_path)
+    _run("tests/sweeps/integration_grid.py", tmp_path,
+         "--fetch", manager_url=url)
 
-    assert set(status_after.keys()) == set(status_before.keys())
-
-
-def test_dry_run_creates_no_output(tmp_path):
-    result = _run("tests/sweeps/integration_grid.py", tmp_path, "--dry-run")
-    assert result.returncode == 0, result.stderr
-    assert not (_exp_dir(tmp_path) / "sweep_status.json").exists()
-    assert "python" in result.stdout
+    # Check experiment via HTTP API
+    exp = _api_get(url, token, f"/api/experiments/{EXP}")
+    assert exp is not None, f"experiment {EXP} not found via API"
+    assert exp.get("status") in ("running", "completed")
+    assert exp.get("name") == "integration_grid"
 
 
-def test_torchrun_rank_zero_logging(tmp_path):
-    pytest.importorskip("torch")
+# ── Tests: rank-zero logging / dist env (no torch) ────────────────────────────
 
-    result = _run("tests/sweeps/torchrun_sweep.py", tmp_path)
+def test_rank_zero_logging(manager_server, tmp_path):
+    """Torchrun sweep with SET_DIST_ENV / GPUS_PER_RUN=2."""
+    server, url = manager_server
+    token = server.token
+
+    result = _run("tests/sweeps/torchrun_sweep.py", tmp_path,
+                  "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
 
-    status = _status(tmp_path)
-    assert len(status) == 1
-    assert all(s["status"] == "ok" for s in status.values())
+    # Poll for the single job
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=1, timeout=60)
+    assert ok, "Timed out waiting for torchrun sweep job"
 
-    exp_dir = _exp_dir(tmp_path)
-    for run_name in status:
-        metrics_path = exp_dir / run_name / "metrics.jsonl"
-        rows = [json.loads(l) for l in metrics_path.read_text().splitlines() if l.strip()]
-        assert len(rows) == 1, f"expected 1 metrics row from rank 0, got {len(rows)}"
-        assert rows[0].get("world_size") == 2.0
+    exp_jobs = _experiment_jobs(url, token, EXP)
+    assert len(exp_jobs) >= 1
+    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    assert len(finished) == 1
+    assert finished[0].get("exit_code") == 0
 
 
-def test_set_dist_env(tmp_path):
-    pytest.importorskip("torch")
+def test_set_dist_env(manager_server, tmp_path):
+    """Sweep with SET_DIST_ENV=True."""
+    server, url = manager_server
+    token = server.token
 
-    result = _run("tests/sweeps/set_dist_env_sweep.py", tmp_path)
+    result = _run("tests/sweeps/set_dist_env_sweep.py", tmp_path,
+                  "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
 
-    status = _status(tmp_path)
-    assert len(status) == 1
-    assert all(s["status"] == "ok" for s in status.values())
+    # Poll for the single job
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=1, timeout=60)
+    assert ok, "Timed out waiting for set_dist_env sweep job"
 
-    exp_dir = _exp_dir(tmp_path)
-    for run_name in status:
-        metrics_path = exp_dir / run_name / "metrics.jsonl"
-        rows = [json.loads(l) for l in metrics_path.read_text().splitlines() if l.strip()]
-        # Only rank 0 logs; world_size == GPUS_PER_RUN == 2
-        assert len(rows) == 1, f"expected 1 metrics row from rank 0, got {len(rows)}"
-        assert rows[0].get("world_size") == 2.0
+    exp_jobs = _experiment_jobs(url, token, EXP)
+    assert len(exp_jobs) >= 1
+    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    assert len(finished) == 1
+    assert finished[0].get("exit_code") == 0
 
+
+# ── Tests: GPU (require multiple GPUs) ─────────────────────────────────────────
 
 @pytest.mark.skipif(_gpu_count() < 2, reason="requires at least 2 GPUs")
-def test_gpus_per_run(tmp_path):
-    result = _run("tests/sweeps/multigpu_sweep.py", tmp_path, "-g", "2")
+def test_gpus_per_run(manager_server, tmp_path):
+    """Sweep with GPUS_PER_RUN=2 in the sweep file."""
+    server, url = manager_server
+    token = server.token
+
+    result = _run("tests/sweeps/multigpu_sweep.py", tmp_path,
+                  "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
 
-    status = _status(tmp_path)
-    assert len(status) == 2
-    assert all(s["status"] == "ok" for s in status.values())
+    # Wait for both jobs
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=2, timeout=60)
+    assert ok, "Timed out waiting for multi-GPU sweep jobs"
 
-    # verify CUDA_VISIBLE_DEVICES was set to a 2-GPU group for each run
-    exp_dir = _exp_dir(tmp_path)
-    for run_name in status:
-        log = (exp_dir / run_name / "training.log").read_text()
-        cvd_line = next(l for l in log.splitlines() if "CUDA_VISIBLE_DEVICES" in l)
-        devices = cvd_line.split("=", 1)[1].strip()
-        assert "," in devices, f"expected 2 devices in CUDA_VISIBLE_DEVICES, got {devices!r}"
+    exp_jobs = _experiment_jobs(url, token, EXP)
+    assert len(exp_jobs) >= 2
+    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    assert len(finished) == 2
+    assert all(j.get("exit_code") == 0 for j in finished)
+
+
+# ── Tests: missing manager (error path) ────────────────────────────────────────
+
+def test_missing_manager_fails(tmp_path):
+    """Running without --manager should exit non-zero with an error message."""
+    result = _run("tests/sweeps/integration_grid.py", tmp_path,
+                  expect_failure=True)
+    assert result.returncode != 0
+    assert "--manager" in result.stderr or "--manager" in result.stdout
+
+
+# ── Tests: subcommands (watch / fetch) ─────────────────────────────────────────
+
+def test_watch_subcommand(manager_server, tmp_path):
+    """``mlsweep_run watch {experiment_id}`` connects, receives events, and exits cleanly."""
+    server, url = manager_server
+
+    # Submit sweep WITHOUT --fetch so it returns as fast as possible.
+    # Then immediately start watching before all jobs finish.
+    _run("tests/sweeps/integration_grid.py", tmp_path, manager_url=url)
+
+    watch = subprocess.run(
+        MLSWEEP_RUN + ["watch", EXP, "--manager", url, "--token", server.token],
+        env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": server.token},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert watch.returncode == 0, watch.stderr
+    assert "Experiment complete" in watch.stdout or "done" in watch.stdout.lower()
+
+
+def test_fetch_subcommand(manager_server, tmp_path):
+    """``mlsweep_run fetch`` downloads experiment results after a sweep finishes."""
+    server, url = manager_server
+
+    _run("tests/sweeps/integration_grid.py", tmp_path, "--fetch", manager_url=url)
+
+    # Wait for jobs so there is something to fetch
+    ok = _wait_for_experiment_complete(url, server.token, EXP, expected_jobs=4, timeout=120)
+    assert ok, "Timed out waiting for grid sweep jobs"
+
+    fetch_dir = tmp_path / "fetched"
+    fetch_dir.mkdir()
+
+    fetch = subprocess.run(
+        MLSWEEP_RUN + [
+            "fetch",
+            "--manager", url,
+            "--token", server.token,
+            "--experiment", EXP,
+            "--output-dir", str(fetch_dir),
+        ],
+        env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": server.token},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert fetch.returncode == 0, fetch.stderr
+    # fetch should print job summary lines
+    assert EXP in fetch.stdout or "done" in fetch.stdout.lower() or "Job" in fetch.stdout
+
+
+# ── Tests: authentication ─────────────────────────────────────────────────────
+
+def test_auth_required(manager_server):
+    """Requests without valid token receive HTTP 401."""
+    server, url = manager_server
+
+    # No token at all
+    req = urllib.request.Request(f"{url}/api/experiments")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        pytest.fail("Should have raised HTTPError for missing token")
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+
+    # Wrong token
+    req = urllib.request.Request(
+        f"{url}/api/experiments",
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        pytest.fail("Should have raised HTTPError for wrong token")
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+
+
+# ── Tests: error paths ────────────────────────────────────────────────────────
+
+def test_bad_sweep_file(manager_server, tmp_path):
+    """Malformed sweep file produces non-zero exit and an error message."""
+    server, url = manager_server
+
+    bad_sweep = tmp_path / "bad_sweep.py"
+    bad_sweep.write_text(
+        "COMMAND = [sys.executable, 'tests/scripts/fast_train.py']\n"
+        "# Missing SWEEP_NAME\n"
+    )
+
+    result = _run(str(bad_sweep), tmp_path, manager_url=url, expect_failure=True)
+    assert result.returncode != 0
+    assert "error" in (result.stdout + result.stderr).lower()

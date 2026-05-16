@@ -1,8 +1,14 @@
 mlsweep.egg-info/**
 mlsweep/_bin/parsync
+mlsweep/_wheels/**
+
+.cache/**
 .venv/**
 venv/**
 **/__pycache__/**
 **/outputs/**
 **/*.swp
 wandb/**
+.nac/*
+**/.pytest_cache/**
+

@@ -417,8 +417,6 @@ OPTIMIZE = {
 }
 ```
 
-Requires `optuna`: `pip install 'mlsweep[bayes]'`
-
 ### `OPTIMIZE` fields
 
 | Key | Required | Description |

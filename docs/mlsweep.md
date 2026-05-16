@@ -252,8 +252,6 @@ OPTIONS = {
 }
 ```
 
-Requires: `pip install 'mlsweep[bayes]'`
-
 Discrete dims (`"values"`) and subdims work unchanged in bayes mode — optuna treats them as categorical.
 
 ---

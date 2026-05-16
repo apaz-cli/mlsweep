@@ -1,23 +1,15 @@
 """Bayesian optimization backend (optuna TPE) for mlsweep."""
 
 import itertools
+import warnings
 from typing import Any
 
+import optuna
+import optuna.exceptions
+from optuna.samplers import TPESampler
 
-def _import_optuna() -> Any:
-    """Lazy import of optuna. Raises ImportError with install hint if missing."""
-    try:
-        import warnings as _warnings
-        import optuna
-        from optuna.samplers import TPESampler  # noqa: F401
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        _warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
-        return optuna
-    except ImportError:
-        raise ImportError(
-            "Bayesian optimization requires optuna. "
-            "Install with: pip install 'mlsweep[bayes]'"
-        )
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
 
 
 def _build_lex_combo(
@@ -43,8 +35,8 @@ def _build_lex_combo(
         if opt.get("singular"):
             continue  # singular dims are handled separately by _expand_singular_probes
 
-        sub_opts_map = opt.get("_sub_opts_map", {})
-        values = opt.get("_values", [])
+        sub_opts_map = opt["_sub_opts_map"]
+        values = opt["_values"]
 
         if values == [None]:
             # Fixed dim — always append its flags, no optuna call, record None in combo
@@ -94,7 +86,7 @@ def _build_effective_options(combo: dict[str, Any], all_options: dict[str, Any])
     effective: dict[str, Any] = {k[1:]: v for k, v in all_options.items()}
     # Add the selected subdim branch's children
     for k, v in all_options.items():
-        sub_map = v.get("_sub_opts_map", {})
+        sub_map = v["_sub_opts_map"]
         dim = k[1:]
         if sub_map and dim in combo:
             for ck, cv in sub_map.get(combo[dim], {}).items():
@@ -175,8 +167,6 @@ class BayesianOptimizer:
         optimize_cfg: dict[str, Any],
         extra_flags: list[str] | None = None,
     ) -> None:
-        optuna = _import_optuna()
-        from optuna.samplers import TPESampler
         self._optuna = optuna
         self._sweep_name = sweep_name
         self._budget: int = optimize_cfg["budget"]
