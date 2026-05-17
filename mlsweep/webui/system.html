@@ -70,6 +70,14 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .jobs-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .mono { font-family: monospace; font-size: 11px; }
 .no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
+
+/* Connection indicator */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -78,6 +86,10 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link active" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
   <button id="theme-toggle" title="Toggle theme">☀</button>
 </nav>
 <div id="content">
@@ -98,6 +110,17 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 </div>
 
 <script>
+// ── Connection indicator ──────────────────────────────────────────────────────
+function setConnStatus(state) {
+  const dot = document.getElementById("conn-dot");
+  const lbl = document.getElementById("conn-label");
+  if (!dot) return;
+  dot.className = (state === "connected") ? "" : state;
+  lbl.textContent = state === "disconnected" ? "Disconnected"
+                  : state === "reconnecting" ? "Reconnecting…"
+                  : "";
+}
+
 // ── Token handling ────────────────────────────────────────────────────────────
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
@@ -210,12 +233,17 @@ async function refresh() {
       apiFetch("/api/workers"),
       apiFetch("/api/jobs?status=running"),
     ]);
-    const workers = wRes.ok ? await wRes.json() : [];
-    const jobs    = jRes.ok ? await jRes.json() : [];
+    if (!wRes.ok || !jRes.ok) {
+      setConnStatus("disconnected");
+      return;
+    }
+    const workers = await wRes.json();
+    const jobs    = await jRes.json();
+    setConnStatus("connected");
     renderWorkers(workers);
     renderInFlight(jobs);
   } catch (e) {
-    console.error("refresh error:", e);
+    setConnStatus("disconnected");
   }
 }
 

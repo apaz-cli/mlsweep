@@ -879,8 +879,9 @@ async def _handle_pong(
     wc: WorkerConn,
     msg: MsgPong,
 ) -> None:
-    """Handle ``MsgPong`` — heartbeat reply, nothing to do."""
-    pass
+    """Handle ``MsgPong`` — update last_seen so the UI reflects a live worker."""
+    from mlsweep._manager_db import touch_worker
+    await touch_worker(db, wc.worker_id)
 
 
 # ── Message dispatch table ─────────────────────────────────────────────────────

@@ -140,6 +140,14 @@ select:focus { outline: none; border-color: #4c9be8; }
 
 #sweep-note { font-size: 11px; color: var(--text-muted); font-style: italic;
               margin-top: 4px; word-break: break-word; }
+
+/* Connection indicator */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -150,6 +158,10 @@ select:focus { outline: none; border-color: #4c9be8; }
   <a class="nav-link active" href="#">Results</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
   <button id="theme-toggle" title="Switch to dark mode">☾</button>
 </div>
 
@@ -211,6 +223,17 @@ select:focus { outline: none; border-color: #4c9be8; }
 </div>
 
 <script>
+// ── Connection indicator ──────────────────────────────────────────────────────
+function setConnStatus(state) {
+  const dot = document.getElementById("conn-dot");
+  const lbl = document.getElementById("conn-label");
+  if (!dot) return;
+  dot.className = (state === "connected") ? "" : state;
+  lbl.textContent = state === "disconnected" ? "Disconnected"
+                  : state === "reconnecting" ? "Reconnecting…"
+                  : "";
+}
+
 // ── Token handling (new — not in visualize.py) ────────────────────────────────
 const _urlParams = new URLSearchParams(location.search);
 const TOKEN = _urlParams.get("token") || localStorage.getItem("mlsweep_token") || "";
@@ -892,6 +915,7 @@ function connectWS(expId) {
 
   let pingInterval = null;
   _ws.onopen = () => {
+    setConnStatus("connected");
     pingInterval = setInterval(() => {
       if (_ws && _ws.readyState === WebSocket.OPEN)
         _ws.send(JSON.stringify({ type: "ping" }));
@@ -900,11 +924,16 @@ function connectWS(expId) {
 
   _ws.onclose = () => {
     clearInterval(pingInterval);
-    // Auto-reconnect if this experiment is still selected.
-    setTimeout(() => {
-      const sel = document.getElementById("experiment-sel");
-      if (sel && sel.value === expId) connectWS(expId);
-    }, 3000);
+    const sel = document.getElementById("experiment-sel");
+    if (sel && sel.value === expId) {
+      setConnStatus("reconnecting");
+      // Auto-reconnect if this experiment is still selected.
+      setTimeout(() => {
+        if (document.getElementById("experiment-sel")?.value === expId) connectWS(expId);
+      }, 3000);
+    } else {
+      setConnStatus("disconnected");
+    }
   };
 
   _ws.onerror = () => {};
@@ -1116,6 +1145,7 @@ async function loadExperiment(expId) {
     expNameEl.classList.remove("loading");
     expNameEl.textContent = "Error";
     document.getElementById("status").textContent = "Failed to load: " + err;
+    setConnStatus("disconnected");
   }
 }
 
@@ -1157,6 +1187,7 @@ apiFetch("/api/experiments")
     el.classList.remove("loading");
     el.textContent = "Error";
     document.getElementById("status").textContent = "Error fetching experiments: " + err;
+    setConnStatus("disconnected");
   });
 </script>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" onload="if(DATA)buildActiveChart()"></script>

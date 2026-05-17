@@ -69,7 +69,7 @@ def _wait_for_job(url, token, run_id, experiment_id, timeout=60):
         except Exception:
             time.sleep(0.5)
             continue
-        if job and job.get("status") in ("done", "failed", "cancelled"):
+        if job and job["status"] in ("done", "failed", "cancelled"):
             return job
         time.sleep(0.5)
     return None
@@ -92,9 +92,9 @@ def _wait_for_experiment_complete(url, token, experiment_id,
             time.sleep(1.0)
             continue
         terminal = [j for j in jobs
-                    if j.get("status") in ("done", "failed",
-                                           "cancelled")]
-        success = [j for j in jobs if j.get("status") == "done"]
+                    if j["status"] in ("done", "failed",
+                                       "cancelled")]
+        success = [j for j in jobs if j["status"] == "done"]
         if expected_success and len(success) >= expected_success:
             return True
         if expected_jobs and len(terminal) >= expected_jobs:
@@ -102,7 +102,7 @@ def _wait_for_experiment_complete(url, token, experiment_id,
         # If no expected count given, wait until no pending/dispatched/running
         if not expected_jobs and not expected_success:
             active = [j for j in jobs
-                      if j.get("status") in ("pending", "dispatched", "running")]
+                      if j["status"] in ("pending", "dispatched", "running")]
             if not active and jobs:
                 return True
         time.sleep(1.0)

@@ -1023,10 +1023,10 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
         sweep_print("  No jobs found.")
         return False
 
-    n_ok = sum(1 for j in jobs if j.get("status") == "done")
-    n_fail = sum(1 for j in jobs if j.get("status") == "failed")
-    n_pending = sum(1 for j in jobs if j.get("status") in ("pending", "dispatched", "running"))
-    n_cancelled = sum(1 for j in jobs if j.get("status") == "cancelled")
+    n_ok = sum(1 for j in jobs if j["status"] == "done")
+    n_fail = sum(1 for j in jobs if j["status"] == "failed")
+    n_pending = sum(1 for j in jobs if j["status"] in ("pending", "dispatched", "running"))
+    n_cancelled = sum(1 for j in jobs if j["status"] == "cancelled")
     total = len(jobs)
 
     sweep_print(f"\n{'=' * 80}")
@@ -1035,15 +1035,15 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
     sweep_print(f"{'=' * 80}")
 
     for j in jobs:
-        status = j.get("status", "?")
-        run_id = j.get("run_id", "?")
-        elapsed = j.get("elapsed")
+        status = j["status"]
+        run_id = j["run_id"]
+        elapsed = j["elapsed"]
         elapsed_str = f" ({elapsed:.1f}s)" if isinstance(elapsed, (int, float)) else ""
 
         if status == "done":
             sweep_print(f"  {_GREEN}   OK{_RESET}  {run_id}{elapsed_str}")
         elif status == "failed":
-            exit_code = j.get("exit_code", "")
+            exit_code = j["exit_code"]
             sweep_print(f"  {_RED} FAIL{_RESET}  {run_id} (exit {exit_code}){elapsed_str}")
         elif status in ("pending", "dispatched", "running"):
             sweep_print(f"  {_YELLOW}{status.upper()}{_RESET}  {run_id}")
@@ -1260,9 +1260,9 @@ def _fetch_cmd(args: list[str]) -> None:
     # Get experiment summary
     summary = manager_get_experiment_summary(manager, token, parsed.experiment)
     if summary:
-        sweep_print(f"Experiment: {summary.get('name', parsed.experiment)}")
-        sweep_print(f"Status:     {summary.get('status', '?')}")
-        counts = summary.get("job_counts", {})
+        sweep_print(f"Experiment: {summary['name']}")
+        sweep_print(f"Status:     {summary['status']}")
+        counts = summary["job_counts"]
         if counts:
             sweep_print(f"Jobs:       {counts}")
         sweep_print("")
@@ -1515,8 +1515,8 @@ def main() -> None:
         if summary is None:
             sweep_print(f"  {_RED}FAIL{_RESET}  Cannot fetch experiment summary — is manager reachable?")
             sys.exit(1)
-        sweep_print(f"  Experiment: {summary.get('name', experiment_id)}")
-        sweep_print(f"  Status:     {summary.get('status', '?')}")
+        sweep_print(f"  Experiment: {summary['name']}")
+        sweep_print(f"  Status:     {summary['status']}")
 
         done_jobs = manager_list_experiment_jobs(manager, token, experiment_id, status_filter="done")  # type: ignore[assignment]
         if done_jobs is None:
@@ -1529,7 +1529,7 @@ def main() -> None:
         goal = optimize_cfg["goal"]
         told_count = 0
         for job in done_jobs:
-            combo = job.get("combo")
+            combo = job["combo"]
             if isinstance(combo, str):
                 try:
                     combo = json.loads(combo)
@@ -1537,7 +1537,7 @@ def main() -> None:
                     continue
             if not isinstance(combo, dict):
                 continue
-            run_id = job.get("run_id", "")
+            run_id = job["run_id"]
             metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id)
             if metrics_list is None:
                 continue
@@ -1594,7 +1594,7 @@ def main() -> None:
         # Fetch artifact_id from a completed job
         artifact_id = None
         if done_jobs:
-            artifact_id = done_jobs[0].get("artifact_id")
+            artifact_id = done_jobs[0]["artifact_id"]
         if not artifact_id:
             sweep_print(f"  {_YELLOW}WARN{_RESET}  Cannot determine artifact_id; jobs may fail without artifact")
     else:
@@ -1772,7 +1772,7 @@ def main() -> None:
                         tok,
                     )
                     if status_code == 200 and isinstance(job_resp, dict):
-                        combo_raw = job_resp.get("combo")
+                        combo_raw = job_resp["combo"]
                         if isinstance(combo_raw, str):
                             try:
                                 combo = json.loads(combo_raw)

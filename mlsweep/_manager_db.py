@@ -498,6 +498,18 @@ async def update_worker_status(
     return _row_to_worker(row)
 
 
+async def touch_worker(
+    db: aiosqlite.Connection,
+    worker_id: str,
+) -> None:
+    """Update last_seen to now without changing any other fields."""
+    await db.execute(
+        "UPDATE workers SET last_seen = ? WHERE worker_id = ?",
+        (_now_epoch(), worker_id),
+    )
+    await db.commit()
+
+
 async def get_worker(
     db: aiosqlite.Connection,
     worker_id: str,

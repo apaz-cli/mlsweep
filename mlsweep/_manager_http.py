@@ -825,7 +825,7 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         d["gpus"] = wc.gpus
         d["gpu_occupancy"] = wc.gpu_occupancy
     else:
-        devices_str = d.get("devices")
+        devices_str = d["devices"]
         if isinstance(devices_str, str) and devices_str:
             try:
                 d["gpus"] = json.loads(devices_str)

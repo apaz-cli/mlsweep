@@ -84,6 +84,14 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 .count-cell { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
 #empty-msg { color: var(--text-muted); font-size: 13px; margin-top: 40px; text-align: center; }
 #error-msg { color: #d62728; font-size: 12px; margin-bottom: 10px; }
+
+/* Connection indicator */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
 </head>
 <body>
@@ -92,6 +100,10 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
   <button id="theme-toggle" title="Toggle theme">☀</button>
 </nav>
 <div id="content">
@@ -117,6 +129,17 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 </div>
 
 <script>
+// ── Connection indicator ──────────────────────────────────────────────────────
+function setConnStatus(state) {
+  const dot = document.getElementById("conn-dot");
+  const lbl = document.getElementById("conn-label");
+  if (!dot) return;
+  dot.className = (state === "connected") ? "" : state;
+  lbl.textContent = state === "disconnected" ? "Disconnected"
+                  : state === "reconnecting" ? "Reconnecting…"
+                  : "";
+}
+
 // ── Token handling ────────────────────────────────────────────────────────────
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
@@ -358,14 +381,17 @@ async function fetchExperiments() {
   try {
     const r = await apiFetch("/api/experiments");
     if (!r.ok) {
+      setConnStatus("disconnected");
       document.getElementById("error-msg").textContent = `API error: ${r.status}`;
       document.getElementById("error-msg").style.display = "";
       return;
     }
     experiments = await r.json();
+    setConnStatus("connected");
     document.getElementById("error-msg").style.display = "none";
     renderExperiments(experiments);
   } catch (e) {
+    setConnStatus("disconnected");
     document.getElementById("error-msg").textContent = `Failed to fetch: ${e}`;
     document.getElementById("error-msg").style.display = "";
   }

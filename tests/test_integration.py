@@ -132,7 +132,7 @@ def test_grid_end_to_end(manager_server, tmp_path):
     # Check via HTTP API: 4 jobs, all finished
     exp_jobs = _experiment_jobs(url, token, EXP)
     assert len(exp_jobs) >= 4
-    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    finished = [j for j in exp_jobs if j["status"] == "done"]
     assert len(finished) == 4, f"Expected 4 done, got {len(finished)}: {exp_jobs}"
 
 
@@ -151,8 +151,9 @@ def test_bayes_end_to_end(manager_server, tmp_path):
     assert ok, "Timed out waiting for bayes sweep jobs"
 
     exp_jobs = _experiment_jobs(url, token, EXP)
-    completed = [j for j in exp_jobs if j.get("status") == "done"]
-    failed = [j for j in exp_jobs if j.get("status") == "failed"]
+    completed = [j for j in exp_jobs if j["status"] == "done"]
+    # batch_size=256 and =128 fail then get reclassified as xfailed when =64 succeeds
+    xfailed = [j for j in exp_jobs if j["status"] == "xfailed"]
 
     # budget=12: at least 12 successful evaluations
     assert len(completed) >= 12
@@ -161,9 +162,10 @@ def test_bayes_end_to_end(manager_server, tmp_path):
     assert all(j["run_id"].startswith("bayes_sweep_bayes_") for j in completed)
 
     # All completions have exit_code 0
-    assert all(j.get("exit_code") == 0 for j in completed)
-    assert len(failed) > 0, "expected at least one failed job"
-    assert all(j.get("exit_code") != 0 for j in failed)
+    assert all(j["exit_code"] == 0 for j in completed)
+    # Singular probes that OOMed are reclassified to xfailed (not failed)
+    assert len(xfailed) > 0, "expected at least one xfailed singular probe"
+    assert all(j["exit_code"] != 0 for j in xfailed)
 
 
 def test_experiment_created(manager_server, tmp_path):
@@ -177,8 +179,8 @@ def test_experiment_created(manager_server, tmp_path):
     # Check experiment via HTTP API
     exp = _api_get(url, token, f"/api/experiments/{EXP}")
     assert exp is not None, f"experiment {EXP} not found via API"
-    assert exp.get("status") in ("running", "completed")
-    assert exp.get("name") == "integration_grid"
+    assert exp["status"] in ("running", "completed")
+    assert exp["name"] == "integration_grid"
 
 
 # ── Tests: rank-zero logging / dist env (no torch) ────────────────────────────
@@ -198,9 +200,9 @@ def test_rank_zero_logging(manager_server, tmp_path):
 
     exp_jobs = _experiment_jobs(url, token, EXP)
     assert len(exp_jobs) >= 1
-    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    finished = [j for j in exp_jobs if j["status"] == "done"]
     assert len(finished) == 1
-    assert finished[0].get("exit_code") == 0
+    assert finished[0]["exit_code"] == 0
 
 
 def test_set_dist_env(manager_server, tmp_path):
@@ -218,9 +220,9 @@ def test_set_dist_env(manager_server, tmp_path):
 
     exp_jobs = _experiment_jobs(url, token, EXP)
     assert len(exp_jobs) >= 1
-    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    finished = [j for j in exp_jobs if j["status"] == "done"]
     assert len(finished) == 1
-    assert finished[0].get("exit_code") == 0
+    assert finished[0]["exit_code"] == 0
 
 
 # ── Tests: GPU (require multiple GPUs) ─────────────────────────────────────────
@@ -241,9 +243,9 @@ def test_gpus_per_run(manager_server, tmp_path):
 
     exp_jobs = _experiment_jobs(url, token, EXP)
     assert len(exp_jobs) >= 2
-    finished = [j for j in exp_jobs if j.get("status") == "done"]
+    finished = [j for j in exp_jobs if j["status"] == "done"]
     assert len(finished) == 2
-    assert all(j.get("exit_code") == 0 for j in finished)
+    assert all(j["exit_code"] == 0 for j in finished)
 
 
 # ── Tests: missing manager (error path) ────────────────────────────────────────

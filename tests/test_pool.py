@@ -74,7 +74,7 @@ def test_simple_command(manager_server):
 
     job = _submit_and_wait(url, "exp_simple", "run1", ["echo", "hello"])
     assert job["status"] == "done", f"unexpected status: {job['status']}"
-    assert job.get("exit_code") == 0
+    assert job["exit_code"] == 0
 
 
 def test_failed_command(manager_server):
@@ -85,7 +85,7 @@ def test_failed_command(manager_server):
 
     job = _submit_and_wait(url, "exp_fail", "run1", ["sh", "-c", "exit 42"])
     assert job["status"] == "failed"
-    assert job.get("exit_code") == 42
+    assert job["exit_code"] == 42
 
 
 def test_files_workspace(manager_server, tmp_path):
@@ -113,7 +113,7 @@ def test_files_workspace(manager_server, tmp_path):
     )
 
     assert job["status"] == "done"
-    assert job.get("exit_code") == 0
+    assert job["exit_code"] == 0
 
     # remote_dir must be unmodified
     assert (remote_dir / "untouched.txt").read_text() == "original"
@@ -153,5 +153,5 @@ def test_concurrent_slots(manager_server):
     assert job_b is not None, "run_beta did not complete"
     assert job_a["status"] == "done"
     assert job_b["status"] == "done"
-    assert job_a.get("exit_code") == 0
-    assert job_b.get("exit_code") == 0
+    assert job_a["exit_code"] == 0
+    assert job_b["exit_code"] == 0
