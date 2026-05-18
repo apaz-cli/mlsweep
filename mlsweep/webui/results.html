@@ -163,7 +163,7 @@ select:focus { outline: none; border-color: #4c9be8; }
   <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link active" href="#">Results</a>
   <a class="nav-link" id="nav-logs" href="#">Logs</a>
-  <a class="nav-link" id="nav-files" href="#">Files</a>
+  <a class="nav-link" id="nav-files" href="#">Artifacts</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -1284,7 +1284,7 @@ async function _loadMetrics(expId, jobs) {
 // ── Load experiment (replaces loadExperiment from visualize.py) ───────────────
 
 async function loadExperiment(expId) {
-  // Keep Files nav link in sync with the viewed experiment
+  // Keep Artifacts nav link in sync with the viewed experiment
   const _fq = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
   _fq.set("experiment", expId);
   document.getElementById("nav-files").href = "files.html?" + _fq.toString();

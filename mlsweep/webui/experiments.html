@@ -113,7 +113,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
   <a class="nav-link active" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link" id="nav-logs" href="#">Logs</a>
-  <a class="nav-link" id="nav-files" href="#">Files</a>
+  <a class="nav-link" id="nav-files" href="#">Artifacts</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -306,7 +306,7 @@ function renderJobs(expId) {
       <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
-      <td onclick="event.stopPropagation()"><a class="btn-link" href="${filesHref}">Files</a></td>
+      <td onclick="event.stopPropagation()"><a class="btn-link" href="${filesHref}">Artifacts</a></td>
     </tr>
     <tr id="job-detail-${expId}-${j.run_id}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
       <td colspan="6">${isOpen ? renderJobDetail(j) : ""}</td>
@@ -460,7 +460,7 @@ function renderExperiments(exps) {
       <td>${relTime(exp.submit_time)}</td>
       <td class="exp-actions">
         <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
-        <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Files</a>
+        <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Artifacts</a>
         <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
       </td>`;
 
