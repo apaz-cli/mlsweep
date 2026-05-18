@@ -120,8 +120,7 @@ async def _rebuild_state(
     return state
 
 
-async def _async_main(argv: list[str] | None = None) -> None:
-    args = _parse_args(argv)
+async def _async_main(args: argparse.Namespace) -> None:
 
     mlsweep_dir = Path(args.mlsweep_dir).expanduser().resolve()
 
@@ -258,9 +257,10 @@ async def _async_main(argv: list[str] | None = None) -> None:
 
 def main() -> None:
     """Synchronous entry point for console_scripts."""
+    args = _parse_args()
     from mlsweep._manager_workers import _ensure_worker_wheels
     _ensure_worker_wheels()
-    asyncio.run(_async_main())
+    asyncio.run(_async_main(args))
 
 
 if __name__ == "__main__":
