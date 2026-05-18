@@ -204,6 +204,10 @@ function escHtml(s) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
+function jobName(j) {
+  if (!j.label) return escHtml(j.run_id);
+  return `${escHtml(j.label)} <span style="color:var(--text-muted);font-size:9px">${escHtml(j.run_id)}</span>`;
+}
 function parseJSON(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
 }
@@ -291,7 +295,7 @@ async function selectJob(job) {
 
   currentRunId = job.run_id;
 
-  logRunIdEl.textContent = job.run_id;
+  logRunIdEl.innerHTML = jobName(job);
   setBadge(job.status);
   logHeader.style.display = "";
   logWrap.style.display   = "flex";
@@ -362,7 +366,7 @@ function renderJobList() {
     const sel      = j.run_id === currentRunId;
     return `<div class="job-item${sel ? " selected" : ""}" data-run-id="${escHtml(j.run_id)}" data-exp-id="${escHtml(j.experiment_id)}">
       <div class="job-item-top">
-        <span class="job-run-id" title="${escHtml(j.run_id)}">${escHtml(j.run_id)}</span>
+        <span class="job-run-id" title="${escHtml(j.run_id)}">${jobName(j)}</span>
         <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
       </div>
       ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}

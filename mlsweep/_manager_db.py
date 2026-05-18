@@ -103,6 +103,7 @@ class JobRecord:
     combo: str = "{}"  # JSON object
     dispatched_gpu_ids: str | None = None  # JSON list of ints, set on dispatch
     jobs_per_gpu: int = 1
+    label: str | None = None
 
 
 @dataclass(order=False)
@@ -164,6 +165,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         combo=_col(row, "combo", "{}"),
         dispatched_gpu_ids=row["dispatched_gpu_ids"],
         jobs_per_gpu=_col(row, "jobs_per_gpu", 1),
+        label=_col(row, "label", None),
     )
 
 
@@ -377,6 +379,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
             combo              TEXT NOT NULL DEFAULT '{}',
             dispatched_gpu_ids TEXT,
             jobs_per_gpu       INTEGER NOT NULL DEFAULT 1,
+            label              TEXT,
             PRIMARY KEY (run_id, experiment_id)
         );
     """)
@@ -508,6 +511,21 @@ async def update_experiment_status(
         db,
         "UPDATE experiments SET status = ? WHERE experiment_id = ? RETURNING *",
         (status, experiment_id),
+    )
+    await db.commit()
+    return _row_to_experiment(row) if row else None
+
+
+async def update_experiment_name(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    name: str,
+) -> ExperimentRecord | None:
+    """Update an experiment's display name. Returns updated row or None."""
+    row = await _exec_one(
+        db,
+        "UPDATE experiments SET name = ? WHERE experiment_id = ? RETURNING *",
+        (name, experiment_id),
     )
     await db.commit()
     return _row_to_experiment(row) if row else None
@@ -1082,6 +1100,22 @@ async def update_job_priority(
     return _row_to_job(row) if row else None
 
 
+async def update_job_label(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+    label: str | None,
+) -> JobRecord | None:
+    """Set or clear a job's human-readable label."""
+    row = await _exec_one(
+        db,
+        "UPDATE jobs SET label = ? WHERE run_id = ? AND experiment_id = ? RETURNING *",
+        (label, run_id, experiment_id),
+    )
+    await db.commit()
+    return _row_to_job(row) if row else None
+
+
 async def list_jobs_by_status(
     db: aiosqlite.Connection,
     status: JobStatus,
@@ -1477,6 +1511,12 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: update_experiment_status(db, experiment_id, status))
 
+    async def update_experiment_name(
+        self, experiment_id: str, name: str
+    ) -> ExperimentRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_experiment_name(db, experiment_id, name))
+
     async def delete_experiment(self, experiment_id: str) -> bool:
         db = self._db
         return await self._enqueue(lambda: delete_experiment(db, experiment_id))
@@ -1613,6 +1653,12 @@ class DbWriter:
     ) -> JobRecord | None:
         db = self._db
         return await self._enqueue(lambda: update_job_priority(db, run_id, experiment_id, priority))
+
+    async def update_job_label(
+        self, run_id: str, experiment_id: str, label: str | None
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_job_label(db, run_id, experiment_id, label))
 
     async def reset_worker_jobs(
         self, worker_id: str

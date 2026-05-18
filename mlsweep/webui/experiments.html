@@ -234,6 +234,47 @@ async function deleteExperiment(expId) {
   }
 }
 
+async function renameExperiment(expId) {
+  const exp = experiments.find(e => e.experiment_id === expId);
+  const current = exp?.name || expId;
+  const newName = await mlPrompt("Rename experiment:", current, { okLabel: "Rename" });
+  if (newName === null || newName === current) return;
+  if (!newName) { await mlAlert("Name cannot be empty."); return; }
+  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/name`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: newName }),
+  });
+  if (r.ok) {
+    if (exp) exp.name = newName;
+    renderExperiments(experiments);
+  } else {
+    await mlAlert(`Rename failed: ${r.status}`);
+  }
+}
+
+async function renameJob(expId, runId) {
+  const jobs = jobsCache[expId] || [];
+  const job = jobs.find(j => j.run_id === runId);
+  const current = job?.label || "";
+  const newLabel = await mlPrompt("Label for this run:", current, { okLabel: "Save", placeholder: runId });
+  if (newLabel === null) return;
+  const label = newLabel.trim() || null;
+  if (label === (current || null)) return;
+  const r = await apiFetch(`/api/jobs/${encodeURIComponent(runId)}/label`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ experiment_id: expId, label }),
+  });
+  if (r.ok) {
+    if (job) job.label = label;
+    const jobsRow = document.getElementById(`jobs-row-${expId}`);
+    if (jobsRow) jobsRow.querySelector("td").innerHTML = renderJobs(expId);
+  } else {
+    await mlAlert(`Rename failed: ${r.status}`);
+  }
+}
+
 // ── Job detail panel ──────────────────────────────────────────────────────────
 function fmtTime(iso) {
   if (!iso) return "—";
@@ -301,13 +342,19 @@ function renderJobs(expId) {
     const isOpen = expandedJobs.has(key);
     const safeExpId = JSON.stringify(expId).replace(/"/g, '&quot;');
     const safeRunId = JSON.stringify(j.run_id).replace(/"/g, '&quot;');
+    const displayName = j.label
+      ? `${j.label} <span style="color:var(--text-muted);font-size:9px">${j.run_id}</span>`
+      : j.run_id;
     return `<tr style="cursor:pointer" onclick="toggleJobDetail(${safeExpId}, ${safeRunId})">
-      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${j.run_id}</td>
+      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${displayName}</td>
       <td>${badge(j.status)}</td>
       <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
-      <td onclick="event.stopPropagation()"><a class="btn-link" href="${filesHref}">Artifacts</a></td>
+      <td onclick="event.stopPropagation()">
+        <a class="btn-link" href="${filesHref}">Artifacts</a>
+        <button class="btn-link" onclick="event.stopPropagation();renameJob(${safeExpId},${safeRunId})">Rename</button>
+      </td>
     </tr>
     <tr id="job-detail-${expId}-${j.run_id}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
       <td colspan="6">${isOpen ? renderJobDetail(j) : ""}</td>
@@ -462,6 +509,7 @@ function renderExperiments(exps) {
       <td class="exp-actions">
         <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
         <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Artifacts</a>
+        <button class="btn-link" onclick="event.stopPropagation();renameExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Rename</button>
         <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
       </td>`;
 

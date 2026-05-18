@@ -322,6 +322,26 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     return _json_response(exp)
 
 
+@routes.put("/api/experiments/{experiment_id}/name")
+async def handle_update_experiment_name(request: web.Request) -> web.Response:
+    """Update an experiment's display name."""
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    experiment_id = request.match_info["experiment_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+    name = body.get("name")
+    if not name or not isinstance(name, str):
+        return _error_response("'name' is required")
+    name = name.strip()
+    exp = await state.db_writer.update_experiment_name(experiment_id, name)
+    if exp is None:
+        return _not_found("experiment")
+    _broadcast_experiment_event(request, experiment_id, "name_updated", name=name)
+    return _json_response(exp)
+
+
 @routes.delete("/api/experiments/{experiment_id}")
 async def handle_delete_experiment(request: web.Request) -> web.Response:
     """Delete an experiment and all its jobs."""
@@ -614,6 +634,31 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
         run_id=run_id, priority=priority,
     )
 
+    return _json_response(job)
+
+
+@routes.put("/api/jobs/{run_id}/label")
+async def handle_update_job_label(request: web.Request) -> web.Response:
+    """Set or clear a job's human-readable label."""
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    run_id = request.match_info["run_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+    experiment_id = body.get("experiment_id", "")
+    if not experiment_id:
+        return _error_response("'experiment_id' is required")
+    label = body.get("label")
+    if label is not None:
+        label = label.strip() or None
+    job = await state.db_writer.update_job_label(run_id, experiment_id, label)
+    if job is None:
+        return _not_found("job")
+    _broadcast_experiment_event(
+        request, job.experiment_id, "job_updated",
+        run_id=run_id, label=label,
+    )
     return _json_response(job)
 
 

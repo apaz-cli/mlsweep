@@ -294,6 +294,10 @@ let compareFile = null;         // file path shown in Compare grid
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+function runName(j) {
+  if (!j.label) return esc(j.run_id);
+  return `${esc(j.label)} <span style="color:var(--text-muted);font-size:9px">${esc(j.run_id)}</span>`;
+}
 function fmtSize(b) {
   if (b == null) return "";
   if (b < 1024) return b + " B";
@@ -381,7 +385,7 @@ function renderRunList() {
     info.className = "run-info";
     const combo = comboStr(j);
     const elapsed = fmtElapsed(j.elapsed);
-    info.innerHTML = `<div class="run-id-text">${esc(j.run_id.slice(0,26))}</div>` +
+    info.innerHTML = `<div class="run-id-text">${runName(j)}</div>` +
       (combo ? `<div class="run-combo-text">${esc(combo)}</div>` : "") +
       (elapsed ? `<div class="run-elapsed-text">${esc(elapsed)}</div>` : "");
 
@@ -503,7 +507,7 @@ async function renderCompareGrid() {
 
     card.innerHTML = `
       <div class="card-header">
-        <span class="card-run-id" title="${esc(j.run_id)}">${esc(j.run_id.slice(0,24))}</span>
+        <span class="card-run-id" title="${esc(j.run_id)}">${runName(j)}</span>
         <span class="badge badge-${j.status}">${j.status}</span>
       </div>
       ${combo ? `<div class="card-combo" title="${esc(combo)}">${esc(combo)}</div>` : ""}
@@ -565,7 +569,8 @@ async function loadBrowse(runId) {
   const toolbar = document.getElementById("browse-toolbar");
   toolbar.style.display = "flex";
   document.getElementById("run-dl-zip").href = runZipURL(expId(), runId);
-  document.getElementById("browse-run-label").textContent = runId;
+  const _browseJob = jobs.find(j => j.run_id === runId);
+  document.getElementById("browse-run-label").innerHTML = _browseJob ? runName(_browseJob) : esc(runId);
   tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">Loading…</div>`;
   pane.innerHTML = `<div class="placeholder">Loading files…</div>`;
 

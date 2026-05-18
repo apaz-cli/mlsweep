@@ -42,7 +42,7 @@
   styleEl.textContent = css;
   document.head.appendChild(styleEl);
 
-  function showDialog({ message, buttons }) {
+  function showDialog({ message, buttons, extraContent = null, onExtraKeydown = null }) {
     return new Promise(resolve => {
       const backdrop = document.createElement("div");
       backdrop.className = "ml-dialog-backdrop";
@@ -68,20 +68,28 @@
         if (e.key === "Escape") close(null);
       });
 
-      for (const { label, value, cls } of buttons) {
+      if (extraContent && onExtraKeydown) {
+        extraContent.addEventListener("keydown", e => onExtraKeydown(e, close));
+      }
+
+      for (const { label, value, getValue, cls } of buttons) {
         const btn = document.createElement("button");
         btn.className = `ml-btn ${cls}`;
         btn.textContent = label;
-        btn.onclick = () => close(value);
+        btn.onclick = () => close(getValue ? getValue() : value);
         actions.appendChild(btn);
       }
 
-      dlg.append(msg, actions);
+      if (extraContent) {
+        dlg.append(msg, extraContent, actions);
+        extraContent.focus();
+        extraContent.select?.();
+      } else {
+        dlg.append(msg, actions);
+        actions.querySelector("button:last-child").focus();
+      }
       backdrop.appendChild(dlg);
       document.body.appendChild(backdrop);
-
-      // Focus the primary (last) button
-      actions.querySelector("button:last-child").focus();
     });
   }
 
@@ -109,6 +117,26 @@
     return showDialog({
       message,
       buttons: [{ label: okLabel, value: null, cls: "ml-btn-ok" }],
+    });
+  };
+
+  // mlPrompt(message, defaultValue?, opts?) → Promise<string|null>
+  // opts: { okLabel, cancelLabel, placeholder }
+  window.mlPrompt = function (message, defaultValue = "", opts = {}) {
+    const { okLabel = "OK", cancelLabel = "Cancel", placeholder = "" } = opts;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = defaultValue;
+    input.placeholder = placeholder;
+    input.style.cssText = "width:100%;padding:6px 8px;font-size:13px;border:1px solid var(--border-input);border-radius:4px;background:var(--btn-bg);color:var(--text);outline:none;box-sizing:border-box;";
+    return showDialog({
+      message,
+      extraContent: input,
+      onExtraKeydown: (e, close) => { if (e.key === "Enter") close(input.value.trim()); },
+      buttons: [
+        { label: cancelLabel, value: null, cls: "ml-btn-cancel" },
+        { label: okLabel, getValue: () => input.value.trim(), cls: "ml-btn-ok" },
+      ],
     });
   };
 })();

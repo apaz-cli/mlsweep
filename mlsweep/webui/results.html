@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>mlsweep — Results</title>
-<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="icon" href="/static/favicon.ico">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1233,7 +1233,7 @@ async function _refreshJobs(expId) {
       if (!existing.has(j.run_id)) {
         const combo = {};
         for (const [k, v] of Object.entries(parseCombo(j.combo))) combo[k] = String(v);
-        DATA.runs.push({ name: j.run_id, hash: j.run_id, combo });
+        DATA.runs.push({ name: j.label || j.run_id, hash: j.run_id, combo });
         for (const [k, v] of Object.entries(combo)) {
           if (!DATA.dims[k]) { DATA.dims[k] = []; filters[k] = new Set(); }
           if (!DATA.dims[k].includes(v)) { DATA.dims[k].push(v); DATA.dims[k].sort(); filters[k].add(v); }
@@ -1332,7 +1332,7 @@ async function loadExperiment(expId) {
       experiment: expId,
       dims,
       runs: jobs.map(j => ({
-        name: j.run_id,
+        name: j.label || j.run_id,
         hash: j.run_id,
         combo: Object.fromEntries(Object.entries(parseCombo(j.combo)).map(([k, v]) => [k, String(v)])),
       })),

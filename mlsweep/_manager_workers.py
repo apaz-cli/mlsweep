@@ -571,7 +571,15 @@ async def _handle_worker_hello(
     *,
     workers_ready: asyncio.Event | None = None,
 ) -> None:
-    """Handle ``MsgWorkerHello``: initialise GPU occupancy, mark connected."""
+    """Handle ``MsgWorkerHello``: initialise GPU occupancy, mark connected.
+
+    If the worker reports ``resuming`` runs (jobs it kept executing across a
+    manager restart), those jobs are pulled out of the pending queue and
+    restored to in-flight state so the scheduler does not re-dispatch them.
+    """
+    resuming_map: dict[str, dict[str, Any]] = {r["run_id"]: r for r in msg.resuming}
+    resumed_jobs: list[tuple[JobRecord, list[int]]] = []
+
     async with state.scheduler_lock:
         wc.gpus = msg.gpus
         wc.topo = msg.topo
@@ -583,6 +591,44 @@ async def _handle_worker_hello(
         # Mark connected
         wc.status = "connected"
         wc.connected_at = datetime.now(timezone.utc)
+
+        # Restore in-flight state for jobs the worker is already running.
+        # On manager restart, reset_dispatched_running_to_pending moved these
+        # jobs back to pending.  Remove them from state.pending and add them to
+        # state.in_flight so the scheduler does not re-dispatch them.
+        if resuming_map:
+            new_pending: list[JobRecord] = []
+            for job in state.pending:
+                if job.run_id in resuming_map and job.run_id not in state.in_flight:
+                    # Assign GPU slots for occupancy tracking (exact GPU
+                    # assignment is unknown post-restart; pick the first N
+                    # available to prevent over-scheduling).
+                    gpus_needed = job.gpus_per_run
+                    gpu_ids: list[int] = []
+                    for g in wc.gpus:
+                        if len(gpu_ids) >= gpus_needed:
+                            break
+                        if wc.gpu_occupancy[g] < job.jobs_per_gpu:
+                            gpu_ids.append(g)
+                            wc.gpu_occupancy[g] += 1
+
+                    combo = json.loads(job.combo) if isinstance(job.combo, str) else (job.combo or {})
+                    in_flight_job = InFlightJob(
+                        run_id=job.run_id,
+                        worker_id=wc.worker_id,
+                        experiment_id=job.experiment_id,
+                        dispatch_time=datetime.now(timezone.utc),
+                        gpu_ids=gpu_ids,
+                        worker_ids=[wc.worker_id],
+                        combo=combo,
+                    )
+                    state.add_in_flight(in_flight_job)
+                    wc.in_flight[job.run_id] = in_flight_job
+                    resumed_jobs.append((job, gpu_ids))
+                else:
+                    new_pending.append(job)
+            if resumed_jobs:
+                state.pending = new_pending
 
         # Persist to DB
         await state.db_writer.upsert_worker(
@@ -602,10 +648,28 @@ async def _handle_worker_hello(
         print(
             f"  {_GREEN}OK{_RESET}    {wc.host}: {n_gpus} GPU{gpu_plural} available"
         )
+        if resumed_jobs:
+            print(f"  {_GREEN}RESUME{_RESET} {wc.host}: {len(resumed_jobs)} run(s) still active")
 
         # If all workers have completed hello, signal the manager
         if workers_ready is not None:
             _check_all_workers_ready(state, workers_ready)
+
+    # Re-mark resumed jobs as running in DB and send MsgReplay so the worker
+    # replays any logs/metrics the manager missed while it was down.
+    # Done outside the scheduler lock to avoid holding it during I/O.
+    for job, gpu_ids in resumed_jobs:
+        rinfo = resuming_map[job.run_id]
+        dispatched = await state.db_writer.dispatch_job(
+            job.run_id, job.experiment_id, wc.worker_id, gpu_ids
+        )
+        if dispatched is not None:
+            await state.db_writer.mark_job_running(job.run_id, job.experiment_id)
+        await _send_to_worker(wc, encode(MsgReplay(
+            run_id=job.run_id,
+            log_seq=rinfo.get("log_seq", 0),
+            metric_seq=rinfo.get("metric_seq", 0),
+        )))
 
     # Broadcast worker-connected event
     state.broadcast(
