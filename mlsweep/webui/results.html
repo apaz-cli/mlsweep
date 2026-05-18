@@ -186,6 +186,7 @@ select:focus { outline: none; border-color: #4c9be8; }
     <div class="section-title">Experiment</div>
     <div class="row">
       <select id="experiment-sel"></select>
+      <a class="icon-btn" id="exp-dl-metrics" href="#" style="display:none" title="Download all experiment metrics"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
       <button id="refresh-experiments" title="Refresh experiment list">&#8635;</button>
     </div>
   </div>
@@ -1288,6 +1289,11 @@ async function loadExperiment(expId) {
   const _fq = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
   _fq.set("experiment", expId);
   document.getElementById("nav-files").href = "files.html?" + _fq.toString();
+
+  const metricsZipUrl = `/api/experiments/${encodeURIComponent(expId)}/metrics.zip`;
+  const dlBtn = document.getElementById("exp-dl-metrics");
+  dlBtn.href = TOKEN ? `${metricsZipUrl}?token=${encodeURIComponent(TOKEN)}` : metricsZipUrl;
+  dlBtn.style.display = "";
 
   const expNameEl = document.getElementById("exp-name");
   expNameEl.classList.add("loading");

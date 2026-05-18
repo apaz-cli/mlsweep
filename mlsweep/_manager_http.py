@@ -909,6 +909,67 @@ async def handle_zip_experiment_artifacts(request: web.Request) -> web.StreamRes
     )
 
 
+@routes.get("/api/experiments/{experiment_id}/metrics.zip")
+async def handle_zip_experiment_metrics(request: web.Request) -> web.StreamResponse:
+    """Serve a zip of all metrics files (JSONL) for every run in an experiment."""
+    experiment_id = request.match_info["experiment_id"]
+    db = request.config_dict["mlsweep_db"]
+
+    jobs = await list_jobs_by_experiment(db, experiment_id)
+    if not jobs:
+        return _error_response("no jobs", status=404)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for job in jobs:
+                rows = await get_metrics_for_run(db, job.run_id, experiment_id)
+                if rows:
+                    jsonl = "\n".join(json.dumps(row) for row in rows)
+                    zf.writestr(f"{job.run_id}.jsonl", jsonl)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+    dl_name = f"{experiment_id[:16]}-metrics.zip"
+    _schedule_cleanup(tmp_path, delay=300)
+    return web.FileResponse(
+        tmp_path,
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
+
+
+@routes.get("/api/experiments/{experiment_id}/logs.zip")
+async def handle_zip_experiment_logs(request: web.Request) -> web.StreamResponse:
+    """Serve a zip of all log files for every run in an experiment."""
+    experiment_id = request.match_info["experiment_id"]
+    db = request.config_dict["mlsweep_db"]
+
+    jobs = await list_jobs_by_experiment(db, experiment_id)
+    if not jobs:
+        return _error_response("no jobs", status=404)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for job in jobs:
+                text = await get_logs_for_run(db, job.run_id, experiment_id)
+                if text:
+                    zf.writestr(f"{job.run_id}.log", text)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+    dl_name = f"{experiment_id[:16]}-logs.zip"
+    _schedule_cleanup(tmp_path, delay=300)
+    return web.FileResponse(
+        tmp_path,
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
+
+
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifacts/{path:.*}")
 async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
     """Serve a file from a job's artifacts/ directory."""
