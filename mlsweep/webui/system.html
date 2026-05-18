@@ -467,6 +467,7 @@ function renderWorkers(workers) {
         ${w.ssh_key   ? `<div><span>key</span> ${w.ssh_key}</div>` : ""}
         ${w.devices   ? `<div><span>devices</span> ${JSON.parse(w.devices).join(", ")}</div>` : ""}
         ${w.scratch_dir ? `<div><span>scratch</span> ${w.scratch_dir}</div>` : ""}
+        ${w.jobs_per_gpu > 1 ? `<div><span>jobs/gpu</span> ${w.jobs_per_gpu}</div>` : ""}
       </div>
       <div class="worker-actions">
         <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
@@ -496,16 +497,17 @@ function renderInFlight(jobs) {
 // ── Poll ──────────────────────────────────────────────────────────────────────
 async function refresh() {
   try {
-    const [wRes, jRes] = await Promise.all([
+    const [wRes, jRes, dRes] = await Promise.all([
       apiFetch("/api/workers"),
       apiFetch("/api/jobs?status=running"),
+      apiFetch("/api/jobs?status=dispatched"),
     ]);
-    if (!wRes.ok || !jRes.ok) {
+    if (!wRes.ok || !jRes.ok || !dRes.ok) {
       setConnStatus("disconnected");
       return;
     }
     const workers = await wRes.json();
-    const jobs    = await jRes.json();
+    const jobs    = [...(await jRes.json()), ...(await dRes.json())];
     setConnStatus("connected");
     renderWorkers(workers);
     renderInFlight(jobs);

@@ -80,6 +80,17 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 .mono { font-family: monospace; font-size: 10px; }
 .combo-cell { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
 
+/* Job detail expand */
+.job-toggle { cursor: pointer; font-size: 10px; color: var(--text-dim); user-select: none; margin-right: 5px; }
+.job-detail-row td { padding: 0; border-bottom: 1px solid var(--border); }
+.job-detail-panel { padding: 8px 12px 10px 28px; background: var(--surface); display: flex; flex-direction: column; gap: 7px; }
+.job-detail-section { display: flex; flex-wrap: wrap; gap: 14px; }
+.job-detail-item { display: flex; flex-direction: column; gap: 1px; }
+.job-detail-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
+.job-detail-value { font-size: 11px; color: var(--text); font-family: monospace; }
+.job-detail-value.muted { color: var(--text-muted); }
+.job-cmd-block { font-family: monospace; font-size: 10px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 5px 8px; white-space: pre-wrap; word-break: break-all; max-height: 80px; overflow-y: auto; }
+
 .count-cell { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
 #empty-msg { color: var(--text-muted); font-size: 13px; margin-top: 40px; text-align: center; }
 #empty-msg .run-cmd { display: inline-block; margin-top: 10px; padding: 7px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; font-family: monospace; font-size: 12px; color: var(--text); text-align: left; white-space: pre; }
@@ -123,7 +134,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
         <th style="width:6%;text-align:right">Failed</th>
         <th style="width:6%;text-align:right">XFailed</th>
         <th style="width:6%;text-align:right">Running</th>
-        <th style="width:6%;text-align:right">Total</th>
+        <th style="width:6%;text-align:right">Finished</th>
         <th style="width:12%">Submitted</th>
         <th style="width:22%">Actions</th>
       </tr>
@@ -181,6 +192,7 @@ document.getElementById("nav-system").href  = pageHref("system.html");
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const expandedExps = new Set();
+const expandedJobs = new Set();  // "expId/runId"
 const jobsCache = {};  // experiment_id → [jobs]
 let experiments = [];
 
@@ -220,6 +232,62 @@ async function deleteExperiment(expId) {
   }
 }
 
+// ── Job detail panel ──────────────────────────────────────────────────────────
+function fmtTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+       + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function renderJobDetail(j) {
+  const cmd = (() => { try { return JSON.parse(j.command || "[]").join(" "); } catch { return j.command || ""; } })();
+  const gpuIds = (() => { try { return JSON.parse(j.dispatched_gpu_ids || "null"); } catch { return null; } })();
+  const retryStr = j.retry_count > 0 ? `${j.retry_count} / ${j.max_retries}` : `0 / ${j.max_retries}`;
+  const exitStr  = j.exit_code != null ? String(j.exit_code) : "—";
+  const resources = [
+    j.gpus_per_run > 1  ? `${j.gpus_per_run} GPUs/run` : "1 GPU/run",
+    j.nodes_per_run > 1 ? `${j.nodes_per_run} nodes` : null,
+    j.jobs_per_gpu > 1  ? `${j.jobs_per_gpu} jobs/GPU` : null,
+    gpuIds              ? `GPU IDs: ${gpuIds.join(",")}` : null,
+  ].filter(Boolean).join(" · ");
+
+  return `<div class="job-detail-panel">
+    <div class="job-detail-section">
+      <div class="job-detail-item"><span class="job-detail-label">Submitted</span><span class="job-detail-value">${fmtTime(j.submit_time)}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Dispatched</span><span class="job-detail-value">${fmtTime(j.dispatch_time)}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Started</span><span class="job-detail-value">${fmtTime(j.start_time)}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Finished</span><span class="job-detail-value">${fmtTime(j.finish_time)}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Exit code</span><span class="job-detail-value ${j.exit_code ? 'muted' : ''}">${exitStr}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Retries</span><span class="job-detail-value ${j.retry_count === 0 ? 'muted' : ''}">${retryStr}</span></div>
+      <div class="job-detail-item"><span class="job-detail-label">Priority</span><span class="job-detail-value">${j.priority}</span></div>
+      ${resources ? `<div class="job-detail-item"><span class="job-detail-label">Resources</span><span class="job-detail-value">${resources}</span></div>` : ""}
+    </div>
+    ${cmd ? `<div><div class="job-detail-label" style="margin-bottom:3px">Command</div><div class="job-cmd-block">${cmd.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</div></div>` : ""}
+  </div>`;
+}
+
+function toggleJobDetail(expId, runId) {
+  const key = `${expId}/${runId}`;
+  const detailRow = document.getElementById(`job-detail-${expId}-${runId}`);
+  const toggleEl  = document.getElementById(`job-toggle-${expId}-${runId}`);
+  if (!detailRow) return;
+  const isOpen = expandedJobs.has(key);
+  if (isOpen) {
+    expandedJobs.delete(key);
+    detailRow.style.display = "none";
+    if (toggleEl) toggleEl.textContent = "▶";
+  } else {
+    expandedJobs.add(key);
+    detailRow.style.display = "";
+    if (toggleEl) toggleEl.textContent = "▼";
+    // Populate if empty (in case job was added after initial render)
+    const jobs = jobsCache[expId] || [];
+    const j = jobs.find(x => x.run_id === runId);
+    if (j) detailRow.querySelector("td").innerHTML = renderJobDetail(j);
+  }
+}
+
 // ── Render jobs sub-table ─────────────────────────────────────────────────────
 function renderJobs(expId) {
   const jobs = jobsCache[expId] || [];
@@ -227,13 +295,20 @@ function renderJobs(expId) {
     const comboObj = j.combo ? (typeof j.combo === "string" ? (() => { try { return JSON.parse(j.combo); } catch { return {}; } })() : j.combo) : {};
     const comboStr = Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" ");
     const filesHref = `files.html?${TOKEN?"token="+encodeURIComponent(TOKEN)+"&":""}experiment=${encodeURIComponent(expId)}&run=${encodeURIComponent(j.run_id)}`;
-    return `<tr>
-      <td class="mono">${j.run_id}</td>
+    const key = `${expId}/${j.run_id}`;
+    const isOpen = expandedJobs.has(key);
+    const safeExpId = JSON.stringify(expId).replace(/"/g, '&quot;');
+    const safeRunId = JSON.stringify(j.run_id).replace(/"/g, '&quot;');
+    return `<tr style="cursor:pointer" onclick="toggleJobDetail(${safeExpId}, ${safeRunId})">
+      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${j.run_id}</td>
       <td>${badge(j.status)}</td>
       <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
-      <td><a class="btn-link" href="${filesHref}">Files</a></td>
+      <td onclick="event.stopPropagation()"><a class="btn-link" href="${filesHref}">Files</a></td>
+    </tr>
+    <tr id="job-detail-${expId}-${j.run_id}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
+      <td colspan="6">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
   return `<div class="jobs-container">
@@ -432,8 +507,12 @@ async function fetchExperiments() {
     const r = await apiFetch("/api/experiments");
     if (!r.ok) {
       setConnStatus("disconnected");
-      document.getElementById("error-msg").textContent = `API error: ${r.status}`;
+      document.getElementById("error-msg").textContent = r.status === 401
+        ? `Unauthorized — open the dashboard URL printed by the manager (it includes ?token=…).`
+        : `API error: ${r.status}`;
       document.getElementById("error-msg").style.display = "";
+      document.getElementById("empty-msg").style.display = "none";
+      document.getElementById("exp-table").style.display = "none";
       return;
     }
     experiments = await r.json();

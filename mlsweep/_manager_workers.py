@@ -203,7 +203,7 @@ def _ensure_worker_wheels() -> None:
          "--platform", "manylinux_2_17_x86_64",
          "--implementation", "cp",
          "--abi", "abi3",
-         "--python-version", "3.9",
+         "--python-version", "3.10",
          "--only-binary", ":all:",
          "mlsweep"],
         capture_output=True,

@@ -110,35 +110,41 @@ def _wait_for_experiment_complete(url, token, experiment_id,
 
 
 # ---------------------------------------------------------------------------
-# Fixture
+# Fixture helpers
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def manager_server(tmp_path):
-    """Start a real mlsweep manager, yield ``(server, url)``, tear down."""
+def _start_manager(tmp_path, *, with_worker: bool = False):
+    """Start a real mlsweep manager process and return (proc, server, url).
+
+    with_worker=False (default): passes an empty workers file so no local
+    worker is spawned.  Use for tests that inspect job state directly via the
+    API without needing jobs to execute.
+
+    with_worker=True: omits --workers so the manager spawns a local worker
+    automatically.  Use for tests that submit jobs and wait for them to run.
+    """
     db_path = str(tmp_path / "manager.db")
     port = _find_free_port()
     mlsweep_dir = tmp_path / "mlsweep"
     mlsweep_dir.mkdir()
     token = "test-token"
 
-    # Empty workers file prevents the manager from spawning a local worker,
-    # which would race with tests that check or change job status.
-    workers_file = tmp_path / "workers.toml"
-    workers_file.write_text("")
+    cmd = [
+        sys.executable, "-m", "mlsweep.manager",
+        "--port", str(port),
+        "--db", db_path,
+        "--mlsweep-dir", str(mlsweep_dir),
+        "--token", token,
+    ]
 
-    proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "mlsweep.manager",
-            "--port", str(port),
-            "--db", db_path,
-            "--mlsweep-dir", str(mlsweep_dir),
-            "--token", token,
-            "--workers", str(workers_file),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    if not with_worker:
+        # Empty workers file prevents manager from spawning a local worker,
+        # avoiding races with tests that check or manipulate job status directly.
+        workers_file = tmp_path / "workers.toml"
+        workers_file.write_text("")
+        cmd += ["--workers", str(workers_file)]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     url = f"http://127.0.0.1:{port}"
     deadline = time.time() + 30
@@ -158,11 +164,25 @@ def manager_server(tmp_path):
     if not started:
         proc.terminate()
         proc.wait()
-        stdout, stderr = proc.communicate()
-        pytest.fail(
-            f"Manager did not start within 30 seconds.\n"
-            f"stdout: {stdout}\nstderr: {stderr}"
-        )
+        pytest.fail(f"Manager did not start within 30 seconds.")
+
+    if with_worker:
+        # Wait for at least one worker to connect before yielding.
+        deadline = time.time() + 30
+        ready = False
+        while time.time() < deadline:
+            try:
+                workers = _api_get(url, token, "/api/workers")
+                if any(w.get("status") == "connected" for w in workers):
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        if not ready:
+            proc.terminate()
+            proc.wait()
+            pytest.fail("Local worker did not connect within 30 seconds.")
 
     class Server:
         pass
@@ -171,12 +191,36 @@ def manager_server(tmp_path):
     server.url = url
     server.token = token
     server.proc = proc
+    server.mlsweep_dir = mlsweep_dir
 
-    yield server, url
+    return proc, server, url
 
+
+def _teardown_manager(proc):
     proc.send_signal(signal.SIGTERM)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def manager_server(tmp_path):
+    """Manager with no worker — for API/status tests that don't execute jobs."""
+    proc, server, url = _start_manager(tmp_path, with_worker=False)
+    yield server, url
+    _teardown_manager(proc)
+
+
+@pytest.fixture
+def manager_with_worker(tmp_path):
+    """Manager with a local worker — for tests that submit and run jobs."""
+    proc, server, url = _start_manager(tmp_path, with_worker=True)
+    yield server, url
+    _teardown_manager(proc)

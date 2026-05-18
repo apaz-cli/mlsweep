@@ -111,9 +111,9 @@ def test_validate_prints_combos(tmp_path):
 
 # ── Tests: end-to-end via real manager ─────────────────────────────────────────
 
-def test_grid_end_to_end(manager_server, tmp_path):
+def test_grid_end_to_end(manager_with_worker, tmp_path):
     """Grid sweep: submit 4 jobs, verify all finish successfully."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     result = _run("tests/sweeps/integration_grid.py", tmp_path,
@@ -136,9 +136,9 @@ def test_grid_end_to_end(manager_server, tmp_path):
     assert len(finished) == 4, f"Expected 4 done, got {len(finished)}: {exp_jobs}"
 
 
-def test_bayes_end_to_end(manager_server, tmp_path):
+def test_bayes_end_to_end(manager_with_worker, tmp_path):
     """Bayesian sweep: submit budget=12 jobs, verify behaviour."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     result = _run("tests/sweeps/bayes_sweep.py", tmp_path,
@@ -168,9 +168,9 @@ def test_bayes_end_to_end(manager_server, tmp_path):
     assert all(j["exit_code"] != 0 for j in xfailed)
 
 
-def test_experiment_created(manager_server, tmp_path):
+def test_experiment_created(manager_with_worker, tmp_path):
     """Verify the manager records the experiment metadata."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     _run("tests/sweeps/integration_grid.py", tmp_path,
@@ -185,9 +185,9 @@ def test_experiment_created(manager_server, tmp_path):
 
 # ── Tests: rank-zero logging / dist env (no torch) ────────────────────────────
 
-def test_rank_zero_logging(manager_server, tmp_path):
+def test_rank_zero_logging(manager_with_worker, tmp_path):
     """Torchrun sweep with SET_DIST_ENV / GPUS_PER_RUN=2."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     result = _run("tests/sweeps/torchrun_sweep.py", tmp_path,
@@ -205,9 +205,9 @@ def test_rank_zero_logging(manager_server, tmp_path):
     assert finished[0]["exit_code"] == 0
 
 
-def test_set_dist_env(manager_server, tmp_path):
+def test_set_dist_env(manager_with_worker, tmp_path):
     """Sweep with SET_DIST_ENV=True."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     result = _run("tests/sweeps/set_dist_env_sweep.py", tmp_path,
@@ -228,9 +228,9 @@ def test_set_dist_env(manager_server, tmp_path):
 # ── Tests: GPU (require multiple GPUs) ─────────────────────────────────────────
 
 @pytest.mark.skipif(_gpu_count() < 2, reason="requires at least 2 GPUs")
-def test_gpus_per_run(manager_server, tmp_path):
+def test_gpus_per_run(manager_with_worker, tmp_path):
     """Sweep with GPUS_PER_RUN=2 in the sweep file."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     result = _run("tests/sweeps/multigpu_sweep.py", tmp_path,
@@ -260,9 +260,9 @@ def test_missing_manager_fails(tmp_path):
 
 # ── Tests: subcommands (watch / fetch) ─────────────────────────────────────────
 
-def test_watch_subcommand(manager_server, tmp_path):
+def test_watch_subcommand(manager_with_worker, tmp_path):
     """``mlsweep_run watch {experiment_id}`` connects, receives events, and exits cleanly."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     # Submit sweep WITHOUT --fetch so it returns as fast as possible.
     # Then immediately start watching before all jobs finish.
@@ -277,9 +277,9 @@ def test_watch_subcommand(manager_server, tmp_path):
     assert "Experiment complete" in watch.stdout or "done" in watch.stdout.lower()
 
 
-def test_fetch_subcommand(manager_server, tmp_path):
+def test_fetch_subcommand(manager_with_worker, tmp_path):
     """``mlsweep_run fetch`` downloads experiment results after a sweep finishes."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     _run("tests/sweeps/integration_grid.py", tmp_path, "--fetch", manager_url=url)
 
@@ -347,3 +347,84 @@ def test_bad_sweep_file(manager_server, tmp_path):
     result = _run(str(bad_sweep), tmp_path, manager_url=url, expect_failure=True)
     assert result.returncode != 0
     assert "error" in (result.stdout + result.stderr).lower()
+
+
+# ── Tests: artifact sweep ─────────────────────────────────────────────────────
+
+
+def test_artifact_sweep_end_to_end(manager_with_worker, tmp_path):
+    """Artifact sweep: jobs download a project tarball, write output files, and
+    those files are synced back to the manager's experiment output directory.
+
+    This exercises:
+    - Artifact upload to the manager via the HTTP API (run_sweep.py)
+    - MsgRun dispatched via a worker thread (worker.py threading change)
+    - Artifact download from the manager's HTTP server (localhost tunnel path)
+    - Output file rsync from worker scratch to manager output dir
+    """
+    server, url = manager_with_worker
+    token = server.token
+
+    # Run 2×2 = 4 jobs (subset of the full 3×3 grid — fast enough for CI)
+    result = _run(
+        "tests/sweeps/artifacts.py", tmp_path,
+        "--fetch", "--experiment", EXP,
+        manager_url=url, timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=9, timeout=150)
+    assert ok, "Timed out waiting for artifact sweep to complete"
+
+    jobs = _experiment_jobs(url, token, EXP)
+    done = [j for j in jobs if j["status"] == "done"]
+    assert len(done) == 9, f"Expected 9 done jobs, got {len(done)}: {[j['status'] for j in jobs]}"
+
+    # Verify artifact files were synced back for every completed run.
+    # Output path: {mlsweep_dir}/experiments/{experiment_id}/{run_id}/artifacts/
+    exp_output = server.mlsweep_dir / "experiments" / EXP
+    for job in done:
+        run_dir = exp_output / job["run_id"] / "artifacts"
+        assert (run_dir / "plot.png").exists(), f"Missing plot.png for {job['run_id']}"
+        assert (run_dir / "results.json").exists(), f"Missing results.json for {job['run_id']}"
+        assert (run_dir / "training.csv").exists(), f"Missing training.csv for {job['run_id']}"
+
+
+# ── Tests: logs sweep ─────────────────────────────────────────────────────────
+
+
+def test_logs_sweep_end_to_end(manager_with_worker, tmp_path):
+    """Logs sweep: runs log_train.py with varied lr/bs, verifies all jobs
+    complete and the log endpoint returns data for each run.
+
+    Passes ``-- --epochs 1 --bs 512`` to cap runtime to a few seconds per run.
+    """
+    server, url = manager_with_worker
+    token = server.token
+
+    result = _run(
+        "tests/sweeps/logs.py", tmp_path,
+        "--fetch", "--experiment", EXP,
+        "--", "--epochs", "1", "--bs", "512",
+        manager_url=url, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+    ok = _wait_for_experiment_complete(url, token, EXP, expected_jobs=4, timeout=90)
+    assert ok, "Timed out waiting for logs sweep to complete"
+
+    jobs = _experiment_jobs(url, token, EXP)
+    done = [j for j in jobs if j["status"] == "done"]
+    assert len(done) == 4, f"Expected 4 done jobs, got {len(done)}"
+
+    # Every run should have at least one log line streamed back.
+    for job in done:
+        try:
+            req = urllib.request.Request(
+                f"{url}/api/experiments/{EXP}/jobs/{job['run_id']}/logs",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            text = urllib.request.urlopen(req, timeout=10).read().decode()
+            assert text.strip(), f"No logs for {job['run_id']}"
+        except urllib.error.HTTPError as e:
+            pytest.fail(f"Log endpoint returned {e.code} for {job['run_id']}")

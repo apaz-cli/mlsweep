@@ -65,9 +65,9 @@ def _submit_and_wait(url: str, experiment_id: str, run_id: str,
 # ===============================================================================
 
 
-def test_simple_command(manager_server):
+def test_simple_command(manager_with_worker):
     """Submit a job that echoes hello; verify success."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     exp = manager_create_experiment(url, _TOKEN, "exp_simple", "simple_test")
     assert exp is not None
@@ -77,9 +77,9 @@ def test_simple_command(manager_server):
     assert job["exit_code"] == 0
 
 
-def test_failed_command(manager_server):
+def test_failed_command(manager_with_worker):
     """Submit a job that exits with code 42; verify failure."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     manager_create_experiment(url, _TOKEN, "exp_fail", "fail_test")
 
@@ -88,10 +88,10 @@ def test_failed_command(manager_server):
     assert job["exit_code"] == 42
 
 
-def test_files_workspace(manager_server, tmp_path):
+def test_files_workspace(manager_with_worker, tmp_path):
     """Submit a job with file injection; verify the command can read the file
     and the original project directory is unmodified."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     # Create a "project" directory with an existing file
     remote_dir = tmp_path / "project"
@@ -120,9 +120,9 @@ def test_files_workspace(manager_server, tmp_path):
     assert not (remote_dir / "a.py").exists()
 
 
-def test_concurrent_slots(manager_server):
+def test_concurrent_slots(manager_with_worker):
     """Submit two jobs in one bulk call; verify both complete."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     manager_create_experiment(url, _TOKEN, "exp_concurrent", "concurrent_test")
 

@@ -118,7 +118,9 @@ select:focus { outline: none; border-color: #4c9be8; }
 .file-row.selected { background: var(--radio-checked-bg); color: var(--radio-checked-color); }
 .file-icon { font-size: 11px; flex-shrink: 0; }
 .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.file-sz { font-size: 10px; color: var(--text-muted); padding-left: 6px; flex-shrink: 0; }
+.file-size { font-size: 10px; color: var(--text-muted); padding-left: 6px; flex-shrink: 0; }
+.file-modified { font-size: 10px; color: var(--text-muted); padding-left: 4px; flex-shrink: 0; }
+.run-elapsed-text { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
 
 #preview-pane { flex: 1; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 .preview-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex-shrink: 0; }
@@ -291,6 +293,22 @@ function fmtSize(b) {
   if (b < 1048576) return (b/1024).toFixed(1) + " KB";
   return (b/1048576).toFixed(1) + " MB";
 }
+function fmtElapsed(s) {
+  if (s == null) return "";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
+}
+function fmtModified(iso) {
+  if (!iso) return "";
+  const d = new Date(iso), now = Date.now(), diff = now - d.getTime();
+  if (diff < 60e3) return "just now";
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
+  if (diff < 7 * 86400e3) return Math.floor(diff / 86400e3) + "d ago";
+  return d.toLocaleDateString();
+}
 function comboStr(job) {
   try { const c = typeof job.combo==="string" ? JSON.parse(job.combo) : (job.combo||{}); return Object.entries(c).map(([k,v])=>`${k}=${v}`).join("  "); }
   catch { return ""; }
@@ -355,8 +373,10 @@ function renderRunList() {
     const info = document.createElement("div");
     info.className = "run-info";
     const combo = comboStr(j);
+    const elapsed = fmtElapsed(j.elapsed);
     info.innerHTML = `<div class="run-id-text">${esc(j.run_id.slice(0,26))}</div>` +
-      (combo ? `<div class="run-combo-text">${esc(combo)}</div>` : "");
+      (combo ? `<div class="run-combo-text">${esc(combo)}</div>` : "") +
+      (elapsed ? `<div class="run-elapsed-text">${esc(elapsed)}</div>` : "");
 
     const bdg = document.createElement("span");
     bdg.className = `badge badge-${j.status}`;
@@ -552,7 +572,7 @@ async function loadBrowse(runId) {
     const row = document.createElement("div");
     row.className = "file-row" + (f.path === browseFile ? " selected" : "");
     row.dataset.path = f.path;
-    row.innerHTML = `<span class="file-icon">${fileIcon(f.path)}</span><span class="file-name" title="${esc(f.path)}">${esc(f.path)}</span><span class="file-sz">${fmtSize(f.size)}</span>`;
+    row.innerHTML = `<span class="file-icon">${fileIcon(f.path)}</span><span class="file-name" title="${esc(f.path)}">${esc(f.path)}</span><span class="file-size">${fmtSize(f.size)}</span><span class="file-modified">${fmtModified(f.modified)}</span>`;
     row.addEventListener("click", () => {
       browseFile = f.path;
       tree.querySelectorAll(".file-row").forEach(r => r.classList.remove("selected"));
@@ -581,7 +601,7 @@ function showBrowsePreview(runId, file) {
   pane.innerHTML = `
     <div class="preview-header">
       <span class="preview-filename">${esc(file.path)}</span>
-      <span class="preview-meta">${fmtSize(file.size)}</span>
+      <span class="preview-meta">${fmtSize(file.size)}${file.modified ? ` · ${fmtModified(file.modified)}` : ""}</span>
       <a class="btn-sm" href="${esc(authURL(url))}" download="${esc(fname)}">Download</a>
     </div>
     <div id="preview-content"></div>`;

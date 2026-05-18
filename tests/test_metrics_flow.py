@@ -33,9 +33,9 @@ MLSWEEP_RUN = [sys.executable, "-m", "mlsweep.run_sweep"]
 
 
 @pytest.fixture
-def submit_grid_sweep(manager_server, tmp_path):
+def submit_grid_sweep(manager_with_worker, tmp_path):
     """Submit the grid sweep and return (server, url). Poll for completion."""
-    server, url = manager_server
+    server, url = manager_with_worker
 
     import subprocess
     proc = subprocess.run(
@@ -102,9 +102,9 @@ def test_metrics_endpoint_empty(manager_server):
         assert e.code == 404
 
 
-def test_metrics_websocket_broadcast(manager_server):
+def test_metrics_websocket_broadcast(manager_with_worker):
     """Connect to WebSocket, submit a job that logs, verify metric events arrive."""
-    server, url = manager_server
+    server, url = manager_with_worker
     token = server.token
 
     # Create the experiment and job
