@@ -39,7 +39,8 @@ nav { background: var(--surface); border-bottom: 1px solid var(--border); displa
 #layout { flex: 1; display: flex; min-height: 0; }
 
 /* ── Sidebar ──────────────────────────────────────────────────────────────────── */
-#sidebar { width: 270px; min-width: 270px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 14px; padding: 14px 12px; overflow-y: auto; }
+#sidebar { width: 270px; min-width: 270px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+#sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .sb-section { display: flex; flex-direction: column; gap: 6px; }
 .sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
 .sb-row { display: flex; gap: 6px; align-items: center; }
@@ -54,11 +55,12 @@ select:focus { outline: none; border-color: #4c9be8; }
 .quick-btns { display: flex; gap: 4px; flex-wrap: wrap; }
 .quick-btn { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .quick-btn:hover { background: var(--btn-hover); }
+.quick-btn.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
 
-#run-list { display: flex; flex-direction: column; gap: 1px; }
-.run-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 4px; border-radius: 4px; cursor: pointer; user-select: none; }
+#run-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+.run-item { display: flex; align-items: flex-start; gap: 6px; padding: 7px 12px; cursor: pointer; user-select: none; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
 .run-item:hover { background: var(--btn-hover); }
-.run-item.browse-hl { background: var(--radio-checked-bg); }
+.run-item.browse-hl { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
 .run-item input[type=checkbox] { margin-top: 2px; cursor: pointer; flex-shrink: 0; }
 .run-info { flex: 1; min-width: 0; }
 .run-id-text { font-size: 11px; font-weight: 600; font-family: monospace; color: var(--text-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -155,6 +157,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 <body>
 
 <nav>
+  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
   <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link" id="nav-logs" href="#">Logs</a>
@@ -172,23 +175,26 @@ select:focus { outline: none; border-color: #4c9be8; }
 
   <!-- ── Sidebar ──────────────────────────────────────────────────────────────── -->
   <div id="sidebar">
-    <div class="sb-section">
-      <div class="sb-title">Experiment</div>
-      <div class="sb-row">
-        <select id="exp-sel"></select>
-        <a class="icon-btn" id="exp-dl-all" href="#" style="display:none" title="Download all experiment artifacts"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
-        <button class="icon-btn" id="refresh-btn" title="Refresh experiments">&#8635;</button>
+    <div id="sidebar-top">
+      <div class="sb-section">
+        <div class="sb-title">Experiment</div>
+        <div class="sb-row">
+          <select id="exp-sel"></select>
+          <a class="icon-btn" id="exp-dl-all" href="#" style="display:none" title="Download all experiment artifacts"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
+          <button class="icon-btn" id="refresh-btn" title="Refresh experiments">&#8635;</button>
+        </div>
+      </div>
+      <div class="sb-section">
+        <div class="sb-title">Runs</div>
+        <div class="quick-btns">
+          <button class="quick-btn" id="sel-all">all</button>
+          <button class="quick-btn" id="sel-none">none</button>
+          <button class="quick-btn" id="sel-done">done</button>
+          <button class="quick-btn" id="sel-failed">failed</button>
+        </div>
       </div>
     </div>
-    <div class="sb-section">
-      <div class="sb-title">Runs</div>
-      <div class="quick-btns">
-        <button class="quick-btn" id="sel-all">all</button>
-        <button class="quick-btn" id="sel-none">none</button>
-        <button class="quick-btn" id="sel-done">done</button>
-      </div>
-      <div id="run-list"></div>
-    </div>
+    <div id="run-list"></div>
   </div>
 
   <!-- ── Main ─────────────────────────────────────────────────────────────────── -->
@@ -407,6 +413,12 @@ document.getElementById("sel-none").onclick = () => {
 document.getElementById("sel-done").onclick = () => {
   checkedRuns.clear();
   jobs.filter(j => j.status === "done").forEach(j => checkedRuns.add(j.run_id));
+  renderRunList(); if (activeTab === "compare") renderCompareGrid();
+};
+document.getElementById("sel-failed").onclick = () => {
+  const FAILED_STATUSES = new Set(["failed", "xfailed", "cancelled"]);
+  checkedRuns.clear();
+  jobs.filter(j => FAILED_STATUSES.has(j.status)).forEach(j => checkedRuns.add(j.run_id));
   renderRunList(); if (activeTab === "compare") renderCompareGrid();
 };
 

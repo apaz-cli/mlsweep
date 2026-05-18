@@ -67,6 +67,10 @@ select:focus { outline: none; border-color: #4c9be8; }
 .icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
 .icon-btn svg { display: block; }
 .icon-btn:hover { background: var(--btn-hover); }
+.quick-btns { display: flex; gap: 4px; flex-wrap: wrap; }
+.quick-btn { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.quick-btn:hover { background: var(--btn-hover); }
+.quick-btn.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
 #job-list { flex: 1; overflow-y: auto; }
 .job-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
 .job-item:hover { background: var(--btn-hover); }
@@ -116,6 +120,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 </head>
 <body>
 <nav>
+  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
   <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link active" href="#">Logs</a>
@@ -138,6 +143,14 @@ select:focus { outline: none; border-color: #4c9be8; }
           <select id="exp-select"><option disabled selected>Loading…</option></select>
           <a class="icon-btn" id="exp-dl-all" href="#" style="display:none" title="Download all experiment logs"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
           <button class="icon-btn" id="refresh-btn" title="Refresh experiments">&#8635;</button>
+        </div>
+      </div>
+      <div class="sb-section">
+        <span class="sb-title">Show</span>
+        <div class="quick-btns">
+          <button class="quick-btn active" id="filter-all">all</button>
+          <button class="quick-btn" id="filter-done">done</button>
+          <button class="quick-btn" id="filter-failed">failed</button>
         </div>
       </div>
     </div>
@@ -255,6 +268,7 @@ jumpBtn.addEventListener("click", () => {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let jobsData      = [];
+let jobFilter     = "all";
 let currentExpId  = null;
 let currentRunId  = null;
 let ansiUp        = new AnsiUp();
@@ -328,7 +342,19 @@ function renderJobList() {
     return;
   }
 
-  const sorted = [...jobsData].sort((a, b) => new Date(b.submit_time) - new Date(a.submit_time));
+  const FAILED_STATUSES = new Set(["failed", "xfailed", "cancelled"]);
+  const filtered = jobsData.filter(j =>
+    jobFilter === "all"    ? true :
+    jobFilter === "done"   ? j.status === "done" :
+    jobFilter === "failed" ? FAILED_STATUSES.has(j.status) : true
+  );
+
+  if (!filtered.length) {
+    jobListEl.innerHTML = `<div class="job-list-msg">No ${jobFilter} jobs</div>`;
+    return;
+  }
+
+  const sorted = [...filtered].sort((a, b) => new Date(b.submit_time) - new Date(a.submit_time));
 
   jobListEl.innerHTML = sorted.map(j => {
     const combo    = parseJSON(typeof j.combo === "string" ? j.combo : JSON.stringify(j.combo || {}), {});
@@ -467,6 +493,14 @@ async function loadExperiments() {
 
 expSelect.addEventListener("change", () => selectExperiment(expSelect.value));
 refreshBtn.addEventListener("click", loadExperiments);
+
+["all", "done", "failed"].forEach(f => {
+  document.getElementById(`filter-${f}`).addEventListener("click", () => {
+    jobFilter = f;
+    document.querySelectorAll(".quick-btn").forEach(b => b.classList.toggle("active", b.id === `filter-${f}`));
+    renderJobList();
+  });
+});
 
 // Refresh job list periodically to pick up newly submitted jobs.
 setInterval(() => { if (currentExpId) loadJobs(currentExpId); }, 15000);
