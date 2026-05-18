@@ -551,8 +551,7 @@ function buildCurvesChart() {
   Plotly.react("chart-curves", traces, {
     margin: { t: 20, r: 20, b: 50, l: 60 },
     xaxis: { title: "step", gridcolor: plotGrid, color: plotText },
-    yaxis: { title: metric, gridcolor: plotGrid, color: plotText,
-             range: yRangeOf(DATA.runs), autorange: yRangeOf(DATA.runs) === undefined },
+    yaxis: { title: metric, gridcolor: plotGrid, color: plotText, autorange: true },
     paper_bgcolor: plotBg, plot_bgcolor: plotBg,
     legend: { groupclick: "toggleitem", font: { size: 11, color: plotText } },
     hovermode: "closest",
