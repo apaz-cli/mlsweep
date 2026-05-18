@@ -558,7 +558,7 @@ function buildCurvesChart() {
     paper_bgcolor: plotBg, plot_bgcolor: plotBg,
     legend: { groupclick: "toggleitem", font: { size: 11, color: plotText } },
     hovermode: "closest",
-  }, { responsive: true, scrollZoom: true });
+  }, { responsive: true, scrollZoom: true, displaylogo: false });
 
   // Capture trace-index map for incremental WS updates.
   _traceIndexMap = {};
@@ -593,7 +593,7 @@ function buildSensitivityChart() {
 
   const effects = computeDimEffects(runs);
   if (!effects.length) {
-    Plotly.react("chart-sensitivity", [], { paper_bgcolor: plotBg, plot_bgcolor: plotBg }, { responsive: true });
+    Plotly.react("chart-sensitivity", [], { paper_bgcolor: plotBg, plot_bgcolor: plotBg }, { responsive: true, displaylogo: false });
     document.getElementById("status").textContent = "No data";
     return;
   }
@@ -691,7 +691,7 @@ function buildSensitivityChart() {
       font: { color: plotText, size: 13 }, x: 0.5,
     },
     hovermode: "closest",
-  }, { responsive: true });
+  }, { responsive: true, displaylogo: false });
 
   document.getElementById("status").textContent =
     `${runs.length} runs · ${effects.length} dimensions`;
@@ -720,11 +720,15 @@ function buildOptimizationChart() {
       paper_bgcolor: plotBg, plot_bgcolor: plotBg,
       annotations: [{ text: "No metric data yet", showarrow: false,
         font: { color: plotText, size: 13 }, xref: "paper", yref: "paper", x: 0.5, y: 0.5 }],
-    }, { responsive: true });
+    }, { responsive: true, displaylogo: false });
     document.getElementById("opt-scatter-grid").innerHTML = "";
     document.getElementById("status").textContent = "No data";
     return;
   }
+
+  const n         = allRuns.length;
+  const trialColor = d => lerpColor(n > 1 ? d.trialIdx / (n - 1) : 0.5);
+  const comboText  = d => Object.entries(d.r.combo).map(([k, v]) => `${k}=${v}`).join("  ");
 
   // ── Best-so-far curve ───────────────────────────────────────────────────────
   let best = null;
@@ -738,9 +742,10 @@ function buildOptimizationChart() {
     {
       x: trialNums, y: withData.map(d => d.v),
       mode: "markers", name: "trial",
-      marker: { color: cssVar("--text-dim"), size: 6, opacity: 0.75 },
+      marker: { color: withData.map(trialColor), size: 7, line: { color: plotBg, width: 1 } },
+      text: withData.map(comboText),
       showlegend: false,
-      hovertemplate: "trial %{x}<br>" + metric + ": %{y:.4f}<extra></extra>",
+      hovertemplate: "trial %{x}<br>" + metric + ": %{y:.4f}<br>%{text}<extra></extra>",
     },
     {
       x: trialNums, y: bestLine,
@@ -756,7 +761,7 @@ function buildOptimizationChart() {
     paper_bgcolor: plotBg, plot_bgcolor: plotBg,
     legend: { font: { size: 11, color: plotText }, x: 1, xanchor: "right", y: 1 },
     hovermode: "closest",
-  }, { responsive: true });
+  }, { responsive: true, displaylogo: false });
 
   // ── Scatter grid ────────────────────────────────────────────────────────────
   const grid = document.getElementById("opt-scatter-grid");
@@ -764,8 +769,6 @@ function buildOptimizationChart() {
   grid.innerHTML = "";
 
   // Color dots blue→red by trial order so you can see where the optimizer searched over time.
-  const n = allRuns.length;
-  const trialColor = d => lerpColor(n > 1 ? d.trialIdx / (n - 1) : 0.5);
 
   // Sort dimensions by effect size so the most informative panels come first.
   const effects = computeDimEffects(allRuns);
@@ -793,13 +796,13 @@ function buildOptimizationChart() {
       showlegend: false,
     }], {
       height: 220,
-      margin: { t: 34, r: 10, b: 44, l: 55 },
-      title: { text: `${e.dim}   Δ${e.effectSize.toFixed(3)}`, font: { size: 11, color: plotText }, x: 0.5 },
-      xaxis: { gridcolor: plotGrid, color: plotText, type: numeric ? "linear" : "category", automargin: true },
-      yaxis: { title: metric, gridcolor: plotGrid, color: plotText },
+      margin: { t: 38, r: 10, b: 52, l: 60 },
+      title: { text: `${e.dim} vs ${metric}   Δ${e.effectSize.toFixed(3)}`, font: { size: 11, color: plotText }, x: 0.5 },
+      xaxis: { title: { text: e.dim, font: { size: 10, color: plotText } }, gridcolor: plotGrid, color: plotText, type: numeric ? "linear" : "category" },
+      yaxis: { title: { text: metric, font: { size: 10, color: plotText } }, gridcolor: plotGrid, color: plotText },
       paper_bgcolor: plotBg, plot_bgcolor: plotBg,
       hovermode: "closest",
-    }, { responsive: true });
+    }, { responsive: true, displaylogo: false });
   }
 
   document.getElementById("status").textContent =

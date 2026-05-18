@@ -43,6 +43,13 @@ strict = true
 module = ["wandb", "wandb.*", "tensorboard", "tensorboard.*", "tensorboardX", "tensorboardX.*", "torch.*"]
 ignore_missing_imports = true
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short", "--strict-markers"]
+markers = [
+    "gpu: tests that require GPU hardware",
+]
+
 [tool.pyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.10"
