@@ -60,6 +60,7 @@ from mlsweep._shared import (
     MsgStarted,
     MsgSyncReq,
     MsgWorkerHello,
+    _resolve_safe_subpath,
     decode,
     encode,
 )
@@ -286,18 +287,6 @@ def _download_file(url: str, dest: str, timeout: int = 300) -> None:
                     break
                 f.write(chunk)
 
-
-def _resolve_safe_subpath(base: str, sub: str | None) -> str:
-    """Join *base* and relative *sub*; reject paths that escape *base*."""
-    if not sub:
-        return base
-    resolved = os.path.realpath(os.path.join(base, sub))
-    base_resolved = os.path.realpath(base)
-    if os.path.commonpath([resolved, base_resolved]) != base_resolved:
-        raise ValueError(
-            f"path {sub!r} escapes base directory {base!r}"
-        )
-    return resolved
 
 
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:

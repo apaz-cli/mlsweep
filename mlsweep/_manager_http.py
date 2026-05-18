@@ -44,7 +44,7 @@ from mlsweep._manager_db import (
     list_workers,
 )
 from mlsweep._manager_state import ManagerState
-from mlsweep._shared import MsgCancel, MsgShutdown, encode
+from mlsweep._shared import MsgCancel, MsgShutdown, _resolve_safe_subpath, encode
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,26 @@ def _schedule_cleanup(path: str, *, delay: float = 300) -> None:
             logger.warning("Failed to unlink temp zip: %s", path)
 
     asyncio.get_event_loop().call_later(delay, _do)
+
+
+def _zip_directory(tmp_path: str, source_dir: Path) -> None:
+    """Write all files under *source_dir* into a new zip at *tmp_path* (sync, for executor)."""
+    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in sorted(source_dir.rglob("*")):
+            if p.is_file():
+                zf.write(p, p.relative_to(source_dir))
+
+
+def _zip_experiment_artifacts(tmp_path: str, exp_dir: Path) -> None:
+    """Write artifacts from every run under *exp_dir* into a zip (sync, for executor)."""
+    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for run_dir in sorted(exp_dir.iterdir()):
+            artifacts_dir = run_dir / "artifacts"
+            if not artifacts_dir.is_dir():
+                continue
+            for p in sorted(artifacts_dir.rglob("*")):
+                if p.is_file():
+                    zf.write(p, Path(run_dir.name) / p.relative_to(artifacts_dir))
 
 
 # ===============================================================================
@@ -864,10 +884,8 @@ async def handle_zip_job_artifacts(request: web.Request) -> web.StreamResponse:
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
     os.close(fd)
     try:
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in sorted(artifacts_dir.rglob("*")):
-                if p.is_file():
-                    zf.write(p, p.relative_to(artifacts_dir))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _zip_directory, tmp_path, artifacts_dir)
     except Exception:
         os.unlink(tmp_path)
         raise
@@ -890,14 +908,8 @@ async def handle_zip_experiment_artifacts(request: web.Request) -> web.StreamRes
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
     os.close(fd)
     try:
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for run_dir in sorted(exp_dir.iterdir()):
-                artifacts_dir = run_dir / "artifacts"
-                if not artifacts_dir.is_dir():
-                    continue
-                for p in sorted(artifacts_dir.rglob("*")):
-                    if p.is_file():
-                        zf.write(p, Path(run_dir.name) / p.relative_to(artifacts_dir))
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _zip_experiment_artifacts, tmp_path, exp_dir)
     except Exception:
         os.unlink(tmp_path)
         raise
@@ -980,15 +992,13 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
     mlsweep_dir = Path(request.config_dict["mlsweep_dir"]).expanduser().resolve()
     file_path = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts" / artifact_path
 
-    # Security: ensure the resolved path is still within the artifacts directory
     try:
-        file_path = file_path.resolve()
-    except (ValueError, OSError):
-        return _error_response("invalid path", status=400)
-
-    artifacts_root = (mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts").resolve()
-    if not str(file_path).startswith(str(artifacts_root)):
+        artifacts_root = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
+        file_path = Path(_resolve_safe_subpath(artifacts_root, artifact_path))
+    except ValueError:
         return _error_response("path traversal denied", status=403)
+    except (OSError, TypeError):
+        return _error_response("invalid path", status=400)
 
     if not file_path.is_file():
         return _not_found("artifact file")
@@ -1145,10 +1155,8 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     # Re-queue any pending jobs from this worker: reset dispatched/running
     # jobs assigned to this worker back to pending
     re_queued_rows = await state.db_writer.reset_worker_jobs(worker_id)
-    re_queued: list[tuple[str, str]] = []
-    for run_id, experiment_id in re_queued_rows:
-        re_queued.append((run_id, experiment_id))
-        # Broadcast job_done (cancelled) for each re-queued job
+    re_queued: list[tuple[str, str]] = list(re_queued_rows)
+    for run_id, experiment_id in re_queued:
         state.broadcast(
             experiment_id,
             {

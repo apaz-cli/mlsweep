@@ -619,6 +619,21 @@ async def list_workers(
 # ===============================================================================
 
 
+def _serialize_job_fields(
+    command: "Sequence[str] | str",
+    combo: "dict[str, Any] | None",
+    env: "dict[str, str] | None",
+    return_files: "Sequence[str] | None",
+    files: "dict[str, str] | None",
+) -> tuple[str, str, str, str, str]:
+    command_json = json.dumps(command if isinstance(command, list) else [command])
+    combo_json = json.dumps(combo or {})
+    env_json = json.dumps(env or {})
+    return_files_json = json.dumps(list(return_files or []))
+    files_json = json.dumps(files or {})
+    return command_json, combo_json, env_json, return_files_json, files_json
+
+
 async def insert_job(
     db: aiosqlite.Connection,
     *,
@@ -642,13 +657,9 @@ async def insert_job(
 ) -> JobRecord:
     """Insert a new job row. Returns the created JobRecord."""
     now = _now_epoch()
-    command_json = json.dumps(
-        command if isinstance(command, list) else [command]
+    command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
+        command, combo, env, return_files, files
     )
-    combo_json = json.dumps(combo or {})
-    env_json = json.dumps(env or {})
-    return_files_json = json.dumps(list(return_files or []))
-    files_json = json.dumps(files or {})
 
     row = await _exec_one(
         db,
@@ -691,13 +702,9 @@ async def insert_jobs_bulk(
     try:
         records: list[JobRecord] = []
         for j in jobs:
-            command_json = json.dumps(
-                j["command"] if isinstance(j["command"], list) else [j["command"]]
+            command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
+                j["command"], j.get("combo"), j.get("env"), j.get("return_files"), j.get("files")
             )
-            combo_json = json.dumps(j.get("combo", {}))
-            env_json = json.dumps(j.get("env", {}))
-            return_files_json = json.dumps(list(j.get("return_files", [])))
-            files_json = json.dumps(j.get("files", {}))
 
             row = await _exec_one(
                 db,

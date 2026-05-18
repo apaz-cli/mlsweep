@@ -1,13 +1,36 @@
 """Shared utilities and wire protocol for mlsweep worker ↔ controller communication."""
 
 import json
+import os
 import subprocess
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from secrets import token_hex as _token_hex
 from typing import Any
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
+
+# ANSI escape codes
+_GREEN = "\033[32m"
+_RED = "\033[31m"
+_YELLOW = "\033[33m"
+_CYAN = "\033[36m"
+_MAGENTA = "\033[35m"
+_BLUE = "\033[34m"
+_RESET = "\033[0m"
+
+
+def _resolve_safe_subpath(base: str | Path, sub: str | None) -> str:
+    """Join *base* and relative *sub*; raise ValueError if *sub* escapes *base*."""
+    base = str(base)
+    if not sub:
+        return base
+    resolved = os.path.realpath(os.path.join(base, sub))
+    base_resolved = os.path.realpath(base)
+    if os.path.commonpath([resolved, base_resolved]) != base_resolved:
+        raise ValueError(f"path {sub!r} escapes base directory {base!r}")
+    return resolved
 
 
 def _git_root(path: str) -> str | None:

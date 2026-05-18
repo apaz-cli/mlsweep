@@ -50,23 +50,18 @@ from mlsweep._shared import (
     MsgStarted,
     MsgSyncReq,
     MsgWorkerHello,
+    _GREEN,
+    _RED,
+    _YELLOW,
+    _CYAN,
+    _MAGENTA,
+    _BLUE,
+    _RESET,
     _git_root,
     decode,
     encode,
 )
 from mlsweep._topology import _best_gpu_groups, _gpu_topology, _parse_topo_wire, visible_devices
-
-# ===============================================================================
-# ANSI helpers (kept minimal — the manager may want its own later)
-# ===============================================================================
-
-_GREEN = "\033[32m"
-_RED = "\033[31m"
-_YELLOW = "\033[33m"
-_CYAN = "\033[36m"
-_MAGENTA = "\033[35m"
-_BLUE = "\033[34m"
-_RESET = "\033[0m"
 
 
 # ===============================================================================

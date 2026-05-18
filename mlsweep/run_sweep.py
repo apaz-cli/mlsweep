@@ -43,19 +43,11 @@ from mlsweep._writers import (
     MultiWriterFactory,
     WriterFactory,
 )
-from mlsweep._shared import _git_root
+from mlsweep._shared import _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET, _git_root
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = _git_root(os.getcwd()) or os.getcwd()
 
-# ANSI colors
-_GREEN = "\033[32m"
-_RED = "\033[31m"
-_YELLOW = "\033[33m"
-_CYAN = "\033[36m"
-_MAGENTA = "\033[35m"
-_BLUE = "\033[34m"
-_RESET = "\033[0m"
 _DIM_COLORS = [_CYAN, _YELLOW, _MAGENTA, _BLUE]
 
 _log_file = None
