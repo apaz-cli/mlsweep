@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import os
 import signal
+import socket
 import sys
 from pathlib import Path
 from secrets import token_hex
@@ -120,6 +121,60 @@ async def _rebuild_state(
     return state
 
 
+async def _find_reachable_urls(port: int, token: str) -> list[tuple[str, str]]:
+    """Return list of (dashboard_url, label) for each IP that can reach us."""
+    import aiohttp
+
+    candidates: list[tuple[str, str]] = [("localhost", "local")]
+    lan_ip: str = ""
+
+    # LAN IP via UDP trick (no actual I/O)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+        if lan_ip and lan_ip != "127.0.0.1":
+            candidates.append((lan_ip, "LAN"))
+    except OSError:
+        pass
+
+    # Public IP via ipify
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.ipify.org?format=json", timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                data = await resp.json()
+                pub_ip = data.get("ip", "")
+                if pub_ip and pub_ip != lan_ip and pub_ip != "127.0.0.1":
+                    candidates.append((pub_ip, "public"))
+    except Exception:
+        pass
+
+    # Probe each candidate
+    reachable: list[tuple[str, str]] = []
+    headers = {"Authorization": f"Bearer {token}"}
+    async with aiohttp.ClientSession() as session:
+        for host, label in candidates:
+            try:
+                async with session.get(
+                    f"http://{host}:{port}/api/health",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=4),
+                ) as resp:
+                    if resp.status < 500:
+                        reachable.append((f"http://{host}:{port}/?token={token}", label))
+            except Exception:
+                pass
+
+    # Always include localhost even if probe fails (firewall may block self-connect)
+    if not reachable:
+        reachable.append((f"http://localhost:{port}/?token={token}", ""))
+
+    return reachable
+
+
 async def _async_main(args: argparse.Namespace) -> None:
 
     mlsweep_dir = Path(args.mlsweep_dir).expanduser().resolve()
@@ -209,9 +264,15 @@ async def _async_main(args: argparse.Namespace) -> None:
     await site.start()
 
     # ── Startup message ──────────────────────────────────────────────────
-    dashboard_url = f"{state.artifact_base_url}/?token={token}"
     print(f"mlsweep manager ready — dir {mlsweep_dir}")
-    print(f"Dashboard: {dashboard_url}")
+    reachable = await _find_reachable_urls(args.port, token)
+    if len(reachable) == 1:
+        print(f"Dashboard: {reachable[0][0]}")
+    else:
+        print("Dashboard:")
+        for url, label in reachable:
+            suffix = f"  ({label})" if label else ""
+            print(f"  {url}{suffix}")
 
     # ── Worker connections ───────────────────────────────────────────────
     # Connect to workers (local or via workers file).  Workers register
