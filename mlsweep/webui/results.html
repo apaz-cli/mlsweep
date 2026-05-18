@@ -1298,6 +1298,7 @@ async function loadExperiment(expId) {
   clearTimeout(_jobRefreshTimer);
   DATA = null; METRIC_CACHE = {}; _traceIndexMap = {}; LAST_EMA_S = {}; LIVE_RUNS = new Set();
   _pendingMetrics = {}; _rafPending = false;
+  dirtyTabs.add("curves"); dirtyTabs.add("sensitivity"); dirtyTabs.add("optimization");
   if (typeof Plotly !== "undefined") {
     Plotly.purge("chart-curves");
     Plotly.purge("chart-sensitivity");
