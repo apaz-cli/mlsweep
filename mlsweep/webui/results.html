@@ -78,13 +78,9 @@ select { width: 100%; padding: 5px 7px; border: 1px solid var(--border-input);
          border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
 select:focus { outline: none; border-color: #4c9be8; }
 
-#refresh-experiments {
-  flex-shrink: 0; width: 28px; height: 28px;
-  background: var(--btn-bg); border: 1px solid var(--border-input);
-  border-radius: 4px; font-size: 14px; cursor: pointer;
-  color: var(--text); display: flex; align-items: center; justify-content: center;
-}
-#refresh-experiments:hover { background: var(--btn-hover); }
+.icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
+.icon-btn svg { display: block; }
+.icon-btn:hover { background: var(--btn-hover); }
 
 .radio-row { display: flex; flex-wrap: wrap; gap: 3px; }
 .radio-row input[type=radio] { display: none; }
@@ -187,7 +183,7 @@ select:focus { outline: none; border-color: #4c9be8; }
     <div class="row">
       <select id="experiment-sel"></select>
       <a class="icon-btn" id="exp-dl-metrics" href="#" style="display:none" title="Download all experiment metrics"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
-      <button id="refresh-experiments" title="Refresh experiment list">&#8635;</button>
+      <button class="icon-btn" id="refresh-experiments" title="Refresh experiment list">&#8635;</button>
     </div>
   </div>
 
