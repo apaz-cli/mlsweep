@@ -257,7 +257,12 @@ def _read_thread(conn: ConnState) -> None:
 
 def _handle_msg(msg: Any, conn: ConnState) -> None:
     if isinstance(msg, MsgRun):
-        _handle_run(msg, conn)
+        t = threading.Thread(
+            target=_handle_run, args=(msg, conn),
+            daemon=True,
+            name=f"setup-{msg.run_id}",
+        )
+        t.start()
     elif isinstance(msg, MsgCancel):
         _handle_cancel(msg)
     elif isinstance(msg, MsgCleanup):
@@ -280,6 +285,19 @@ def _download_file(url: str, dest: str, timeout: int = 300) -> None:
                 if not chunk:
                     break
                 f.write(chunk)
+
+
+def _resolve_safe_subpath(base: str, sub: str | None) -> str:
+    """Join *base* and relative *sub*; reject paths that escape *base*."""
+    if not sub:
+        return base
+    resolved = os.path.realpath(os.path.join(base, sub))
+    base_resolved = os.path.realpath(base)
+    if os.path.commonpath([resolved, base_resolved]) != base_resolved:
+        raise ValueError(
+            f"path {sub!r} escapes base directory {base!r}"
+        )
+    return resolved
 
 
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:
@@ -310,14 +328,14 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
         workspace = os.path.join(scratch_path, "workspace")
         os.makedirs(workspace, exist_ok=True)
         for rel_path, content in msg.files.items():
-            abs_path = os.path.join(workspace, rel_path)
+            abs_path = _resolve_safe_subpath(workspace, rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             Path(abs_path).write_text(content, encoding="utf-8")
         cwd = workspace
     else:
         workspace = None
         remote_dir = msg.remote_dir or _remote_dir
-        cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
+        cwd = _resolve_safe_subpath(remote_dir, msg.run_from) if msg.run_from else remote_dir
 
     # ── Artifact download & extraction ───────────────────────────────────────
     if msg.artifact_id and msg.artifact_url:
@@ -485,9 +503,9 @@ def _run_thread(
     # run_dir is the workspace (when files={...}) or the cwd (when files={}).
     if return_files:
         for rel_path in return_files:
-            src = os.path.join(run_dir, rel_path)
+            src = _resolve_safe_subpath(run_dir, rel_path)
             if os.path.isfile(src):
-                dst = os.path.join(artifacts_path, rel_path)
+                dst = _resolve_safe_subpath(artifacts_path, rel_path)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
 

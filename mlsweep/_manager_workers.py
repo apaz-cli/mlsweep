@@ -1109,8 +1109,9 @@ async def _reconnect_worker(
         backoff = min(backoff * 2, 30.0)
 
         try:
+            connect_host = wc.host.split("@")[-1]
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(wc.host, wc.port),
+                asyncio.open_connection(connect_host, wc.port),
                 timeout=5.0,
             )
 
@@ -1282,6 +1283,81 @@ def _start_worker_tasks(
 
 
 # ===============================================================================
+# SSH reverse tunnel (artifact delivery for remote workers)
+# ===============================================================================
+
+
+async def _launch_tunnel(
+    host: str,
+    manager_port: int,
+    ssh_key: str | None = None,
+    password: str | None = None,
+) -> "asyncio.subprocess.Process | None":
+    """Spawn ssh -N -R {port}:localhost:{port} so the worker can reach the manager's HTTP server."""
+    key_args = ["-i", ssh_key] if ssh_key else []
+    sshpass_args, sshpass_env = _sshpass_args(password)
+    try:
+        return await asyncio.create_subprocess_exec(
+            *sshpass_args,
+            "ssh", "-N",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"{manager_port}:localhost:{manager_port}",
+            *key_args,
+            host,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=sshpass_env,
+        )
+    except OSError as e:
+        print(f"  {_YELLOW}WARN{_RESET}  Could not start tunnel to {host}: {e}", file=sys.stderr)
+        return None
+
+
+async def _tunnel_monitor_task(
+    wc: WorkerConn,
+    manager_port: int,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Keep the SSH reverse tunnel alive, restarting with backoff if it dies."""
+    backoff = 2.0
+    while True:
+        proc = wc.tunnel_proc
+        if proc is None or shutdown_event.is_set():
+            return
+
+        wait_proc = asyncio.create_task(proc.wait())
+        wait_shut = asyncio.create_task(shutdown_event.wait())
+        done, pending = await asyncio.wait(
+            {wait_proc, wait_shut}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        if shutdown_event.is_set() or wc.status == "dead":
+            if proc.returncode is None:
+                proc.terminate()
+            return
+
+        print(
+            f"  {_YELLOW}WARN{_RESET}  SSH tunnel to {wc.host} lost; "
+            f"reconnecting in {backoff:.0f}s"
+        )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
+
+        new_proc = await _launch_tunnel(
+            wc.host, manager_port, ssh_key=wc.ssh_key, password=wc.password
+        )
+        if new_proc is not None:
+            wc.tunnel_proc = new_proc
+            backoff = 2.0
+            print(f"  {_GREEN}OK{_RESET}    SSH tunnel to {wc.host} re-established")
+
+
+# ===============================================================================
 # Top-level: connect to all workers
 # ===============================================================================
 
@@ -1293,6 +1369,7 @@ async def connect_workers(
     workers_file: str | None = None,
     scratch_dir: str = "/tmp/mlsweep",
     max_gpus: int | None = None,
+    manager_port: int = 0,
     shutdown_event: asyncio.Event | None = None,
     workers_ready: asyncio.Event | None = None,
 ) -> list[WorkerConn]:
@@ -1346,6 +1423,7 @@ async def connect_workers(
             venv=w_venv,
             port=w_port,
             devices=w_devices,
+            manager_port=manager_port,
             shutdown_event=shutdown_event,
             workers_ready=workers_ready,
         )
@@ -1376,6 +1454,7 @@ async def connect_single_worker(
     venv: str | None = None,
     port: int = 0,
     devices: list[int] | None = None,
+    manager_port: int = 0,
     shutdown_event: asyncio.Event | None = None,
     workers_ready: asyncio.Event | None = None,
 ) -> WorkerConn | None:
@@ -1421,6 +1500,15 @@ async def connect_single_worker(
         ssh_key=ssh_key,
         venv=venv,
     )
+
+    if host != "localhost" and manager_port:
+        tunnel_proc = await _launch_tunnel(
+            host, manager_port, ssh_key=ssh_key, password=password
+        )
+        wc.tunnel_proc = tunnel_proc
+        asyncio.create_task(
+            _tunnel_monitor_task(wc, manager_port, shutdown_event or asyncio.Event())
+        )
 
     async with state.scheduler_lock:
         state.workers[worker_id] = wc

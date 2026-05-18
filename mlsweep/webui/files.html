@@ -234,6 +234,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 const _p       = new URLSearchParams(location.search);
 const TOKEN    = _p.get("token") || localStorage.getItem("mlsweep_token") || "";
 if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+if (_p.get("token")) history.replaceState(null, "", location.pathname + location.hash);
 const INIT_EXP  = _p.get("experiment") || "";
 const INIT_RUN  = _p.get("run")  || "";
 const INIT_FILE = _p.get("file") || "";

@@ -151,8 +151,8 @@ async def auth_middleware(
     Skips static file routes (prefix ``/static/``) so the web UI can load
     without a token in every asset request.
     """
-    # Allow static files and health check without auth
-    if request.path.startswith("/static/") or request.path == "/api/health":
+    # Allow static files without auth
+    if request.path.startswith("/static/"):
         return await handler(request)
 
     # Allow OPTIONS (CORS preflight) without auth
@@ -199,6 +199,7 @@ async def handle_reachable(request: web.Request) -> web.Response:
 
     server_port = request.url.port
     target_url = f"http://{host}:{server_port}/api/health"
+    token: str = request.config_dict["mlsweep_token"]
 
     import aiohttp
 
@@ -206,6 +207,7 @@ async def handle_reachable(request: web.Request) -> web.Response:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 target_url,
+                headers={"Authorization": f"Bearer {token}"},
                 timeout=aiohttp.ClientTimeout(total=4),
             ) as resp:
                 reachable = resp.status == 200

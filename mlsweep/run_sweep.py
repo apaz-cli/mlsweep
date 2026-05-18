@@ -619,7 +619,7 @@ def manager_download_experiment(
                 return False
             sweep_print(f"  Downloading and extracting to {out}...")
             with tarfile.open(fileobj=resp, mode="r|gz") as tar:
-                tar.extractall(path=str(out))
+                _safe_tar_extract(tar, str(out))
         sweep_print(f"  {_GREEN}OK{_RESET}    Experiment downloaded to {out}")
         return True
     except HTTPError as e:
@@ -634,6 +634,25 @@ def manager_download_experiment(
     except Exception as e:
         sweep_print(f"  {_RED}FAIL{_RESET}  Download error: {e}")
         return False
+
+
+def _safe_tar_extract(tar: tarfile.TarFile, dest: str) -> None:
+    """Extract a tar archive with path-traversal protection."""
+    try:
+        tar.extractall(path=dest, filter="data")
+    except TypeError:
+        pass
+    else:
+        return
+
+    resolved_dest = os.path.realpath(dest)
+    for member in tar.getmembers():
+        member_path = os.path.realpath(os.path.join(resolved_dest, member.name))
+        if os.path.commonpath([member_path, resolved_dest]) != resolved_dest:
+            raise ValueError(
+                f"tar member {member.name!r} escapes destination"
+            )
+    tar.extractall(path=dest)
 
 
 # ===============================================================================

@@ -5,6 +5,14 @@ Provides:
   - Data-class row types: JobRecord, ExperimentRecord, WorkerRecord, ArtifactRecord
   - Full CRUD async functions for every entity
   - Bulk / query helpers used by the manager scheduler and HTTP API
+
+Write convention
+----------------
+All mutating statements that use ``RETURNING *`` must go through ``_exec_one``
+or ``_exec_all`` rather than the bare ``cursor = await db.execute(...)`` form.
+See the comment block above those helpers for the full explanation.  The caller
+is always responsible for ``await db.commit()`` so that multiple writes can share
+one transaction (batching).
 """
 
 from __future__ import annotations
@@ -236,6 +244,55 @@ def _now_epoch() -> float:
 
 
 # ===============================================================================
+# Write helpers
+# ===============================================================================
+#
+# aiosqlite's Connection.execute() returns a Result object (aiosqlite/context.py)
+# that is both awaitable and an async context manager.  Its __aexit__ closes the
+# cursor, which resets the underlying SQLite statement to "not busy".  Without
+# that close, Python 3.12+ commit() raises "cannot commit transaction - SQL
+# statements in progress" when a RETURNING * statement was stepped but not yet
+# finished (e.g. the last fetchone() left rows on the wire, or the cursor was
+# never explicitly closed before commit).
+#
+# Rule for write functions: use _exec_one / _exec_all for any statement that
+# produces rows (RETURNING *).  Plain `await db.execute(sql)` is safe for DML
+# with no RETURNING clause because those statements step to completion during
+# execute() itself.  Never write `cursor = await db.execute(sql)` on a
+# RETURNING statement followed by a commit.
+#
+# The caller is responsible for `await db.commit()` (and rollback on error).
+# Keeping commit at the call site preserves the ability to batch multiple
+# _exec_* calls into a single transaction.
+
+
+async def _exec_one(
+    db: aiosqlite.Connection,
+    sql: str,
+    params: tuple[Any, ...] = (),
+) -> sqlite3.Row | None:
+    """Execute *sql* and return the first row, closing the cursor immediately.
+
+    The caller must ``await db.commit()`` (or rollback) after this returns.
+    """
+    async with db.execute(sql, params) as cursor:
+        return await cursor.fetchone()
+
+
+async def _exec_all(
+    db: aiosqlite.Connection,
+    sql: str,
+    params: tuple[Any, ...] = (),
+) -> list[sqlite3.Row]:
+    """Execute *sql* and return all rows, closing the cursor immediately.
+
+    The caller must ``await db.commit()`` (or rollback) after this returns.
+    """
+    async with db.execute(sql, params) as cursor:
+        return list(await cursor.fetchall())
+
+
+# ===============================================================================
 # Schema initialisation
 # ===============================================================================
 
@@ -393,7 +450,8 @@ async def create_experiment(
     """Insert a new experiment and return the row."""
     now = _now_epoch()
     singular_dims_json = json.dumps(singular_dims or [])
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status, expected_jobs, singular_dims)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -408,7 +466,6 @@ async def create_experiment(
         """,
         (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json),
     )
-    row = await cursor.fetchone()
     await db.commit()
     assert row is not None
     return _row_to_experiment(row)
@@ -447,15 +504,13 @@ async def update_experiment_status(
     status: ExperimentStatus,
 ) -> ExperimentRecord | None:
     """Update an experiment's status. Returns updated row or None."""
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         "UPDATE experiments SET status = ? WHERE experiment_id = ? RETURNING *",
         (status, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_experiment(row)
+    return _row_to_experiment(row) if row else None
 
 
 # ===============================================================================
@@ -478,7 +533,8 @@ async def upsert_worker(
 ) -> WorkerRecord:
     """Insert or update a worker row; set last_seen = now."""
     now = _now_epoch()
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         INSERT INTO workers (worker_id, host, remote_dir, status, last_seen,
                              scratch_dir, port, ssh_key, venv, devices)
@@ -498,7 +554,6 @@ async def upsert_worker(
         (worker_id, host, remote_dir, status, now,
          scratch_dir, port, ssh_key, venv, devices),
     )
-    row = await cursor.fetchone()
     await db.commit()
     assert row is not None
     return _row_to_worker(row)
@@ -511,15 +566,13 @@ async def update_worker_status(
 ) -> WorkerRecord | None:
     """Update a worker's status and last_seen. Returns updated row or None."""
     now = _now_epoch()
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         "UPDATE workers SET status = ?, last_seen = ? WHERE worker_id = ? RETURNING *",
         (status, now, worker_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_worker(row)
+    return _row_to_worker(row) if row else None
 
 
 async def touch_worker(
@@ -597,7 +650,8 @@ async def insert_job(
     return_files_json = json.dumps(list(return_files or []))
     files_json = json.dumps(files or {})
 
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         INSERT INTO jobs (
             run_id, experiment_id, priority, status, submit_time,
@@ -617,7 +671,6 @@ async def insert_job(
          int(set_dist_env), run_from, return_files_json, files_json, max_retries,
          artifact_id, setup_command, jobs_per_gpu),
     )
-    row = await cursor.fetchone()
     await db.commit()
     assert row is not None
     return _row_to_job(row)
@@ -635,7 +688,6 @@ async def insert_jobs_bulk(
     Returns the inserted JobRecord list.
     """
     now = _now_epoch()
-    await db.execute("BEGIN")
     try:
         records: list[JobRecord] = []
         for j in jobs:
@@ -647,7 +699,8 @@ async def insert_jobs_bulk(
             return_files_json = json.dumps(list(j.get("return_files", [])))
             files_json = json.dumps(j.get("files", {}))
 
-            cursor = await db.execute(
+            row = await _exec_one(
+                db,
                 """
                 INSERT INTO jobs (
                     run_id, experiment_id, priority, status, submit_time,
@@ -671,13 +724,12 @@ async def insert_jobs_bulk(
                  j.get("artifact_id"), j.get("setup_command"),
                  j.get("jobs_per_gpu", 1)),
             )
-            row = await cursor.fetchone()
             assert row is not None
             records.append(_row_to_job(row))
         await db.commit()
         return records
     except Exception:
-        await db.execute("ROLLBACK")
+        await db.rollback()
         raise
 
 
@@ -789,15 +841,13 @@ async def update_job_status(
         values.append(val)
     values.append(run_id)
     values.append(experiment_id)
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         f"UPDATE jobs SET {', '.join(set_clauses)} WHERE run_id = ? AND experiment_id = ? RETURNING *",
         tuple(values),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def dispatch_job(
@@ -814,7 +864,8 @@ async def dispatch_job(
     """
     now = _now_epoch()
     gpu_json = json.dumps(dispatched_gpu_ids) if dispatched_gpu_ids is not None else None
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         UPDATE jobs
         SET status = 'dispatched',
@@ -826,11 +877,8 @@ async def dispatch_job(
         """,
         (now, worker_id, gpu_json, run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def mark_job_running(
@@ -840,7 +888,8 @@ async def mark_job_running(
 ) -> JobRecord | None:
     """Atomically move a job from dispatched → running. Sets start_time."""
     now = _now_epoch()
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         UPDATE jobs
         SET status = 'running', start_time = ?
@@ -849,11 +898,8 @@ async def mark_job_running(
         """,
         (now, run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def finish_job(
@@ -868,7 +914,8 @@ async def finish_job(
     """Mark a job as done or failed."""
     status = "done" if success else "failed"
     now = _now_epoch()
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         UPDATE jobs
         SET status = ?, finish_time = ?, exit_code = ?, elapsed = ?
@@ -877,11 +924,8 @@ async def finish_job(
         """,
         (status, now, exit_code, elapsed, run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def reclassify_singular_xfails(
@@ -941,7 +985,8 @@ async def cancel_job(
     experiment_id: str,
 ) -> JobRecord | None:
     """Mark a pending job as cancelled (does not affect running jobs)."""
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         UPDATE jobs SET status = 'cancelled'
         WHERE run_id = ? AND experiment_id = ? AND status = 'pending'
@@ -949,11 +994,8 @@ async def cancel_job(
         """,
         (run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def reset_dispatched_running_to_pending(
@@ -963,7 +1005,7 @@ async def reset_dispatched_running_to_pending(
 
     Returns the number of jobs reset.
     """
-    cursor = await db.execute(
+    async with db.execute(
         """
         UPDATE jobs
         SET status = 'pending',
@@ -973,9 +1015,10 @@ async def reset_dispatched_running_to_pending(
             dispatched_gpu_ids = NULL
         WHERE status IN ('dispatched', 'running');
         """,
-    )
+    ) as cursor:
+        rowcount = cursor.rowcount
     await db.commit()
-    return cursor.rowcount
+    return rowcount
 
 
 async def increment_retry(
@@ -986,7 +1029,8 @@ async def increment_retry(
     """Increment retry_count and reset status to pending. Returns None if
     max_retries already reached.
     """
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         UPDATE jobs
         SET retry_count = retry_count + 1,
@@ -1003,11 +1047,8 @@ async def increment_retry(
         """,
         (run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def update_job_priority(
@@ -1018,22 +1059,20 @@ async def update_job_priority(
 ) -> JobRecord | None:
     """Update a job's priority."""
     # Try pending first (lightweight lock)
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         "UPDATE jobs SET priority = ? WHERE run_id = ? AND experiment_id = ? AND status = 'pending' RETURNING *",
         (priority, run_id, experiment_id),
     )
-    row = await cursor.fetchone()
     if row is None:
         # Fallback: update regardless of status
-        cursor = await db.execute(
+        row = await _exec_one(
+            db,
             "UPDATE jobs SET priority = ? WHERE run_id = ? AND experiment_id = ? RETURNING *",
             (priority, run_id, experiment_id),
         )
-        row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_job(row)
+    return _row_to_job(row) if row else None
 
 
 async def list_jobs_by_status(
@@ -1067,7 +1106,8 @@ async def reset_worker_jobs(
     pending and clear their dispatch metadata.  Returns a list of
     ``(run_id, experiment_id)`` tuples for the affected jobs.
     """
-    cursor = await db.execute(
+    rows = await _exec_all(
+        db,
         """
         UPDATE jobs
         SET status = 'pending',
@@ -1080,7 +1120,6 @@ async def reset_worker_jobs(
         """,
         (worker_id,),
     )
-    rows = await cursor.fetchall()
     await db.commit()
     return [(r["run_id"], r["experiment_id"]) for r in rows]
 
@@ -1131,7 +1170,8 @@ async def register_artifact(
 ) -> ArtifactRecord:
     """Insert or update an artifact row; bump ref_count by 1."""
     now = _now_epoch()
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         """
         INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, setup_command)
         VALUES (?, ?, ?, 1, ?)
@@ -1143,7 +1183,6 @@ async def register_artifact(
         """,
         (artifact_id, size_bytes, now, setup_command),
     )
-    row = await cursor.fetchone()
     await db.commit()
     assert row is not None
     return _row_to_artifact(row)
@@ -1167,15 +1206,13 @@ async def increment_artifact_ref(
     delta: int = 1,
 ) -> ArtifactRecord | None:
     """Increment (or decrement) an artifact's ref_count."""
-    cursor = await db.execute(
+    row = await _exec_one(
+        db,
         "UPDATE artifacts SET ref_count = ref_count + ? WHERE artifact_id = ? RETURNING *",
         (delta, artifact_id),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    if row is None:
-        return None
-    return _row_to_artifact(row)
+    return _row_to_artifact(row) if row else None
 
 
 # ===============================================================================
@@ -1278,20 +1315,14 @@ async def delete_experiment(
     experiment_id: str,
 ) -> bool:
     """Delete an experiment and all its jobs. Returns True if it existed."""
-    cursor = await db.execute(
-        "DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,)
-    )
-    await db.execute(
-        "DELETE FROM metrics WHERE experiment_id = ?", (experiment_id,)
-    )
-    await db.execute(
-        "DELETE FROM logs WHERE experiment_id = ?", (experiment_id,)
-    )
-    cursor2 = await db.execute(
+    await db.execute("DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,))
+    await db.execute("DELETE FROM metrics WHERE experiment_id = ?", (experiment_id,))
+    await db.execute("DELETE FROM logs WHERE experiment_id = ?", (experiment_id,))
+    row = await _exec_one(
+        db,
         "DELETE FROM experiments WHERE experiment_id = ? RETURNING experiment_id",
         (experiment_id,),
     )
-    row = await cursor2.fetchone()
     await db.commit()
     return row is not None
 
@@ -1400,6 +1431,10 @@ class DbWriter:
             try:
                 fut.set_result(await fn())
             except Exception as exc:
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    pass
                 fut.set_exception(exc)
 
     async def _enqueue(self, fn: Callable[[], Coroutine[Any, Any, _T]]) -> _T:

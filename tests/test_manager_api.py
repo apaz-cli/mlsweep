@@ -55,9 +55,20 @@ def _api_head(url, token, path):
 # ── Health / Auth ───────────────────────────────────────────────────────────────
 
 
-def test_health_no_auth_required(manager_server):
+def test_health_endpoint_requires_auth(manager_server):
+    """Health endpoint should require authentication."""
     _, url = manager_server
-    req = urllib.request.Request(f"{url}/api/health")
+    # Without auth token → 401
+    req_no_auth = urllib.request.Request(f"{url}/api/health")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req_no_auth, timeout=10)
+    assert exc.value.code == 401
+
+    # With valid token → 200
+    req = urllib.request.Request(
+        f"{url}/api/health",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read())
     assert data["status"] == "ok"

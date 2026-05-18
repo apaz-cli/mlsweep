@@ -77,6 +77,7 @@ class WorkerConn:
     password: str | None = None
     ssh_key: str | None = None
     venv: str | None = None
+    tunnel_proc: Any = None  # asyncio.subprocess.Process keeping the reverse tunnel alive
 
 
 # ── Manager state ──────────────────────────────────────────────────────────────

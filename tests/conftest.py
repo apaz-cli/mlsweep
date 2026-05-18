@@ -122,6 +122,11 @@ def manager_server(tmp_path):
     mlsweep_dir.mkdir()
     token = "test-token"
 
+    # Empty workers file prevents the manager from spawning a local worker,
+    # which would race with tests that check or change job status.
+    workers_file = tmp_path / "workers.toml"
+    workers_file.write_text("")
+
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "mlsweep.manager",
@@ -129,6 +134,7 @@ def manager_server(tmp_path):
             "--db", db_path,
             "--mlsweep-dir", str(mlsweep_dir),
             "--token", token,
+            "--workers", str(workers_file),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

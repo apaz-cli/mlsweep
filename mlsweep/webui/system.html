@@ -212,6 +212,7 @@ function setConnStatus(state) {
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
 if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+if (params.get("token")) history.replaceState(null, "", location.pathname + location.hash);
 
 function apiFetch(path, opts = {}) {
   return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });

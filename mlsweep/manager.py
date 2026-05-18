@@ -140,8 +140,16 @@ async def _async_main(argv: list[str] | None = None) -> None:
         token = token_file.read_text().strip()
     else:
         token = token_hex(16)
-    token_file.write_text(token)
-    token_file.chmod(0o600)
+    import tempfile as _tempfile
+    _tmp_fd, _tmp_path = _tempfile.mkstemp(dir=token_file.parent)
+    try:
+        os.write(_tmp_fd, token.encode())
+        os.close(_tmp_fd)
+        os.chmod(_tmp_path, 0o600)
+        os.replace(_tmp_path, str(token_file))
+    except Exception:
+        os.unlink(_tmp_path)
+        raise
 
     # ── Database ──────────────────────────────────────────────────────────
     db_path = args.db or os.path.join(str(mlsweep_dir), "manager.db")
@@ -215,6 +223,7 @@ async def _async_main(argv: list[str] | None = None) -> None:
     workers = await connect_workers(
         read_db, state,
         workers_file=args.workers,
+        manager_port=args.port,
         shutdown_event=shutdown_event,
         workers_ready=workers_ready,
     )

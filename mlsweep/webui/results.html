@@ -240,6 +240,7 @@ function setConnStatus(state) {
 const _urlParams = new URLSearchParams(location.search);
 const TOKEN = _urlParams.get("token") || localStorage.getItem("mlsweep_token") || "";
 if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+if (_urlParams.get("token")) history.replaceState(null, "", location.pathname + location.hash);
 const INIT_EXP = _urlParams.get("experiment") || "";
 
 function apiFetch(path, opts = {}) {
