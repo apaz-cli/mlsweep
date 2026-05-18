@@ -84,9 +84,14 @@ def _check_pid_file(pid_file: Path) -> None:
 
 
 async def _rebuild_state(
-    db: aiosqlite.Connection,
+    read_db: aiosqlite.Connection,
+    write_db: aiosqlite.Connection,
 ) -> "ManagerState":  # noqa: F821
-    """Rebuild in-memory state from the database on startup."""
+    """Rebuild in-memory state from the database on startup.
+
+    Called before the DbWriter actor starts, so writes go directly to
+    write_db via the module-level functions.
+    """
     from mlsweep._manager_db import (
         list_pending_jobs,
         list_workers,
@@ -96,20 +101,20 @@ async def _rebuild_state(
     state = ManagerState()
 
     # Reset any jobs that were left in dispatched/running state by a
-    # previous manager crash.
-    n = await reset_dispatched_running_to_pending(db)
+    # previous manager crash.  Actor is not running yet — call directly.
+    n = await reset_dispatched_running_to_pending(write_db)
     if n:
         print(f"Reset {n} dispatched/running jobs to pending")
 
     # Load pending jobs into sorted list.
-    pending_jobs = await list_pending_jobs(db)
+    pending_jobs = await list_pending_jobs(read_db)
     for job in pending_jobs:
         state.insert_pending(job)
     print(f"Loaded {len(pending_jobs)} pending jobs")
 
     # Workers are loaded from DB for reference; WorkerConn objects are
     # created on-demand when workers actually connect over TCP.
-    db_workers = await list_workers(db)
+    db_workers = await list_workers(read_db)
     print(f"Found {len(db_workers)} known workers in database")
 
     return state
@@ -140,15 +145,30 @@ async def _async_main(argv: list[str] | None = None) -> None:
 
     # ── Database ──────────────────────────────────────────────────────────
     db_path = args.db or os.path.join(str(mlsweep_dir), "manager.db")
-    db = await aiosqlite.connect(db_path)
-    print(f"Connected to database: {db_path}")
 
-    from mlsweep._manager_db import init_db
-    await init_db(db)
+    # write_db is owned exclusively by the DbWriter actor (serial writes).
+    # read_db is used by all other coroutines for SELECT queries; WAL mode
+    # allows concurrent reads alongside the writer without blocking.
+    from mlsweep._manager_db import DbWriter, init_db
+    import sqlite3 as _sqlite3
+
+    write_db = await aiosqlite.connect(db_path)
+    await init_db(write_db)
+    print(f"Connected to database: {db_path}")
     print("Database schema initialized")
 
+    read_db = await aiosqlite.connect(db_path)
+    read_db.row_factory = _sqlite3.Row
+    await read_db.execute("PRAGMA journal_mode=WAL")
+    await read_db.execute("PRAGMA foreign_keys=ON")
+
+    # ── DB writer actor ──────────────────────────────────────────────────
+    writer = DbWriter(write_db)
+    writer_task = asyncio.create_task(writer.run(), name="db-writer")
+
     # ── Rebuild state ────────────────────────────────────────────────────
-    state = await _rebuild_state(db)
+    state = await _rebuild_state(read_db, write_db)
+    state.db_writer = writer
 
     # ── Shutdown coordination ────────────────────────────────────────────
     shutdown_event = asyncio.Event()
@@ -172,9 +192,9 @@ async def _async_main(argv: list[str] | None = None) -> None:
     state.output_dir = os.path.join(str(mlsweep_dir), "experiments")
     state.artifact_base_url = f"http://{args.host}:{args.port}"
     state.token = token
-    state.dispatch_callback = lambda: schedule_pending(db, state)
+    state.dispatch_callback = lambda: schedule_pending(read_db, state)
 
-    app = create_app(db, state, token, mlsweep_dir=mlsweep_dir)
+    app = create_app(read_db, state, token, mlsweep_dir=mlsweep_dir)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -193,7 +213,7 @@ async def _async_main(argv: list[str] | None = None) -> None:
     workers_ready = asyncio.Event()
 
     workers = await connect_workers(
-        db, state,
+        read_db, state,
         workers_file=args.workers,
         shutdown_event=shutdown_event,
         workers_ready=workers_ready,
@@ -208,7 +228,7 @@ async def _async_main(argv: list[str] | None = None) -> None:
         print("Warning: timed out waiting for worker hello handshakes")
 
     # Initial scheduling pass — dispatch any pending jobs loaded at startup.
-    n = await schedule_pending(db, state)
+    n = await schedule_pending(read_db, state)
     if n:
         print(f"Initial dispatch: {n} job(s) started")
 
@@ -218,8 +238,10 @@ async def _async_main(argv: list[str] | None = None) -> None:
     # ── Cleanup ──────────────────────────────────────────────────────────
     print("Shutting down HTTP server...")
     await runner.cleanup()
+    writer_task.cancel()
     print("Closing database...")
-    await db.close()
+    await read_db.close()
+    await write_db.close()
     pid_file = mlsweep_dir / "manager.pid"
     pid_file.unlink(missing_ok=True)
     print("Manager stopped.")
@@ -227,6 +249,8 @@ async def _async_main(argv: list[str] | None = None) -> None:
 
 def main() -> None:
     """Synchronous entry point for console_scripts."""
+    from mlsweep._manager_workers import _ensure_worker_wheels
+    _ensure_worker_wheels()
     asyncio.run(_async_main())
 
 

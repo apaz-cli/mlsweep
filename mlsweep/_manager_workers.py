@@ -29,16 +29,8 @@ import aiosqlite
 from mlsweep._manager_db import (
     JobRecord,
     WorkerRecord,
-    dispatch_job,
-    finish_job,
     get_experiment,
-    increment_retry,
-    mark_job_running,
-    reclassify_singular_xfails,
-    update_experiment_status,
     update_job_status,
-    update_worker_status,
-    upsert_worker,
 )
 from mlsweep._manager_state import InFlightJob, ManagerState, WorkerConn
 from mlsweep._parsync import parsync_bin
@@ -95,7 +87,7 @@ def _parse_workers_file(
     try:
         import tomllib  # type: ignore[import-not-found]  # Python 3.11+
     except ImportError:
-        import tomli as tomllib  # type: ignore[import-not-found]
+        import tomli as tomllib  # fallback: python_version < '3.11'
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -170,6 +162,71 @@ def _worker_shell_cmd(candidates: list[str], worker_args: list[str]) -> str:
     )
 
 
+def _ensure_worker_wheels() -> None:
+    """Build _wheels/ if it doesn't already contain a mlsweep wheel.
+
+    Runs synchronously at manager startup (before the event loop).
+    Two steps:
+      1. pip wheel --no-deps  → builds the local mlsweep wheel
+      2. pip download         → fetches abi3 deps from PyPI, seeded by the
+                                wheel from step 1 so mlsweep itself is never
+                                pulled from the public index
+    """
+    wheels_dir = Path(__file__).resolve().parent / "_wheels"
+    if wheels_dir.exists() and (wheels_dir / ".complete").exists():
+        return
+
+    print("[wheels] Building worker wheels...", flush=True)
+    wheels_dir.mkdir(exist_ok=True)
+
+    # Step 1: build the local mlsweep wheel.
+    repo_root = Path(__file__).resolve().parent.parent
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", "--no-deps",
+         "--wheel-dir", str(wheels_dir), str(repo_root)],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        print(
+            f"[wheels] pip wheel failed:\n{r.stderr.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        return
+
+    # Step 2: download abi3 deps from PyPI for the mlsweep wheel we just built.
+    # --find-links points at our wheels dir so pip reads mlsweep's metadata
+    # from the local wheel and never fetches mlsweep itself from PyPI.
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "download",
+         "--dest", str(wheels_dir),
+         "--find-links", str(wheels_dir),
+         "--platform", "manylinux_2_17_x86_64",
+         "--implementation", "cp",
+         "--abi", "abi3",
+         "--python-version", "3.9",
+         "--only-binary", ":all:",
+         "mlsweep"],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        print(
+            f"[wheels] pip download failed:\n{r.stderr.decode(errors='replace')}",
+            file=sys.stderr,
+        )
+        # Step 1 left an orphaned mlsweep wheel — remove it so the
+        # guard on next startup doesn't skip the full rebuild.
+        for w in wheels_dir.glob("mlsweep-*.whl"):
+            w.unlink(missing_ok=True)
+        return
+
+    # Both steps succeeded — write a sentinel so we never reuse a
+    # partial result.
+    (wheels_dir / ".complete").touch()
+
+    wheels = [p.name for p in wheels_dir.iterdir()]
+    print(f"[wheels] Ready ({len(wheels)} wheels)", flush=True)
+
+
 async def _bootstrap_worker_venv(
     host: str,
     ssh_key: str | None = None,
@@ -184,17 +241,20 @@ async def _bootstrap_worker_venv(
     Returns ``True`` on success, ``False`` if any step fails.
     """
     key_args = ["-i", ssh_key] if ssh_key else []
+    ssh_opts = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+    sshpass_args, sshpass_env = _sshpass_args(password)
 
     # 1. Quick check: is the binary already present?
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_sshpass_prefix(password),
-            "ssh", "-o", "ConnectTimeout=10",
+            *sshpass_args,
+            "ssh", *ssh_opts,
             *key_args,
             host,
             "test -x /tmp/mlsweep_venv/bin/mlsweep_worker && echo OK || echo MISSING",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=sshpass_env,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
         if b"OK" in stdout:
@@ -202,19 +262,43 @@ async def _bootstrap_worker_venv(
     except (OSError, asyncio.TimeoutError):
         pass  # fall through to bootstrap
 
-    # 2. SCP the bundled wheels to /tmp/mlsweep_wheels/
-    wheels_src = str(Path(__file__).resolve().parent / "_wheels") + "/"
+    # 2. mkdir + SCP bundled wheels to remote.
+    wheels_dir = Path(__file__).resolve().parent / "_wheels"
+    wheel_files = [str(p) for p in wheels_dir.iterdir()]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_sshpass_prefix(password),
-            "scp", "-r", "-o", "ConnectTimeout=10",
+            *sshpass_args,
+            "ssh", *ssh_opts,
             *key_args,
-            wheels_src,
+            host,
+            "mkdir -p /tmp/mlsweep_wheels",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=sshpass_env,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        if proc.returncode != 0:
+            print(
+                f"[bootstrap] mkdir failed for {host}: "
+                f"{stderr.decode(errors='replace')[:200]}",
+                file=sys.stderr,
+            )
+            return False
+    except (OSError, asyncio.TimeoutError) as e:
+        print(f"[bootstrap] mkdir failed for {host}: {e}", file=sys.stderr)
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *sshpass_args,
+            "scp", *ssh_opts,
+            *key_args,
+            *wheel_files,
             f"{host}:/tmp/mlsweep_wheels/",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=sshpass_env,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
         if proc.returncode != 0:
             print(
                 f"[bootstrap] scp failed for {host}: "
@@ -226,11 +310,11 @@ async def _bootstrap_worker_venv(
         print(f"[bootstrap] scp failed for {host}: {e}", file=sys.stderr)
         return False
 
-    # 3. Create venv and install mlsweep from local wheels
+    # 3. Create venv and install mlsweep fully offline.
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_sshpass_prefix(password),
-            "ssh", "-o", "ConnectTimeout=10",
+            *sshpass_args,
+            "ssh", *ssh_opts,
             *key_args,
             host,
             (
@@ -240,6 +324,7 @@ async def _bootstrap_worker_venv(
             ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=sshpass_env,
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120.0)
         if proc.returncode != 0:
@@ -258,16 +343,20 @@ async def _bootstrap_worker_venv(
 _sshpass_available: bool | None = None
 
 
-def _sshpass_prefix(password: str | None) -> list[str]:
-    """Return ``['sshpass', '-p', password]`` if a password is given, else ``[]``."""
+def _sshpass_args(password: str | None) -> tuple[list[str], dict[str, str] | None]:
+    """Return ``(sshpass_prefix, env_dict)`` for subprocess calls.
+
+    Uses ``sshpass -e`` to pass *password* via the ``SSHPASS`` env var
+    rather than exposing it on the command line via ``-p``.
+    """
     global _sshpass_available
     if not password:
-        return []
+        return [], None
     if _sshpass_available is None:
         _sshpass_available = shutil.which("sshpass") is not None
     if not _sshpass_available:
         raise RuntimeError("sshpass is not installed but a password was specified")
-    return ["sshpass", "-p", password]
+    return ["sshpass", "-e"], {**os.environ, "SSHPASS": password}
 
 
 # ===============================================================================
@@ -330,6 +419,7 @@ async def launch_worker(
         )
     else:
         # Remote: bootstrap venv if needed, then SSH and run worker binary
+        sshpass_args, sshpass_env = _sshpass_args(password)
         ok = await _bootstrap_worker_venv(
             host, ssh_key=ssh_key, password=password,
         )
@@ -345,7 +435,7 @@ async def launch_worker(
         ]
         shell_cmd = _worker_shell_cmd(_worker_candidates(venv), worker_args)
         ssh_cmd = [
-            *_sshpass_prefix(password),
+            *sshpass_args,
             "ssh", "-o", "ConnectTimeout=10",
             *key_args,
             host, shell_cmd,
@@ -354,6 +444,7 @@ async def launch_worker(
             *ssh_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=sshpass_env,
         )
 
     assert proc.stdout is not None and proc.stderr is not None
@@ -499,13 +590,14 @@ async def _handle_worker_hello(
         wc.connected_at = datetime.now(timezone.utc)
 
         # Persist to DB
-        await upsert_worker(
-            db,
+        await state.db_writer.upsert_worker(
             worker_id=wc.worker_id,
             host=wc.host,
             remote_dir=wc.remote_dir,
             scratch_dir=msg.scratch_dir,
             port=wc.port,
+            ssh_key=wc.ssh_key,
+            venv=wc.venv,
             devices=json.dumps(msg.gpus),
             status="connected",
         )
@@ -543,23 +635,13 @@ async def _handle_started(
     wc: WorkerConn,
     msg: MsgStarted,
 ) -> None:
-    """Handle ``MsgStarted``: create run directory, open log handles, mark job running."""
+    """Handle ``MsgStarted``: mark job running."""
     async with state.scheduler_lock:
         job = state.get_in_flight(msg.run_id)
         if job is not None:
             job.start_time = datetime.now(timezone.utc)
 
-    if job is not None and state.output_dir:
-        run_dir = os.path.join(state.output_dir, job.experiment_id, msg.run_id)
-        os.makedirs(run_dir, exist_ok=True)
-        log_path = os.path.join(run_dir, "training.log")
-        try:
-            fh = open(log_path, "a")
-            wc.log_handles[msg.run_id] = fh
-        except OSError:
-            pass
-
-    await mark_job_running(db, msg.run_id, job.experiment_id if job else "")
+    await state.db_writer.mark_job_running(msg.run_id, job.experiment_id if job else "")
 
     state.broadcast(
         job.experiment_id if job else "*",
@@ -578,14 +660,11 @@ async def _handle_log(
     wc: WorkerConn,
     msg: MsgLog,
 ) -> None:
-    """Handle ``MsgLog``: write to log file and broadcast."""
+    """Handle ``MsgLog``: persist to DB and broadcast."""
     job = state.get_in_flight(msg.run_id)
-    fh = wc.log_handles.get(msg.run_id)
-    if fh is not None:
-        fh.write(msg.data)
-        fh.flush()
 
     if job:
+        await state.db_writer.insert_log(msg.run_id, job.experiment_id, msg.seq, msg.data)
         state.broadcast(
             job.experiment_id,
             {
@@ -603,10 +682,11 @@ async def _handle_metric(
     wc: WorkerConn,
     msg: MsgMetric,
 ) -> None:
-    """Handle ``MsgMetric``: broadcast to WebSocket subscribers."""
+    """Handle ``MsgMetric``: persist to DB and broadcast to WebSocket subscribers."""
     job = state.get_in_flight(msg.run_id)
 
     if job:
+        await state.db_writer.insert_metric(msg.run_id, job.experiment_id, msg.step, msg.data)
         state.broadcast(
             job.experiment_id,
             {
@@ -762,8 +842,7 @@ async def _handle_result(
         final_elapsed = msg.elapsed
 
     # Persist to DB
-    await finish_job(
-        db,
+    await state.db_writer.finish_job(
         msg.run_id,
         job.experiment_id if job else "",
         success=final_success,
@@ -774,15 +853,7 @@ async def _handle_result(
     # Retroactively reclassify singular-probe failures as xfailed
     xfailed_ids: list[str] = []
     if final_success and job is not None:
-        xfailed_ids = await reclassify_singular_xfails(db, job.experiment_id, job.combo)
-
-    # Close log file handle
-    fh = wc.log_handles.pop(msg.run_id, None)
-    if fh is not None:
-        try:
-            fh.close()
-        except OSError:
-            pass
+        xfailed_ids = await state.db_writer.reclassify_singular_xfails(job.experiment_id, job.combo)
 
     # Broadcast
     if job:
@@ -823,6 +894,11 @@ async def _handle_result(
         await state.dispatch_callback()
 
     # ── Check if experiment is complete ─────────────────────────────────
+    # The in-memory scan (has_active, has_pending) is a fast-path: it only
+    # prevents marking complete, and the DB count query below serves as the
+    # authoritative safety net (SELECT COUNT ... WHERE status = 'done').
+    # A TOCTOU window exists between dispatch_callback() releasing its lock
+    # and us re-acquiring below, but the DB count guards correctness.
     if job is not None:
         experiment_id = job.experiment_id
         async with state.scheduler_lock:
@@ -851,7 +927,7 @@ async def _handle_result(
             if expected != 0 and submitted_count < expected:
                 return
 
-            await update_experiment_status(db, experiment_id, "completed")
+            await state.db_writer.update_experiment_status(experiment_id, "completed")
 
         state.broadcast(
             experiment_id,
@@ -880,8 +956,7 @@ async def _handle_pong(
     msg: MsgPong,
 ) -> None:
     """Handle ``MsgPong`` — update last_seen so the UI reflects a live worker."""
-    from mlsweep._manager_db import touch_worker
-    await touch_worker(db, wc.worker_id)
+    await state.db_writer.touch_worker(wc.worker_id)
 
 
 # ── Message dispatch table ─────────────────────────────────────────────────────
@@ -998,7 +1073,7 @@ async def _on_worker_lost(
     async with state.scheduler_lock:
         wc.status = "reconnecting"
 
-    await update_worker_status(db, wc.worker_id, "reconnecting")
+    await state.db_writer.update_worker_status(wc.worker_id, "reconnecting")
 
     print(f"  {_YELLOW}WARN{_RESET}  Worker {wc.host} disconnected; reconnecting...")
 
@@ -1060,7 +1135,7 @@ async def _reconnect_worker(
                 wc.status = "connected"
                 wc.connected_at = datetime.now(timezone.utc)
 
-            await update_worker_status(db, wc.worker_id, "connected")
+            await state.db_writer.update_worker_status(wc.worker_id, "connected")
 
             print(f"  {_GREEN}OK{_RESET}    Worker {wc.host} reconnected")
 
@@ -1116,7 +1191,7 @@ async def _reconnect_worker(
         wc.status = "dead"
         wc.gpu_occupancy.clear()
 
-    await update_worker_status(db, wc.worker_id, "dead")
+    await state.db_writer.update_worker_status(wc.worker_id, "dead")
 
     print(f"  {_RED}FAIL{_RESET}  Worker {wc.host} unreachable; re-queuing runs")
 
@@ -1138,7 +1213,7 @@ async def _handle_orphaned_run(
     experiment_id: str = "",
 ) -> None:
     """Re-queue or fail an orphaned run after a worker disconnect."""
-    job = await increment_retry(db, run_id, experiment_id)
+    job = await state.db_writer.increment_retry(run_id, experiment_id)
 
     async with state.scheduler_lock:
         # Free GPU occupancy for the orphaned run
@@ -1157,8 +1232,8 @@ async def _handle_orphaned_run(
         print(f"  {_YELLOW}RETRY{_RESET} {run_id} (attempt {job.retry_count}/{job.max_retries})")
     else:
         # Max retries exceeded — mark as failed
-        await finish_job(
-            db, run_id, experiment_id,
+        await state.db_writer.finish_job(
+            run_id, experiment_id,
             success=False, exit_code=-1, elapsed=0.0,
         )
         print(f"  {_RED}FAIL{_RESET}  {run_id}: max retries exceeded")
@@ -1325,7 +1400,10 @@ async def connect_single_worker(
         print(f"  {_RED}WARN{_RESET}  Cannot start worker on {host}: {e}")
         return None
 
-    # Determine worker_id if not provided
+    # Determine worker_id if not provided.
+    # NOTE: all current callers pass an explicit worker_id, so this branch
+    # is never reached.  Kept as a defensive fallback; if called without an
+    # id, the format matches none of the other id-generation sites.
     if worker_id is None:
         worker_id = f"{host}:{actual_port}"
 
@@ -1341,6 +1419,7 @@ async def connect_single_worker(
         scratch_dir=scratch_dir,
         password=password,
         ssh_key=ssh_key,
+        venv=venv,
     )
 
     async with state.scheduler_lock:
@@ -1392,8 +1471,8 @@ async def dispatch_to_worker(
     # double-assign them.
     async with state.scheduler_lock:
         # Atomically claim the job in DB
-        dispatched = await dispatch_job(
-            db, job.run_id, job.experiment_id, wc.worker_id, gpu_ids
+        dispatched = await state.db_writer.dispatch_job(
+            job.run_id, job.experiment_id, wc.worker_id, gpu_ids
         )
         if dispatched is None:
             return False  # job already taken by another scheduler
@@ -1482,6 +1561,11 @@ async def _dispatch_core(
     # Send MsgRun (outside the lock — I/O)
     success = await _send_to_worker(wc, encode(run_msg))
     if not success:
+        async with state.scheduler_lock:
+            for gpu_id in gpu_ids:
+                wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
+            wc.in_flight.pop(job.run_id, None)
+            state.remove_in_flight(job.run_id)
         return False
 
     # Broadcast
@@ -1681,8 +1765,8 @@ async def _execute_assignment(
 
     # Atomically claim the job in DB via the primary worker
     async with state.scheduler_lock:
-        dispatched = await dispatch_job(
-            db, job.run_id, job.experiment_id, primary_wc.worker_id, primary_gpus,
+        dispatched = await state.db_writer.dispatch_job(
+            job.run_id, job.experiment_id, primary_wc.worker_id, primary_gpus,
         )
         if dispatched is None:
             return False  # job already taken by another scheduler

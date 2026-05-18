@@ -56,7 +56,7 @@ class MLSweepLogger:
                             ``MLSWEEP_NODE_RANK`` are unset or ``"0"``.  Set to
                             ``False`` to log from every rank.
         """
-        self._run_id: str = run_name or os.environ.get("MLSWEEP_RUN_NAME", "")
+        self._run_id: str = run_name if run_name is not None else os.environ.get("MLSWEEP_RUN_NAME", "")
         _is_lead = (
             os.environ.get("MLSWEEP_GPU_RANK", "0") == "0"
             and os.environ.get("MLSWEEP_NODE_RANK", "0") == "0"

@@ -156,6 +156,8 @@ select:focus { outline: none; border-color: #4c9be8; }
 <div id="topnav">
   <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link active" href="#">Results</a>
+  <a class="nav-link" id="nav-logs" href="#">Logs</a>
+  <a class="nav-link" id="nav-files" href="#">Files</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -251,6 +253,8 @@ function pageHref(page) {
   return `${page}${TOKEN ? "?token="+encodeURIComponent(TOKEN) : ""}`;
 }
 document.getElementById("nav-experiments").href = pageHref("experiments.html");
+document.getElementById("nav-files").href       = pageHref("files.html");
+document.getElementById("nav-logs").href        = pageHref("logs.html");
 document.getElementById("nav-system").href      = pageHref("system.html");
 
 // ── Constants & state (from visualize.py verbatim) ────────────────────────────
@@ -279,6 +283,8 @@ let _ws            = null;       // WebSocket for live updates
 let _traceIndexMap = {};
 // last EMA accumulator: {metric: {run_hash: s_prev}} for incremental smoothing
 let LAST_EMA_S     = {};
+let _pendingMetrics = {};   // runId → metricName → {steps, values} accumulated between RAF flushes
+let _rafPending     = false;
 
 // ── Tab management (from visualize.py verbatim) ───────────────────────────────
 
@@ -903,12 +909,94 @@ function mergeJsonlIntoCache(rows, runId) {
   }
 }
 
+// ── Metric batch buffer (replaces per-step Plotly calls with one RAF flush) ────
+
+function _scheduleFlush() {
+  if (_rafPending) return;
+  _rafPending = true;
+  requestAnimationFrame(_flushPendingMetrics);
+}
+
+function _flushPendingMetrics() {
+  _rafPending = false;
+  const pending = _pendingMetrics;
+  _pendingMetrics = {};
+  if (!DATA) return;
+
+  let gotCurrentMetric   = false;
+  let metricNamesChanged = false;
+  const incrementalUpdates = [];
+
+  for (const [runId, perMetric] of Object.entries(pending)) {
+    for (const [mname, {steps, values}] of Object.entries(perMetric)) {
+      if (!METRIC_CACHE[mname]) METRIC_CACHE[mname] = {};
+      if (!METRIC_CACHE[mname][runId]) METRIC_CACHE[mname][runId] = { steps: [], values: [] };
+      METRIC_CACHE[mname][runId].steps.push(...steps);
+      METRIC_CACHE[mname][runId].values.push(...values);
+
+      if (!DATA.metricNames.includes(mname)) {
+        DATA.metricNames.push(mname);
+        metricNamesChanged = true;
+      }
+
+      if (mname === metric) {
+        gotCurrentMetric = true;
+        if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
+        const [newSmoothed, newS] = _applyEmaIncremental(values, LAST_EMA_S[metric][runId] ?? null);
+        LAST_EMA_S[metric][runId] = newS;
+        const lineIdx = _traceIndexMap[runId];
+        if (lineIdx !== undefined) {
+          const n      = Object.keys(_traceIndexMap).length;
+          const dotIdx = n + lineIdx;
+          const lastStep = steps[steps.length - 1];
+          const lastY    = newSmoothed[newSmoothed.length - 1];
+          incrementalUpdates.push({ lineIdx, dotIdx, newSteps: steps, newSmoothed, lastStep, lastY });
+        }
+      }
+    }
+  }
+
+  if (metricNamesChanged) {
+    DATA.metricNames.sort();
+    if (!metric || !DATA.metricNames.includes(metric)) {
+      metric = DATA.metricNames.find(m => m.includes("loss")) || DATA.metricNames[0];
+      buildMetricSelect();
+      buildActiveChart();
+      return;
+    }
+    buildMetricSelect();
+  }
+  if (!gotCurrentMetric) return;
+
+  if (activeTab === "curves" && !dirtyTabs.has("curves") && smoothAlpha === 0) {
+    const lineIdxs = [], lineXs = [], lineYs = [];
+    const dotIdxs  = [], dotXs  = [], dotYs  = [];
+    for (const u of incrementalUpdates) {
+      lineIdxs.push(u.lineIdx); lineXs.push(u.newSteps);  lineYs.push(u.newSmoothed);
+      dotIdxs.push(u.dotIdx);   dotXs.push([u.lastStep]); dotYs.push([u.lastY]);
+    }
+    if (lineIdxs.length) {
+      Plotly.extendTraces("chart-curves", { x: lineXs, y: lineYs }, lineIdxs);
+      Plotly.restyle("chart-curves",      { x: dotXs,  y: dotYs  }, dotIdxs);
+    }
+    const vis = Object.keys(_traceIndexMap).length;
+    document.getElementById("status").textContent =
+      `${vis} / ${DATA.runs.length} runs visible` +
+      (LIVE_RUNS.size ? `  •  ${LIVE_RUNS.size} live` : "");
+  } else {
+    buildActiveChart();
+  }
+  dirtyTabs.add("sensitivity");
+}
+
 // ── WebSocket live updates (replaces connectSSE from visualize.py) ────────────
 
 function connectWS(expId) {
   if (_ws) { _ws.close(); _ws = null; }
-  LIVE_RUNS  = new Set();
-  LAST_EMA_S = {};
+  LIVE_RUNS       = new Set();
+  LAST_EMA_S      = {};
+  _pendingMetrics = {};
+  _rafPending     = false;
 
   const url = wsURL(`/ws/experiments/${encodeURIComponent(expId)}`);
   _ws = new WebSocket(url);
@@ -944,69 +1032,24 @@ function connectWS(expId) {
     if (!DATA) return;
 
     if (evt.type === "metric") {
-      // Manager sends: {type, run_id, step, data: {metric_name: value}}
       const runId = evt.run_id;
       const step  = evt.step;
-      const data  = evt.data || {};
-
-      const incrementalUpdates = [];
-      let gotCurrentMetric = false;
-
-      for (const [mname, val] of Object.entries(data)) {
+      if (!_pendingMetrics[runId]) _pendingMetrics[runId] = {};
+      for (const [mname, val] of Object.entries(evt.data || {})) {
         const fval = (typeof val === "number" && isFinite(val)) ? val : null;
-        if (!METRIC_CACHE[mname]) METRIC_CACHE[mname] = {};
-        if (!METRIC_CACHE[mname][runId]) METRIC_CACHE[mname][runId] = { steps: [], values: [] };
-        METRIC_CACHE[mname][runId].steps.push(step);
-        METRIC_CACHE[mname][runId].values.push(fval);
-
-        // Discover new metric names.
-        if (!DATA.metricNames.includes(mname)) {
-          DATA.metricNames.push(mname);
-          DATA.metricNames.sort();
-          buildMetricSelect();
-        }
-
-        if (mname === metric) {
-          gotCurrentMetric = true;
-          if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
-          const [newSmoothed, newS] = _applyEmaIncremental([fval], LAST_EMA_S[metric][runId] ?? null);
-          LAST_EMA_S[metric][runId] = newS;
-          const lineIdx = _traceIndexMap[runId];
-          if (lineIdx !== undefined) {
-            const n = Object.keys(_traceIndexMap).length;
-            const dotIdx = n + lineIdx;
-            const lastY = newSmoothed[newSmoothed.length - 1];
-            incrementalUpdates.push({ lineIdx, dotIdx, step, lastY });
-          }
-        }
+        if (!_pendingMetrics[runId][mname]) _pendingMetrics[runId][mname] = { steps: [], values: [] };
+        _pendingMetrics[runId][mname].steps.push(step);
+        _pendingMetrics[runId][mname].values.push(fval);
       }
-
-      if (!gotCurrentMetric) return;
-
-      if (activeTab === "curves" && !dirtyTabs.has("curves") && smoothAlpha === 0) {
-        // Incremental Plotly update — same pattern as visualize.py.
-        const lineIdxs = [], lineXs = [], lineYs = [];
-        const dotIdxs  = [], dotXs  = [], dotYs  = [];
-        for (const u of incrementalUpdates) {
-          lineIdxs.push(u.lineIdx); lineXs.push([u.step]);   lineYs.push([u.lastY]);
-          dotIdxs.push(u.dotIdx);   dotXs.push([u.step]);    dotYs.push([u.lastY]);
-        }
-        if (lineIdxs.length) {
-          Plotly.extendTraces("chart-curves", { x: lineXs, y: lineYs }, lineIdxs);
-          Plotly.restyle("chart-curves",      { x: dotXs,  y: dotYs  }, dotIdxs);
-        }
-        const vis = Object.keys(_traceIndexMap).length;
-        document.getElementById("status").textContent =
-          `${vis} / ${DATA.runs.length} runs visible` +
-          (LIVE_RUNS.size ? `  •  ${LIVE_RUNS.size} live` : "");
-      } else {
-        buildActiveChart();
-      }
-      dirtyTabs.add("sensitivity");
+      _scheduleFlush();
     }
 
     else if (evt.type === "job_started" || evt.type === "job_dispatched") {
       LIVE_RUNS.add(evt.run_id);
+      // If this run isn't in DATA.runs yet (started after page load), schedule a
+      // refresh to add it to the chart and give _traceIndexMap an entry for it.
+      if (DATA && !DATA.runs.some(r => r.hash === evt.run_id))
+        _scheduleJobRefresh(expId);
     }
 
     else if (evt.type === "job_done") {
@@ -1062,7 +1105,22 @@ async function _refreshJobs(expId) {
     if (added) { buildColorBySelect(); buildFilters(); }
     // Fetch metrics for any new runs.
     await _loadMetrics(expId, jobs.filter(j => !existing.has(j.run_id)));
-    if (added) buildActiveChart();
+    // Sync any newly discovered metric names and auto-select if unset.
+    let metricNamesChanged = false;
+    for (const mname of Object.keys(METRIC_CACHE)) {
+      if (!DATA.metricNames.includes(mname)) {
+        DATA.metricNames.push(mname);
+        metricNamesChanged = true;
+      }
+    }
+    if (metricNamesChanged) {
+      DATA.metricNames.sort();
+      if (!metric || !DATA.metricNames.includes(metric)) {
+        metric = DATA.metricNames.find(m => m.includes("loss")) || DATA.metricNames[0];
+      }
+      buildMetricSelect();
+    }
+    if (added || metricNamesChanged) buildActiveChart();
   } catch {}
 }
 
@@ -1084,6 +1142,11 @@ async function _loadMetrics(expId, jobs) {
 // ── Load experiment (replaces loadExperiment from visualize.py) ───────────────
 
 async function loadExperiment(expId) {
+  // Keep Files nav link in sync with the viewed experiment
+  const _fq = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
+  _fq.set("experiment", expId);
+  document.getElementById("nav-files").href = "files.html?" + _fq.toString();
+
   const expNameEl = document.getElementById("exp-name");
   expNameEl.classList.add("loading");
   expNameEl.textContent = "Fetching data…";
@@ -1092,6 +1155,7 @@ async function loadExperiment(expId) {
   if (_ws) { _ws.close(); _ws = null; }
   clearTimeout(_jobRefreshTimer);
   DATA = null; METRIC_CACHE = {}; _traceIndexMap = {}; LAST_EMA_S = {}; LIVE_RUNS = new Set();
+  _pendingMetrics = {}; _rafPending = false;
 
   try {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);

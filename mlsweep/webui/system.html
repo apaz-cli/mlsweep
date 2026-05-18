@@ -52,14 +52,53 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 [data-theme=dark] .badge-running   { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
 
 /* Workers grid */
-.workers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.workers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
 .worker-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
 .worker-header { display: flex; justify-content: space-between; align-items: center; }
 .worker-host { font-size: 13px; font-weight: 600; color: var(--text-strong); font-family: monospace; }
 .worker-detail { font-size: 11px; color: var(--text-muted); }
 .worker-detail span { color: var(--text-dim); }
+.worker-actions { display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 8px; }
+.worker-last-seen { font-size: 10px; color: var(--text-muted); }
+.btn-disconnect { font-size: 11px; padding: 2px 8px; border-radius: 3px; border: 1px solid #c0392b44; background: var(--btn-bg); color: #c0392b; cursor: pointer; }
+.btn-disconnect:hover { background: #c0392b18; }
 
-.gpus-section { display: flex; flex-direction: column; gap: 4px; }
+/* Section header with action button */
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.section-header h3 { margin-bottom: 0; }
+.btn-connect { font-size: 12px; padding: 4px 12px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
+.btn-connect:hover { opacity: 0.85; }
+
+/* Modal */
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-backdrop.hidden { display: none; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; width: 380px; max-width: 95vw; display: flex; flex-direction: column; gap: 14px; }
+.modal h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
+.form-row { display: flex; flex-direction: column; gap: 4px; }
+.form-row label { font-size: 11px; font-weight: 600; color: var(--text-label); }
+.form-row input { font-size: 12px; padding: 5px 8px; border-radius: 4px; border: 1px solid var(--border-input); background: var(--bg); color: var(--text); }
+.form-row input:focus { outline: none; border-color: var(--radio-checked-border); }
+.form-hint { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.btn-cancel { font-size: 12px; padding: 5px 14px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.btn-submit { font-size: 12px; padding: 5px 14px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
+.btn-submit:disabled { opacity: 0.5; cursor: default; }
+.modal-error { font-size: 11px; color: #d62728; background: #d6272811; border: 1px solid #d6272833; border-radius: 4px; padding: 6px 10px; }
+.modal-error.hidden { display: none; }
+.known-workers-list { display: flex; flex-direction: column; gap: 6px; }
+.known-worker-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+.known-worker-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.known-worker-host { font-size: 12px; font-weight: 600; color: var(--text-strong); font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.known-worker-dir { font-size: 10px; color: var(--text-muted); font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.btn-reconnect { flex-shrink: 0; font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
+.btn-reconnect:hover { opacity: 0.85; }
+.btn-reconnect:disabled { opacity: 0.5; cursor: default; }
+.modal-divider { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+.modal-divider::before, .modal-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.modal-divider.hidden { display: none; }
+.new-worker-form { display: flex; flex-direction: column; gap: 14px; }
+
+.gpus-section { display: flex; flex-direction: column; gap: 4px; min-height: calc(8 * 14px + 7 * 4px); }
 .gpu-row { display: flex; align-items: center; gap: 6px; }
 .gpu-label { font-size: 10px; color: var(--text-dim); min-width: 36px; font-family: monospace; }
 .gpu-count { font-size: 10px; color: var(--text-dim); }
@@ -79,11 +118,14 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 @keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
 #conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
+<script src="dialog.js"></script>
 </head>
 <body>
 <nav>
   <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link" id="nav-logs" href="#">Logs</a>
+  <a class="nav-link" id="nav-files" href="#">Files</a>
   <a class="nav-link active" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -95,7 +137,10 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 <div id="content">
   <div>
     <h2>System Status</h2>
-    <h3>Workers</h3>
+    <div class="section-header">
+      <h3>Workers</h3>
+      <button class="btn-connect" id="btn-connect-worker">+ Connect Worker</button>
+    </div>
     <div id="workers-grid" class="workers-grid">
       <div class="no-data">Loading…</div>
     </div>
@@ -106,6 +151,48 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
       <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th></tr></thead>
       <tbody id="inflight-tbody"><tr><td colspan="6" class="no-data">Loading…</td></tr></tbody>
     </table>
+  </div>
+</div>
+
+<!-- Connect worker modal -->
+<div class="modal-backdrop hidden" id="connect-modal">
+  <div class="modal">
+    <h2>Connect Worker</h2>
+    <div class="modal-error hidden" id="connect-error"></div>
+
+    <!-- Previously registered workers -->
+    <div class="known-workers-list hidden" id="known-workers-list"></div>
+
+    <div class="modal-divider hidden" id="connect-divider">or add new</div>
+
+    <!-- New worker form -->
+    <div class="new-worker-form" id="new-worker-form">
+      <div class="form-row">
+        <label for="fw-host">Host <span style="color:#d62728">*</span></label>
+        <input id="fw-host" type="text" placeholder="user@hostname" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="fw-remote-dir">Remote directory <span style="color:#d62728">*</span></label>
+        <input id="fw-remote-dir" type="text" placeholder="/home/user/project" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="fw-venv">Venv path <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+        <input id="fw-venv" type="text" placeholder="/home/user/venv" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="fw-ssh-key">SSH key path <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+        <input id="fw-ssh-key" type="text" placeholder="~/.ssh/id_rsa" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="fw-devices">GPU device IDs <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+        <input id="fw-devices" type="text" placeholder="0,1,2,3" autocomplete="off">
+        <span class="form-hint">Comma-separated GPU indices. Leave blank to auto-detect.</span>
+      </div>
+      <div class="modal-actions" style="margin-top:0">
+        <button class="btn-cancel" id="connect-cancel">Cancel</button>
+        <button class="btn-submit" id="connect-submit">Connect</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -135,6 +222,8 @@ function pageHref(page) {
 
 document.getElementById("nav-experiments").href = pageHref("experiments.html");
 document.getElementById("nav-results").href    = pageHref("results.html");
+document.getElementById("nav-files").href      = pageHref("files.html");
+document.getElementById("nav-logs").href       = pageHref("logs.html");
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 (function() {
@@ -174,6 +263,174 @@ function fmtElapsed(s) {
   return `${sec}s`;
 }
 
+// ── Connect worker modal ──────────────────────────────────────────────────────
+(function() {
+  const modal     = document.getElementById("connect-modal");
+  const errEl     = document.getElementById("connect-error");
+  const submit    = document.getElementById("connect-submit");
+  const knownList = document.getElementById("known-workers-list");
+  const divider   = document.getElementById("connect-divider");
+
+  // Workers fetched on open; keyed by worker_id for reconnect lookups.
+  let _knownWorkers = [];
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  function clearForm() {
+    ["fw-host","fw-remote-dir","fw-venv","fw-ssh-key","fw-devices"].forEach(id => {
+      document.getElementById(id).value = "";
+    });
+    errEl.textContent = "";
+    errEl.classList.add("hidden");
+  }
+
+  async function openModal() {
+    clearForm();
+    knownList.innerHTML = "";
+    knownList.classList.add("hidden");
+    divider.classList.add("hidden");
+
+    modal.classList.remove("hidden");
+    document.getElementById("fw-host").focus();
+
+    // Fetch all known workers; show inactive ones as quick-reconnect options.
+    try {
+      const res = await apiFetch("/api/workers");
+      if (res.ok) {
+        const workers = await res.json();
+        _knownWorkers = workers;
+        const inactive = workers.filter(w => !["idle","busy","connecting"].includes(w.status));
+        if (inactive.length) {
+          knownList.innerHTML = inactive.map(w => `
+            <div class="known-worker-row">
+              <div class="known-worker-info">
+                <span class="known-worker-host">${escHtml(w.host)}</span>
+                <span class="known-worker-dir">${escHtml(w.remote_dir)}</span>
+              </div>
+              <button class="btn-reconnect" data-worker-id="${escHtml(w.worker_id)}">Reconnect</button>
+            </div>`).join("");
+          knownList.classList.remove("hidden");
+          divider.classList.remove("hidden");
+        }
+      }
+    } catch (_) {}
+  }
+
+  function closeModal() { modal.classList.add("hidden"); }
+
+  // Reconnect a previously registered worker with one click.
+  knownList.addEventListener("click", async e => {
+    const btn = e.target.closest(".btn-reconnect");
+    if (!btn) return;
+    const workerId = btn.dataset.workerId;
+    const w = _knownWorkers.find(x => x.worker_id === workerId);
+    if (!w) return;
+
+    btn.disabled = true;
+    btn.textContent = "Connecting…";
+    errEl.classList.add("hidden");
+
+    const devices = (() => {
+      try { return w.devices ? JSON.parse(w.devices) : null; } catch(_) { return null; }
+    })();
+
+    try {
+      const res = await apiFetch("/api/workers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          worker_id: w.worker_id,
+          host: w.host, remote_dir: w.remote_dir,
+          venv: w.venv || null, ssh_key: w.ssh_key || null,
+          devices,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        errEl.textContent = data.error || `Error ${res.status}`;
+        errEl.classList.remove("hidden");
+        btn.disabled = false;
+        btn.textContent = "Reconnect";
+        return;
+      }
+      closeModal();
+      refresh();
+    } catch (e) {
+      errEl.textContent = "Network error: " + e.message;
+      errEl.classList.remove("hidden");
+      btn.disabled = false;
+      btn.textContent = "Reconnect";
+    }
+  });
+
+  document.getElementById("btn-connect-worker").addEventListener("click", openModal);
+  document.getElementById("connect-cancel").addEventListener("click", closeModal);
+  modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeModal();
+  });
+
+  submit.addEventListener("click", async () => {
+    const host       = document.getElementById("fw-host").value.trim();
+    const remote_dir = document.getElementById("fw-remote-dir").value.trim();
+    const venv       = document.getElementById("fw-venv").value.trim() || null;
+    const ssh_key    = document.getElementById("fw-ssh-key").value.trim() || null;
+    const devStr     = document.getElementById("fw-devices").value.trim();
+    const devices    = devStr ? devStr.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)) : null;
+
+    if (!host || !remote_dir) {
+      errEl.textContent = "Host and remote directory are required.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+
+    submit.disabled = true;
+    submit.textContent = "Connecting…";
+    errEl.classList.add("hidden");
+
+    try {
+      const res = await apiFetch("/api/workers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host, remote_dir, venv, ssh_key, devices }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        errEl.textContent = data.error || `Error ${res.status}`;
+        errEl.classList.remove("hidden");
+        return;
+      }
+      closeModal();
+      refresh();
+    } catch (e) {
+      errEl.textContent = "Network error: " + e.message;
+      errEl.classList.remove("hidden");
+    } finally {
+      submit.disabled = false;
+      submit.textContent = "Connect";
+    }
+  });
+})();
+
+// ── Disconnect worker ─────────────────────────────────────────────────────────
+async function disconnectWorker(workerId) {
+  if (!await mlConfirm(`Disconnect worker "${workerId}"?\nIn-flight jobs will be re-queued.`, { confirmLabel: "Disconnect" })) return;
+  try {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      await mlAlert("Failed to disconnect: " + (data.error || res.status));
+      return;
+    }
+    refresh();
+  } catch (e) {
+    await mlAlert("Network error: " + e.message);
+  }
+}
+
 // ── Render workers ─────────────────────────────────────────────────────────────
 function renderWorkers(workers) {
   const grid = document.getElementById("workers-grid");
@@ -195,15 +452,24 @@ function renderWorkers(workers) {
       </div>`;
     }).join("");
 
+    const canDisconnect = status !== "dead";
+
     return `<div class="worker-card">
       <div class="worker-header">
         <span class="worker-host">${w.host}${w.port ? `:${w.port}` : ""}</span>
         ${badge(status, status)}
       </div>
-      ${gpuRows ? `<div class="gpus-section">${gpuRows}</div>` : ""}
+      <div class="gpus-section">${gpuRows || `<span style="color:var(--text-muted)">—</span>`}</div>
       <div class="worker-detail">
+        ${w.remote_dir ? `<div><span>dir</span> ${w.remote_dir}</div>` : ""}
+        ${w.venv      ? `<div><span>venv</span> ${w.venv}</div>` : ""}
+        ${w.ssh_key   ? `<div><span>key</span> ${w.ssh_key}</div>` : ""}
+        ${w.devices   ? `<div><span>devices</span> ${JSON.parse(w.devices).join(", ")}</div>` : ""}
         ${w.scratch_dir ? `<div><span>scratch</span> ${w.scratch_dir}</div>` : ""}
-        ${w.last_seen ? `<div><span>last seen</span> ${relTime(w.last_seen)}</div>` : ""}
+      </div>
+      <div class="worker-actions">
+        <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
+        ${canDisconnect ? `<button class="btn-disconnect" onclick="disconnectWorker(${JSON.stringify(w.worker_id).replace(/"/g, '&quot;')})">Disconnect</button>` : ""}
       </div>
     </div>`;
   }).join("");

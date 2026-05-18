@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>mlsweep — Logs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
+  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+}
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
+  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+/* Nav */
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+/* Connection indicator */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
+
+/* Badges */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+.badge-pending    { background: #44444466; color: var(--text-dim); }
+.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
+.badge-running    { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-done       { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
+.badge-failed     { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-xfailed    { background: #44444422; color: var(--text-dim); border: 1px solid #44444433; }
+.badge-cancelled  { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
+
+/* Layout */
+#layout { flex: 1; display: flex; min-height: 0; }
+
+/* Sidebar */
+#sidebar { width: 270px; min-width: 270px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+#sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.sb-section { display: flex; flex-direction: column; gap: 6px; }
+.sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.sb-row { display: flex; gap: 6px; align-items: center; }
+select { flex: 1; padding: 5px 7px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
+select:focus { outline: none; border-color: #4c9be8; }
+.icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
+.icon-btn svg { display: block; }
+.icon-btn:hover { background: var(--btn-hover); }
+#job-list { flex: 1; overflow-y: auto; }
+.job-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
+.job-item:hover { background: var(--btn-hover); }
+.job-item.selected { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
+.job-item-top { display: flex; align-items: center; gap: 6px; }
+.job-run-id { font-family: monospace; font-size: 11px; color: var(--text-strong); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-combo { font-size: 10px; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-list-msg { padding: 20px 12px; color: var(--text-muted); font-size: 12px; text-align: center; }
+
+/* Main */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+#log-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 7px 14px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.log-run-id { font-family: monospace; font-size: 11px; color: var(--text-strong); }
+.hdr-spacer { flex: 1; }
+.autoscroll-label { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-label); cursor: pointer; white-space: nowrap; user-select: none; }
+.autoscroll-label input { cursor: pointer; accent-color: var(--radio-checked-border); }
+
+/* Log output */
+#log-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
+#log-output {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: auto;
+  padding: 12px 16px;
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', Consolas, Monaco, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#jump-btn {
+  position: absolute; bottom: 14px; right: 20px;
+  font-size: 11px; padding: 4px 14px; border-radius: 12px;
+  border: 1px solid #4c9be888;
+  background: rgba(30, 47, 80, 0.88);
+  color: #82b4f0;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  display: none;
+}
+#jump-btn:hover { background: rgba(30, 47, 80, 1); }
+
+/* No selection */
+#no-sel { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<nav>
+  <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
+  <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link active" href="#">Logs</a>
+  <a class="nav-link" id="nav-files" href="#">Files</a>
+  <a class="nav-link" id="nav-system" href="#">System</a>
+  <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
+  <button id="theme-toggle" title="Toggle theme">☀</button>
+</nav>
+
+<div id="layout">
+  <div id="sidebar">
+    <div id="sidebar-top">
+      <div class="sb-section">
+        <span class="sb-title">Experiment</span>
+        <div class="sb-row">
+          <select id="exp-select"><option disabled selected>Loading…</option></select>
+          <button class="icon-btn" id="refresh-btn" title="Refresh experiments">&#8635;</button>
+        </div>
+      </div>
+    </div>
+    <div id="job-list">
+      <div class="job-list-msg">Loading…</div>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="log-header" style="display:none">
+      <a class="icon-btn" id="log-dl-btn" href="#" download="" title="Download log" style="display:none">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 1v8M4 6l3 3 3-3"/><path d="M2 11h10"/>
+        </svg>
+      </a>
+      <span class="log-run-id" id="log-run-id"></span>
+      <span id="log-badge"></span>
+      <span class="hdr-spacer"></span>
+      <label class="autoscroll-label">
+        <input type="checkbox" id="auto-scroll" checked> Auto-scroll
+      </label>
+    </div>
+    <div id="log-wrap" style="display:none">
+      <div id="log-output"></div>
+      <button id="jump-btn">↓ Jump to bottom</button>
+    </div>
+    <div id="no-sel">Select a job to view its log</div>
+  </div>
+</div>
+
+<script type="module">
+import { AnsiUp } from './ansi_up.js';
+
+// ── Token & fetch helpers ─────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const TOKEN  = params.get("token") || localStorage.getItem("mlsweep_token") || "";
+if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+
+function apiFetch(path, opts = {}) {
+  return fetch(path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` },
+  });
+}
+function pageHref(page) {
+  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
+}
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function parseJSON(s, fallback) {
+  try { return JSON.parse(s); } catch { return fallback; }
+}
+
+// ── Nav ───────────────────────────────────────────────────────────────────────
+document.getElementById("nav-experiments").href = pageHref("experiments.html");
+document.getElementById("nav-results").href     = pageHref("results.html");
+document.getElementById("nav-files").href       = pageHref("files.html");
+document.getElementById("nav-system").href      = pageHref("system.html");
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+(function () {
+  const btn  = document.getElementById("theme-toggle");
+  const root = document.documentElement;
+  function applyTheme(dark) {
+    dark ? root.setAttribute("data-theme", "dark") : root.removeAttribute("data-theme");
+    btn.textContent = dark ? "☀" : "☾";
+  }
+  applyTheme(localStorage.getItem("theme") !== "light");
+  btn.addEventListener("click", () => {
+    const dark = root.getAttribute("data-theme") !== "dark";
+    localStorage.setItem("theme", dark ? "dark" : "light");
+    applyTheme(dark);
+  });
+})();
+
+// ── Connection indicator ──────────────────────────────────────────────────────
+function setConnStatus(state) {
+  const dot = document.getElementById("conn-dot");
+  const lbl = document.getElementById("conn-label");
+  dot.className = state === "connected" ? "" : state;
+  lbl.textContent = state === "disconnected" ? "Disconnected"
+                  : state === "reconnecting"  ? "Reconnecting…" : "";
+}
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const expSelect    = document.getElementById("exp-select");
+const jobListEl    = document.getElementById("job-list");
+const logHeader    = document.getElementById("log-header");
+const logWrap      = document.getElementById("log-wrap");
+const logOutput    = document.getElementById("log-output");
+const noSel        = document.getElementById("no-sel");
+const jumpBtn      = document.getElementById("jump-btn");
+const autoScrollCb = document.getElementById("auto-scroll");
+const logRunIdEl   = document.getElementById("log-run-id");
+const logBadgeEl   = document.getElementById("log-badge");
+const logDlBtn     = document.getElementById("log-dl-btn");
+const refreshBtn   = document.getElementById("refresh-btn");
+
+// ── Auto-scroll ───────────────────────────────────────────────────────────────
+logOutput.addEventListener("scroll", () => {
+  const atBottom = logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight < 60;
+  jumpBtn.style.display = atBottom ? "none" : "";
+  if (atBottom) autoScrollCb.checked = true;
+});
+jumpBtn.addEventListener("click", () => {
+  logOutput.scrollTop = logOutput.scrollHeight;
+  jumpBtn.style.display = "none";
+  autoScrollCb.checked = true;
+});
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let jobsData      = [];
+let currentExpId  = null;
+let currentRunId  = null;
+let ansiUp        = new AnsiUp();
+let ws            = null;
+let wsExpId       = null;
+let wsReconnTimer = null;
+let loadAbort     = null;   // AbortController for in-flight history fetches
+
+// ── Log rendering ─────────────────────────────────────────────────────────────
+function appendLog(text) {
+  if (!text) return;
+  logOutput.insertAdjacentHTML("beforeend", ansiUp.ansi_to_html(text));
+  if (autoScrollCb.checked) logOutput.scrollTop = logOutput.scrollHeight;
+}
+
+// ── Job selection ─────────────────────────────────────────────────────────────
+async function selectJob(job) {
+  // Abort any previous in-flight history fetch.
+  if (loadAbort) { loadAbort.abort(); loadAbort = null; }
+
+  currentRunId = job.run_id;
+
+  logRunIdEl.textContent = job.run_id;
+  setBadge(job.status);
+  logHeader.style.display = "";
+  logWrap.style.display   = "flex";
+  noSel.style.display     = "none";
+
+  // Wire download button.
+  const logUrl = `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/log`;
+  logDlBtn.href            = TOKEN ? `${logUrl}?token=${encodeURIComponent(TOKEN)}` : logUrl;
+  logDlBtn.download        = `${job.run_id}.log`;
+  logDlBtn.style.display   = "";
+
+  // Highlight in sidebar.
+  jobListEl.querySelectorAll(".job-item").forEach(el => {
+    el.classList.toggle("selected", el.dataset.runId === job.run_id);
+  });
+
+  // Reset output.
+  logOutput.innerHTML  = "";
+  ansiUp               = new AnsiUp();
+  autoScrollCb.checked = true;
+  jumpBtn.style.display = "none";
+
+  // Fetch history.
+  const ctrl = new AbortController();
+  loadAbort  = ctrl;
+  try {
+    const r = await apiFetch(
+      `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/log`,
+      { signal: ctrl.signal },
+    );
+    if (!ctrl.signal.aborted && r.ok) {
+      const text = await r.text();
+      if (!ctrl.signal.aborted) appendLog(text);
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") console.warn("Log fetch failed:", e);
+  }
+}
+
+function setBadge(status) {
+  logBadgeEl.innerHTML = `<span class="badge badge-${escHtml(status)}">${escHtml(status)}</span>`;
+}
+
+// ── Job list ──────────────────────────────────────────────────────────────────
+function renderJobList() {
+  if (!jobsData.length) {
+    jobListEl.innerHTML = `<div class="job-list-msg">No jobs</div>`;
+    return;
+  }
+
+  const sorted = [...jobsData].sort((a, b) => new Date(b.submit_time) - new Date(a.submit_time));
+
+  jobListEl.innerHTML = sorted.map(j => {
+    const combo    = parseJSON(typeof j.combo === "string" ? j.combo : JSON.stringify(j.combo || {}), {});
+    const comboStr = Object.entries(combo).map(([k, v]) => `${k}=${v}`).join(" ");
+    const sel      = j.run_id === currentRunId;
+    return `<div class="job-item${sel ? " selected" : ""}" data-run-id="${escHtml(j.run_id)}" data-exp-id="${escHtml(j.experiment_id)}">
+      <div class="job-item-top">
+        <span class="job-run-id" title="${escHtml(j.run_id)}">${escHtml(j.run_id)}</span>
+        <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
+      </div>
+      ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  jobListEl.querySelectorAll(".job-item").forEach(el => {
+    el.addEventListener("click", () => {
+      const job = jobsData.find(j => j.run_id === el.dataset.runId);
+      if (job) selectJob(job);
+    });
+  });
+}
+
+function setJobStatus(runId, status) {
+  const job = jobsData.find(j => j.run_id === runId);
+  if (job) job.status = status;
+
+  // Update badge in list without full re-render.
+  const el = Array.from(jobListEl.querySelectorAll(".job-item"))
+    .find(el => el.dataset.runId === runId);
+  if (el) {
+    const b = el.querySelector(".badge");
+    if (b) { b.className = `badge badge-${status}`; b.textContent = status; }
+  }
+
+  if (runId === currentRunId) setBadge(status);
+}
+
+// ── Experiment selection ──────────────────────────────────────────────────────
+async function loadJobs(expId) {
+  try {
+    const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
+    if (!r.ok) return;
+    jobsData = await r.json();
+    renderJobList();
+  } catch {}
+}
+
+async function selectExperiment(expId) {
+  if (loadAbort) { loadAbort.abort(); loadAbort = null; }
+
+  currentExpId = expId;
+  currentRunId = null;
+  jobsData     = [];
+
+  logOutput.innerHTML      = "";
+  logHeader.style.display  = "none";
+  logWrap.style.display    = "none";
+  noSel.style.display      = "";
+  logDlBtn.style.display   = "none";
+  jobListEl.innerHTML      = `<div class="job-list-msg">Loading…</div>`;
+
+  await loadJobs(expId);
+  connectWS(expId);
+
+  // Auto-select run from URL on first load only.
+  const urlRun = params.get("run");
+  if (urlRun) {
+    const job = jobsData.find(j => j.run_id === urlRun);
+    if (job) await selectJob(job);
+  }
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+function connectWS(expId) {
+  if (wsReconnTimer) { clearTimeout(wsReconnTimer); wsReconnTimer = null; }
+  if (ws) { ws.close(); ws = null; }
+
+  wsExpId = expId;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url   = `${proto}//${location.host}/ws/experiments/${encodeURIComponent(expId)}?token=${encodeURIComponent(TOKEN)}`;
+  ws = new WebSocket(url);
+
+  ws.addEventListener("open", () => setConnStatus("connected"));
+
+  ws.addEventListener("message", e => {
+    try { handleWsEvent(JSON.parse(e.data)); } catch {}
+  });
+
+  ws.addEventListener("close", () => {
+    setConnStatus("reconnecting");
+    if (wsExpId === expId)
+      wsReconnTimer = setTimeout(() => connectWS(expId), 3000);
+  });
+
+  ws.addEventListener("error", () => setConnStatus("disconnected"));
+}
+
+function handleWsEvent(evt) {
+  if (evt.type === "log" && evt.run_id === currentRunId) {
+    appendLog(evt.data);
+  } else if (evt.type === "job_started") {
+    setJobStatus(evt.run_id, "running");
+  } else if (evt.type === "job_dispatched") {
+    setJobStatus(evt.run_id, "dispatched");
+  } else if (evt.type === "job_done") {
+    setJobStatus(evt.run_id, evt.status || (evt.success ? "done" : "failed"));
+  }
+}
+
+// ── Experiment list ───────────────────────────────────────────────────────────
+async function loadExperiments() {
+  try {
+    const r = await apiFetch("/api/experiments");
+    if (!r.ok) { setConnStatus("disconnected"); return; }
+    const exps = await r.json();
+    setConnStatus("connected");
+
+    const urlExp   = params.get("experiment");
+    const targetId = urlExp || (exps.length ? exps[0].experiment_id : null);
+
+    expSelect.innerHTML = exps.length
+      ? exps.map(e =>
+          `<option value="${escHtml(e.experiment_id)}"${e.experiment_id === targetId ? " selected" : ""}>${escHtml(e.name || e.experiment_id)}</option>`
+        ).join("")
+      : `<option disabled>No experiments</option>`;
+
+    if (targetId) await selectExperiment(targetId);
+  } catch {
+    setConnStatus("disconnected");
+  }
+}
+
+expSelect.addEventListener("change", () => selectExperiment(expSelect.value));
+refreshBtn.addEventListener("click", loadExperiments);
+
+// Refresh job list periodically to pick up newly submitted jobs.
+setInterval(() => { if (currentExpId) loadJobs(currentExpId); }, 15000);
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadExperiments();
+</script>
+</body>
+</html>

@@ -13,11 +13,13 @@ stored in ``manager.token``.
 from __future__ import annotations
 
 import asyncio
-import bisect
 import dataclasses
 import json
 import logging
+import os
 import re
+import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -26,37 +28,20 @@ import aiosqlite
 from aiohttp import WSMsgType, web
 
 from mlsweep._manager_db import (
-    ArtifactRecord,
-    ExperimentRecord,
-    JobRecord,
     WorkerRecord,
-    cancel_job,
-    count_jobs_by_status,
-    create_experiment,
-    delete_experiment,
     experiment_summary,
     get_artifact,
     get_experiment,
     get_job,
+    get_logs_for_run,
+    get_metrics_for_run,
     get_worker,
-    increment_artifact_ref,
-    increment_retry,
-    insert_job,
-    insert_jobs_bulk,
-    list_experiments,
     list_experiments_with_counts,
     list_jobs_by_experiment,
     list_jobs_by_status,
     list_jobs_since,
     list_pending_jobs,
     list_workers,
-    register_artifact,
-    reset_worker_jobs,
-    update_experiment_status,
-    update_job_priority,
-    update_job_status,
-    upsert_worker,
-    update_worker_status,
 )
 from mlsweep._manager_state import ManagerState
 from mlsweep._shared import MsgCancel, MsgShutdown, encode
@@ -98,6 +83,23 @@ def _error_response(message: str, *, status: int = 400) -> web.Response:
 def _not_found(entity: str) -> web.Response:
     """Return a 404 JSON error."""
     return _error_response(f"{entity} not found", status=404)
+
+
+def _schedule_cleanup(path: str, *, delay: float = 300) -> None:
+    """Unlink *path* after *delay* seconds (best-effort, non-blocking).
+
+    Intended for temporary zip files served via ``FileResponse``.
+    """
+
+    def _do() -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to unlink temp zip: %s", path)
+
+    asyncio.get_event_loop().call_later(delay, _do)
 
 
 # ===============================================================================
@@ -149,8 +151,8 @@ async def auth_middleware(
     Skips static file routes (prefix ``/static/``) so the web UI can load
     without a token in every asset request.
     """
-    # Allow static files without auth
-    if request.path.startswith("/static/"):
+    # Allow static files and health check without auth
+    if request.path.startswith("/static/") or request.path == "/api/health":
         return await handler(request)
 
     # Allow OPTIONS (CORS preflight) without auth
@@ -171,6 +173,48 @@ async def auth_middleware(
 routes = web.RouteTableDef()
 
 
+# ── Reachability check ────────────────────────────────────────────────────────
+
+
+@routes.get("/api/reachable")
+async def handle_reachable(request: web.Request) -> web.Response:
+    """Check whether this manager is reachable via an external host.
+
+    Accepts a bare *host* (hostname or IP, no scheme / path / port)
+    and makes an outbound GET to ``http://{host}:{port}/api/health``.
+    The manager constructs the full URL internally to prevent URL
+    injection and token leakage.
+    """
+    host = (request.query.get("host", "") or "").strip()
+    if not host:
+        return _error_response("'host' query parameter is required")
+
+    # Reject anything that looks like a URL rather than a bare host.
+    if any(c in host for c in ("://", "/", "?", "#", "@")):
+        return _error_response("'host' must be a bare hostname or IP, not a URL")
+
+    # Reject obviously invalid host patterns without reaching DNS.
+    if not re.match(r"^[a-zA-Z0-9.\-:\[\]]+$", host):
+        return _error_response("'host' contains invalid characters")
+
+    server_port = request.url.port
+    target_url = f"http://{host}:{server_port}/api/health"
+
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                target_url,
+                timeout=aiohttp.ClientTimeout(total=4),
+            ) as resp:
+                reachable = resp.status == 200
+    except Exception:
+        reachable = False
+
+    return _json_response({"reachable": reachable})
+
+
 # ── Experiments ────────────────────────────────────────────────────────────────
 
 
@@ -186,7 +230,7 @@ async def handle_list_experiments(request: web.Request) -> web.Response:
 @routes.post("/api/experiments")
 async def handle_create_experiment(request: web.Request) -> web.Response:
     """Create a new experiment."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     try:
         body = await request.json()
     except Exception:
@@ -210,8 +254,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     singular_dims = body.get("singular_dims") or []
 
     try:
-        exp = await create_experiment(
-            db,
+        exp = await state.db_writer.create_experiment(
             experiment_id=experiment_id,
             name=name,
             controller_id=controller_id,
@@ -240,7 +283,7 @@ async def handle_get_experiment(request: web.Request) -> web.Response:
 @routes.put("/api/experiments/{experiment_id}/status")
 async def handle_update_experiment_status(request: web.Request) -> web.Response:
     """Update an experiment's status."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     experiment_id = request.match_info["experiment_id"]
     try:
         body = await request.json()
@@ -249,7 +292,7 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     status = body.get("status")
     if not status:
         return _error_response("'status' is required")
-    exp = await update_experiment_status(db, experiment_id, status)
+    exp = await state.db_writer.update_experiment_status(experiment_id, status)
     if exp is None:
         return _not_found("experiment")
     # Broadcast event
@@ -260,9 +303,9 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
 @routes.delete("/api/experiments/{experiment_id}")
 async def handle_delete_experiment(request: web.Request) -> web.Response:
     """Delete an experiment and all its jobs."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     experiment_id = request.match_info["experiment_id"]
-    existed = await delete_experiment(db, experiment_id)
+    existed = await state.db_writer.delete_experiment(experiment_id)
     if not existed:
         return _not_found("experiment")
     return _json_response({"deleted": experiment_id})
@@ -384,7 +427,6 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
 @routes.post("/api/jobs")
 async def handle_insert_job(request: web.Request) -> web.Response:
     """Insert a single job."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
 
     try:
@@ -398,8 +440,7 @@ async def handle_insert_job(request: web.Request) -> web.Response:
         return _error_response("'run_id' and 'experiment_id' are required")
 
     try:
-        job = await insert_job(
-            db,
+        job = await state.db_writer.insert_job(
             run_id=run_id,
             experiment_id=experiment_id,
             priority=body.get("priority", 0),
@@ -423,7 +464,8 @@ async def handle_insert_job(request: web.Request) -> web.Response:
 
     # Add to pending list if status is pending
     if job.status == "pending":
-        state.insert_pending(job)
+        async with state.scheduler_lock:
+            state.insert_pending(job)
         # Trigger scheduling
         _trigger_scheduling(request)
 
@@ -433,7 +475,6 @@ async def handle_insert_job(request: web.Request) -> web.Response:
 @routes.post("/api/jobs/bulk")
 async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
     """Insert multiple jobs in a single transaction."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
 
     try:
@@ -447,14 +488,15 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
         return _error_response("provide a JSON array of job objects")
 
     try:
-        records = await insert_jobs_bulk(db, jobs_data)
+        records = await state.db_writer.insert_jobs_bulk(jobs_data)
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
     # Add pending jobs to state
-    for job in records:
-        if job.status == "pending":
-            state.insert_pending(job)
+    async with state.scheduler_lock:
+        for job in records:
+            if job.status == "pending":
+                state.insert_pending(job)
 
     # Trigger scheduling
     if records:
@@ -489,7 +531,7 @@ async def handle_get_job(request: web.Request) -> web.Response:
 @routes.put("/api/jobs/{run_id}/status")
 async def handle_update_job_status(request: web.Request) -> web.Response:
     """Update a job's status (and optionally other fields)."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     try:
         body = await request.json()
@@ -506,7 +548,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
     # Build kwargs from body, excluding 'status' and 'experiment_id'
     kwargs = {k: v for k, v in body.items() if k not in ("status", "experiment_id")}
 
-    job = await update_job_status(db, run_id, experiment_id, status, **kwargs)
+    job = await state.db_writer.update_job_status(run_id, experiment_id, status, **kwargs)
     if job is None:
         return _not_found("job")
 
@@ -522,7 +564,6 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
 @routes.put("/api/jobs/{run_id}/priority")
 async def handle_update_job_priority(request: web.Request) -> web.Response:
     """Update a pending job's priority."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     try:
@@ -538,7 +579,7 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
         return _error_response("'experiment_id' is required")
 
     # Update in DB
-    job = await update_job_priority(db, run_id, experiment_id, priority)
+    job = await state.db_writer.update_job_priority(run_id, experiment_id, priority)
     if job is None:
         return _not_found("job")
 
@@ -557,12 +598,11 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
 @routes.post("/api/jobs/{run_id}/cancel")
 async def handle_cancel_job(request: web.Request) -> web.Response:
     """Cancel a pending job."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
 
-    job = await cancel_job(db, run_id, experiment_id)
+    job = await state.db_writer.cancel_job(run_id, experiment_id)
     if job is None:
         return _not_found("job")
 
@@ -600,14 +640,15 @@ async def handle_retry_job(request: web.Request) -> web.Response:
             status=409,
         )
 
-    job = await increment_retry(db, run_id, experiment_id)
+    job = await state.db_writer.increment_retry(run_id, experiment_id)
     if job is None:
         return _error_response(
             "job not found or max_retries reached", status=400,
         )
 
     # Add back to pending list
-    state.insert_pending(job)
+    async with state.scheduler_lock:
+        state.insert_pending(job)
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -648,7 +689,7 @@ async def handle_delete_job(request: web.Request) -> web.Response:
         state.remove_pending(run_id)
 
         # Mark cancelled in DB
-        job = await cancel_job(db, run_id, experiment_id)
+        job = await state.db_writer.cancel_job(run_id, experiment_id)
         if job is None:
             return _error_response("failed to cancel job", status=500)
 
@@ -671,7 +712,7 @@ async def handle_delete_job(request: web.Request) -> web.Response:
                     pass
 
         # Mark cancelled in DB
-        job = await update_job_status(db, run_id, experiment_id, "cancelled")
+        job = await state.db_writer.update_job_status(run_id, experiment_id, "cancelled")
         if job is None:
             return _error_response("failed to cancel job", status=500)
 
@@ -689,7 +730,7 @@ async def handle_delete_job(request: web.Request) -> web.Response:
     else:
         # Already terminal — mark cancelled if not already
         if status != "cancelled":
-            job = await update_job_status(db, run_id, experiment_id, "cancelled")
+            job = await state.db_writer.update_job_status(run_id, experiment_id, "cancelled")
         _broadcast_experiment_event(
             request, experiment_id, "job_done",
             run_id=run_id, status="cancelled", success=False,
@@ -730,7 +771,7 @@ async def handle_patch_job(request: web.Request) -> web.Response:
         return _not_found("job")
 
     # Update priority in DB (works for any status)
-    job = await update_job_priority(db, run_id, experiment_id, priority)
+    job = await state.db_writer.update_job_priority(run_id, experiment_id, priority)
     if job is None:
         return _error_response("failed to update priority", status=500)
 
@@ -753,33 +794,117 @@ async def handle_patch_job(request: web.Request) -> web.Response:
 
 
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/metrics")
-async def handle_get_job_metrics(request: web.Request) -> web.StreamResponse:
-    """Read and return metrics.jsonl for a job."""
+async def handle_get_job_metrics(request: web.Request) -> web.Response:
+    """Return all logged metrics for a job as JSONL (one row per step)."""
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
-
-    mlsweep_dir = Path(request.config_dict["mlsweep_dir"]).expanduser().resolve()
-    metrics_path = mlsweep_dir / "experiments" / experiment_id / run_id / "metrics.jsonl"
-
-    if not metrics_path.is_file():
+    rows = await get_metrics_for_run(db, run_id, experiment_id)
+    if not rows:
         return _not_found("metrics")
-
-    return web.FileResponse(metrics_path)
+    jsonl = "\n".join(json.dumps(row) for row in rows)
+    return web.Response(text=jsonl, content_type="text/plain")
 
 
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/log")
-async def handle_get_job_log(request: web.Request) -> web.StreamResponse:
-    """Read and return training.log for a job."""
+async def handle_get_job_log(request: web.Request) -> web.Response:
+    """Return training log for a job from the database."""
+    db = request.config_dict["mlsweep_db"]
+    experiment_id = request.match_info["experiment_id"]
+    run_id = request.match_info["run_id"]
+
+    text = await get_logs_for_run(db, run_id, experiment_id)
+    if not text:
+        return _not_found("log")
+
+    return web.Response(text=text, content_type="text/plain")
+
+
+@routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifacts")
+async def handle_list_job_artifacts(request: web.Request) -> web.Response:
+    """List files in a job's artifacts/ directory, recursively.
+
+    Returns a JSON array of ``{path, size, modified}`` objects sorted by path.
+    Returns an empty array if the artifacts directory does not exist.
+    """
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
     mlsweep_dir = Path(request.config_dict["mlsweep_dir"]).expanduser().resolve()
-    log_path = mlsweep_dir / "experiments" / experiment_id / run_id / "training.log"
+    artifacts_dir = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
 
-    if not log_path.is_file():
-        return _not_found("log")
+    if not artifacts_dir.is_dir():
+        return _json_response([])
 
-    return web.FileResponse(log_path)
+    files = []
+    for p in sorted(artifacts_dir.rglob("*")):
+        if p.is_file():
+            rel = str(p.relative_to(artifacts_dir)).replace("\\", "/")
+            stat = p.stat()
+            files.append({
+                "path": rel,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
+
+    return _json_response(files)
+
+
+@routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifacts.zip")
+async def handle_zip_job_artifacts(request: web.Request) -> web.StreamResponse:
+    """Serve a zip of all artifact files for a single run."""
+    experiment_id = request.match_info["experiment_id"]
+    run_id = request.match_info["run_id"]
+    mlsweep_dir = Path(request.config_dict["mlsweep_dir"]).expanduser().resolve()
+    artifacts_dir = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
+    if not artifacts_dir.is_dir():
+        return _error_response("no artifacts", status=404)
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(artifacts_dir.rglob("*")):
+                if p.is_file():
+                    zf.write(p, p.relative_to(artifacts_dir))
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+    dl_name = f"{run_id[:12]}-artifacts.zip"
+    _schedule_cleanup(tmp_path, delay=300)
+    return web.FileResponse(
+        tmp_path,
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
+
+
+@routes.get("/api/experiments/{experiment_id}/artifacts.zip")
+async def handle_zip_experiment_artifacts(request: web.Request) -> web.StreamResponse:
+    """Serve a zip of all artifact files for every run in an experiment."""
+    experiment_id = request.match_info["experiment_id"]
+    mlsweep_dir = Path(request.config_dict["mlsweep_dir"]).expanduser().resolve()
+    exp_dir = mlsweep_dir / "experiments" / experiment_id
+    if not exp_dir.is_dir():
+        return _error_response("no experiment artifacts", status=404)
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for run_dir in sorted(exp_dir.iterdir()):
+                artifacts_dir = run_dir / "artifacts"
+                if not artifacts_dir.is_dir():
+                    continue
+                for p in sorted(artifacts_dir.rglob("*")):
+                    if p.is_file():
+                        zf.write(p, Path(run_dir.name) / p.relative_to(artifacts_dir))
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+    dl_name = f"{experiment_id[:16]}-artifacts.zip"
+    _schedule_cleanup(tmp_path, delay=300)
+    return web.FileResponse(
+        tmp_path,
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
 
 
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifacts/{path:.*}")
@@ -890,13 +1015,12 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     port = body.get("port", 0)
     devices = body.get("devices")
 
-    # Generate worker_id from host
-    worker_id = f"{host}:{port or 'dynamic'}"
+    # Use explicit worker_id (reconnect) or derive from host/port (new worker).
+    worker_id = body.get("worker_id") or f"{host}:{port or 'dynamic'}"
 
     # Upsert into DB
     try:
-        worker = await upsert_worker(
-            db,
+        worker = await state.db_writer.upsert_worker(
             worker_id=worker_id,
             host=host,
             remote_dir=remote_dir,
@@ -937,7 +1061,7 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     worker_id = request.match_info["worker_id"]
 
     # Mark worker dead in DB
-    worker = await update_worker_status(db, worker_id, "dead")
+    worker = await state.db_writer.update_worker_status(worker_id, "dead")
     if worker is None:
         return _not_found("worker")
 
@@ -957,7 +1081,7 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
 
     # Re-queue any pending jobs from this worker: reset dispatched/running
     # jobs assigned to this worker back to pending
-    re_queued_rows = await reset_worker_jobs(db, worker_id)
+    re_queued_rows = await state.db_writer.reset_worker_jobs(worker_id)
     re_queued: list[tuple[str, str]] = []
     for run_id, experiment_id in re_queued_rows:
         re_queued.append((run_id, experiment_id))
@@ -978,7 +1102,8 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     for run_id, experiment_id in re_queued:
         job = await get_job(db, run_id, experiment_id)
         if job is not None:
-            state.insert_pending(job)
+            async with state.scheduler_lock:
+                state.insert_pending(job)
 
     # Trigger scheduling for re-queued jobs
     if state.dispatch_callback is not None and re_queued:
@@ -1047,7 +1172,7 @@ async def handle_head_artifact(request: web.Request) -> web.StreamResponse:
 @routes.post("/api/artifacts")
 async def handle_register_artifact(request: web.Request) -> web.Response:
     """Register or update an artifact."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     try:
         body = await request.json()
     except Exception:
@@ -1058,8 +1183,7 @@ async def handle_register_artifact(request: web.Request) -> web.Response:
         return _error_response("'artifact_id' is required")
 
     try:
-        artifact = await register_artifact(
-            db,
+        artifact = await state.db_writer.register_artifact(
             artifact_id=artifact_id,
             size_bytes=body.get("size_bytes"),
             setup_command=body.get("setup_command"),
@@ -1073,7 +1197,7 @@ async def handle_register_artifact(request: web.Request) -> web.Response:
 @routes.put("/api/artifacts/{artifact_id}/ref")
 async def handle_increment_artifact_ref(request: web.Request) -> web.Response:
     """Increment or decrement an artifact's reference count."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
     artifact_id = request.match_info["artifact_id"]
     try:
         body = await request.json()
@@ -1082,7 +1206,7 @@ async def handle_increment_artifact_ref(request: web.Request) -> web.Response:
 
     delta = body.get("delta", 1)
 
-    artifact = await increment_artifact_ref(db, artifact_id, delta=delta)
+    artifact = await state.db_writer.increment_artifact_ref(artifact_id, delta=delta)
     if artifact is None:
         return _not_found("artifact")
     return _json_response(artifact)
@@ -1373,11 +1497,11 @@ async def _connect_worker(
         devices=devices,
     )
     if wc is None:
-        await update_worker_status(db, worker_id, "dead")
+        await state.db_writer.update_worker_status(worker_id, "dead")
         return
 
     # Update DB status
-    await update_worker_status(db, worker_id, "connected")
+    await state.db_writer.update_worker_status(worker_id, "connected")
 
     logger.info("Dynamic worker %s connected on %s:%d", worker_id, host, wc.port)
 

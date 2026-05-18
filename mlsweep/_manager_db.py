@@ -9,14 +9,17 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Coroutine, Literal, Sequence, TypeVar
 
 import aiosqlite
+
+_T = TypeVar("_T")
 
 JobStatus = Literal["pending", "dispatched", "running", "done", "failed", "xfailed", "cancelled"]
 ExperimentStatus = Literal["running", "completed", "aborted"]
@@ -321,6 +324,28 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
+    # ── metrics ─────────────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            run_id        TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            step          INTEGER NOT NULL,
+            data          TEXT NOT NULL,
+            PRIMARY KEY (run_id, experiment_id, step)
+        );
+    """)
+
+    # ── logs ─────────────────────────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            run_id        TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            seq           INTEGER NOT NULL,
+            data          TEXT NOT NULL,
+            PRIMARY KEY (run_id, experiment_id, seq)
+        );
+    """)
+
     # ── migrations for existing databases ───────────────────────────
     try:
         await db.execute("ALTER TABLE jobs ADD COLUMN jobs_per_gpu INTEGER DEFAULT 1")
@@ -334,19 +359,18 @@ async def init_db(db: aiosqlite.Connection) -> None:
         pass  # column already exists
 
     # ── indexes ─────────────────────────────────────────────────────
-    await db.execute("""
+    await db.executescript("""
         CREATE INDEX IF NOT EXISTS idx_jobs_experiment
             ON jobs(experiment_id);
-    """)
-    await db.execute("""
         CREATE INDEX IF NOT EXISTS idx_jobs_dispatch
             ON jobs(status, priority DESC, submit_time ASC);
-    """)
-    await db.execute("""
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
             ON jobs(worker_id);
+        CREATE INDEX IF NOT EXISTS idx_metrics_experiment
+            ON metrics(experiment_id);
+        CREATE INDEX IF NOT EXISTS idx_logs_experiment
+            ON logs(experiment_id);
     """)
-
     await db.commit()
 
 
@@ -369,7 +393,7 @@ async def create_experiment(
     """Insert a new experiment and return the row."""
     now = _now_epoch()
     singular_dims_json = json.dumps(singular_dims or [])
-    await db.execute(
+    cursor = await db.execute(
         """
         INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status, expected_jobs, singular_dims)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -379,13 +403,13 @@ async def create_experiment(
             note = EXCLUDED.note,
             status = EXCLUDED.status,
             expected_jobs = EXCLUDED.expected_jobs,
-            singular_dims = EXCLUDED.singular_dims;
+            singular_dims = EXCLUDED.singular_dims
+        RETURNING *;
         """,
         (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json),
     )
-    await db.commit()
-    cursor = await db.execute("SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,))
     row = await cursor.fetchone()
+    await db.commit()
     assert row is not None
     return _row_to_experiment(row)
 
@@ -454,7 +478,7 @@ async def upsert_worker(
 ) -> WorkerRecord:
     """Insert or update a worker row; set last_seen = now."""
     now = _now_epoch()
-    await db.execute(
+    cursor = await db.execute(
         """
         INSERT INTO workers (worker_id, host, remote_dir, status, last_seen,
                              scratch_dir, port, ssh_key, venv, devices)
@@ -468,14 +492,14 @@ async def upsert_worker(
             port = EXCLUDED.port,
             ssh_key = EXCLUDED.ssh_key,
             venv = EXCLUDED.venv,
-            devices = EXCLUDED.devices;
+            devices = EXCLUDED.devices
+        RETURNING *;
         """,
         (worker_id, host, remote_dir, status, now,
          scratch_dir, port, ssh_key, venv, devices),
     )
-    await db.commit()
-    cursor = await db.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,))
     row = await cursor.fetchone()
+    await db.commit()
     assert row is not None
     return _row_to_worker(row)
 
@@ -573,7 +597,7 @@ async def insert_job(
     return_files_json = json.dumps(list(return_files or []))
     files_json = json.dumps(files or {})
 
-    await db.execute(
+    cursor = await db.execute(
         """
         INSERT INTO jobs (
             run_id, experiment_id, priority, status, submit_time,
@@ -585,19 +609,16 @@ async def insert_job(
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?
-        );
+        )
+        RETURNING *;
         """,
         (run_id, experiment_id, priority, status, now,
          command_json, combo_json, env_json, gpus_per_run, nodes_per_run,
          int(set_dist_env), run_from, return_files_json, files_json, max_retries,
          artifact_id, setup_command, jobs_per_gpu),
     )
-    await db.commit()
-    cursor = await db.execute(
-        "SELECT * FROM jobs WHERE run_id = ? AND experiment_id = ?",
-        (run_id, experiment_id),
-    )
     row = await cursor.fetchone()
+    await db.commit()
     assert row is not None
     return _row_to_job(row)
 
@@ -1110,20 +1131,20 @@ async def register_artifact(
 ) -> ArtifactRecord:
     """Insert or update an artifact row; bump ref_count by 1."""
     now = _now_epoch()
-    await db.execute(
+    cursor = await db.execute(
         """
         INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, setup_command)
         VALUES (?, ?, ?, 1, ?)
         ON CONFLICT (artifact_id) DO UPDATE SET
             size_bytes = EXCLUDED.size_bytes,
             ref_count = artifacts.ref_count + 1,
-            setup_command = EXCLUDED.setup_command;
+            setup_command = EXCLUDED.setup_command
+        RETURNING *;
         """,
         (artifact_id, size_bytes, now, setup_command),
     )
-    await db.commit()
-    cursor = await db.execute("SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,))
     row = await cursor.fetchone()
+    await db.commit()
     assert row is not None
     return _row_to_artifact(row)
 
@@ -1260,6 +1281,12 @@ async def delete_experiment(
     cursor = await db.execute(
         "DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,)
     )
+    await db.execute(
+        "DELETE FROM metrics WHERE experiment_id = ?", (experiment_id,)
+    )
+    await db.execute(
+        "DELETE FROM logs WHERE experiment_id = ?", (experiment_id,)
+    )
     cursor2 = await db.execute(
         "DELETE FROM experiments WHERE experiment_id = ? RETURNING experiment_id",
         (experiment_id,),
@@ -1267,3 +1294,328 @@ async def delete_experiment(
     row = await cursor2.fetchone()
     await db.commit()
     return row is not None
+
+
+# ===============================================================================
+# Metrics
+# ===============================================================================
+
+
+async def insert_metric(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+    step: int,
+    data: dict[str, Any],
+) -> None:
+    """Persist a single metric row. Silently ignores duplicate (run_id, experiment_id, step)."""
+    await db.execute(
+        "INSERT OR IGNORE INTO metrics (run_id, experiment_id, step, data) VALUES (?, ?, ?, ?)",
+        (run_id, experiment_id, step, json.dumps(data)),
+    )
+    await db.commit()
+
+
+async def get_metrics_for_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> list[dict[str, Any]]:
+    """Return all metric rows for a run as dicts, ordered by step."""
+    async with db.execute(
+        "SELECT step, data FROM metrics WHERE run_id = ? AND experiment_id = ? ORDER BY step",
+        (run_id, experiment_id),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    result = []
+    for row in rows:
+        d = json.loads(row["data"])
+        d["step"] = row["step"]
+        result.append(d)
+    return result
+
+
+# ===============================================================================
+# Logs
+# ===============================================================================
+
+
+async def insert_log(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+    seq: int,
+    data: str,
+) -> None:
+    """Persist a single log chunk. Silently ignores duplicate (run_id, experiment_id, seq)."""
+    await db.execute(
+        "INSERT OR IGNORE INTO logs (run_id, experiment_id, seq, data) VALUES (?, ?, ?, ?)",
+        (run_id, experiment_id, seq, data),
+    )
+    await db.commit()
+
+
+async def get_logs_for_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> str:
+    """Return the full log text for a run, ordered by seq."""
+    async with db.execute(
+        "SELECT data FROM logs WHERE run_id = ? AND experiment_id = ? ORDER BY seq",
+        (run_id, experiment_id),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return "".join(row["data"] for row in rows)
+
+
+# ===============================================================================
+# DB Writer Actor
+# ===============================================================================
+
+
+class DbWriter:
+    """Serial write actor for the SQLite database.
+
+    Owns an exclusive write connection.  All mutations are submitted through
+    an asyncio.Queue and processed one at a time, eliminating the
+    "cannot commit transaction - SQL statements in progress" race that occurs
+    when multiple coroutines share a single aiosqlite connection.
+
+    Usage::
+
+        writer = DbWriter(write_db)
+        asyncio.create_task(writer.run())   # start the actor loop
+        await writer.insert_metric(...)     # submit a write from any coroutine
+    """
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        self._db = db
+        self._q: asyncio.Queue[tuple[Callable[[], Coroutine[Any, Any, Any]], asyncio.Future[Any]]] = asyncio.Queue()
+
+    async def run(self) -> None:
+        """Actor loop — run as a long-lived asyncio task."""
+        while True:
+            fn, fut = await self._q.get()
+            try:
+                fut.set_result(await fn())
+            except Exception as exc:
+                fut.set_exception(exc)
+
+    async def _enqueue(self, fn: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[_T] = loop.create_future()
+        await self._q.put((fn, fut))
+        return await fut
+
+    # ── Experiments ───────────────────────────────────────────────────────────
+
+    async def create_experiment(
+        self,
+        *,
+        experiment_id: str,
+        name: str,
+        controller_id: str | None = None,
+        note: str | None = None,
+        status: ExperimentStatus = "running",
+        expected_jobs: int = 0,
+        singular_dims: list[str] | None = None,
+    ) -> ExperimentRecord:
+        db = self._db
+        return await self._enqueue(lambda: create_experiment(
+            db, experiment_id=experiment_id, name=name,
+            controller_id=controller_id, note=note,
+            status=status, expected_jobs=expected_jobs,
+            singular_dims=singular_dims,
+        ))
+
+    async def update_experiment_status(
+        self, experiment_id: str, status: ExperimentStatus
+    ) -> ExperimentRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_experiment_status(db, experiment_id, status))
+
+    async def delete_experiment(self, experiment_id: str) -> bool:
+        db = self._db
+        return await self._enqueue(lambda: delete_experiment(db, experiment_id))
+
+    # ── Workers ───────────────────────────────────────────────────────────────
+
+    async def upsert_worker(
+        self,
+        *,
+        worker_id: str,
+        host: str,
+        remote_dir: str,
+        scratch_dir: str | None = None,
+        port: int = 7890,
+        ssh_key: str | None = None,
+        venv: str | None = None,
+        devices: str | None = None,
+        status: WorkerStatus = "connected",
+    ) -> WorkerRecord:
+        db = self._db
+        return await self._enqueue(lambda: upsert_worker(
+            db, worker_id=worker_id, host=host, remote_dir=remote_dir,
+            scratch_dir=scratch_dir, port=port, ssh_key=ssh_key,
+            venv=venv, devices=devices, status=status,
+        ))
+
+    async def update_worker_status(
+        self, worker_id: str, status: WorkerStatus
+    ) -> WorkerRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_worker_status(db, worker_id, status))
+
+    async def touch_worker(self, worker_id: str) -> None:
+        db = self._db
+        await self._enqueue(lambda: touch_worker(db, worker_id))
+
+    # ── Jobs ──────────────────────────────────────────────────────────────────
+
+    async def insert_job(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        priority: int = 0,
+        command: Sequence[str] | str,
+        combo: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        status: JobStatus = "pending",
+        gpus_per_run: int = 1,
+        nodes_per_run: int = 1,
+        set_dist_env: bool = False,
+        run_from: str | None = None,
+        return_files: Sequence[str] | None = None,
+        files: dict[str, str] | None = None,
+        max_retries: int = 2,
+        artifact_id: str | None = None,
+        setup_command: str | None = None,
+        jobs_per_gpu: int = 1,
+    ) -> JobRecord:
+        db = self._db
+        return await self._enqueue(lambda: insert_job(
+            db, run_id=run_id, experiment_id=experiment_id, priority=priority,
+            command=command, combo=combo, env=env, status=status,
+            gpus_per_run=gpus_per_run, nodes_per_run=nodes_per_run,
+            set_dist_env=set_dist_env, run_from=run_from, return_files=return_files,
+            files=files, max_retries=max_retries, artifact_id=artifact_id,
+            setup_command=setup_command, jobs_per_gpu=jobs_per_gpu,
+        ))
+
+    async def insert_jobs_bulk(self, jobs: list[dict[str, Any]]) -> list[JobRecord]:
+        db = self._db
+        return await self._enqueue(lambda: insert_jobs_bulk(db, jobs))
+
+    async def update_job_status(
+        self,
+        run_id: str,
+        experiment_id: str,
+        status: JobStatus,
+        **kwargs: Any,
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_job_status(db, run_id, experiment_id, status, **kwargs))
+
+    async def dispatch_job(
+        self,
+        run_id: str,
+        experiment_id: str,
+        worker_id: str,
+        dispatched_gpu_ids: list[int] | None = None,
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: dispatch_job(db, run_id, experiment_id, worker_id, dispatched_gpu_ids))
+
+    async def mark_job_running(
+        self, run_id: str, experiment_id: str
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: mark_job_running(db, run_id, experiment_id))
+
+    async def finish_job(
+        self,
+        run_id: str,
+        experiment_id: str,
+        *,
+        success: bool,
+        exit_code: int,
+        elapsed: float,
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: finish_job(
+            db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed
+        ))
+
+    async def reclassify_singular_xfails(
+        self, experiment_id: str, succeeded_combo: dict[str, Any]
+    ) -> list[str]:
+        db = self._db
+        return await self._enqueue(lambda: reclassify_singular_xfails(db, experiment_id, succeeded_combo))
+
+    async def cancel_job(
+        self, run_id: str, experiment_id: str
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: cancel_job(db, run_id, experiment_id))
+
+    async def increment_retry(
+        self, run_id: str, experiment_id: str
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: increment_retry(db, run_id, experiment_id))
+
+    async def update_job_priority(
+        self, run_id: str, experiment_id: str, priority: int
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_job_priority(db, run_id, experiment_id, priority))
+
+    async def reset_worker_jobs(
+        self, worker_id: str
+    ) -> list[tuple[str, str]]:
+        db = self._db
+        return await self._enqueue(lambda: reset_worker_jobs(db, worker_id))
+
+    # ── Artifacts ─────────────────────────────────────────────────────────────
+
+    async def register_artifact(
+        self,
+        *,
+        artifact_id: str,
+        size_bytes: int | None = None,
+        setup_command: str | None = None,
+    ) -> ArtifactRecord:
+        db = self._db
+        return await self._enqueue(lambda: register_artifact(
+            db, artifact_id=artifact_id, size_bytes=size_bytes, setup_command=setup_command
+        ))
+
+    async def increment_artifact_ref(
+        self, artifact_id: str, delta: int = 1
+    ) -> ArtifactRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: increment_artifact_ref(db, artifact_id, delta))
+
+    # ── Metrics and logs ──────────────────────────────────────────────────────
+
+    async def insert_metric(
+        self,
+        run_id: str,
+        experiment_id: str,
+        step: int,
+        data: dict[str, Any],
+    ) -> None:
+        db = self._db
+        await self._enqueue(lambda: insert_metric(db, run_id, experiment_id, step, data))
+
+    async def insert_log(
+        self,
+        run_id: str,
+        experiment_id: str,
+        seq: int,
+        data: str,
+    ) -> None:
+        db = self._db
+        await self._enqueue(lambda: insert_log(db, run_id, experiment_id, seq, data))

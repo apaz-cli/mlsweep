@@ -49,9 +49,8 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 .badge-running  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
 .badge-done     { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
 .badge-failed   { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
-.badge-xfailed  { background: #e07b0022; color: #c87000; border: 1px solid #e07b0044; }
+.badge-xfailed  { background: #44444422; color: var(--text-dim); border: 1px solid #44444433; }
 .badge-cancelled { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
-[data-theme=dark] .badge-xfailed { color: #e8a030; border-color: #e8a03044; background: #e8a03022; }
 [data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
 [data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
 
@@ -83,6 +82,8 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 
 .count-cell { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
 #empty-msg { color: var(--text-muted); font-size: 13px; margin-top: 40px; text-align: center; }
+#empty-msg .run-cmd { display: inline-block; margin-top: 10px; padding: 7px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; font-family: monospace; font-size: 12px; color: var(--text); text-align: left; white-space: pre; }
+#empty-msg .run-label { font-size: 11px; color: var(--text-dim); margin-top: 14px; }
 #error-msg { color: #d62728; font-size: 12px; margin-bottom: 10px; }
 
 /* Connection indicator */
@@ -93,11 +94,14 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 @keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
 #conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
+<script src="dialog.js"></script>
 </head>
 <body>
 <nav>
   <a class="nav-link active" id="nav-experiments" href="#">Experiments</a>
   <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link" id="nav-logs" href="#">Logs</a>
+  <a class="nav-link" id="nav-files" href="#">Files</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -109,7 +113,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 <div id="content">
   <h2>Experiments</h2>
   <div id="error-msg" style="display:none"></div>
-  <div id="empty-msg" style="display:none">No experiments found.</div>
+  <div id="empty-msg" style="display:none"></div>
   <table class="exp-table" id="exp-table">
     <thead>
       <tr>
@@ -154,6 +158,8 @@ function pageHref(page) {
 
 // ── Nav links ─────────────────────────────────────────────────────────────────
 document.getElementById("nav-results").href = pageHref("results.html");
+document.getElementById("nav-files").href   = pageHref("files.html");
+document.getElementById("nav-logs").href    = pageHref("logs.html");
 document.getElementById("nav-system").href  = pageHref("system.html");
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
@@ -202,14 +208,14 @@ function fmtElapsed(s) {
 
 
 async function deleteExperiment(expId) {
-  if (!confirm(`Delete experiment "${expId}" and all its jobs?`)) return;
+  if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
   if (r.ok) {
     document.getElementById(`exp-row-${expId}`)?.remove();
     document.getElementById(`jobs-row-${expId}`)?.remove();
     experiments = experiments.filter(e => e.experiment_id !== expId);
   } else {
-    alert(`Delete failed: ${r.status}`);
+    await mlAlert(`Delete failed: ${r.status}`);
   }
 }
 
@@ -219,18 +225,20 @@ function renderJobs(expId) {
   const rows = jobs.map(j => {
     const comboObj = j.combo ? (typeof j.combo === "string" ? (() => { try { return JSON.parse(j.combo); } catch { return {}; } })() : j.combo) : {};
     const comboStr = Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" ");
+    const filesHref = `files.html?${TOKEN?"token="+encodeURIComponent(TOKEN)+"&":""}experiment=${encodeURIComponent(expId)}&run=${encodeURIComponent(j.run_id)}`;
     return `<tr>
       <td class="mono">${j.run_id}</td>
       <td>${badge(j.status)}</td>
       <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
+      <td><a class="btn-link" href="${filesHref}">Files</a></td>
     </tr>`;
   }).join("");
   return `<div class="jobs-container">
     <table class="jobs-table">
-      <thead><tr><th>Run ID</th><th>Status</th><th>Worker</th><th>Elapsed</th><th>Combo</th></tr></thead>
-      <tbody>${rows || "<tr><td colspan=5 style='color:var(--text-muted)'>No jobs</td></tr>"}</tbody>
+      <thead><tr><th>Run ID</th><th>Status</th><th>Worker</th><th>Elapsed</th><th>Combo</th><th></th></tr></thead>
+      <tbody>${rows || "<tr><td colspan=6 style='color:var(--text-muted)'>No jobs</td></tr>"}</tbody>
     </table>
   </div>`;
 }
@@ -282,6 +290,45 @@ async function refreshExpandedJobs() {
   }
 }
 
+// ── Empty state: run instructions ────────────────────────────────────────────
+(async function buildEmptyMsg() {
+  const managerUrl = window.location.origin;
+
+  function cmdBlock(url) {
+    const lines = [
+      `mlsweep_run`,
+      `     --manager ${url}`,
+    ];
+    if (TOKEN) lines.push(`     --token ${TOKEN}`);
+    lines.push(`    sweep.py`);
+    const maxLen = Math.max(...lines.map(l => l.length));
+    return `<code class="run-cmd">${lines.map((l, i) =>
+      i < lines.length - 1 ? l + " ".repeat(maxLen - l.length + 1) + "\\" : l
+    ).join("\n")}</code>`;
+  }
+
+  let html = `No experiments yet. Submit one with:<br>${cmdBlock(managerUrl)}`;
+
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    if (r.ok) {
+      const { ip } = await r.json();
+      if (ip && ip !== window.location.hostname) {
+        const publicUrl = `${window.location.protocol}//${ip}:${window.location.port}`;
+        const check = await apiFetch(`/api/reachable?host=${encodeURIComponent(ip)}`);
+        if (check.ok) {
+          const { reachable } = await check.json();
+          if (reachable) {
+            html += `<div class="run-label">From a remote machine:</div>${cmdBlock(publicUrl)}`;
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
+  document.getElementById("empty-msg").innerHTML = html;
+})();
+
 // ── Render experiments table ──────────────────────────────────────────────────
 function renderExperiments(exps) {
   const tbody = document.getElementById("exp-tbody");
@@ -319,6 +366,7 @@ function renderExperiments(exps) {
     const c = exp.job_counts || {};
     const running = (c.running || 0) + (c.dispatched || 0);
     const total = c.total || exp.expected_jobs || 0;
+    const done = exp.status && exp.status !== "running" && exp.status !== "pending";
     const html = `<td>
         <div class="exp-name-cell">
           <span class="exp-toggle" onclick="toggleExpand('${expId}')">${isExpanded ? "▼" : "▶"}</span>
@@ -328,13 +376,14 @@ function renderExperiments(exps) {
       </td>
       <td>${badge(exp.status || "unknown")}</td>
       <td class="count-cell">${c.done || 0}</td>
-      <td class="count-cell">${c.failed ? `<span style="color:#d62728">${c.failed}</span>` : "—"}</td>
-      <td class="count-cell">${c.xfailed ? `<span style="color:#c87000">${c.xfailed}</span>` : "—"}</td>
-      <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : "—"}</td>
+      <td class="count-cell">${c.failed ? `<span style="color:#d62728">${c.failed}</span>` : (done ? "0" : "—")}</td>
+      <td class="count-cell">${c.xfailed || (done ? "0" : "—")}</td>
+      <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
       <td class="exp-actions">
         <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
+        <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Files</a>
         <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
       </td>`;
 

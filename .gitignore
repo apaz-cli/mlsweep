@@ -1,8 +1,11 @@
 mlsweep.egg-info/**
 mlsweep/_bin/parsync
 mlsweep/_wheels/**
+build/**
+uv.lock
 
 .cache/**
+.claude/
 .venv/**
 venv/**
 **/__pycache__/**

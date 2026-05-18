@@ -7,7 +7,7 @@ from secrets import token_hex as _token_hex
 from typing import Any
 
 
-# ── Utilities (from _utils.py) ─────────────────────────────────────────────────
+# ── Utilities ──────────────────────────────────────────────────────────────────
 
 
 def _git_root(path: str) -> str | None:

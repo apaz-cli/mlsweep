@@ -16,7 +16,6 @@ import json
 import os
 import re
 import secrets
-import shlex
 import socket
 import ssl
 import struct
@@ -29,24 +28,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from mlsweep._sweep import (
     _append_manifest_run,
-    _singular_desc,
-    _treatment_key,
-    _update_sweep_status,
     _write_manifest,
     count_expected,
-    extract_objective_metric,
     generate_variations,
     load_sweep_file,
     validate_options,
 )
 from mlsweep._writers import (
     MultiWriterFactory,
-    RunWriter,
     WriterFactory,
 )
 from mlsweep._shared import _git_root
@@ -1697,11 +1691,11 @@ def main() -> None:
             # singular probes all share the same lex_key.
             _sing_dim_names = frozenset(k[1:] for k in optimizer._singular_options)
 
-            def _lex_key(c: dict[str, Any]) -> tuple:
+            def _lex_key(c: dict[str, Any]) -> tuple[tuple[str, str], ...]:
                 return tuple((k, str(c[k])) for k in sorted(c) if k not in _sing_dim_names)
 
-            _lex_pending: dict[tuple, int] = {}   # lex_key → outstanding probes
-            _lex_done: set[tuple] = set()          # lex_keys already told
+            _lex_pending: dict[tuple[tuple[str, str], ...], int] = {}   # lex_key → outstanding probes
+            _lex_done: set[tuple[tuple[str, str], ...]] = set()          # lex_keys already told
 
             def _register_vars(vs: list[dict[str, Any]]) -> None:
                 for v in vs:

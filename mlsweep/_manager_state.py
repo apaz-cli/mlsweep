@@ -13,9 +13,9 @@ import asyncio
 import bisect
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
-from mlsweep._manager_db import JobRecord
+from mlsweep._manager_db import DbWriter, JobRecord
 
 
 # ── Multi-node aggregation state ──────────────────────────────────────────────
@@ -76,7 +76,7 @@ class WorkerConn:
     remote_dir: str = ""
     password: str | None = None
     ssh_key: str | None = None
-    log_handles: dict[str, Any] = field(default_factory=dict)
+    venv: str | None = None
 
 
 # ── Manager state ──────────────────────────────────────────────────────────────
@@ -99,6 +99,7 @@ class ManagerState:
         self.artifact_base_url: str = artifact_base_url
         self.token: str = token
         self.dispatch_callback: Any = None
+        self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
         self.pending: list[JobRecord] = []
         self.in_flight: dict[str, InFlightJob] = {}

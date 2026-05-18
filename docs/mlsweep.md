@@ -12,7 +12,7 @@ The core loop:
 1. Write a sweep file (`sweeps/my_sweep.py`) declaring which hyperparams to vary.
 2. Add a few lines to your training script to log metrics.
 3. Run `mlsweep_run sweeps/my_sweep.py -g N` with N GPUs.
-4. View results with `mlsweep_viz`.
+4. View results in the manager web dashboard.
 
 ---
 
@@ -55,12 +55,6 @@ with MLSweepLogger() as logger:
 mlsweep_run sweeps/my_sweep.py            # 1 GPU, sequential
 mlsweep_run sweeps/my_sweep.py -g 4       # 4 GPUs, up to 4 runs in parallel
 mlsweep_run sweeps/my_sweep.py -g 4 -j 2  # 4 GPUs, 2 runs per GPU (8 concurrent)
-```
-
-**Visualize:**
-```bash
-mlsweep_viz              # most recent experiment
-mlsweep_viz my_exp_name  # specific experiment
 ```
 
 ---
@@ -303,19 +297,9 @@ outputs/sweeps/
 
 ---
 
-## mlsweep_viz
+## Manager web dashboard
 
-`mlsweep_viz` starts a local web server and opens an interactive browser UI for exploring loss curves and comparing runs. It reads from `outputs/sweeps/` and live-updates as new runs complete.
-
-```bash
-mlsweep_viz                         # open most recent experiment
-mlsweep_viz my_sweep_20240315_1430  # open a specific experiment by name
-mlsweep_viz --open-browser          # auto-open browser tab (default: prints URL)
-mlsweep_viz --port 8080             # use a different port (default: 43801)
-mlsweep_viz --dir ./other/path      # look for experiments in a different directory
-```
-
-The UI lets you:
+The manager serves a web dashboard at ``http://localhost:7890`` with live metrics visualization. It lets you:
 - Select which metric to plot on the y-axis.
 - Filter runs by dimension value (e.g. show only `lr=0.001` runs).
 - Toggle individual runs on/off.
