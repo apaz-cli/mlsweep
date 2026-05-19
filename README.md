@@ -174,7 +174,7 @@ jobs = 2
 | `venv`       | no       | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root, venv root, `bin/` dir, activate script, or python binary. |
 | `devices`    | no       | Specific GPU IDs to use |
 | `gpus`       | no       | Total GPU count (default: all visible) |
-| `jobs`       | no       | Concurrent jobs per GPU slot (default: 1) |
+| `jobs`       | no       | Max concurrent jobs per GPU on this worker. Composes with `-j` on `mlsweep_run` via `min()`; 0 or omitted means no worker-level cap. |
 | `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). |
 
 #### 2. Start the manager with the workers file

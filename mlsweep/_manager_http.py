@@ -44,6 +44,7 @@ from mlsweep._manager_db import (
     list_workers,
 )
 from mlsweep._manager_state import ManagerState
+from mlsweep._manager_workers import evict_jobs
 from mlsweep._shared import MsgCancel, MsgShutdown, _resolve_safe_subpath, encode
 
 logger = logging.getLogger(__name__)
@@ -1067,6 +1068,8 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
     if wc is not None:
         d["gpus"] = wc.gpus
         d["gpu_occupancy"] = wc.gpu_occupancy
+        d["gpu_stats"] = wc.gpu_stats
+        d["max_jobs_per_gpu"] = wc.max_jobs_per_gpu
     else:
         devices_str = d["devices"]
         if isinstance(devices_str, str) and devices_str:
@@ -1077,6 +1080,8 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         else:
             d["gpus"] = []
         d["gpu_occupancy"] = {}
+        d["gpu_stats"] = {}
+        d["max_jobs_per_gpu"] = 1
     return d
 
 
@@ -1226,6 +1231,125 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
         asyncio.get_running_loop().create_task(state.dispatch_callback())
 
     return _json_response({"worker_id": worker_id, "status": "dead"})
+
+
+@routes.patch("/api/workers/{worker_id}/concurrency")
+async def handle_patch_worker_concurrency(request: web.Request) -> web.Response:
+    """Set max_jobs_per_gpu for a live worker.
+
+    Accepts JSON: {"max_jobs_per_gpu": int}.  0 means unlimited.
+    Takes effect immediately for the next scheduling pass.
+    """
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    worker_id = request.match_info["worker_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+
+    value = body.get("max_jobs_per_gpu")
+    if value is None or not isinstance(value, int) or value < 0:
+        return _error_response("'max_jobs_per_gpu' (int >= 0) is required")
+
+    wc = state.workers.get(worker_id)
+    if wc is None:
+        return _not_found("worker")
+
+    async with state.scheduler_lock:
+        wc.max_jobs_per_gpu = value
+
+    _trigger_scheduling(request)
+    return _json_response({"worker_id": worker_id, "max_jobs_per_gpu": value})
+
+
+@routes.patch("/api/workers/{worker_id}/devices")
+async def handle_patch_worker_devices(request: web.Request) -> web.Response:
+    """Add or remove GPU device indices from a live worker.
+
+    Accepts JSON: {"add": [int, ...], "remove": [int, ...]}.
+    Removing a GPU evicts any jobs currently using it (they are re-queued).
+    """
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    worker_id = request.match_info["worker_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+
+    add_gpus: list[int] = body.get("add") or []
+    remove_gpus: list[int] = body.get("remove") or []
+
+    if not isinstance(add_gpus, list) or not isinstance(remove_gpus, list):
+        return _error_response("'add' and 'remove' must be lists of ints")
+
+    wc = state.workers.get(worker_id)
+    if wc is None:
+        return _not_found("worker")
+
+    # Find jobs to evict: any in-flight job using a GPU being removed
+    to_evict: list[str] = []
+    async with state.scheduler_lock:
+        remove_set = set(remove_gpus)
+        for run_id, in_flight in wc.in_flight.items():
+            if remove_set.intersection(in_flight.gpu_ids):
+                to_evict.append(run_id)
+
+    # Evict affected jobs (releases occupancy, re-queues, sends MsgCancel)
+    if to_evict:
+        await evict_jobs(db, state, to_evict)
+
+    # Update the worker's GPU list
+    async with state.scheduler_lock:
+        current = set(wc.gpus)
+        current.difference_update(remove_gpus)
+        current.update(add_gpus)
+        wc.gpus = sorted(current)
+        # Initialise occupancy for newly added GPUs
+        for g in add_gpus:
+            wc.gpu_occupancy.setdefault(g, 0)
+        # Drop occupancy entries for removed GPUs
+        for g in remove_gpus:
+            wc.gpu_occupancy.pop(g, None)
+
+    await state.db_writer.update_worker_devices(worker_id, json.dumps(wc.gpus))
+    _trigger_scheduling(request)
+    return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict})
+
+
+@routes.patch("/api/experiments/{experiment_id}/concurrency")
+async def handle_patch_experiment_concurrency(request: web.Request) -> web.Response:
+    """Set jobs_per_gpu for all pending jobs in an experiment.
+
+    Accepts JSON: {"jobs_per_gpu": int}.
+    Takes effect immediately for the next scheduling pass.
+    """
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    experiment_id = request.match_info["experiment_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+
+    value = body.get("jobs_per_gpu")
+    if value is None or not isinstance(value, int) or value < 1:
+        return _error_response("'jobs_per_gpu' (int >= 1) is required")
+
+    # Update DB
+    updated = await state.db_writer.update_jobs_concurrency(experiment_id, value)
+
+    # Mirror into in-memory pending list under lock
+    updated_ids = {job.run_id for job in updated}
+    async with state.scheduler_lock:
+        for job in state.pending:
+            if job.run_id in updated_ids:
+                job.jobs_per_gpu = value
+
+    _trigger_scheduling(request)
+    return _json_response({"experiment_id": experiment_id, "jobs_per_gpu": value, "updated": len(updated)})
 
 
 # ── Artifacts ──────────────────────────────────────────────────────────────────

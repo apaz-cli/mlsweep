@@ -577,6 +577,19 @@ async def upsert_worker(
     return _row_to_worker(row)
 
 
+async def update_worker_devices(
+    db: aiosqlite.Connection,
+    worker_id: str,
+    devices: str,
+) -> None:
+    """Persist an updated GPU device list for a worker."""
+    await db.execute(
+        "UPDATE workers SET devices = ? WHERE worker_id = ?",
+        (devices, worker_id),
+    )
+    await db.commit()
+
+
 async def update_worker_status(
     db: aiosqlite.Connection,
     worker_id: str,
@@ -1116,6 +1129,82 @@ async def update_job_label(
     return _row_to_job(row) if row else None
 
 
+async def reset_job_to_pending(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> JobRecord | None:
+    """Reset a running/dispatched job back to pending without consuming a retry."""
+    row = await _exec_one(
+        db,
+        """
+        UPDATE jobs
+        SET status = 'pending',
+            dispatch_time = NULL,
+            start_time = NULL,
+            finish_time = NULL,
+            elapsed = NULL,
+            exit_code = NULL,
+            worker_id = NULL,
+            dispatched_gpu_ids = NULL
+        WHERE run_id = ? AND experiment_id = ?
+        RETURNING *;
+        """,
+        (run_id, experiment_id),
+    )
+    await db.commit()
+    return _row_to_job(row) if row else None
+
+
+async def reset_jobs_to_pending_batch(
+    db: aiosqlite.Connection,
+    pairs: list[tuple[str, str]],
+) -> list[JobRecord]:
+    """Reset multiple running/dispatched jobs back to pending without consuming retries."""
+    if not pairs:
+        return []
+    where = " OR ".join("(run_id = ? AND experiment_id = ?)" for _ in pairs)
+    params = tuple(x for pair in pairs for x in pair)
+    rows = await _exec_all(
+        db,
+        f"""
+        UPDATE jobs
+        SET status = 'pending',
+            dispatch_time = NULL,
+            start_time = NULL,
+            finish_time = NULL,
+            elapsed = NULL,
+            exit_code = NULL,
+            worker_id = NULL,
+            dispatched_gpu_ids = NULL
+        WHERE {where}
+        RETURNING *;
+        """,
+        params,
+    )
+    await db.commit()
+    return [_row_to_job(r) for r in rows]
+
+
+async def update_jobs_concurrency(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    jobs_per_gpu: int,
+) -> list[JobRecord]:
+    """Update jobs_per_gpu for all pending jobs in an experiment."""
+    rows = await _exec_all(
+        db,
+        """
+        UPDATE jobs SET jobs_per_gpu = ?
+        WHERE experiment_id = ? AND status = 'pending'
+        RETURNING *;
+        """,
+        (jobs_per_gpu, experiment_id),
+    )
+    await db.commit()
+    return [_row_to_job(r) for r in rows]
+
+
 async def list_jobs_by_status(
     db: aiosqlite.Connection,
     status: JobStatus,
@@ -1553,6 +1642,10 @@ class DbWriter:
         db = self._db
         await self._enqueue(lambda: touch_worker(db, worker_id))
 
+    async def update_worker_devices(self, worker_id: str, devices: str) -> None:
+        db = self._db
+        await self._enqueue(lambda: update_worker_devices(db, worker_id, devices))
+
     # ── Jobs ──────────────────────────────────────────────────────────────────
 
     async def insert_job(
@@ -1659,6 +1752,24 @@ class DbWriter:
     ) -> JobRecord | None:
         db = self._db
         return await self._enqueue(lambda: update_job_label(db, run_id, experiment_id, label))
+
+    async def reset_job_to_pending(
+        self, run_id: str, experiment_id: str
+    ) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: reset_job_to_pending(db, run_id, experiment_id))
+
+    async def reset_jobs_to_pending_batch(
+        self, pairs: list[tuple[str, str]]
+    ) -> list[JobRecord]:
+        db = self._db
+        return await self._enqueue(lambda: reset_jobs_to_pending_batch(db, pairs))
+
+    async def update_jobs_concurrency(
+        self, experiment_id: str, jobs_per_gpu: int
+    ) -> list[JobRecord]:
+        db = self._db
+        return await self._enqueue(lambda: update_jobs_concurrency(db, experiment_id, jobs_per_gpu))
 
     async def reset_worker_jobs(
         self, worker_id: str

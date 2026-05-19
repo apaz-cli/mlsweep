@@ -44,13 +44,16 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 
 /* Status badges */
 .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
-.badge-connected  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
-.badge-offline    { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
-.badge-dead       { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
-.badge-running    { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
-.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
-[data-theme=dark] .badge-connected { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
-[data-theme=dark] .badge-running   { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+.badge-connected    { background: #2ca02c22; color: #2ca02c;  border: 1px solid #2ca02c44; }
+.badge-offline      { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+.badge-dead         { background: #d6272822; color: #d62728;  border: 1px solid #d6272844; }
+.badge-connecting   { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
+.badge-reconnecting { background: #e07b0022; color: #b85c00;  border: 1px solid #e07b0044; }
+.badge-running      { background: #2ca02c22; color: #2ca02c;  border: 1px solid #2ca02c44; }
+.badge-dispatched   { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
+[data-theme=dark] .badge-connected    { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-running      { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-reconnecting { color: #ffaa44; border-color: #ffaa4444; background: #ffaa4422; }
 
 /* Workers grid */
 .workers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
@@ -99,10 +102,22 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .modal-divider.hidden { display: none; }
 .new-worker-form { display: flex; flex-direction: column; gap: 14px; }
 
-.gpus-section { display: flex; flex-direction: column; gap: 4px; min-height: calc(8 * 14px + 7 * 4px); }
-.gpu-row { display: flex; align-items: center; gap: 6px; }
-.gpu-label { font-size: 10px; color: var(--text-dim); min-width: 36px; font-family: monospace; }
-.gpu-count { font-size: 10px; color: var(--text-dim); }
+.gpu-stat-list { display: flex; flex-direction: column; gap: 5px; }
+.gpu-stat-row { display: flex; align-items: center; gap: 7px; }
+.gpu-stat-id { font-size: 10px; font-family: monospace; color: var(--text-dim); min-width: 42px; flex-shrink: 0; }
+.gpu-bar-wrap { flex: 1; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; min-width: 40px; }
+.gpu-bar-fill { height: 100%; border-radius: 2px; background: var(--radio-checked-border); transition: width 0.4s; }
+.gpu-stat-pct { font-size: 10px; color: var(--text-dim); min-width: 28px; text-align: right; flex-shrink: 0; }
+.gpu-stat-mem { font-size: 10px; color: var(--text-muted); min-width: 76px; text-align: right; flex-shrink: 0; font-family: monospace; }
+.gpu-stat-jobs { font-size: 10px; color: var(--text-label); min-width: 38px; text-align: right; flex-shrink: 0; font-weight: 600; }
+.gpu-stat-col-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.worker-controls { display: flex; flex-direction: column; gap: 6px; padding-top: 2px; }
+.worker-control-row { display: flex; align-items: center; gap: 8px; }
+.worker-control-label { font-size: 11px; color: var(--text-label); font-weight: 600; min-width: 56px; flex-shrink: 0; }
+.worker-control-input { font-size: 12px; padding: 3px 7px; border-radius: 4px; border: 1px solid var(--border-input); background: var(--bg); color: var(--text); flex: 1; min-width: 0; }
+.worker-control-input:focus { outline: none; border-color: var(--radio-checked-border); }
+.worker-control-narrow { flex: none; width: 58px; }
+.worker-control-hint { font-size: 10px; color: var(--text-muted); }
 
 /* In-flight jobs table */
 .jobs-table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -304,7 +319,7 @@ function fmtElapsed(s) {
       if (res.ok) {
         const workers = await res.json();
         _knownWorkers = workers;
-        const inactive = workers.filter(w => !["idle","busy","connecting"].includes(w.status));
+        const inactive = workers.filter(w => w.status !== "connected");
         if (inactive.length) {
           knownList.innerHTML = inactive.map(w => `
             <div class="known-worker-row">
@@ -335,9 +350,7 @@ function fmtElapsed(s) {
     btn.textContent = "Connecting…";
     errEl.classList.add("hidden");
 
-    const devices = (() => {
-      try { return w.devices ? JSON.parse(w.devices) : null; } catch(_) { return null; }
-    })();
+    const devices = w.gpus && w.gpus.length ? w.gpus : null;
 
     try {
       const res = await apiFetch("/api/workers", {
@@ -434,46 +447,136 @@ async function disconnectWorker(workerId) {
   }
 }
 
+// ── Worker live controls ───────────────────────────────────────────────────────
+async function setWorkerConcurrency(workerId, value) {
+  try {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}/concurrency`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_jobs_per_gpu: value }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      await mlAlert("Failed: " + (data.error || res.status));
+    }
+  } catch (e) {
+    await mlAlert("Network error: " + e.message);
+  }
+}
+
+async function setWorkerGpus(el, workerId, currentGpus) {
+  const newIds = el.value.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+  const oldSet = new Set(currentGpus);
+  const newSet = new Set(newIds);
+  const add    = newIds.filter(n => !oldSet.has(n));
+  const remove = currentGpus.filter(n => !newSet.has(n));
+  if (!add.length && !remove.length) return;
+  if (remove.length) {
+    const gpuList = remove.join(", ");
+    if (!await mlConfirm(`Remove GPU${remove.length > 1 ? "s" : ""} ${gpuList}?\nAny jobs using them will be re-queued.`, { confirmLabel: "Remove" })) {
+      el.value = currentGpus.join(",");
+      return;
+    }
+  }
+  try {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}/devices`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add, remove }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      await mlAlert("Failed: " + (data.error || res.status));
+      el.value = currentGpus.join(",");
+      return;
+    }
+    refresh();
+  } catch (e) {
+    await mlAlert("Network error: " + e.message);
+    el.value = currentGpus.join(",");
+  }
+}
+
+// ── GPU stat list ──────────────────────────────────────────────────────────────
+function renderGpuList(gpus, occ, gpuStats) {
+  if (!gpus.length) return "";
+  const header = `<div class="gpu-stat-row">
+    <span class="gpu-stat-id"></span>
+    <div class="gpu-bar-wrap" style="background:none"></div>
+    <span class="gpu-stat-pct gpu-stat-col-label">util</span>
+    <span class="gpu-stat-mem gpu-stat-col-label">memory</span>
+    <span class="gpu-stat-jobs gpu-stat-col-label">jobs</span>
+  </div>`;
+  return `<div class="gpu-stat-list">${header}${gpus.map(gid => {
+    const used  = occ[gid] ?? occ[String(gid)] ?? 0;
+    const stat  = gpuStats && (gpuStats[gid] ?? gpuStats[String(gid)]);
+    const util  = stat?.util_pct ?? null;
+    const memUsed  = stat?.mem_used_mb  ?? -1;
+    const memTotal = stat?.mem_total_mb ?? -1;
+    const memStr = memTotal > 0
+      ? `${(memUsed / 1024).toFixed(1)}/${Math.round(memTotal / 1024)}G`
+      : "";
+    return `<div class="gpu-stat-row">
+      <span class="gpu-stat-id">GPU ${gid}</span>
+      <div class="gpu-bar-wrap"><div class="gpu-bar-fill" style="width:${util ?? 0}%"></div></div>
+      <span class="gpu-stat-pct">${util !== null ? util + "%" : "—"}</span>
+      <span class="gpu-stat-mem">${memStr}</span>
+      <span class="gpu-stat-jobs">${used}</span>
+    </div>`;
+  }).join("")}</div>`;
+}
+
 // ── Render workers ─────────────────────────────────────────────────────────────
 function renderWorkers(workers) {
   const grid = document.getElementById("workers-grid");
+  // Don't clobber an input the user is actively editing
+  const active = document.activeElement;
+  if (active && active.tagName === "INPUT" && grid.contains(active)) return;
   if (!workers.length) {
     grid.innerHTML = `<div class="no-data">No workers connected.</div>`;
     return;
   }
 
   grid.innerHTML = workers.map(w => {
-    const gpus = w.gpus || [];
-    const occ  = w.gpu_occupancy || {};
-    const status = w.status || "offline";
-
-    const gpuRows = gpus.map(gid => {
-      const used = occ[gid] || occ[String(gid)] || 0;
-      return `<div class="gpu-row">
-        <span class="gpu-label">GPU ${gid}</span>
-        <span class="gpu-count">${used} running</span>
-      </div>`;
-    }).join("");
-
+    const gpus     = w.gpus || [];
+    const occ      = w.gpu_occupancy || {};
+    const gpuStats = w.gpu_stats || {};
+    const status   = w.status || "offline";
+    const isLive   = status === "connected";
     const canDisconnect = status !== "dead";
+    const wIdJson  = JSON.stringify(w.worker_id).replace(/"/g, '&quot;');
+    const gpusJson = JSON.stringify(gpus).replace(/"/g, '&quot;');
+    const maxJobs  = w.max_jobs_per_gpu || 0;
 
     return `<div class="worker-card">
       <div class="worker-header">
         <span class="worker-host">${w.host}${w.port ? `:${w.port}` : ""}</span>
         ${badge(status, status)}
       </div>
-      <div class="gpus-section">${gpuRows || `<span style="color:var(--text-muted)">—</span>`}</div>
+      ${renderGpuList(gpus, occ, gpuStats)}
+      ${isLive ? `<div class="worker-controls">
+        <div class="worker-control-row">
+          <span class="worker-control-label">GPUs</span>
+          <input class="worker-control-input" type="text" value="${gpus.join(",")}"
+            placeholder="e.g. 0,1,2,3"
+            onchange="setWorkerGpus(this, ${wIdJson}, ${gpusJson})">
+        </div>
+        <div class="worker-control-row">
+          <span class="worker-control-label">Jobs/GPU</span>
+          <input class="worker-control-input worker-control-narrow" type="number" min="0" value="${maxJobs}"
+            onchange="setWorkerConcurrency(${wIdJson}, +this.value)">
+          <span class="worker-control-hint">0 = unlimited</span>
+        </div>
+      </div>` : ""}
       <div class="worker-detail">
-        ${w.remote_dir ? `<div><span>dir</span> ${w.remote_dir}</div>` : ""}
-        ${w.venv      ? `<div><span>venv</span> ${w.venv}</div>` : ""}
-        ${w.ssh_key   ? `<div><span>key</span> ${w.ssh_key}</div>` : ""}
-        ${w.devices   ? `<div><span>devices</span> ${JSON.parse(w.devices).join(", ")}</div>` : ""}
+        ${w.remote_dir  ? `<div><span>dir</span> ${w.remote_dir}</div>` : ""}
+        ${w.venv        ? `<div><span>venv</span> ${w.venv}</div>` : ""}
+        ${w.ssh_key     ? `<div><span>key</span> ${w.ssh_key}</div>` : ""}
         ${w.scratch_dir ? `<div><span>scratch</span> ${w.scratch_dir}</div>` : ""}
-        ${w.jobs_per_gpu > 1 ? `<div><span>jobs/gpu</span> ${w.jobs_per_gpu}</div>` : ""}
       </div>
       <div class="worker-actions">
         <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
-        ${canDisconnect ? `<button class="btn-disconnect" onclick="disconnectWorker(${JSON.stringify(w.worker_id).replace(/"/g, '&quot;')})">Disconnect</button>` : ""}
+        ${canDisconnect ? `<button class="btn-disconnect" onclick="disconnectWorker(${wIdJson})">Disconnect</button>` : ""}
       </div>
     </div>`;
   }).join("");

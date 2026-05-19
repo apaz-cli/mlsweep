@@ -270,7 +270,7 @@ host = "user@host1"              # SSH target (required)
 remote_dir = "/path/to/project"  # project root on the remote (required)
 ssh_key = "~/.ssh/id_ed25519"
 gpus = 4                         # total GPUs to use (default: all visible)
-jobs = 2                         # concurrent jobs per GPU slot (default: 1)
+jobs = 2                         # worker-level cap: max concurrent jobs per GPU (0 = unlimited)
 devices = [0, 1, 2, 3]           # specific GPU IDs (alternative to gpus)
 venv = "/path/to/venv"           # prefer this venv over the auto-bootstrapped one
 ```

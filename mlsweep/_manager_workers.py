@@ -30,6 +30,7 @@ from mlsweep._manager_db import (
     JobRecord,
     WorkerRecord,
     get_experiment,
+    reset_jobs_to_pending_batch,
     update_job_status,
 )
 from mlsweep._manager_state import InFlightJob, ManagerState, WorkerConn
@@ -38,6 +39,7 @@ from mlsweep._shared import (
     MsgCancel,
     MsgCleaned,
     MsgCleanup,
+    MsgGpuStats,
     MsgHello,
     MsgLog,
     MsgMetric,
@@ -58,6 +60,7 @@ from mlsweep._shared import (
     _BLUE,
     _RESET,
     _git_root,
+    aread_msg,
     decode,
     encode,
 )
@@ -82,7 +85,7 @@ def _parse_workers_file(
     try:
         import tomllib  # type: ignore[import-not-found]  # Python 3.11+
     except ImportError:
-        import tomli as tomllib  # fallback: python_version < '3.11'
+        import tomli as tomllib  # Python < 3.11
 
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -852,6 +855,10 @@ async def _handle_result(
     async with state.scheduler_lock:
         job = state.get_in_flight(msg.run_id)
 
+        # Job was pre-evicted and re-queued; this result is stale — discard it.
+        if job is None and msg.run_id not in wc.in_flight:
+            return
+
         # Free GPU occupancy for this worker regardless
         if job is not None:
             for gpu_id in job.gpu_ids:
@@ -1018,6 +1025,16 @@ async def _handle_pong(
     await state.db_writer.touch_worker(wc.worker_id)
 
 
+async def _handle_gpu_stats(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    wc: WorkerConn,
+    msg: MsgGpuStats,
+) -> None:
+    """Handle ``MsgGpuStats`` — store latest GPU utilization data for the UI."""
+    wc.gpu_stats = {s["gpu"]: s for s in msg.stats if "gpu" in s}
+
+
 # ── Message dispatch table ─────────────────────────────────────────────────────
 
 _HANDLERS: dict[type, Any] = {
@@ -1029,6 +1046,7 @@ _HANDLERS: dict[type, Any] = {
     MsgResult: _handle_result,
     MsgCleaned: _handle_cleaned,
     MsgPong: _handle_pong,
+    MsgGpuStats: _handle_gpu_stats,
 }
 
 
@@ -1061,17 +1079,13 @@ async def _worker_read_task(
     """
     # First message MUST be MsgWorkerHello
     try:
-        line = await asyncio.wait_for(wc.reader.readline(), timeout=30.0)
-    except (asyncio.TimeoutError, OSError):
-        await _on_worker_lost(db, state, wc, shutdown_event)
-        return
-
-    if not line:
+        payload = await asyncio.wait_for(aread_msg(wc.reader), timeout=30.0)
+    except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
         await _on_worker_lost(db, state, wc, shutdown_event)
         return
 
     try:
-        msg = decode(line)
+        msg = decode(payload)
     except (ValueError, json.JSONDecodeError, TypeError):
         await _on_worker_lost(db, state, wc, shutdown_event)
         return
@@ -1090,17 +1104,14 @@ async def _worker_read_task(
             return
 
         try:
-            line = await asyncio.wait_for(wc.reader.readline(), timeout=60.0)
+            payload = await asyncio.wait_for(aread_msg(wc.reader), timeout=60.0)
         except asyncio.TimeoutError:
             continue
-        except OSError:
-            break
-
-        if not line:
+        except (OSError, asyncio.IncompleteReadError):
             break
 
         try:
-            msg = decode(line)
+            msg = decode(payload)
         except (ValueError, json.JSONDecodeError, TypeError):
             continue
 
@@ -1178,12 +1189,13 @@ async def _reconnect_worker(
             await writer.drain()
 
             # Read MsgWorkerHello
-            line = await asyncio.wait_for(reader.readline(), timeout=10.0)
-            if not line:
+            try:
+                payload = await asyncio.wait_for(aread_msg(reader), timeout=10.0)
+            except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
                 writer.close()
                 continue
 
-            msg = decode(line)
+            msg = decode(payload)
             if not isinstance(msg, MsgWorkerHello):
                 writer.close()
                 continue
@@ -1468,6 +1480,7 @@ async def connect_workers(
         w_key = cfg.get("ssh_key")
         w_venv = cfg.get("venv")
         w_port = cfg.get("port", 0)
+        w_max_jobs = cfg.get("jobs") or 1
 
         worker_id = f"{host}:{w_port or 'ephemeral'}:{idx}"
 
@@ -1482,6 +1495,7 @@ async def connect_workers(
             venv=w_venv,
             port=w_port,
             devices=w_devices,
+            max_jobs_per_gpu=w_max_jobs,
             manager_port=manager_port,
             shutdown_event=shutdown_event,
             workers_ready=workers_ready,
@@ -1513,6 +1527,7 @@ async def connect_single_worker(
     venv: str | None = None,
     port: int = 0,
     devices: list[int] | None = None,
+    max_jobs_per_gpu: int = 1,
     manager_port: int = 0,
     shutdown_event: asyncio.Event | None = None,
     workers_ready: asyncio.Event | None = None,
@@ -1558,6 +1573,7 @@ async def connect_single_worker(
         password=password,
         ssh_key=ssh_key,
         venv=venv,
+        max_jobs_per_gpu=max_jobs_per_gpu,
     )
 
     if host != "localhost" and manager_port:
@@ -1756,7 +1772,8 @@ def _find_gpu_group(
         return []
 
     occ = occupancy if occupancy is not None else wc.gpu_occupancy
-    capacity = jobs_per_gpu
+    worker_cap = wc.max_jobs_per_gpu if wc.max_jobs_per_gpu > 0 else jobs_per_gpu
+    capacity = min(jobs_per_gpu, worker_cap)
 
     # Filter GPUs that have room for another job
     available = [
@@ -1774,6 +1791,73 @@ def _find_gpu_group(
 
     # Fallback: first N available GPUs
     return available[:gpus_needed]
+
+
+# ===============================================================================
+# Eviction
+# ===============================================================================
+
+
+async def evict_jobs(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    run_ids: list[str],
+) -> None:
+    """Pre-evict jobs and re-queue them without consuming a retry.
+
+    For each run_id:
+      - Moves the job from in_flight back to pending in DB and in memory.
+      - Frees GPU occupancy on all workers involved (including multi-node).
+      - Sends MsgCancel to each worker holding the job.
+
+    The stale MsgResult that arrives after SIGTERM is discarded by the
+    early-return guard in _handle_result.
+    """
+    # Phase 1: collect targets and pre-remove from in-flight state so that
+    # any stale MsgResult arriving during the DB write is discarded by
+    # the early-return guard in _handle_result.
+    to_evict: list[tuple[InFlightJob, list[tuple[WorkerConn, str]]]] = []
+    async with state.scheduler_lock:
+        for run_id in run_ids:
+            in_flight = state.get_in_flight(run_id)
+            if in_flight is None:
+                continue
+            cancel_targets: list[tuple[WorkerConn, str]] = []
+            for wid in in_flight.worker_ids:
+                wc = state.workers.get(wid)
+                if wc is None:
+                    continue
+                wc.in_flight.pop(run_id, None)
+                for gpu_id in in_flight.gpu_ids:
+                    if gpu_id in wc.gpu_occupancy:
+                        wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
+                cancel_targets.append((wc, run_id))
+            state.remove_in_flight(run_id)
+            to_evict.append((in_flight, cancel_targets))
+
+    if not to_evict:
+        return
+
+    # Phase 2: batch DB reset — one transaction for all evicted jobs
+    pairs = [(inf.run_id, inf.experiment_id) for inf, _ in to_evict]
+    jobs = await state.db_writer.reset_jobs_to_pending_batch(pairs)
+    job_map = {job.run_id: job for job in jobs}
+
+    # Phase 3: insert successfully-reset jobs into pending
+    to_cancel: list[tuple[WorkerConn, str]] = []
+    async with state.scheduler_lock:
+        for in_flight, cancel_targets in to_evict:
+            if in_flight.run_id not in job_map:
+                continue
+            state.insert_pending(job_map[in_flight.run_id])
+            to_cancel.extend(cancel_targets)
+
+    # Phase 4: send MsgCancel outside the lock (non-blocking queue put)
+    for wc, run_id in to_cancel:
+        await _send_to_worker(wc, encode(MsgCancel(run_id=run_id)))
+
+    if to_cancel and state.dispatch_callback is not None:
+        await state.dispatch_callback()
 
 
 # ===============================================================================

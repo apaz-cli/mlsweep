@@ -1,7 +1,10 @@
 """Shared utilities and wire protocol for mlsweep worker ↔ controller communication."""
 
+import asyncio
 import json
 import os
+import socket
+import struct
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -235,6 +238,13 @@ class MsgPong:
     t: str = "pong"
 
 
+@dataclass
+class MsgGpuStats:
+    stats: list[dict[str, Any]] = field(default_factory=list)
+    # Each entry: {"gpu": int, "util_pct": int, "mem_used_mb": int, "mem_total_mb": int}
+    t: str = "gpu_stats"
+
+
 _MSG_TYPES: dict[str, type] = {
     "hello": MsgHello,
     "run": MsgRun,
@@ -251,19 +261,49 @@ _MSG_TYPES: dict[str, type] = {
     "result": MsgResult,
     "cleaned": MsgCleaned,
     "pong": MsgPong,
+    "gpu_stats": MsgGpuStats,
 }
 
 
 def encode(msg: Any) -> bytes:
-    """Encode a protocol message dataclass to a wire line (JSON + newline)."""
-    return (json.dumps(asdict(msg)) + "\n").encode()
+    """Encode a protocol message to a length-prefixed frame: 4-byte big-endian length + JSON payload."""
+    payload = json.dumps(asdict(msg)).encode()
+    return struct.pack(">I", len(payload)) + payload
 
 
-def decode(line: bytes) -> Any:
-    """Decode a wire line to the appropriate protocol message dataclass."""
-    obj: dict[str, Any] = json.loads(line)
+def decode(payload: bytes) -> Any:
+    """Decode a JSON payload bytes to the appropriate protocol message dataclass."""
+    obj: dict[str, Any] = json.loads(payload)
     t = obj.get("t")
     cls = _MSG_TYPES.get(t)  # type: ignore[arg-type]
     if cls is None:
         raise ValueError(f"Unknown message type: {t!r}")
     return cls(**obj)
+
+
+async def aread_msg(reader: asyncio.StreamReader) -> bytes:
+    """Read one length-prefixed message from an asyncio StreamReader."""
+    hdr = await reader.readexactly(4)
+    (n,) = struct.unpack(">I", hdr)
+    return await reader.readexactly(n)
+
+
+def read_msg(sock: socket.socket) -> bytes | None:
+    """Read one length-prefixed message from a blocking socket. Returns None on EOF/error."""
+    def _recv_exactly(n: int) -> bytes | None:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return bytes(buf)
+
+    hdr = _recv_exactly(4)
+    if hdr is None:
+        return None
+    (n,) = struct.unpack(">I", hdr)
+    return _recv_exactly(n)

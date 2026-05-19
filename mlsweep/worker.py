@@ -48,6 +48,7 @@ from mlsweep._shared import (
     MsgCancel,
     MsgCleaned,
     MsgCleanup,
+    MsgGpuStats,
     MsgHello,
     MsgLog,
     MsgMetric,
@@ -63,6 +64,7 @@ from mlsweep._shared import (
     _resolve_safe_subpath,
     decode,
     encode,
+    read_msg,
 )
 from mlsweep._topology import _gpu_topology, visible_devices
 
@@ -136,26 +138,6 @@ def _artifact_lock_done(artifact_id: str) -> None:
 # ── Wire I/O helpers ───────────────────────────────────────────────────────────
 
 
-class _LineReader:
-    """Buffer TCP data and yield complete newline-terminated lines."""
-
-    def __init__(self, sock: socket.socket) -> None:
-        self._sock = sock
-        self._buf = b""
-
-    def readline(self) -> bytes | None:
-        """Return the next complete line (including \\n), or None on EOF/error."""
-        while True:
-            if b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                return line + b"\n"
-            try:
-                chunk = self._sock.recv(4096)
-            except OSError:
-                return None
-            if not chunk:
-                return None
-            self._buf += chunk
 
 
 # ── Write thread (one per connection) ─────────────────────────────────────────
@@ -188,15 +170,13 @@ def _write_thread(conn: ConnState) -> None:
 
 def _read_thread(conn: ConnState) -> None:
     """Read protocol messages from a controller connection and dispatch them."""
-    reader = _LineReader(conn.sock)
-
     # First message must be MsgHello
-    line = reader.readline()
-    if not line:
+    payload = read_msg(conn.sock)
+    if not payload:
         conn.send_queue.put(None)
         return
     try:
-        msg = decode(line)
+        msg = decode(payload)
     except (ValueError, json.JSONDecodeError, TypeError):
         conn.send_queue.put(None)
         return
@@ -235,11 +215,11 @@ def _read_thread(conn: ConnState) -> None:
 
     # Main message loop
     while not _shutdown_event.is_set():
-        line = reader.readline()
-        if not line:
+        payload = read_msg(conn.sock)
+        if not payload:
             break
         try:
-            msg = decode(line)
+            msg = decode(payload)
         except (ValueError, json.JSONDecodeError, TypeError):
             continue
         _handle_msg(msg, conn)
@@ -701,6 +681,93 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
             conn.send_queue.put(wire)
 
 
+# ── GPU stats polling ─────────────────────────────────────────────────────────
+
+
+def _query_gpu_stats() -> list[dict[str, Any]]:
+    """Return per-GPU utilization stats from nvidia-smi or rocm-smi."""
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                stats: list[dict[str, Any]] = []
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        stats.append({
+                            "gpu": int(parts[0]),
+                            "util_pct": int(parts[1]),
+                            "mem_used_mb": int(parts[2]),
+                            "mem_total_mb": int(parts[3]),
+                        })
+                    except ValueError:
+                        continue
+                return stats
+        except Exception:
+            pass
+
+    if shutil.which("rocm-smi"):
+        try:
+            r = subprocess.run(
+                ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                stats = []
+                for key, val in sorted(data.items()):
+                    if not isinstance(val, dict):
+                        continue
+                    try:
+                        gpu_id = int(key.lstrip("card"))
+                        used_str = val.get("VRAM Total Used Memory (B)", "0")
+                        total_str = val.get("VRAM Total Memory (B)", "0")
+                        util_str = val.get("GPU use (%)", "0")
+                        stats.append({
+                            "gpu": gpu_id,
+                            "util_pct": int(float(util_str)),
+                            "mem_used_mb": int(int(used_str) / 1024 / 1024),
+                            "mem_total_mb": int(int(total_str) / 1024 / 1024),
+                        })
+                    except (ValueError, KeyError):
+                        continue
+                return stats
+        except Exception:
+            pass
+
+    return []
+
+
+def _gpu_stats_thread() -> None:
+    """Periodically poll GPU stats and broadcast to all manager connections."""
+    while not _shutdown_event.wait(5.0):
+        stats = _query_gpu_stats()
+        if not stats:
+            continue
+        # Filter to our assigned GPUs only
+        if _device_override is not None:
+            our_gpus = set(_device_override)
+            stats = [s for s in stats if s["gpu"] in our_gpus]
+        if not stats:
+            continue
+        wire = encode(MsgGpuStats(stats=stats))
+        with _lock:
+            conns = list(_connections)
+        for conn in conns:
+            if not conn.closed:
+                try:
+                    conn.send_queue.put_nowait(wire)
+                except Exception:
+                    pass
+
+
 # ── Accept loop ────────────────────────────────────────────────────────────────
 
 
@@ -801,6 +868,9 @@ def main() -> None:
         _ipc_sock_path = os.path.join(_scratch_dir, f".worker-{port}.sock")
         ipc_t = threading.Thread(target=_ipc_thread, args=(_ipc_sock_path,), daemon=True)
         ipc_t.start()
+
+        gpu_t = threading.Thread(target=_gpu_stats_thread, daemon=True)
+        gpu_t.start()
 
         # Enter accept loop (blocks until _shutdown_event is set)
         _accept_loop(server_sock)

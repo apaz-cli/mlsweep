@@ -68,6 +68,8 @@ class WorkerConn:
     gpus: list[int] = field(default_factory=list)
     topo: dict[str, int] = field(default_factory=dict)
     gpu_occupancy: dict[int, int] = field(default_factory=dict)
+    gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
+    max_jobs_per_gpu: int = 1
     send_queue: asyncio.Queue[bytes] = field(default_factory=asyncio.Queue)
     in_flight: dict[str, InFlightJob] = field(default_factory=dict)
     status: str = "connected"

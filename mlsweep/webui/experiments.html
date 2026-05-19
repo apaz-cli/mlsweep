@@ -222,6 +222,18 @@ function fmtElapsed(s) {
 }
 
 
+async function setExpConcurrency(expId, value) {
+  if (!value || value < 1) return;
+  const res = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/concurrency`, {
+    method: "PATCH",
+    body: JSON.stringify({ jobs_per_gpu: value }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    await mlAlert("Failed: " + (data.error || res.status));
+  }
+}
+
 async function deleteExperiment(expId) {
   if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
@@ -510,6 +522,11 @@ function renderExperiments(exps) {
         <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
         <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Artifacts</a>
         <button class="btn-link" onclick="event.stopPropagation();renameExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Rename</button>
+        ${running ? `<span class="concurrency-control" onclick="event.stopPropagation()">
+          <label style="font-size:11px;color:var(--text-dim)">jobs/GPU</label>
+          <input type="number" min="1" value="1" style="width:44px;font-size:11px"
+            onchange="setExpConcurrency(${JSON.stringify(expId).replace(/"/g,'&quot;')}, +this.value)">
+        </span>` : ""}
         <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
       </td>`;
 

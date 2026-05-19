@@ -219,7 +219,7 @@ GPUS_PER_RUN = 4
 
 When set, the runner divides the available GPUs into non-overlapping groups of `GPUS_PER_RUN` and assigns one group per concurrent run.  For each run, mlsweep spawns `GPUS_PER_RUN` copies of `COMMAND` — one per GPU — and sets `CUDA_VISIBLE_DEVICES` to the full group and `MLSWEEP_GPU_RANK` to each process's 0-based local rank.  Your training script uses `MLSWEEP_GPU_RANK` as its device index and distributed rank.
 
-The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_PER_RUN=4` and `-g 8`, you get 2 parallel slots (2 concurrent runs). `-g 0` uses all visible GPUs, divided into as many slots as fit.
+The total GPUs available to a worker is set via `devices` or `gpus` in workers.toml, or autodetected when running locally. With `GPUS_PER_RUN=4` and 8 available GPUs, you get 2 parallel slots (2 concurrent runs).
 
 GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
 
@@ -655,7 +655,7 @@ mlsweep_run watch EXP_ID --manager http://host:port                         # st
 | `--output-dir <dir>` | Directory where local sweep manifests are stored. Default: `<git-root>/outputs/sweeps`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. |
 | `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
-| `-j N`, `--jobs-per-gpu N` | Max concurrent jobs per GPU for this sweep (default: 1). |
+| `-j N`, `--jobs-per-gpu N` | Max concurrent jobs per GPU for this sweep (default: 1). Composes with `jobs` in workers.toml via `min()`; the worker cap is never exceeded. |
 | `--priority N` | Job priority — higher values run sooner (default: 0). |
 | `--stream` | Subscribe to the manager's WebSocket event stream for live terminal status. |
 | `--fetch` | Fetch and display results after submission (when `--stream` is not used). |
@@ -719,7 +719,7 @@ venv = "/home/user/myproject/.venv"
 | `host` | string | SSH target (required) |
 | `remote_dir` | string | Repo root on the remote machine (required) |
 | `gpus` | int | Total GPU count to use (default: all visible) |
-| `jobs` | int | Concurrent jobs per GPU slot (default: 1) |
+| `jobs` | int | Worker-level cap: max concurrent jobs per GPU on this machine. Composes with `-j` on `mlsweep_run` via `min()`. Omit or set to 0 for no cap. |
 | `devices` | list of ints | Specific GPU device IDs to use |
 | `ssh_key` | string | Path to SSH identity file (passed as `-i`) |
 | `pass` | string | SSH password. Requires `sshpass` to be installed. Falls back to `MLSWEEP_SSH_PASS` env var if omitted. |
