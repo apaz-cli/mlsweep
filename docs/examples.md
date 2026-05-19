@@ -2,8 +2,6 @@
 
 Practical patterns for common training scenarios.
 
----
-
 ## Basic Hyperparameter Sweep
 
 A single-GPU sweep over learning rate and batch size:
@@ -27,15 +25,13 @@ OPTIONS = {
 }
 ```
 
-Run with 4 GPUs in parallel:
+Submit to the manager (GPU count and concurrency are configured in `mlsweep_manager`):
 
 ```sh
-mlsweep_run sweeps/my_sweep.py -g 4
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891
 ```
 
-This produces 9 runs (3×3 grid) with up to 4 running concurrently.
-
----
+This produces 9 runs (3×3 grid).
 
 ## Multi-GPU DDP
 
@@ -49,7 +45,7 @@ GPUS_PER_RUN = 4
 
 OPTIONS = {
     ".lr": {
-        "values": [1e-4, 3e-4, 1e-3],
+        "values": [3e-5, 1e-4, 3e-4],
         "flags": "--lr",
         "name": "lr",
     },
@@ -77,15 +73,13 @@ device = torch.device(f"cuda:{local_rank}")
 
 > **Port conflicts:** If multiple runs execute concurrently on the same machine, each needs a distinct `MASTER_PORT`. One approach is to derive a port from the run name: `int(hashlib.md5(os.environ["MLSWEEP_RUN_NAME"].encode()).hexdigest()[:4], 16) % 10000 + 20000`.
 
-Run with 8 GPUs to get 2 parallel 4-GPU jobs:
+Submit to a manager that has access to 8+ GPUs:
 
 ```sh
-mlsweep_run sweeps/ddp_sweep.py -g 8
+mlsweep_run sweeps/ddp_sweep.py --manager http://localhost:7891
 ```
 
 GPU groups are chosen to maximise NVLink/interconnect quality.
-
----
 
 ## Multi-Node
 
@@ -100,7 +94,7 @@ NODES_PER_RUN = 2  # 8 GPUs total per run: 2 nodes × 4 GPUs
 
 OPTIONS = {
     ".lr": {
-        "values": [1e-4, 3e-4, 1e-3],
+        "values": [1e-4, 5e-4, 2e-3],
         "flags": "--lr",
         "name": "lr",
     },
@@ -129,15 +123,14 @@ dist.init_process_group(backend="nccl", rank=global_rank, world_size=world_size)
 device = torch.device(f"cuda:{local_rank}")
 ```
 
-Run with a workers file containing at least 2 entries:
+Start the manager with a workers file containing at least 2 entries, then submit:
 
 ```sh
-mlsweep_run sweeps/multinode_sweep.py --workers workers.toml
+mlsweep_manager --workers workers.toml
+mlsweep_run sweeps/multinode_sweep.py --manager http://localhost:7891
 ```
 
 mlsweep launches the command on all nodes simultaneously and records the run as succeeded only when every node exits 0.
-
----
 
 ## TorchTitan: Multi-GPU Pretraining
 
@@ -168,10 +161,10 @@ OPTIONS = {
 }
 ```
 
-Run with 16 GPUs to get 2 concurrent 8-GPU runs:
+Submit to a manager with 16+ GPUs to get 2 concurrent 8-GPU runs:
 
 ```sh
-mlsweep_run sweeps/torchtitan_sweep.py -g 16
+mlsweep_run sweeps/torchtitan_sweep.py --manager http://localhost:7891
 ```
 
 ### Multi-node
@@ -201,14 +194,13 @@ OPTIONS = {
 ```
 
 ```sh
-mlsweep_run sweeps/torchtitan_multinode.py --workers workers.toml
+mlsweep_manager --workers workers.toml
+mlsweep_run sweeps/torchtitan_multinode.py --manager http://localhost:7891
 ```
-
----
 
 ## Prime-RL: Multi-GPU RL Training
 
-[Prime-RL](https://github.com/PrimeIntellect-ai/prime-rl) is a single-entry-point launcher that spawns its own internal processes (trainer, orchestrator, inference server) and manages its own GPU assignment via `CUDA_VISIBLE_DEVICES`. It should be launched once per node, not once per GPU.
+[Prime-RL](https://github.com/PrimeIntellect-ai/prime-rl) is a single-entry-point launcher that spawns its own internal processes (trainer, orchestrator, inference server) and manages its own GPU assignment via `CUDA_VISIBLE_DEVICES`. It should be launched once per node, with mlsweep handling the multi-node coordination.
 
 With `GPUS_PER_RUN=8`, mlsweep spawns 8 processes. Guard the actual launch on `MLSWEEP_GPU_RANK=0`; the other 7 processes exit immediately, leaving rank 0's Prime-RL instance with all 8 GPUs visible.
 
@@ -241,13 +233,13 @@ OPTIONS = {
 }
 ```
 
-Run with 16 GPUs to get 2 parallel jobs:
+Submit to a manager with 16+ GPUs to get 2 parallel jobs:
 
 ```sh
-mlsweep_run sweeps/rl_sweep.py -g 16
+mlsweep_run sweeps/rl_sweep.py --manager http://localhost:7891
 ```
 
-This works because Prime-RL is designed to be isolated by `CUDA_VISIBLE_DEVICES`, which mlsweep sets automatically. It reads the variable on startup and maps all its internal GPU allocations (inference server, trainer, teacher) from it. Each mlsweep slot gets a disjoint GPU group, so two concurrent Prime-RL instances never touch each other's devices. Port conflicts are also not an issue, Prime-RL calls `get_free_port()` for its internal torchrun rendezvous, so each instance binds a different port automatically.
+This works because Prime-RL reads `CUDA_VISIBLE_DEVICES` on startup and maps all its internal GPU allocations from it. Each mlsweep slot gets a disjoint GPU group, so two concurrent Prime-RL instances never touch each other's devices. Port conflicts are also not an issue — Prime-RL calls `get_free_port()` for its internal torchrun rendezvous, so each instance binds a different port automatically.
 
 ### Multi-node
 
@@ -285,8 +277,9 @@ OPTIONS = {
 }
 ```
 
-Run with a workers file that has at least 2 entries (more for parallel runs):
+Start the manager with a workers file (at least 2 entries for more parallel runs), then submit:
 
 ```sh
-mlsweep_run sweeps/rl_multinode.py --workers workers.toml
+mlsweep_manager --workers workers.toml
+mlsweep_run sweeps/rl_multinode.py --manager http://localhost:7891
 ```

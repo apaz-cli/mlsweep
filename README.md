@@ -2,24 +2,25 @@
 
 `mlsweep` is slightly opinionated but very general solution for managing tons of machine learning runs. It takes flexible combinations of hyperparameters and schedules them across your hardware.
 
-The project contains a controller which manages scheduling jobs across workers, and a visualizer. You aren't forced to use our visualizer. You can use mlsweep with the wandb or tensorboard logger, and the mlsweep metrics format can be exported to wandb or tensorboard. The mlsweep logger is also extensible, should you wish. Logs end up on the controller machine.
+The project contains a persistent manager that owns GPU scheduling and a web dashboard, and workers that execute training jobs. You aren't forced to use our web UI. You can export mlsweep to wandb or tensorboard, and use whatever you use for viewing. The mlsweep logger is also extensible, should you wish. Logs end up on the manager machine.
 
-The main feature of mlsweep is not the logger, but the sweep configuration file. The good stuff. The thing that I've been missing all my machine learning life, and the reason I wrote this library.
+The main feature of mlsweep is not the logger, or the cluster managment features, but the sweep configuration file. The good stuff. The thing that I've been missing all my machine learning life, and the reason I wrote this library.
 
 `mlsweep` does pretty much everything that wandb does. If you're missing anything, let me know on [Discord](https://discord.gg/w2K2JWJGUb) or [Twitter](https://twitter.com/apaz_cli).
-
-![Viewer in progress](docs/mlsweep_viz.png)
 
 But first, let's install it, and add the logging.
 
 ## Setup
 
+Install mlsweep on the machine will run `mlsweep_manager`:
+
 ```sh
-git clone <your-project>
-cd <your-project>
-python -m venv .venv
 pip install 'mlsweep[all]'
 ```
+
+That's it. Remote workers get mlsweep bootstrapped automatically over SSH, no install needed.
+
+You con't need to run the manager (`mlsweep_manager`), controller (`mlsweep_run`), or worker (managed automatically by the manager) on separate machines. By default they run on the same machine.
 
 ## Add logging to your training script
 
@@ -32,20 +33,22 @@ with MLSweepLogger() as logger:
         loss = train_step()
         logger.log({"loss": loss}, step=step)
 
-        # Write checkpoints to MLSWEEP_RUN_DIR — they get rsynced back automatically.
+        # Write checkpoints to MLSWEEP_RUN_DIR, they get rsynced back automatically.
         # Call logger.sync() to trigger an immediate rsync mid-run (fire-and-forget).
         if step % 1000 == 0:
-            # If your checkpoint saving is asynchronous remember to launch a thread to await a future and then sync or something.
-            # logger.sync() is async and nonblocking but needs to be called after the artifact dir is ready.
             save_checkpoint(os.environ["MLSWEEP_RUN_DIR"], step)
             logger.sync()
 ```
 
-This logging is usually a no-op when run outside of `mlsweep_run`. Metrics land in `outputs/sweeps/<experiment>/<run>/metrics.jsonl`. Anything written to `MLSWEEP_RUN_DIR` is rsynced to `outputs/sweeps/<experiment>/<run>/artifacts/` — at the end of every run, and immediately on `logger.sync()`.
+`MLSweepLogger` is only active when your script is launched by a worker. It checks for `MLSWEEP_WORKER_SOCKET`, which the worker sets. Run your script directly and it's a no-op. The worker always has mlsweep available (bootstrapped or from your venv), so the logger just works.
+
+If your script doesn't use the logger at all that's fine too, mlsweep still dispatches the job and captures stdout/stderr to `training.log`. You just won't get metrics plots.
+
+Metrics land in `outputs/sweeps/<experiment>/<run>/metrics.jsonl` on the manager. Anything written to `MLSWEEP_RUN_DIR` is rsynced to `outputs/sweeps/<experiment>/<run>/artifacts/` at the end of every run, and immediately on `logger.sync()`.
 
 ## Write a sweep configuration file
 
-Add the following shebang, and use `chmod +x` so that that your sweep file can be directly executable.
+Add the following shebang, and use `chmod +x` so that your sweep file can be directly executable.
 
 ```python
 #!/usr/bin/env mlsweep_run
@@ -74,7 +77,7 @@ See [sweep_configuration.md](docs/sweep_configuration.md) for the full format: s
 
 ## Bayesian optimization
 
-If your sweep is specifically for hyperparameter optimization, you can add an `OPTIMIZE` dict to save compute — it uses TPE (via optuna) to intelligently sample the space and find good configs faster than trying all combinations.
+If your sweep is specifically for hyperparameter optimization, you can add an `OPTIMIZE` dict to save compute. It uses TPE (via [optuna](https://github.com/optuna/optuna)) to intelligently sample the space and find good configs faster than trying all combinations.
 
 ```python
 #!/usr/bin/env mlsweep_run
@@ -113,44 +116,52 @@ OPTIONS = {
 }
 ```
 
-Run the same way as any other sweep:
-
-```sh
-mlsweep_run sweeps/bayes_sweep.py -g 4
-```
-
 See [sweep_configuration.md](docs/sweep_configuration.md) for continuous ranges, singular dims, and all `OPTIMIZE` fields.
 
 ## Run
 
-### Local
+mlsweep uses a manager daemon that owns GPU scheduling and persists state. Start it once, then submit sweeps against it.
+
+### 1. Start the manager
 
 ```sh
-mlsweep_run sweeps/my_sweep.py             # 1 GPU
-mlsweep_run sweeps/my_sweep.py -g 4        # 4 GPUs in parallel
-mlsweep_run sweeps/my_sweep.py -g          # all visible GPUs
-mlsweep_run sweeps/my_sweep.py -g 4 -j 5   # 5 jobs per GPU (20 total)
+mlsweep_manager                                        # local GPUs, dashboard at http://localhost:7891
+mlsweep_manager --workers workers.toml                 # remote workers
+mlsweep_manager --port 7891 --host my.server.com       # custom port and externally-reachable hostname
+mlsweep_manager --mlsweep-dir /data/mlsweep            # custom state dir (DB, token, experiment outputs)
 ```
+
+Launching the manager also creates a worker process on localhost, unless --workers is passed.
+
+The manager prints dashboard URLs on startup, including a token for authentication:
+
+```
+Dashboard: http://localhost:7891/?token=abc123...
+```
+
+The token is also saved to `~/.mlsweep/manager.token` so local workers find it automatically.
+
+### 2. Submit a sweep
+
+```sh
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891 --stream   # live status
+```
+
+If the manager is on localhost, `mlsweep_run` auto-reads the token from `~/.mlsweep/manager.token`. For remote managers, pass `--token` or set `MLSWEEP_TOKEN`.
 
 ### Remote workers
 
-#### 1. Install mlsweep on each remote machine
+The manager installs mlsweep on remote machines automatically over SSH, with no manual setup needed. It builds wheels from the local source at startup, SCPs them to the remote, and installs them into `/tmp/mlsweep_venv/`.
 
-```sh
-ssh user@host -i path/to/key
-cd path/to/project/
-pip install mlsweep
-```
-
-#### 2. Create a workers.toml with your remote worker
+#### 1. Create a workers.toml
 
 ```toml
 [[workers]]
 host = "user@host1"
 remote_dir = "/absolute/path/to/project"
 ssh_key = "~/.ssh/id_ed25519"
-venv = "/absolute/path/to/venv/"          # Optional, resolves .venv/, venv/, calls bin/activate, defaults to remote_dir
-devices = [0, 1, 2, 3]                    # Sets CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES
+devices = [0, 1, 2, 3]
 jobs = 2
 ```
 
@@ -160,112 +171,62 @@ jobs = 2
 | `remote_dir` | yes      | Project root on the remote |
 | `ssh_key`    | no       | Path to identity file (`-i`) |
 | `pass`       | no       | SSH password (needs `sshpass`); or set `MLSWEEP_SSH_PASS` env var |
-| `venv`       | no       | Venv locator (default: `remote_dir`). Accepts a project root, venv root, `bin/` dir, activate script, or python binary. |
+| `venv`       | no       | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root, venv root, `bin/` dir, activate script, or python binary. |
 | `devices`    | no       | Specific GPU IDs to use |
-| `gpus`       | no       | Total GPU count -g (default: all visible) |
-| `jobs`       | no       | Concurrent jobs per GPU slot -j (default: 1) |
-| `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). Fixed port lets multiple controllers share the same worker — e.g. `mlsweep_run` and `WorkerPool` on the same machine queue jobs to the same worker. |
+| `gpus`       | no       | Total GPU count (default: all visible) |
+| `jobs`       | no       | Concurrent jobs per GPU slot (default: 1) |
+| `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). |
 
-**`venv` accepts any of:**
-- Project root containing `.venv/` or `venv/`
-- Venv root directory (contains `bin/mlsweep_worker`)
-- `bin/` directory
-- Path to `activate` script
-- Path to a python binary
-
-#### 3. Run
+#### 2. Start the manager with the workers file
 
 ```sh
-mlsweep_run sweeps/my_sweep.py --workers workers.toml
+mlsweep_manager --workers workers.toml
 ```
 
-## Visualize
+## Dashboard
 
-Once you've launched the sweep, on the machine and in the dir you called `mlsweep_run` from, run:
+The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, and system status. Open it in a browser while your sweep runs.
 
-```bash
-mlsweep_viz
-# or
-mlsweep_viz experiment_name
+## Useful CLI flags
+
+All flags below assume `--manager http://localhost:7891`:
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Print commands without running |
+| `--validate` | Check config, list all combos, exit |
+| `--stream` | Live status in terminal |
+| `--experiment NAME` | Custom experiment name |
+| `--priority N` | Higher values run sooner (default: 0) |
+| `--wandb-project P` | Stream metrics to W&B |
+| `--tensorboard-dir D` | Write TensorBoard logs |
+
+Subcommands:
+
+```sh
+mlsweep_run fetch --manager http://localhost:7891 --experiment EXP_ID    # download results
+mlsweep_run watch EXP_ID --manager http://localhost:7891                 # watch live status
 ```
-
-This will prompt you to open up a browser (or pass --open-browser to do so automatically) to see the sweep visualizer.
-It will watch your experiment folder and update the metrics viewer in real time.
 
 ### Using with W&B
 
-mlsweep can log all runs to Weights & Biases with no changes to your training script. The controller owns the W&B session — your training script only calls `MLSweepLogger` as usual.
-
-Install the extra:
+mlsweep can log all runs to Weights & Biases with no changes to your training script.
 
 ```sh
 pip install 'mlsweep[wandb]'
-```
-
-Then pass `--wandb-project` when launching:
-
-```sh
 export WANDB_API_KEY=your_key_here
-mlsweep_run sweeps/my_sweep.py -g 4 --wandb-project my-project
-mlsweep_run sweeps/my_sweep.py -g 4 --wandb-project my-project --wandb-entity my-team
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891 --wandb-project my-project
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891 --wandb-project my-project --wandb-entity my-team
 ```
-
-Each run appears in W&B under the project, grouped by experiment name, with its hyperparameter combo stored as the run config.
 
 ### Using with TensorBoard
 
-Same idea — no changes to your training script needed.
-
-Install the extra (or use an existing torch/tensorboardX install):
-
 ```sh
 pip install 'mlsweep[tensorboard]'
-```
-
-Then pass `--tensorboard-dir` when launching:
-
-```sh
-mlsweep_run sweeps/my_sweep.py -g 4 --tensorboard-dir ./tb_logs
-```
-
-Logs are written to `<tensorboard-dir>/<experiment>/<run>/`. Point TensorBoard at the top-level dir to compare all runs:
-
-```sh
+mlsweep_run sweeps/my_sweep.py --manager http://localhost:7891 --tensorboard-dir ./tb_logs
 tensorboard --logdir ./tb_logs
 ```
 
-## Programmatic API
-
-For use cases where you want to submit jobs dynamically to run on a machine and get back results,
-you can use `WorkerPool` from `mlsweep.pool`. It uses the same worker backend as
-`mlsweep_run` (`mlsweep_worker`), but does not assume you're using the mlsweep logger. You can
-use it like slurm, to just launch jobs on a cluster. Also supports sending file payloads to
-workers and getting modified files back.
-
-```python
-from mlsweep.pool import WorkerPool, WorkerConfig
-from mlsweep._shared import MsgRun
-
-with WorkerPool([WorkerConfig(host="user@gpu-box", remote_dir="/home/user/project",
-                              devices=[0, 1, 2, 3])]) as pool:
-    result = pool.run(MsgRun(
-        command=["python", "train.py"],
-        files={"train.py": source_code},
-        return_files=["train.py"],
-    ))
-    print(result.stdout)
-    modified = result.files["train.py"]
-```
-
-`run_id`, `gpu_ids`, `remote_dir`, and `scratch` are filled in automatically by the pool. See [docs/pool.md](docs/pool.md) for the full reference.
-
-## Known Issues
-
-In the future we will have better handling for scheduling jobs on multiple workers.
-There should be an extra layer that manages said workers, right now there is not, it
-is just done in `mlsweep_run` and the `WorkerPool` API with nothing to ensure mutual exclusion
-on GPUs.
-
 ## Troubleshooting
 
-If the error messages are bad or the docs are bad or you feel confused feel free to hit me up on [Discord](https://discord.gg/w2K2JWJGUb) or [Twitter](https://twitter.com/apaz_cli).
+If the error messages are bad or the docs are confusing, hit me up on [Discord](https://discord.gg/w2K2JWJGUb) or [Twitter](https://twitter.com/apaz_cli).
