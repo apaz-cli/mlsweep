@@ -360,12 +360,14 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
         base_env["PYTHONPATH"] = workspace + (os.pathsep + existing if existing else "")
     base_env.pop("EXP_SERVER", None)
 
-    # Activate .venv if present in the run directory
+    # Activate .venv if present: workspace first, then remote_dir fallback
     _venv_bin = os.path.join(cwd, ".venv", "bin")
+    if not os.path.isdir(_venv_bin) and _remote_dir:
+        _venv_bin = os.path.join(_remote_dir, ".venv", "bin")
     if os.path.isdir(_venv_bin):
         _old_path = base_env.get("PATH", os.environ.get("PATH", ""))
         base_env["PATH"] = _venv_bin + os.pathsep + _old_path
-        base_env["VIRTUAL_ENV"] = os.path.join(cwd, ".venv")
+        base_env["VIRTUAL_ENV"] = os.path.dirname(_venv_bin)
         base_env.pop("PYTHONHOME", None)
 
     # Pre-compute dist env values if SET_DIST_ENV is requested
