@@ -334,13 +334,11 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
             workspace = os.path.join(scratch_path, "workspace")
             os.makedirs(workspace, exist_ok=True)
             cwd = workspace
-        # Resolve setup_command: accept list[str] (preferred) or str (legacy)
         cmd = msg.setup_command
-        if isinstance(cmd, str) and cmd:
-            cmd = shlex.split(cmd)
+        use_shell = isinstance(cmd, str)
         result = subprocess.run(
             cmd,
-            shell=False,
+            shell=use_shell,
             cwd=workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
