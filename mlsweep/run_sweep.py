@@ -1384,6 +1384,8 @@ def main() -> None:
     set_dist_env: bool = info.get("set_dist_env", False)
     method: str = info.get("method", "grid")
     optimize_cfg: dict[str, Any] = info.get("optimize") or {}
+    if not args.setup_command and info.get("setup_command"):
+        args.setup_command = info["setup_command"]
 
     validate_options(options, method=method)
     assert options is not None and command is not None

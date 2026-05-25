@@ -89,6 +89,10 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
             if not isinstance(optimize["budget"], int) or optimize["budget"] < 1:
                 raise ValueError(f"{path}: OPTIMIZE budget must be a positive int")
 
+    setup_command = getattr(mod, "SETUP_COMMAND", None)
+    if setup_command is not None and not isinstance(setup_command, str):
+        raise ValueError(f"{path}: SETUP_COMMAND must be a str, got {type(setup_command).__name__}")
+
     return {
         "name": Path(path).stem,
         "options": mod.OPTIONS,
@@ -101,6 +105,7 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "set_dist_env": set_dist_env,
         "method": method,
         "optimize": optimize,
+        "setup_command": setup_command,
     }
 
 

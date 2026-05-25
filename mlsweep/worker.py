@@ -338,12 +338,26 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
         cmd = msg.setup_command
         if isinstance(cmd, str) and cmd:
             cmd = shlex.split(cmd)
-        subprocess.run(
+        result = subprocess.run(
             cmd,
             shell=False,
             cwd=workspace,
-            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
+        setup_output = result.stdout or ""
+        if result.returncode != 0:
+            setup_output += f"[mlsweep] setup_command exited {result.returncode}\n"
+        if setup_output:
+            with open(log_path, "a") as _lf:
+                _lf.write(setup_output)
+            if not conn.closed:
+                conn.send_queue.put(encode(MsgLog(
+                    run_id=msg.run_id, seq=len(setup_output), data=setup_output
+                )))
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
 
     # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)
