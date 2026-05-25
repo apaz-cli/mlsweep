@@ -859,9 +859,12 @@ async def _handle_result(
         if job is None and msg.run_id not in wc.in_flight:
             return
 
-        # Free GPU occupancy for this worker regardless
-        if job is not None:
-            for gpu_id in job.gpu_ids:
+        # Use the per-worker InFlightJob to get this worker's GPU IDs — the
+        # global state.in_flight[run_id] is overwritten by each _dispatch_core
+        # call (last node wins), so it does not reliably reflect this worker's GPUs.
+        local_in_flight = wc.in_flight.get(msg.run_id)
+        if local_in_flight is not None:
+            for gpu_id in local_in_flight.gpu_ids:
                 wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
 
         wc.in_flight.pop(msg.run_id, None)
@@ -960,11 +963,10 @@ async def _handle_result(
         await state.dispatch_callback()
 
     # ── Check if experiment is complete ─────────────────────────────────
-    # The in-memory scan (has_active, has_pending) is a fast-path: it only
-    # prevents marking complete, and the DB count query below serves as the
-    # authoritative safety net (SELECT COUNT ... WHERE status = 'done').
-    # A TOCTOU window exists between dispatch_callback() releasing its lock
-    # and us re-acquiring below, but the DB count guards correctness.
+    # Fast in-memory pre-check (under lock, no DB I/O) to skip the DB
+    # count query when jobs are obviously still running or pending.
+    # The DB count is the authoritative guard; TOCTOU between the two is
+    # acceptable because update_experiment_status is idempotent.
     if job is not None:
         experiment_id = job.experiment_id
         async with state.scheduler_lock:
@@ -976,24 +978,25 @@ async def _handle_result(
                 j.experiment_id == experiment_id
                 for j in state.pending
             )
-            if has_active or has_pending:
-                return
+        if has_active or has_pending:
+            return
 
-            exp = await get_experiment(db, experiment_id)
-            if exp is None:
-                return
+        # DB reads and write outside the lock — no need to hold it here.
+        exp = await get_experiment(db, experiment_id)
+        if exp is None:
+            return
 
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM jobs WHERE experiment_id = ? AND status = 'done'",
-                (experiment_id,),
-            )
-            row = await cursor.fetchone()
-            submitted_count: int = row[0] if row else 0
-            expected = exp.expected_jobs
-            if expected != 0 and submitted_count < expected:
-                return
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE experiment_id = ? AND status = 'done'",
+            (experiment_id,),
+        )
+        row = await cursor.fetchone()
+        submitted_count: int = row[0] if row else 0
+        expected = exp.expected_jobs
+        if expected != 0 and submitted_count < expected:
+            return
 
-            await state.db_writer.update_experiment_status(experiment_id, "completed")
+        await state.db_writer.update_experiment_status(experiment_id, "completed")
 
         state.broadcast(
             experiment_id,
@@ -1143,6 +1146,10 @@ async def _on_worker_lost(
     async with state.scheduler_lock:
         wc.status = "reconnecting"
 
+    # Signal the write task to stop draining the now-dead connection.
+    # The write task returns when it dequeues this sentinel.
+    wc.send_queue.put_nowait(None)
+
     await state.db_writer.update_worker_status(wc.worker_id, "reconnecting")
 
     print(f"  {_YELLOW}WARN{_RESET}  Worker {wc.host} disconnected; reconnecting...")
@@ -1227,7 +1234,12 @@ async def _reconnect_worker(
                             for gpu_id in gpu_ids:
                                 wc.gpu_occupancy[gpu_id] += 1
 
-            # Send MsgReplay for resuming runs
+            # Replace the send queue so messages queued for the dead connection
+            # (stale MsgRun, old heartbeats, etc.) cannot bleed onto the new one.
+            # The old write task already exited on the None sentinel from _on_worker_lost.
+            wc.send_queue = asyncio.Queue()
+
+            # Send MsgReplay for resuming runs (into the fresh queue)
             for rinfo in msg.resuming:
                 await _send_to_worker(
                     wc,
@@ -1238,17 +1250,17 @@ async def _reconnect_worker(
                     )),
                 )
 
-            # Handle orphaned runs (were in-flight but worker isn't resuming them)
-            orphaned: list[str] = []
+            # Handle orphaned runs (were in-flight but worker isn't resuming them).
+            # Collect both keys and values under the lock to avoid reading stale data
+            # between iterations.
+            orphaned: list[tuple[str, str]] = []
             async with state.scheduler_lock:
-                for run_id in list(wc.in_flight.keys()):
+                for run_id, ifj in list(wc.in_flight.items()):
                     if run_id not in {r["run_id"] for r in msg.resuming}:
-                        orphaned.append(run_id)
+                        orphaned.append((run_id, ifj.experiment_id))
 
-            for run_id in orphaned:
-                in_flight = wc.in_flight.get(run_id)
-                await _handle_orphaned_run(db, state, wc, run_id,
-                                           experiment_id=in_flight.experiment_id if in_flight else "")
+            for run_id, exp_id in orphaned:
+                await _handle_orphaned_run(db, state, wc, run_id, experiment_id=exp_id)
 
             # Restart read/write/heartbeat tasks for the reconnected worker
             _start_worker_tasks(db, state, wc, shutdown_event)
@@ -1267,14 +1279,15 @@ async def _reconnect_worker(
 
     print(f"  {_RED}FAIL{_RESET}  Worker {wc.host} unreachable; re-queuing runs")
 
-    # Re-queue all in-flight runs
+    # Re-queue all in-flight runs — collect run_id + experiment_id together
+    # under the lock so we don't read stale data between iterations.
+    dead_orphaned: list[tuple[str, str]] = []
     async with state.scheduler_lock:
-        orphaned = list(wc.in_flight.keys())
+        for run_id, ifj in list(wc.in_flight.items()):
+            dead_orphaned.append((run_id, ifj.experiment_id))
 
-    for run_id in orphaned:
-        in_flight = wc.in_flight.get(run_id)
-        await _handle_orphaned_run(db, state, wc, run_id,
-                                   experiment_id=in_flight.experiment_id if in_flight else "")
+    for run_id, exp_id in dead_orphaned:
+        await _handle_orphaned_run(db, state, wc, run_id, experiment_id=exp_id)
 
 
 async def _handle_orphaned_run(
@@ -1629,11 +1642,18 @@ async def dispatch_to_worker(
     if wc.status != "connected":
         return False
 
-    # Hold the scheduler lock through DB write so that another concurrent
-    # scheduling pass cannot see the GPU occupancy as still free and
-    # double-assign them.
+    # Pre-compute stable values — no lock needed, these fields are immutable.
+    if state.artifact_base_url and job.artifact_id:
+        artifact_url = f"{state.artifact_base_url}/api/artifacts/{job.artifact_id}"
+        if state.token:
+            artifact_url += f"?token={state.token}"
+    else:
+        artifact_url = ""
+    run_scratch = os.path.join(wc.scratch_dir, job.experiment_id, job.run_id)
+
+    # Hold the scheduler lock only for the DB write (the CAS that prevents
+    # double-dispatch) and the immediate field extraction — nothing else.
     async with state.scheduler_lock:
-        # Atomically claim the job in DB
         dispatched = await state.db_writer.dispatch_job(
             job.run_id, job.experiment_id, wc.worker_id, gpu_ids
         )
@@ -1642,33 +1662,25 @@ async def dispatch_to_worker(
 
         command, job_env, job_files, job_return_files = _parse_job_fields(dispatched)
 
-        if state.artifact_base_url and job.artifact_id:
-            artifact_url = f"{state.artifact_base_url}/api/artifacts/{job.artifact_id}"
-            if state.token:
-                artifact_url += f"?token={state.token}"
-        else:
-            artifact_url = ""
+    # Build MsgRun outside the lock.
+    run_msg = MsgRun(
+        run_id=job.run_id,
+        experiment=job.experiment_id,
+        command=command,
+        env=job_env,
+        gpu_ids=gpu_ids,
+        remote_dir="",
+        scratch=run_scratch,
+        run_from=job.run_from,
+        set_dist_env=job.set_dist_env,
+        files=job_files,
+        return_files=job_return_files,
+        artifact_id=job.artifact_id or "",
+        artifact_url=artifact_url,
+        setup_command=shlex.split(job.setup_command) if job.setup_command else [],
+    )
 
-        run_scratch = os.path.join(wc.scratch_dir, job.experiment_id, job.run_id)
-
-        run_msg = MsgRun(
-            run_id=job.run_id,
-            experiment=job.experiment_id,
-            command=command,
-            env=job_env,
-            gpu_ids=gpu_ids,
-            remote_dir="",
-            scratch=run_scratch,
-            run_from=job.run_from,
-            set_dist_env=job.set_dist_env,
-            files=job_files,
-            return_files=job_return_files,
-            artifact_id=job.artifact_id or "",
-            artifact_url=artifact_url,
-            setup_command=shlex.split(job.setup_command) if job.setup_command else [],
-        )
-
-    # Delegate in-memory update + send + broadcast to the shared core
+    # Update in-memory state and send.
     return await _dispatch_core(
         state, wc, job,
         gpu_ids=gpu_ids,
@@ -1869,7 +1881,12 @@ async def schedule_pending(
     db: aiosqlite.Connection,
     state: ManagerState,
 ) -> int:
-    """Try to dispatch as many pending jobs as possible.
+    """Coalesced entry point: run scheduling passes until nothing can be dispatched.
+
+    If called while a pass is already in progress, sets a flag so that the
+    running pass executes one more iteration after it finishes.  This collapses
+    any number of rapid concurrent triggers into at most two passes, preventing
+    redundant planning phases and the job-visibility gap they create.
 
     Acquires ``state.scheduler_lock`` to scan the pending list and find
     available GPUs, then releases it before dispatching.  The dispatch
@@ -1878,6 +1895,28 @@ async def schedule_pending(
 
     Returns the number of jobs successfully dispatched.
     """
+    if state._scheduling:
+        state._reschedule = True
+        return 0
+    state._scheduling = True
+    try:
+        total = 0
+        while True:
+            state._reschedule = False
+            n = await _do_schedule_pending(db, state)
+            total += n
+            if not state._reschedule:
+                break
+        return total
+    finally:
+        state._scheduling = False
+
+
+async def _do_schedule_pending(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+) -> int:
+    """Single scheduling pass — called only by ``schedule_pending``."""
     # ── Phase 1: find assignments under lock ───────────────────────────
     async with state.scheduler_lock:
         connected = [
@@ -1888,9 +1927,8 @@ async def schedule_pending(
         if not connected or not state.pending:
             return 0
 
-        # Build tentative occupancy maps per worker for planning.
-        # We copy the current occupancy so that assignments within this
-        # planning pass do not double-book the same GPUs.
+        # Snapshot occupancy per worker so tentative assignments within
+        # this planning pass don't double-book the same GPUs.
         tentative_occ: dict[str, dict[int, int]] = {}
         for wc in connected:
             tentative_occ[wc.worker_id] = dict(wc.gpu_occupancy)
@@ -1912,7 +1950,6 @@ async def schedule_pending(
                     )
                     if gpus is not None:
                         plan.append((job, [(wc, gpus)]))
-                        # Tentatively reserve these GPUs
                         occ = tentative_occ[wc.worker_id]
                         for g in gpus:
                             occ[g] += 1
@@ -1922,7 +1959,7 @@ async def schedule_pending(
                     remaining.append(job)
             else:
                 # ── Multi-node ─────────────────────────────────────────
-                assignments: list[tuple[WorkerConn, list[int]]] = []
+                node_assignments: list[tuple[WorkerConn, list[int]]] = []
                 used_workers: set[str] = set()
                 for wc in connected:
                     if wc.worker_id in used_workers:
@@ -1934,15 +1971,15 @@ async def schedule_pending(
                         jobs_per_gpu=job.jobs_per_gpu,
                     )
                     if gpus is not None:
-                        assignments.append((wc, gpus))
+                        node_assignments.append((wc, gpus))
                         used_workers.add(wc.worker_id)
                         occ = tentative_occ[wc.worker_id]
                         for g in gpus:
                             occ[g] += 1
-                        if len(assignments) >= job.nodes_per_run:
+                        if len(node_assignments) >= job.nodes_per_run:
                             break
-                if len(assignments) >= job.nodes_per_run:
-                    plan.append((job, assignments))
+                if len(node_assignments) >= job.nodes_per_run:
+                    plan.append((job, node_assignments))
                 else:
                     remaining.append(job)
 
@@ -1994,19 +2031,8 @@ async def _execute_assignment(
 
     primary_wc, primary_gpus = assignments[0]
 
-    # Atomically claim the job in DB via the primary worker
-    async with state.scheduler_lock:
-        dispatched = await state.db_writer.dispatch_job(
-            job.run_id, job.experiment_id, primary_wc.worker_id, primary_gpus,
-        )
-        if dispatched is None:
-            return False  # job already taken by another scheduler
-
-        command, job_env, job_files, job_return_files = _parse_job_fields(dispatched)
-
+    # Pre-compute stable values before the DB write.
     all_worker_ids = [wc.worker_id for wc, _ in assignments]
-
-    # Determine master address / port for distributed setup
     master_host = primary_wc.host.split("@")[-1]
     master_port = 29500  # default torch distributed port; could be parameterised
 
@@ -2017,7 +2043,19 @@ async def _execute_assignment(
     else:
         artifact_url = ""
 
-    all_ok = True
+    # Atomically claim the job in DB — hold lock only for the CAS + field extraction.
+    async with state.scheduler_lock:
+        dispatched = await state.db_writer.dispatch_job(
+            job.run_id, job.experiment_id, primary_wc.worker_id, primary_gpus,
+        )
+        if dispatched is None:
+            return False  # job already taken by another scheduler
+
+        command, job_env, job_files, job_return_files = _parse_job_fields(dispatched)
+
+    # Dispatch each node outside the lock, tracking which nodes succeeded so
+    # we can roll back cleanly on partial failure.
+    dispatched_nodes: list[tuple[WorkerConn, list[int]]] = []
 
     for node_rank, (wc, gpu_ids) in enumerate(assignments):
         run_scratch = os.path.join(wc.scratch_dir, job.experiment_id, job.run_id)
@@ -2053,15 +2091,26 @@ async def _execute_assignment(
             run_msg=run_msg,
             worker_ids=all_worker_ids,
         )
-        if not ok:
-            all_ok = False
-            break
+        if ok:
+            dispatched_nodes.append((wc, gpu_ids))
+        else:
+            # Partial failure: roll back every node that already received MsgRun,
+            # cancel them, and reset the DB — otherwise the job is permanently stuck
+            # in in_flight on the successful nodes with no chance of a full result.
+            async with state.scheduler_lock:
+                for prev_wc, prev_gpu_ids in dispatched_nodes:
+                    prev_wc.in_flight.pop(job.run_id, None)
+                    for gpu_id in prev_gpu_ids:
+                        prev_wc.gpu_occupancy[gpu_id] = max(
+                            0, prev_wc.gpu_occupancy[gpu_id] - 1
+                        )
+                state.remove_in_flight(job.run_id)
 
-    if not all_ok:
-        # Partial failure — the primary DB dispatch already happened.
-        # The job will be treated as orphaned and retried via the normal
-        # reconnect / lost-worker path.
-        return False
+            for prev_wc, _ in dispatched_nodes:
+                await _send_to_worker(prev_wc, encode(MsgCancel(run_id=job.run_id)))
+
+            await state.db_writer.reset_job_to_pending(job.run_id, job.experiment_id)
+            return False
 
     return True
 

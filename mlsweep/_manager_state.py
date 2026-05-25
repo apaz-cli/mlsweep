@@ -70,7 +70,7 @@ class WorkerConn:
     gpu_occupancy: dict[int, int] = field(default_factory=dict)
     gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
     max_jobs_per_gpu: int = 1
-    send_queue: asyncio.Queue[bytes] = field(default_factory=asyncio.Queue)
+    send_queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
     in_flight: dict[str, InFlightJob] = field(default_factory=dict)
     status: str = "connected"
     connected_at: datetime | None = None
@@ -109,6 +109,10 @@ class ManagerState:
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self.scheduler_lock: asyncio.Lock = asyncio.Lock()
         self.multinode_pending: dict[str, dict[str, Any]] = {}
+        # Coalescing guard for schedule_pending: prevents concurrent scheduling
+        # passes and folds rapid re-triggers into a single follow-up pass.
+        self._scheduling: bool = False
+        self._reschedule: bool = False
 
     # ── Pending list helpers ──────────────────────────────────────────────
 
