@@ -302,7 +302,7 @@ async function selectJob(job) {
   noSel.style.display     = "none";
 
   // Wire download button.
-  const logUrl = `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/log`;
+  const logUrl = `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`;
   logDlBtn.href            = TOKEN ? `${logUrl}?token=${encodeURIComponent(TOKEN)}` : logUrl;
   logDlBtn.download        = `${job.run_id}.log`;
   logDlBtn.style.display   = "";
@@ -323,7 +323,7 @@ async function selectJob(job) {
   loadAbort  = ctrl;
   try {
     const r = await apiFetch(
-      `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/log`,
+      `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`,
       { signal: ctrl.signal },
     );
     if (!ctrl.signal.aborted && r.ok) {

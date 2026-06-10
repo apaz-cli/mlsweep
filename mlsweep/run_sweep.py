@@ -341,6 +341,7 @@ def manager_create_experiment(
     note: str | None = None,
     expected_jobs: int = 0,
     singular_dims: list[str] | None = None,
+    max_concurrent: int = 0,
 ) -> dict[str, Any] | None:
     """Create an experiment on the manager. Returns the experiment dict or None."""
     status, resp = _http_request(
@@ -355,6 +356,7 @@ def manager_create_experiment(
             "status": "running",
             "expected_jobs": expected_jobs,
             "singular_dims": singular_dims or [],
+            "max_concurrent": max_concurrent,
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -1078,7 +1080,6 @@ def _build_job_payloads(
     priority: int,
     max_retries: int,
     setup_command: str | None = None,
-    jobs_per_gpu: int = 1,
 ) -> list[dict[str, Any]]:
     """Convert sweep variations into job payloads for the manager API.
 
@@ -1107,7 +1108,6 @@ def _build_job_payloads(
             "run_from": run_from,
             "artifact_id": artifact_id,
             "max_retries": max_retries,
-            "jobs_per_gpu": jobs_per_gpu,
             "return_files": [],  # could configure via sweep file
         }
         if setup_command:
@@ -1349,8 +1349,9 @@ def main() -> None:
         "--version", action="version",
         version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
     parser.add_argument(
-        "-j", "--jobs-per-gpu", type=int, default=1, metavar="N",
-        help="Max concurrent jobs per GPU for this sweep (default: 1)")
+        "--max-concurrent", type=int, default=0, metavar="K",
+        help="Cap on this sweep's simultaneously-running jobs across the whole "
+             "cluster (0 = unlimited). Use it to take only a slice of a shared cluster.")
 
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
@@ -1655,6 +1656,7 @@ def main() -> None:
             note=args.note,
             expected_jobs=expected if method == "bayes" else 0,
             singular_dims=singular_dim_names,
+            max_concurrent=args.max_concurrent,
         ):
             sys.exit(1)
 
@@ -1674,7 +1676,6 @@ def main() -> None:
             priority=args.priority,
             max_retries=args.max_retries,
             setup_command=args.setup_command,
-            jobs_per_gpu=args.jobs_per_gpu,
         )
 
         records = manager_submit_jobs_bulk(manager, token, job_payloads)
@@ -1737,7 +1738,6 @@ def main() -> None:
                     priority=args.priority,
                     max_retries=args.max_retries,
                     setup_command=args.setup_command,
-                    jobs_per_gpu=args.jobs_per_gpu,
                 )
                 if new_job:
                     submitted = manager_submit_jobs_bulk(manager, token, new_job)

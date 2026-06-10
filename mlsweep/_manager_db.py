@@ -30,7 +30,13 @@ import aiosqlite
 _T = TypeVar("_T")
 
 JobStatus = Literal["pending", "dispatched", "running", "done", "failed", "xfailed", "cancelled"]
-ExperimentStatus = Literal["running", "completed", "aborted"]
+ExperimentStatus = Literal["running", "paused", "completed", "aborted"]
+
+# Experiment statuses whose pending jobs the scheduler must NOT dispatch.
+# 'paused' is a temporary hold (resumable); 'aborted' is a permanent stop.
+# 'running' and 'completed' remain schedulable so that retrying a job in a
+# finished experiment works without a separate status flip.
+NON_SCHEDULABLE_EXPERIMENT_STATUSES: tuple[str, ...] = ("paused", "aborted")
 WorkerStatus = Literal["offline", "connected", "reconnecting", "dead"]
 
 
@@ -51,6 +57,7 @@ class ExperimentRecord:
     status: ExperimentStatus = "running"
     expected_jobs: int = 0
     singular_dims: str = "[]"  # JSON list of dim names that are singular probes
+    max_concurrent: int = 0  # max simultaneously-running jobs for this exp; 0 = unlimited
 
 
 @dataclass(order=False)
@@ -102,7 +109,6 @@ class JobRecord:
     max_retries: int = 2
     combo: str = "{}"  # JSON object
     dispatched_gpu_ids: str | None = None  # JSON list of ints, set on dispatch
-    jobs_per_gpu: int = 1
     label: str | None = None
 
 
@@ -115,6 +121,20 @@ class ArtifactRecord:
     stored_at: datetime | None = None
     ref_count: int = 0
     setup_command: str | None = None
+
+
+@dataclass(order=False)
+class JobNodeRecord:
+    """One node of a multi-node job (durable placement + per-node result)."""
+
+    run_id: str
+    experiment_id: str
+    node_rank: int
+    worker_id: str | None = None
+    gpu_ids: str = "[]"  # JSON list of ints
+    status: JobStatus = "dispatched"
+    success: bool | None = None
+    elapsed: float | None = None
 
 
 # ===============================================================================
@@ -164,7 +184,6 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         max_retries=_col(row, "max_retries", 2),
         combo=_col(row, "combo", "{}"),
         dispatched_gpu_ids=row["dispatched_gpu_ids"],
-        jobs_per_gpu=_col(row, "jobs_per_gpu", 1),
         label=_col(row, "label", None),
     )
 
@@ -180,6 +199,7 @@ def _row_to_experiment(row: sqlite3.Row) -> ExperimentRecord:
         status=_col(row, "status", "running"),
         expected_jobs=_col(row, "expected_jobs", 0),
         singular_dims=_col(row, "singular_dims", "[]"),
+        max_concurrent=_col(row, "max_concurrent", 0),
     )
 
 
@@ -318,7 +338,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
             note           TEXT,
             status         TEXT NOT NULL DEFAULT 'running',
             expected_jobs  INTEGER NOT NULL DEFAULT 0,
-            singular_dims  TEXT NOT NULL DEFAULT '[]'
+            singular_dims  TEXT NOT NULL DEFAULT '[]',
+            max_concurrent INTEGER NOT NULL DEFAULT 0
         );
     """)
 
@@ -334,8 +355,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
             port          INTEGER NOT NULL DEFAULT 7890,
             ssh_key       TEXT,
             venv          TEXT,
-            devices       TEXT,
-            jobs_per_gpu  INTEGER NOT NULL DEFAULT 1
+            devices       TEXT
         );
     """)
 
@@ -378,7 +398,6 @@ async def init_db(db: aiosqlite.Connection) -> None:
             max_retries        INTEGER NOT NULL DEFAULT 2,
             combo              TEXT NOT NULL DEFAULT '{}',
             dispatched_gpu_ids TEXT,
-            jobs_per_gpu       INTEGER NOT NULL DEFAULT 1,
             label              TEXT,
             PRIMARY KEY (run_id, experiment_id)
         );
@@ -406,17 +425,25 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
-    # ── migrations for existing databases ───────────────────────────
-    try:
-        await db.execute("ALTER TABLE jobs ADD COLUMN jobs_per_gpu INTEGER DEFAULT 1")
-        await db.commit()
-    except Exception:
-        pass  # column already exists
-    try:
-        await db.execute("ALTER TABLE experiments ADD COLUMN singular_dims TEXT NOT NULL DEFAULT '[]'")
-        await db.commit()
-    except Exception:
-        pass  # column already exists
+    # ── job_nodes ────────────────────────────────────────────────────
+    # One row per node of a multi-node job (nodes_per_run > 1).  This is the
+    # durable, restart-safe placement + aggregation state: each node records
+    # which worker/GPUs it runs on and its individual result.  A multi-node job
+    # is complete once none of its node rows are still non-terminal — a query,
+    # not an in-memory counter that a manager restart would lose.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS job_nodes (
+            run_id        TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            node_rank     INTEGER NOT NULL,
+            worker_id     TEXT,
+            gpu_ids       TEXT,
+            status        TEXT NOT NULL DEFAULT 'dispatched',
+            success       INTEGER,
+            elapsed       REAL,
+            PRIMARY KEY (run_id, experiment_id, node_rank)
+        );
+    """)
 
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
@@ -449,6 +476,7 @@ async def create_experiment(
     status: ExperimentStatus = "running",
     expected_jobs: int = 0,
     singular_dims: list[str] | None = None,
+    max_concurrent: int = 0,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row."""
     now = _now_epoch()
@@ -456,18 +484,19 @@ async def create_experiment(
     row = await _exec_one(
         db,
         """
-        INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status, expected_jobs, singular_dims)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status, expected_jobs, singular_dims, max_concurrent)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (experiment_id) DO UPDATE SET
             name = EXCLUDED.name,
             controller_id = EXCLUDED.controller_id,
             note = EXCLUDED.note,
             status = EXCLUDED.status,
             expected_jobs = EXCLUDED.expected_jobs,
-            singular_dims = EXCLUDED.singular_dims
+            singular_dims = EXCLUDED.singular_dims,
+            max_concurrent = EXCLUDED.max_concurrent
         RETURNING *;
         """,
-        (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json),
+        (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json, max_concurrent),
     )
     await db.commit()
     assert row is not None
@@ -684,7 +713,6 @@ async def insert_job(
     max_retries: int = 2,
     artifact_id: str | None = None,
     setup_command: str | None = None,
-    jobs_per_gpu: int = 1,
 ) -> JobRecord:
     """Insert a new job row. Returns the created JobRecord."""
     now = _now_epoch()
@@ -699,19 +727,19 @@ async def insert_job(
             run_id, experiment_id, priority, status, submit_time,
             command, combo, env, gpus_per_run, nodes_per_run,
             set_dist_env, run_from, return_files, files, max_retries,
-            artifact_id, setup_command, jobs_per_gpu
+            artifact_id, setup_command
         ) VALUES (
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
-            ?, ?, ?
+            ?, ?
         )
         RETURNING *;
         """,
         (run_id, experiment_id, priority, status, now,
          command_json, combo_json, env_json, gpus_per_run, nodes_per_run,
          int(set_dist_env), run_from, return_files_json, files_json, max_retries,
-         artifact_id, setup_command, jobs_per_gpu),
+         artifact_id, setup_command),
     )
     await db.commit()
     assert row is not None
@@ -744,12 +772,12 @@ async def insert_jobs_bulk(
                     run_id, experiment_id, priority, status, submit_time,
                     command, combo, env, gpus_per_run, nodes_per_run,
                     set_dist_env, run_from, return_files, files, max_retries,
-                    artifact_id, setup_command, jobs_per_gpu
+                    artifact_id, setup_command
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
-                    ?, ?, ?
+                    ?, ?
                 )
                 RETURNING *;
                 """,
@@ -759,8 +787,7 @@ async def insert_jobs_bulk(
                  j.get("gpus_per_run", 1), j.get("nodes_per_run", 1),
                  int(j.get("set_dist_env", False)), j.get("run_from"),
                  return_files_json, files_json, j.get("max_retries", 2),
-                 j.get("artifact_id"), j.get("setup_command"),
-                 j.get("jobs_per_gpu", 1)),
+                 j.get("artifact_id"), j.get("setup_command")),
             )
             assert row is not None
             records.append(_row_to_job(row))
@@ -838,6 +865,232 @@ async def list_pending_jobs(
             )
     rows = await cursor.fetchall()
     return [_row_to_job(r) for r in rows]
+
+
+async def list_schedulable_jobs(
+    db: aiosqlite.Connection,
+) -> list[JobRecord]:
+    """Return pending jobs eligible for dispatch, in scheduling order.
+
+    A job is schedulable iff its status is ``pending`` and its experiment is
+    not paused or aborted (see ``NON_SCHEDULABLE_EXPERIMENT_STATUSES``).  This
+    is the scheduler's sole input — the in-memory pending mirror is gone, so a
+    paused/aborted experiment simply stops producing schedulable jobs.
+
+    Ordered by priority DESC, submit_time ASC to match ``idx_jobs_dispatch``.
+    """
+    placeholders = ",".join("?" * len(NON_SCHEDULABLE_EXPERIMENT_STATUSES))
+    cursor = await db.execute(
+        f"""
+        SELECT j.* FROM jobs j
+        JOIN experiments e ON j.experiment_id = e.experiment_id
+        WHERE j.status = 'pending'
+          AND e.status NOT IN ({placeholders})
+        ORDER BY j.priority DESC, j.submit_time ASC
+        """,
+        NON_SCHEDULABLE_EXPERIMENT_STATUSES,
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_job(r) for r in rows]
+
+
+async def list_jobs_by_run_ids(
+    db: aiosqlite.Connection,
+    run_ids: list[str],
+) -> list[JobRecord]:
+    """Return job rows whose run_id is in *run_ids* (across all experiments).
+
+    Used on worker reconnect/resume, where the worker reports run_ids but not
+    their experiment_id.  Run ids are effectively unique in practice; callers
+    that need to disambiguate take the first match per run_id.
+    """
+    if not run_ids:
+        return []
+    placeholders = ",".join("?" * len(run_ids))
+    cursor = await db.execute(
+        f"SELECT * FROM jobs WHERE run_id IN ({placeholders})",
+        run_ids,
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_job(r) for r in rows]
+
+
+async def experiment_concurrency_caps(
+    db: aiosqlite.Connection,
+) -> dict[str, int]:
+    """Return ``{experiment_id: max_concurrent}`` for every experiment.
+
+    ``max_concurrent`` of 0 means unlimited.  Used by the scheduler to bound
+    how many of an experiment's jobs run at once.
+    """
+    cursor = await db.execute("SELECT experiment_id, max_concurrent FROM experiments")
+    rows = await cursor.fetchall()
+    return {r["experiment_id"]: _col(r, "max_concurrent", 0) for r in rows}
+
+
+async def count_pending_jobs(db: aiosqlite.Connection) -> int:
+    """Return the number of jobs in 'pending' status (for health/status)."""
+    cursor = await db.execute("SELECT COUNT(*) FROM jobs WHERE status = 'pending'")
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def update_experiment_max_concurrent(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    max_concurrent: int,
+) -> ExperimentRecord | None:
+    """Set an experiment's max_concurrent cap. Returns updated row or None."""
+    row = await _exec_one(
+        db,
+        "UPDATE experiments SET max_concurrent = ? WHERE experiment_id = ? RETURNING *",
+        (max_concurrent, experiment_id),
+    )
+    await db.commit()
+    return _row_to_experiment(row) if row else None
+
+
+# ===============================================================================
+# Job nodes (multi-node placement + per-node aggregation)
+# ===============================================================================
+
+
+def _row_to_job_node(row: sqlite3.Row) -> JobNodeRecord:
+    success = _col(row, "success")
+    return JobNodeRecord(
+        run_id=row["run_id"],
+        experiment_id=row["experiment_id"],
+        node_rank=row["node_rank"],
+        worker_id=_col(row, "worker_id"),
+        gpu_ids=_col(row, "gpu_ids", "[]"),
+        status=_col(row, "status", "dispatched"),
+        success=None if success is None else bool(success),
+        elapsed=_col(row, "elapsed"),
+    )
+
+
+async def insert_job_nodes(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+    placements: list[tuple[int, str, list[int]]],
+) -> None:
+    """Record the placement of every node of a multi-node job.
+
+    *placements* is a list of ``(node_rank, worker_id, gpu_ids)``.  Replaces any
+    existing rows for this run (e.g. on re-dispatch).  Each node starts
+    'dispatched'.
+    """
+    await db.execute(
+        "DELETE FROM job_nodes WHERE run_id = ? AND experiment_id = ?",
+        (run_id, experiment_id),
+    )
+    for node_rank, worker_id, gpu_ids in placements:
+        await db.execute(
+            """
+            INSERT INTO job_nodes (run_id, experiment_id, node_rank, worker_id, gpu_ids, status)
+            VALUES (?, ?, ?, ?, ?, 'dispatched')
+            """,
+            (run_id, experiment_id, node_rank, worker_id, json.dumps(gpu_ids)),
+        )
+    await db.commit()
+
+
+async def mark_job_node_result(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+    worker_id: str,
+    success: bool,
+    elapsed: float,
+) -> None:
+    """Record one node's terminal result, keyed by the worker that ran it.
+
+    A multi-node run places at most one node per worker, so (run_id, worker_id)
+    identifies the node without needing a node_rank on the wire.
+    """
+    await db.execute(
+        """
+        UPDATE job_nodes
+        SET status = ?, success = ?, elapsed = ?
+        WHERE run_id = ? AND experiment_id = ? AND worker_id = ?
+        """,
+        ("done" if success else "failed", int(success), elapsed,
+         run_id, experiment_id, worker_id),
+    )
+    await db.commit()
+
+
+async def is_multinode_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> bool:
+    """True if this run has node rows recorded (i.e. it is multi-node)."""
+    cursor = await db.execute(
+        "SELECT 1 FROM job_nodes WHERE run_id = ? AND experiment_id = ? LIMIT 1",
+        (run_id, experiment_id),
+    )
+    return (await cursor.fetchone()) is not None
+
+
+async def list_job_nodes(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> list[JobNodeRecord]:
+    """Return all node rows for a run, ordered by node_rank."""
+    cursor = await db.execute(
+        "SELECT * FROM job_nodes WHERE run_id = ? AND experiment_id = ? ORDER BY node_rank",
+        (run_id, experiment_id),
+    )
+    return [_row_to_job_node(r) for r in await cursor.fetchall()]
+
+
+async def multinode_progress(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> tuple[int, bool, float]:
+    """Aggregate a multi-node run's node results from the DB.
+
+    Returns ``(remaining, all_success, max_elapsed)`` where *remaining* is the
+    number of nodes not yet in a terminal state.  When *remaining* is 0 the run
+    is finished: *all_success* is the AND of every node's success and
+    *max_elapsed* is the slowest node's wall time.  Because this is derived from
+    durable rows, it is correct even after a manager restart.
+    """
+    cursor = await db.execute(
+        "SELECT status, success, elapsed FROM job_nodes "
+        "WHERE run_id = ? AND experiment_id = ?",
+        (run_id, experiment_id),
+    )
+    rows = await cursor.fetchall()
+    remaining = 0
+    all_success = True
+    max_elapsed = 0.0
+    for r in rows:
+        if r["status"] not in ("done", "failed"):
+            remaining += 1
+            continue
+        if not r["success"]:
+            all_success = False
+        if r["elapsed"] is not None and r["elapsed"] > max_elapsed:
+            max_elapsed = r["elapsed"]
+    return remaining, all_success, max_elapsed
+
+
+async def delete_job_nodes(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> None:
+    """Remove a run's node rows (on finalization or cancellation)."""
+    await db.execute(
+        "DELETE FROM job_nodes WHERE run_id = ? AND experiment_id = ?",
+        (run_id, experiment_id),
+    )
+    await db.commit()
 
 
 async def list_jobs_by_experiment(
@@ -1186,25 +1439,6 @@ async def reset_jobs_to_pending_batch(
     return [_row_to_job(r) for r in rows]
 
 
-async def update_jobs_concurrency(
-    db: aiosqlite.Connection,
-    experiment_id: str,
-    jobs_per_gpu: int,
-) -> list[JobRecord]:
-    """Update jobs_per_gpu for all pending jobs in an experiment."""
-    rows = await _exec_all(
-        db,
-        """
-        UPDATE jobs SET jobs_per_gpu = ?
-        WHERE experiment_id = ? AND status = 'pending'
-        RETURNING *;
-        """,
-        (jobs_per_gpu, experiment_id),
-    )
-    await db.commit()
-    return [_row_to_job(r) for r in rows]
-
-
 async def list_jobs_by_status(
     db: aiosqlite.Connection,
     status: JobStatus,
@@ -1448,6 +1682,7 @@ async def delete_experiment(
     await db.execute("DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,))
     await db.execute("DELETE FROM metrics WHERE experiment_id = ?", (experiment_id,))
     await db.execute("DELETE FROM logs WHERE experiment_id = ?", (experiment_id,))
+    await db.execute("DELETE FROM job_nodes WHERE experiment_id = ?", (experiment_id,))
     row = await _exec_one(
         db,
         "DELETE FROM experiments WHERE experiment_id = ? RETURNING experiment_id",
@@ -1585,13 +1820,14 @@ class DbWriter:
         status: ExperimentStatus = "running",
         expected_jobs: int = 0,
         singular_dims: list[str] | None = None,
+        max_concurrent: int = 0,
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
             db, experiment_id=experiment_id, name=name,
             controller_id=controller_id, note=note,
             status=status, expected_jobs=expected_jobs,
-            singular_dims=singular_dims,
+            singular_dims=singular_dims, max_concurrent=max_concurrent,
         ))
 
     async def update_experiment_status(
@@ -1599,6 +1835,12 @@ class DbWriter:
     ) -> ExperimentRecord | None:
         db = self._db
         return await self._enqueue(lambda: update_experiment_status(db, experiment_id, status))
+
+    async def update_experiment_max_concurrent(
+        self, experiment_id: str, max_concurrent: int
+    ) -> ExperimentRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_experiment_max_concurrent(db, experiment_id, max_concurrent))
 
     async def update_experiment_name(
         self, experiment_id: str, name: str
@@ -1667,7 +1909,6 @@ class DbWriter:
         max_retries: int = 2,
         artifact_id: str | None = None,
         setup_command: str | None = None,
-        jobs_per_gpu: int = 1,
     ) -> JobRecord:
         db = self._db
         return await self._enqueue(lambda: insert_job(
@@ -1676,7 +1917,7 @@ class DbWriter:
             gpus_per_run=gpus_per_run, nodes_per_run=nodes_per_run,
             set_dist_env=set_dist_env, run_from=run_from, return_files=return_files,
             files=files, max_retries=max_retries, artifact_id=artifact_id,
-            setup_command=setup_command, jobs_per_gpu=jobs_per_gpu,
+            setup_command=setup_command,
         ))
 
     async def insert_jobs_bulk(self, jobs: list[dict[str, Any]]) -> list[JobRecord]:
@@ -1765,11 +2006,26 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: reset_jobs_to_pending_batch(db, pairs))
 
-    async def update_jobs_concurrency(
-        self, experiment_id: str, jobs_per_gpu: int
-    ) -> list[JobRecord]:
+    async def insert_job_nodes(
+        self, run_id: str, experiment_id: str,
+        placements: list[tuple[int, str, list[int]]],
+    ) -> None:
         db = self._db
-        return await self._enqueue(lambda: update_jobs_concurrency(db, experiment_id, jobs_per_gpu))
+        await self._enqueue(lambda: insert_job_nodes(db, run_id, experiment_id, placements))
+
+    async def mark_job_node_result(
+        self, run_id: str, experiment_id: str, worker_id: str,
+        success: bool, elapsed: float,
+    ) -> None:
+        db = self._db
+        await self._enqueue(lambda: mark_job_node_result(
+            db, run_id, experiment_id, worker_id, success, elapsed))
+
+    async def delete_job_nodes(
+        self, run_id: str, experiment_id: str
+    ) -> None:
+        db = self._db
+        await self._enqueue(lambda: delete_job_nodes(db, run_id, experiment_id))
 
     async def reset_worker_jobs(
         self, worker_id: str

@@ -172,9 +172,9 @@ jobs = 2
 | `ssh_key`    | no       | Path to identity file (`-i`) |
 | `pass`       | no       | SSH password (needs `sshpass`); or set `MLSWEEP_SSH_PASS` env var |
 | `venv`       | no       | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root, venv root, `bin/` dir, activate script, or python binary. |
-| `devices`    | no       | Specific GPU IDs to use |
+| `devices`    | no       | Specific GPU IDs to use (worker CLI: `-g`). Default: all visible. |
 | `gpus`       | no       | Total GPU count (default: all visible) |
-| `jobs`       | no       | Max concurrent jobs per GPU on this worker. Composes with `-j` on `mlsweep_run` via `min()`; 0 or omitted means no worker-level cap. |
+| `jobs`       | no       | Max concurrent jobs per GPU on this worker (worker CLI: `-j`). Default 1; set to 0 for unlimited. |
 | `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). |
 
 #### 2. Start the manager with the workers file

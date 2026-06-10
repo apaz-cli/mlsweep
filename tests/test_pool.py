@@ -120,6 +120,120 @@ def test_files_workspace(manager_with_worker, tmp_path):
     assert not (remote_dir / "a.py").exists()
 
 
+def _job_status(url: str, experiment_id: str, run_id: str) -> str | None:
+    """Return a single job's status, or None if not found."""
+    status, resp = _http_request(
+        "GET",
+        _manager_url(url, f"/api/jobs/{run_id}?experiment_id={experiment_id}"),
+        _TOKEN,
+    )
+    if status == 200 and isinstance(resp, dict):
+        return resp.get("status")
+    return None
+
+
+def test_abort_experiment_stops_dispatch(manager_with_worker):
+    """Aborting an experiment must immediately stop the scheduler from
+    dispatching its remaining pending jobs (regression for D1: abort used to be
+    a no-op because the scheduler ignored experiment status).
+
+    With a single-slot worker and many short jobs, the buggy version would churn
+    through and complete all of them; the fixed scheduler reads experiment
+    status from the DB each pass, so once aborted, untouched jobs stay pending.
+    """
+    server, url = manager_with_worker
+    exp = "exp_abort"
+    manager_create_experiment(url, _TOKEN, exp, "abort_test")
+
+    n = 6
+    jobs = [
+        {
+            "run_id": f"run{i}",
+            "experiment_id": exp,
+            "command": ["sh", "-c", "sleep 1"],
+            "files": {},
+            "return_files": [],
+        }
+        for i in range(n)
+    ]
+    assert manager_submit_jobs_bulk(url, _TOKEN, jobs) is not None
+
+    # Abort right away — before the single slot can chew through all jobs.
+    status, _ = _http_request(
+        "PUT", _manager_url(url, f"/api/experiments/{exp}/status"),
+        _TOKEN, json_data={"status": "aborted"},
+    )
+    assert status == 200
+
+    # Give the buggy version ample time to (wrongly) run everything serially.
+    time.sleep(n + 3)
+
+    all_jobs = manager_list_experiment_jobs(url, _TOKEN, exp)
+    assert all_jobs is not None
+    by_status: dict[str, int] = {}
+    for j in all_jobs:
+        by_status[j["status"]] = by_status.get(j["status"], 0) + 1
+
+    done = by_status.get("done", 0)
+    pending = by_status.get("pending", 0)
+    # The sweep was halted: not everything ran, and untouched jobs remain pending.
+    assert done < n, f"abort did not stop dispatch; statuses={by_status}"
+    assert pending >= 1, f"expected held pending jobs; statuses={by_status}"
+
+
+def test_cancel_running_job_frees_slot(manager_with_worker):
+    """Cancelling a running job must free its slot so new work can run
+    (regression for D2: cancel used to leak GPU occupancy permanently, so the
+    worker would look 'full' forever and never accept new jobs).
+
+    Every slot is filled first, so a new job can only run if the cancelled
+    job's slot is actually released.
+    """
+    server, url = manager_with_worker
+    exp = "exp_cancel_slot"
+    manager_create_experiment(url, _TOKEN, exp, "cancel_slot_test")
+
+    # Total slots = sum of GPUs across connected workers (one job per GPU).
+    workers = _api_get(url, _TOKEN, "/api/workers")
+    slots = sum(len(w.get("gpus") or []) for w in workers if w.get("status") == "connected")
+    slots = max(slots, 1)
+
+    # Fill every slot with a long-running hog.
+    hogs = [{
+        "run_id": f"hog{i}", "experiment_id": exp,
+        "command": ["sh", "-c", "sleep 30"], "files": {}, "return_files": [],
+    } for i in range(slots)]
+    assert manager_submit_jobs_bulk(url, _TOKEN, hogs) is not None
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if all(_job_status(url, exp, f"hog{i}") in ("dispatched", "running")
+               for i in range(slots)):
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail("hogs did not all start")
+
+    # A new job submitted now stays pending — the cluster is full.
+    assert manager_submit_jobs_bulk(url, _TOKEN, [{
+        "run_id": "follow", "experiment_id": exp,
+        "command": ["echo", "ok"], "files": {}, "return_files": [],
+    }]) is not None
+    time.sleep(1.5)
+    assert _job_status(url, exp, "follow") == "pending"
+
+    # Cancelling one hog must free its slot so the follow-up can run.
+    status, _ = _http_request(
+        "DELETE", _manager_url(url, f"/api/experiments/{exp}/jobs/hog0"), _TOKEN,
+    )
+    assert status == 200
+
+    follow = _wait_for_job(url, _TOKEN, "follow", exp, timeout=30)
+    assert follow is not None and follow["status"] == "done", (
+        "follow-up job did not run — the cancelled job's slot leaked"
+    )
+
+
 def test_concurrent_slots(manager_with_worker):
     """Submit two jobs in one bulk call; verify both complete."""
     server, url = manager_with_worker

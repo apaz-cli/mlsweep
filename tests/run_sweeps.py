@@ -49,8 +49,6 @@ def main() -> None:
                         help="Include multi-GPU sweeps (skipped by default)")
     parser.add_argument("--stream", action="store_true",
                         help="Pass --stream to mlsweep_run for live job status")
-    parser.add_argument("-j", "--jobs-per-gpu", type=int, default=None, metavar="N",
-                        help="Pass -j N to every mlsweep_run call")
     args = parser.parse_args()
 
     # ── Resolve mlsweep_run ───────────────────────────────────────────────────
@@ -100,8 +98,6 @@ def main() -> None:
         cmd = [runner, "--manager", args.manager, "--token", args.token]
         if args.stream:
             cmd.append("--stream")
-        if args.jobs_per_gpu is not None:
-            cmd += ["-j", str(args.jobs_per_gpu)]
         cmd.append(str(sweep_file))
 
         t0 = time.monotonic()

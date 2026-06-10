@@ -29,6 +29,7 @@ from aiohttp import WSMsgType, web
 
 from mlsweep._manager_db import (
     WorkerRecord,
+    count_pending_jobs,
     experiment_summary,
     get_artifact,
     get_experiment,
@@ -44,7 +45,12 @@ from mlsweep._manager_db import (
     list_workers,
 )
 from mlsweep._manager_state import ManagerState
-from mlsweep._manager_workers import evict_jobs
+from mlsweep._manager_workers import (
+    _detach_in_flight,
+    _worker_occupancy,
+    cancel_runs,
+    evict_jobs,
+)
 from mlsweep._shared import MsgCancel, MsgShutdown, _resolve_safe_subpath, encode
 
 logger = logging.getLogger(__name__)
@@ -275,6 +281,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     status = body.get("status", "running")
     expected_jobs = body.get("expected_jobs", 0)
     singular_dims = body.get("singular_dims") or []
+    max_concurrent = body.get("max_concurrent", 0)
 
     try:
         exp = await state.db_writer.create_experiment(
@@ -285,6 +292,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
             status=status,
             expected_jobs=expected_jobs,
             singular_dims=singular_dims,
+            max_concurrent=max_concurrent,
         )
     except Exception as exc:
         return _error_response(str(exc), status=500)
@@ -303,9 +311,19 @@ async def handle_get_experiment(request: web.Request) -> web.Response:
     return _json_response(exp)
 
 
+_VALID_EXPERIMENT_STATUSES = ("running", "paused", "completed", "aborted")
+
+
 @routes.put("/api/experiments/{experiment_id}/status")
 async def handle_update_experiment_status(request: web.Request) -> web.Response:
-    """Update an experiment's status."""
+    """Update an experiment's status.
+
+    ``paused`` and ``aborted`` cause the scheduler to stop dispatching this
+    experiment's pending jobs (the scheduler reads experiment status from the
+    DB).  ``aborted`` additionally cancels any of its jobs that are still
+    in-flight.  Moving back to ``running`` resumes scheduling.
+    """
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     experiment_id = request.match_info["experiment_id"]
     try:
@@ -315,9 +333,27 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     status = body.get("status")
     if not status:
         return _error_response("'status' is required")
+    if status not in _VALID_EXPERIMENT_STATUSES:
+        return _error_response(
+            f"status must be one of {', '.join(_VALID_EXPERIMENT_STATUSES)}"
+        )
     exp = await state.db_writer.update_experiment_status(experiment_id, status)
     if exp is None:
         return _not_found("experiment")
+
+    # Aborting permanently stops the sweep: cancel anything still in-flight.
+    if status == "aborted":
+        in_flight_pairs = [
+            (ifj.run_id, ifj.experiment_id)
+            for ifj in list(state.in_flight.values())
+            if ifj.experiment_id == experiment_id
+        ]
+        if in_flight_pairs:
+            await cancel_runs(db, state, in_flight_pairs)
+    elif status == "running":
+        # Resuming — give the scheduler a chance to dispatch held jobs.
+        _trigger_scheduling(request)
+
     # Broadcast event
     _broadcast_experiment_event(request, experiment_id, "status_updated", status=status)
     return _json_response(exp)
@@ -343,11 +379,56 @@ async def handle_update_experiment_name(request: web.Request) -> web.Response:
     return _json_response(exp)
 
 
-@routes.delete("/api/experiments/{experiment_id}")
-async def handle_delete_experiment(request: web.Request) -> web.Response:
-    """Delete an experiment and all its jobs."""
+@routes.put("/api/experiments/{experiment_id}/max_concurrent")
+async def handle_update_experiment_max_concurrent(request: web.Request) -> web.Response:
+    """Set an experiment's max concurrent running jobs (0 = unlimited).
+
+    The cap is enforced by the scheduler each pass, so lowering it does not kill
+    already-running jobs; it just stops new ones from starting until the running
+    count drops below the cap.
+    """
     state: ManagerState = request.config_dict["mlsweep_state"]
     experiment_id = request.match_info["experiment_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+    value = body.get("max_concurrent")
+    if value is None or not isinstance(value, int) or value < 0:
+        return _error_response("'max_concurrent' (int >= 0) is required")
+    exp = await state.db_writer.update_experiment_max_concurrent(experiment_id, value)
+    if exp is None:
+        return _not_found("experiment")
+    _trigger_scheduling(request)
+    return _json_response(exp)
+
+
+@routes.delete("/api/experiments/{experiment_id}")
+async def handle_delete_experiment(request: web.Request) -> web.Response:
+    """Delete an experiment and all its jobs.
+
+    Any jobs still in-flight are first stopped on their workers (so we don't
+    leave orphaned processes running for a deleted experiment), then the rows
+    are removed.  Pending jobs simply vanish from the scheduler's DB query.
+    """
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    experiment_id = request.match_info["experiment_id"]
+
+    # Stop in-flight runs for this experiment before deleting their rows.
+    in_flight_runs = [
+        ifj.run_id
+        for ifj in list(state.in_flight.values())
+        if ifj.experiment_id == experiment_id
+    ]
+    if in_flight_runs:
+        _, cancel_targets = await _detach_in_flight(state, in_flight_runs)
+        for wc, run_id in cancel_targets:
+            try:
+                wc.send_queue.put_nowait(encode(MsgCancel(run_id=run_id)))
+            except asyncio.QueueFull:
+                pass
+
     existed = await state.db_writer.delete_experiment(experiment_id)
     if not existed:
         return _not_found("experiment")
@@ -500,16 +581,12 @@ async def handle_insert_job(request: web.Request) -> web.Response:
             max_retries=body.get("max_retries", 2),
             artifact_id=body.get("artifact_id"),
             setup_command=body.get("setup_command"),
-            jobs_per_gpu=body.get("jobs_per_gpu", 1),
         )
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
-    # Add to pending list if status is pending
+    # The job now lives in the DB; the scheduler reads pending jobs from there.
     if job.status == "pending":
-        async with state.scheduler_lock:
-            state.insert_pending(job)
-        # Trigger scheduling
         _trigger_scheduling(request)
 
     return _json_response(job, status=201)
@@ -535,14 +612,8 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
-    # Add pending jobs to state
-    async with state.scheduler_lock:
-        for job in records:
-            if job.status == "pending":
-                state.insert_pending(job)
-
-    # Trigger scheduling
-    if records:
+    # Jobs are persisted; the scheduler reads pending jobs from the DB.
+    if any(job.status == "pending" for job in records):
         _trigger_scheduling(request)
 
     return _json_response(records, status=201)
@@ -621,13 +692,13 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
     if not experiment_id:
         return _error_response("'experiment_id' is required")
 
-    # Update in DB
+    # Update in DB — the scheduler reads pending jobs (ordered by priority)
+    # straight from the DB, so this takes effect on the next pass.
     job = await state.db_writer.update_job_priority(run_id, experiment_id, priority)
     if job is None:
         return _not_found("job")
 
-    # Update in-memory sorted list
-    state.update_priority(run_id, priority)
+    _trigger_scheduling(request)
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -665,24 +736,22 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
 
 @routes.post("/api/jobs/{run_id}/cancel")
 async def handle_cancel_job(request: web.Request) -> web.Response:
-    """Cancel a pending job."""
+    """Cancel a job (pending or running) via the unified cancel path."""
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
 
-    job = await state.db_writer.cancel_job(run_id, experiment_id)
+    job = await get_job(db, run_id, experiment_id)
     if job is None:
         return _not_found("job")
 
-    # Remove from pending list
-    state.remove_pending(run_id)
+    # One path stops any in-flight run on its worker, marks the row cancelled,
+    # and broadcasts job_done. Works whether the job is pending or running.
+    await cancel_runs(db, state, [(run_id, experiment_id)])
 
-    # Broadcast event
-    _broadcast_experiment_event(
-        request, job.experiment_id, "job_cancelled", run_id=run_id,
-    )
-
-    return _json_response(job)
+    updated = await get_job(db, run_id, experiment_id)
+    return _json_response(updated if updated is not None else job)
 
 
 @routes.post("/api/jobs/{run_id}/retry")
@@ -714,9 +783,8 @@ async def handle_retry_job(request: web.Request) -> web.Response:
             "job not found or max_retries reached", status=400,
         )
 
-    # Add back to pending list
-    async with state.scheduler_lock:
-        state.insert_pending(job)
+    # increment_retry reset the DB row to 'pending'; the scheduler reads it from
+    # the DB, so a double-click just sets pending twice (idempotent) — no phantom.
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -731,11 +799,11 @@ async def handle_retry_job(request: web.Request) -> web.Response:
 
 @routes.delete("/api/experiments/{experiment_id}/jobs/{run_id}")
 async def handle_delete_job(request: web.Request) -> web.Response:
-    """Cancel a job by experiment_id and run_id.
+    """Cancel a job by experiment_id and run_id via the unified cancel path.
 
-    - If pending: remove from state.pending, mark 'cancelled', broadcast job_done.
-    - If dispatched/running: send MsgCancel to the assigned worker, mark
-      'cancelled', broadcast job_done.
+    Handles pending and running jobs identically: any in-flight run is stopped
+    on its worker (freeing its GPUs), the row is marked 'cancelled', and
+    job_done is broadcast.
     """
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
@@ -743,71 +811,13 @@ async def handle_delete_job(request: web.Request) -> web.Response:
     run_id = request.match_info["run_id"]
 
     job = await get_job(db, run_id, experiment_id)
-    if job is None:
+    if job is None or job.experiment_id != experiment_id:
         return _not_found("job")
 
-    # Verify the job belongs to the given experiment
-    if job.experiment_id != experiment_id:
-        return _not_found("job")
+    await cancel_runs(db, state, [(run_id, experiment_id)])
 
-    status = job.status
-
-    if status == "pending":
-        # Remove from pending list
-        state.remove_pending(run_id)
-
-        # Mark cancelled in DB
-        job = await state.db_writer.cancel_job(run_id, experiment_id)
-        if job is None:
-            return _error_response("failed to cancel job", status=500)
-
-        # Broadcast job_done
-        _broadcast_experiment_event(
-            request, experiment_id, "job_done",
-            run_id=run_id, status="cancelled", success=False,
-        )
-
-    elif status in ("dispatched", "running"):
-        # Send MsgCancel to the assigned worker
-        wc = None
-        if job.worker_id:
-            wc = state.workers.get(job.worker_id)
-            if wc is not None:
-                cancel_msg = encode(MsgCancel(run_id=run_id))
-                try:
-                    wc.send_queue.put_nowait(cancel_msg)
-                except asyncio.QueueFull:
-                    pass
-
-        # Mark cancelled in DB
-        job = await state.db_writer.update_job_status(run_id, experiment_id, "cancelled")
-        if job is None:
-            return _error_response("failed to cancel job", status=500)
-
-        # Remove from in-flight
-        if_job = state.remove_in_flight(run_id)
-        if if_job is not None and wc is not None:
-            wc.in_flight.pop(run_id, None)
-
-        # Broadcast job_done
-        _broadcast_experiment_event(
-            request, experiment_id, "job_done",
-            run_id=run_id, status="cancelled", success=False,
-        )
-
-    else:
-        # Already terminal — mark cancelled if not already
-        if status != "cancelled":
-            job = await state.db_writer.update_job_status(run_id, experiment_id, "cancelled")
-        _broadcast_experiment_event(
-            request, experiment_id, "job_done",
-            run_id=run_id, status="cancelled", success=False,
-        )
-
-    # Trigger scheduling in case we freed up resources
-    _trigger_scheduling(request)
-
-    return _json_response(job)
+    updated = await get_job(db, run_id, experiment_id)
+    return _json_response(updated if updated is not None else job)
 
 
 @routes.patch("/api/experiments/{experiment_id}/jobs/{run_id}")
@@ -838,15 +848,13 @@ async def handle_patch_job(request: web.Request) -> web.Response:
     if job.experiment_id != experiment_id:
         return _not_found("job")
 
-    # Update priority in DB (works for any status)
+    # Update priority in DB (works for any status). The scheduler reads pending
+    # jobs ordered by priority from the DB, so this re-orders the next pass.
     job = await state.db_writer.update_job_priority(run_id, experiment_id, priority)
     if job is None:
         return _error_response("failed to update priority", status=500)
 
-    # If job is in pending list, update its priority and re-sort
     if job.status == "pending":
-        state.update_priority(run_id, priority)
-        # Trigger scheduler to re-evaluate
         _trigger_scheduling(request)
 
     # Broadcast event
@@ -874,7 +882,7 @@ async def handle_get_job_metrics(request: web.Request) -> web.Response:
     return web.Response(text=jsonl, content_type="text/plain")
 
 
-@routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/log")
+@routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/logs")
 async def handle_get_job_log(request: web.Request) -> web.Response:
     """Return training log for a job from the database."""
     db = request.config_dict["mlsweep_db"]
@@ -1067,7 +1075,7 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
     wc = state.workers.get(wr.worker_id)
     if wc is not None:
         d["gpus"] = wc.gpus
-        d["gpu_occupancy"] = wc.gpu_occupancy
+        d["gpu_occupancy"] = _worker_occupancy(wc)
         d["gpu_stats"] = wc.gpu_stats
         d["max_jobs_per_gpu"] = wc.max_jobs_per_gpu
     else:
@@ -1183,51 +1191,38 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
     worker_id = request.match_info["worker_id"]
 
-    # Mark worker dead in DB
-    worker = await state.db_writer.update_worker_status(worker_id, "dead")
+    worker = await get_worker(db, worker_id)
     if worker is None:
         return _not_found("worker")
 
-    # If connected, send shutdown and clean up
     wc = state.workers.get(worker_id)
     if wc is not None:
-        # Send MsgShutdown
+        # Mark dead first so the scheduler won't dispatch new work here. The
+        # write task does not check status, so queued MsgCancel/MsgShutdown
+        # below are still delivered.
+        async with state.scheduler_lock:
+            wc.status = "dead"
+
+        # Evict this worker's in-flight runs: sends MsgCancel (the worker
+        # SIGTERMs the processes — preventing a double-run when they re-dispatch
+        # elsewhere), resets the rows to pending, and triggers scheduling onto
+        # the remaining workers.
+        evicted = list(wc.in_flight.keys())
+        if evicted:
+            await evict_jobs(db, state, evicted)
+
+        # Tell the worker process to exit.
         try:
             wc.send_queue.put_nowait(encode(MsgShutdown()))
         except asyncio.QueueFull:
             pass
 
-        # Mark worker as dead in memory; the worker read task will detect
-        # the status change and clean up gracefully.
-        async with state.scheduler_lock:
-            wc.status = "dead"
+    # Reset any rows still attributed to this worker in the DB (belt and braces
+    # for jobs not tracked in memory) and mark the worker dead.
+    await state.db_writer.reset_worker_jobs(worker_id)
+    await state.db_writer.update_worker_status(worker_id, "dead")
 
-    # Re-queue any pending jobs from this worker: reset dispatched/running
-    # jobs assigned to this worker back to pending
-    re_queued_rows = await state.db_writer.reset_worker_jobs(worker_id)
-    re_queued: list[tuple[str, str]] = list(re_queued_rows)
-    for run_id, experiment_id in re_queued:
-        state.broadcast(
-            experiment_id,
-            {
-                "type": "job_done",
-                "run_id": run_id,
-                "status": "pending",
-                "success": False,
-                "worker_id": worker_id,
-                "orphaned": True,
-            },
-        )
-
-    # Re-fetch the re-queued jobs and insert into pending list
-    for run_id, experiment_id in re_queued:
-        job = await get_job(db, run_id, experiment_id)
-        if job is not None:
-            async with state.scheduler_lock:
-                state.insert_pending(job)
-
-    # Trigger scheduling for re-queued jobs
-    if state.dispatch_callback is not None and re_queued:
+    if state.dispatch_callback is not None:
         asyncio.get_running_loop().create_task(state.dispatch_callback())
 
     return _json_response({"worker_id": worker_id, "status": "dead"})
@@ -1307,49 +1302,12 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
         current.difference_update(remove_gpus)
         current.update(add_gpus)
         wc.gpus = sorted(current)
-        # Initialise occupancy for newly added GPUs
-        for g in add_gpus:
-            wc.gpu_occupancy.setdefault(g, 0)
-        # Drop occupancy entries for removed GPUs
-        for g in remove_gpus:
-            wc.gpu_occupancy.pop(g, None)
+        # Occupancy is derived from wc.in_flight against wc.gpus, so changing
+        # the GPU list needs no separate occupancy bookkeeping.
 
     await state.db_writer.update_worker_devices(worker_id, json.dumps(wc.gpus))
     _trigger_scheduling(request)
     return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict})
-
-
-@routes.patch("/api/experiments/{experiment_id}/concurrency")
-async def handle_patch_experiment_concurrency(request: web.Request) -> web.Response:
-    """Set jobs_per_gpu for all pending jobs in an experiment.
-
-    Accepts JSON: {"jobs_per_gpu": int}.
-    Takes effect immediately for the next scheduling pass.
-    """
-    state: ManagerState = request.config_dict["mlsweep_state"]
-    experiment_id = request.match_info["experiment_id"]
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
-
-    value = body.get("jobs_per_gpu")
-    if value is None or not isinstance(value, int) or value < 1:
-        return _error_response("'jobs_per_gpu' (int >= 1) is required")
-
-    # Update DB
-    updated = await state.db_writer.update_jobs_concurrency(experiment_id, value)
-
-    # Mirror into in-memory pending list under lock
-    updated_ids = {job.run_id for job in updated}
-    async with state.scheduler_lock:
-        for job in state.pending:
-            if job.run_id in updated_ids:
-                job.jobs_per_gpu = value
-
-    _trigger_scheduling(request)
-    return _json_response({"experiment_id": experiment_id, "jobs_per_gpu": value, "updated": len(updated)})
 
 
 # ── Artifacts ──────────────────────────────────────────────────────────────────
@@ -1629,11 +1587,12 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
 @routes.get("/api/health")
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     return _json_response({
         "status": "ok",
         "workers_connected": len(state.workers),
-        "jobs_pending": len(state.pending),
+        "jobs_pending": await count_pending_jobs(db),
         "jobs_in_flight": len(state.in_flight),
     })
 

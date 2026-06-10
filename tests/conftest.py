@@ -113,7 +113,7 @@ def _wait_for_experiment_complete(url, token, experiment_id,
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
-def _start_manager(tmp_path, *, with_worker: bool = False):
+def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int = 0):
     """Start a real mlsweep manager process and return (proc, server, url).
 
     with_worker=False (default): passes an empty workers file so no local
@@ -122,6 +122,11 @@ def _start_manager(tmp_path, *, with_worker: bool = False):
 
     with_worker=True: omits --workers so the manager spawns a local worker
     automatically.  Use for tests that submit jobs and wait for them to run.
+
+    n_local_workers>0: writes a workers.toml with that many distinct localhost
+    worker entries (each pinned to device 0) and waits for all to connect.  Used
+    to exercise multi-node scheduling on a single machine — each worker process
+    is treated as a separate node.
     """
     db_path = str(tmp_path / "manager.db")
     port = _find_free_port()
@@ -137,7 +142,21 @@ def _start_manager(tmp_path, *, with_worker: bool = False):
         "--token", token,
     ]
 
-    if not with_worker:
+    if n_local_workers > 0:
+        proj = tmp_path / "proj"
+        proj.mkdir(exist_ok=True)
+        entries = "\n".join(
+            "[[workers]]\n"
+            'host = "localhost"\n'
+            f'remote_dir = "{proj}"\n'
+            "devices = [0]\n"
+            "port = 0\n"
+            for _ in range(n_local_workers)
+        )
+        workers_file = tmp_path / "workers.toml"
+        workers_file.write_text(entries)
+        cmd += ["--workers", str(workers_file)]
+    elif not with_worker:
         # Empty workers file prevents manager from spawning a local worker,
         # avoiding races with tests that check or manipulate job status directly.
         workers_file = tmp_path / "workers.toml"
@@ -166,14 +185,16 @@ def _start_manager(tmp_path, *, with_worker: bool = False):
         proc.wait()
         pytest.fail(f"Manager did not start within 30 seconds.")
 
-    if with_worker:
-        # Wait for at least one worker to connect before yielding.
+    need_workers = n_local_workers if n_local_workers > 0 else (1 if with_worker else 0)
+    if need_workers:
+        # Wait for the expected number of workers to connect before yielding.
         deadline = time.time() + 30
         ready = False
         while time.time() < deadline:
             try:
                 workers = _api_get(url, token, "/api/workers")
-                if any(w.get("status") == "connected" for w in workers):
+                connected = sum(1 for w in workers if w.get("status") == "connected")
+                if connected >= need_workers:
                     ready = True
                     break
             except Exception:
@@ -182,7 +203,7 @@ def _start_manager(tmp_path, *, with_worker: bool = False):
         if not ready:
             proc.terminate()
             proc.wait()
-            pytest.fail("Local worker did not connect within 30 seconds.")
+            pytest.fail(f"Expected {need_workers} worker(s) to connect within 30 seconds.")
 
     class Server:
         pass
@@ -222,5 +243,16 @@ def manager_server(tmp_path):
 def manager_with_worker(tmp_path):
     """Manager with a local worker — for tests that submit and run jobs."""
     proc, server, url = _start_manager(tmp_path, with_worker=True)
+    yield server, url
+    _teardown_manager(proc)
+
+
+@pytest.fixture
+def manager_with_two_workers(tmp_path):
+    """Manager with two distinct local workers — for multi-node scheduling tests.
+
+    Each worker process is a separate 'node' on the same machine.
+    """
+    proc, server, url = _start_manager(tmp_path, n_local_workers=2)
     yield server, url
     _teardown_manager(proc)

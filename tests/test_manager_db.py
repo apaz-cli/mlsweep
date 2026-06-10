@@ -23,6 +23,14 @@ from mlsweep._manager_db import (
     get_job,
     list_jobs_by_experiment,
     list_pending_jobs,
+    list_schedulable_jobs,
+    experiment_concurrency_caps,
+    update_experiment_max_concurrent,
+    is_multinode_run,
+    insert_job_nodes,
+    mark_job_node_result,
+    multinode_progress,
+    delete_job_nodes,
     update_job_status,
     update_job_priority,
     cancel_job,
@@ -250,6 +258,122 @@ def test_list_pending_jobs_ordering():
                              command=["echo"])
             pending = await list_pending_jobs(db)
             assert [j.run_id for j in pending] == ["r1", "r2", "r3"]
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_list_schedulable_jobs_excludes_paused_and_aborted():
+    """The scheduler's candidate query must skip jobs whose experiment is
+    paused or aborted, and order the rest by priority then submit time.
+
+    This is the DB half of the fix for the 'abort/pause does nothing' bug:
+    the scheduler reads only from here, so a paused/aborted experiment simply
+    stops producing schedulable work.
+    """
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="run_exp", name="t", status="running")
+            await create_experiment(db, experiment_id="pause_exp", name="t", status="paused")
+            await create_experiment(db, experiment_id="abort_exp", name="t", status="aborted")
+            await create_experiment(db, experiment_id="done_exp", name="t", status="completed")
+
+            await insert_job(db, run_id="a", experiment_id="run_exp", priority=1, command=["echo"])
+            await insert_job(db, run_id="b", experiment_id="run_exp", priority=9, command=["echo"])
+            await insert_job(db, run_id="p", experiment_id="pause_exp", priority=5, command=["echo"])
+            await insert_job(db, run_id="x", experiment_id="abort_exp", priority=5, command=["echo"])
+            # 'completed' experiments stay schedulable (so retries still run).
+            await insert_job(db, run_id="d", experiment_id="done_exp", priority=5, command=["echo"])
+
+            schedulable = await list_schedulable_jobs(db)
+            ids = [j.run_id for j in schedulable]
+            assert "p" not in ids  # paused excluded
+            assert "x" not in ids  # aborted excluded
+            assert set(ids) == {"a", "b", "d"}
+            # Highest priority first.
+            assert ids[0] == "b"
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_multinode_aggregation_via_db():
+    """Multi-node result aggregation is derived from durable job_nodes rows, so
+    it is correct and restart-safe (no in-memory counter). A run completes only
+    when every node is terminal; success is the AND across nodes, elapsed the max.
+    """
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="exp", name="t")
+            await insert_job(db, run_id="r", experiment_id="exp",
+                             command=["echo"], nodes_per_run=2)
+
+            assert not await is_multinode_run(db, "r", "exp")
+            await insert_job_nodes(db, "r", "exp", [(0, "w0", [0]), (1, "w1", [0])])
+            assert await is_multinode_run(db, "r", "exp")
+
+            remaining, all_ok, elapsed = await multinode_progress(db, "r", "exp")
+            assert remaining == 2 and all_ok and elapsed == 0.0
+
+            await mark_job_node_result(db, "r", "exp", "w0", True, 1.5)
+            remaining, all_ok, elapsed = await multinode_progress(db, "r", "exp")
+            assert remaining == 1  # still waiting on w1
+
+            await mark_job_node_result(db, "r", "exp", "w1", True, 3.0)
+            remaining, all_ok, elapsed = await multinode_progress(db, "r", "exp")
+            assert remaining == 0
+            assert all_ok is True
+            assert elapsed == 3.0  # slowest node
+
+            await delete_job_nodes(db, "r", "exp")
+            assert not await is_multinode_run(db, "r", "exp")
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_multinode_aggregation_failure():
+    """One failed node makes the aggregated result a failure."""
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="exp", name="t")
+            await insert_job(db, run_id="r", experiment_id="exp",
+                             command=["echo"], nodes_per_run=2)
+            await insert_job_nodes(db, "r", "exp", [(0, "w0", [0]), (1, "w1", [0])])
+
+            await mark_job_node_result(db, "r", "exp", "w0", True, 1.0)
+            await mark_job_node_result(db, "r", "exp", "w1", False, 2.0)
+            remaining, all_ok, elapsed = await multinode_progress(db, "r", "exp")
+            assert remaining == 0
+            assert all_ok is False
+            assert elapsed == 2.0
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_experiment_concurrency_caps_roundtrip():
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="e1", name="t", max_concurrent=3)
+            await create_experiment(db, experiment_id="e2", name="t")  # default 0
+
+            caps = await experiment_concurrency_caps(db)
+            assert caps["e1"] == 3
+            assert caps["e2"] == 0
+
+            updated = await update_experiment_max_concurrent(db, "e1", 7)
+            assert updated is not None and updated.max_concurrent == 7
+            caps = await experiment_concurrency_caps(db)
+            assert caps["e1"] == 7
         finally:
             await db.close()
 

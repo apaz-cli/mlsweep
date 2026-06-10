@@ -106,6 +106,7 @@ _scratch_dir: str = "/tmp/mlsweep"
 _remote_dir: str = ""
 _token: str = ""
 _device_override: list[int] | None = None  # None = use all visible
+_max_jobs_per_gpu: int = 1  # per-GPU packing cap reported to the manager (0 = unlimited)
 _ipc_sock_path: str = "/tmp/mlsweep/.worker.sock"  # set to port-specific path at startup
 
 
@@ -210,6 +211,7 @@ def _read_thread(conn: ConnState) -> None:
         topo=topo_wire,
         resuming=resuming,
         scratch_dir=_scratch_dir,
+        max_jobs_per_gpu=_max_jobs_per_gpu,
     )
     conn.send_queue.put(encode(hello_resp))
 
@@ -821,7 +823,7 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 def main() -> None:
     try:
-        global _scratch_dir, _remote_dir, _token, _device_override
+        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu
 
         parser = argparse.ArgumentParser(description="mlsweep worker daemon")
         parser.add_argument("--token", default="", help="Authentication token")
@@ -829,8 +831,12 @@ def main() -> None:
                             help="Base scratch directory for run buffers (default: /tmp/mlsweep)")
         parser.add_argument("--remote-dir", default="",
                             help="Project directory on this machine (cwd for training scripts)")
-        parser.add_argument("--devices", default=None,
-                            help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7")
+        parser.add_argument("-g", "--devices", default=None,
+                            help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7 "
+                                 "(default: all visible)")
+        parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                            help="Max concurrent jobs per GPU on this worker "
+                                 "(0 = unlimited, default: 1)")
         parser.add_argument("--port", type=int, default=7890,
                             help="TCP port to bind (0 = ephemeral, default: 7890)")
         args = parser.parse_args()
@@ -838,6 +844,7 @@ def main() -> None:
         _scratch_dir = args.scratch_dir
         _remote_dir = args.remote_dir or os.getcwd()
         _token = args.token
+        _max_jobs_per_gpu = args.jobs
         if args.devices:
             _device_override = [int(x) for x in args.devices.split(",")]
 

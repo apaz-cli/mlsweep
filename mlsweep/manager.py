@@ -94,7 +94,7 @@ async def _rebuild_state(
     write_db via the module-level functions.
     """
     from mlsweep._manager_db import (
-        list_pending_jobs,
+        count_pending_jobs,
         list_workers,
         reset_dispatched_running_to_pending,
     )
@@ -107,11 +107,10 @@ async def _rebuild_state(
     if n:
         print(f"Reset {n} dispatched/running jobs to pending")
 
-    # Load pending jobs into sorted list.
-    pending_jobs = await list_pending_jobs(read_db)
-    for job in pending_jobs:
-        state.insert_pending(job)
-    print(f"Loaded {len(pending_jobs)} pending jobs")
+    # Pending jobs live in the DB; the scheduler reads them each pass. Nothing
+    # to load into memory — just report the backlog for visibility.
+    n_pending = await count_pending_jobs(read_db)
+    print(f"{n_pending} pending job(s) in database")
 
     # Workers are loaded from DB for reference; WorkerConn objects are
     # created on-demand when workers actually connect over TCP.

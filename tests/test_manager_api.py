@@ -149,6 +149,44 @@ def test_update_experiment_status(manager_server):
     assert updated["status"] == "completed"
 
 
+def test_update_experiment_status_rejects_bad_value(manager_server):
+    _, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_bad"})
+    try:
+        _api_put(url, _TOKEN, "/api/experiments/e_bad/status", {"status": "bogus"})
+        pytest.fail("expected 400 for invalid status")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
+def test_pause_and_resume_experiment_status(manager_server):
+    _, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_pause"})
+    paused = _api_put(url, _TOKEN, "/api/experiments/e_pause/status", {"status": "paused"})
+    assert paused["status"] == "paused"
+    resumed = _api_put(url, _TOKEN, "/api/experiments/e_pause/status", {"status": "running"})
+    assert resumed["status"] == "running"
+
+
+def test_experiment_max_concurrent_create_and_update(manager_server):
+    _, url = manager_server
+    created = _api_post(url, _TOKEN, "/api/experiments",
+                        {"experiment_id": "e_cap", "max_concurrent": 4})
+    assert created["max_concurrent"] == 4
+
+    updated = _api_put(url, _TOKEN, "/api/experiments/e_cap/max_concurrent",
+                       {"max_concurrent": 2})
+    assert updated["max_concurrent"] == 2
+
+    # Negative is rejected.
+    try:
+        _api_put(url, _TOKEN, "/api/experiments/e_cap/max_concurrent",
+                 {"max_concurrent": -1})
+        pytest.fail("expected 400 for negative max_concurrent")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
 def test_delete_experiment(manager_server):
     _, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_to_del"})

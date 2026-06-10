@@ -563,8 +563,12 @@ OPTIONS = {
 
 Run with:
 ```bash
-mlsweep_run sweeps/bayes_sweep.py -g 4
+mlsweep_run sweeps/bayes_sweep.py
 ```
+
+The GPUs jobs run on are owned by the workers, not the submitter: configure each
+machine's GPUs with `devices`/`gpus` and per-GPU packing with `jobs` in
+`workers.toml` (or live from the system UI). See the workers configuration below.
 
 ## Run Naming
 
@@ -603,7 +607,7 @@ mlsweep_run sweeps/beta.py --manager http://localhost:7891 [options] [-- extra_o
 Example:
 
 ```bash
-mlsweep_run sweeps/beta.py --manager http://localhost:7891 -j 2 -- --training.steps 1000
+mlsweep_run sweeps/beta.py --manager http://localhost:7891 -- --training.steps 1000
 ```
 
 ### Shebang Mode
@@ -655,7 +659,6 @@ mlsweep_run watch EXP_ID --manager http://host:port                         # st
 | `--output-dir <dir>` | Directory where local sweep manifests are stored. Default: `<git-root>/outputs/sweeps`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. |
 | `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
-| `-j N`, `--jobs-per-gpu N` | Max concurrent jobs per GPU for this sweep (default: 1). Composes with `jobs` in workers.toml via `min()`; the worker cap is never exceeded. |
 | `--priority N` | Job priority — higher values run sooner (default: 0). |
 | `--stream` | Subscribe to the manager's WebSocket event stream for live terminal status. |
 | `--fetch` | Fetch and display results after submission (when `--stream` is not used). |
@@ -719,8 +722,8 @@ venv = "/home/user/myproject/.venv"
 | `host` | string | SSH target (required) |
 | `remote_dir` | string | Repo root on the remote machine (required) |
 | `gpus` | int | Total GPU count to use (default: all visible) |
-| `jobs` | int | Worker-level cap: max concurrent jobs per GPU on this machine. Composes with `-j` on `mlsweep_run` via `min()`. Omit or set to 0 for no cap. |
-| `devices` | list of ints | Specific GPU device IDs to use |
+| `jobs` | int | Worker-level cap: max concurrent jobs per GPU on this machine (worker CLI: `-j`). Default 1; set to 0 for unlimited. |
+| `devices` | list of ints | Specific GPU device IDs to use (worker CLI: `-g`). Default: all visible. |
 | `ssh_key` | string | Path to SSH identity file (passed as `-i`) |
 | `pass` | string | SSH password. Requires `sshpass` to be installed. Falls back to `MLSWEEP_SSH_PASS` env var if omitted. |
 | `venv` | string | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root (tries `venv/`, `.venv/`), a venv root, a `bin/` dir, an `activate` script, or a python binary. If omitted, the manager bootstraps mlsweep automatically. |
@@ -947,13 +950,14 @@ device = torch.device(f"cuda:{local_rank}")
 # pass local_rank as rank when initialising your process group
 ```
 
-Run with 8 GPUs to get 2 parallel 4-GPU jobs:
+With `gpus_per_run = 4` in the sweep file, a worker exposing 8 GPUs runs two of
+these jobs in parallel (8 / 4):
 
 ```bash
-mlsweep_run sweeps/my_sweep.py -g 8
+mlsweep_run sweeps/my_sweep.py
 ```
 
-The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second; GPU groups are chosen to maximise NVLink connectivity.  `MLSweepLogger` is a no-op on all ranks except `MLSWEEP_GPU_RANK=0`.
+The worker sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first job and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second; GPU groups are chosen to maximise NVLink connectivity.  `MLSweepLogger` is a no-op on all ranks except `MLSWEEP_GPU_RANK=0`.
 
 ## Troubleshooting
 

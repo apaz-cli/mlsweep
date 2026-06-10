@@ -29,7 +29,12 @@ import aiosqlite
 from mlsweep._manager_db import (
     JobRecord,
     WorkerRecord,
+    experiment_concurrency_caps,
     get_experiment,
+    is_multinode_run,
+    list_jobs_by_run_ids,
+    list_schedulable_jobs,
+    multinode_progress,
     reset_jobs_to_pending_batch,
     update_job_status,
 )
@@ -368,6 +373,7 @@ async def launch_worker(
     token: str,
     scratch_dir: str = "/tmp/mlsweep",
     devices: list[int] | None = None,
+    max_jobs_per_gpu: int = 1,
     password: str | None = None,
     ssh_key: str | None = None,
     venv: str | None = None,
@@ -386,6 +392,7 @@ async def launch_worker(
     devices_args = (
         ["--devices", ",".join(str(d) for d in devices)] if devices else []
     )
+    jobs_args = ["--jobs", str(max_jobs_per_gpu)]
     key_args = ["-i", ssh_key] if ssh_key else []
     bind_port = port
 
@@ -412,6 +419,7 @@ async def launch_worker(
             "--scratch-dir", scratch_dir,
             "--port", str(bind_port),
             *devices_args,
+            *jobs_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -430,6 +438,7 @@ async def launch_worker(
             "--remote-dir", remote_dir,
             "--port", str(bind_port),
             *devices_args,
+            *jobs_args,
         ]
         shell_cmd = _worker_shell_cmd(_worker_candidates(venv), worker_args)
         ssh_cmd = [
@@ -574,64 +583,63 @@ async def _handle_worker_hello(
     *,
     workers_ready: asyncio.Event | None = None,
 ) -> None:
-    """Handle ``MsgWorkerHello``: initialise GPU occupancy, mark connected.
+    """Handle ``MsgWorkerHello``: register the worker's GPUs, mark connected.
 
     If the worker reports ``resuming`` runs (jobs it kept executing across a
-    manager restart), those jobs are pulled out of the pending queue and
-    restored to in-flight state so the scheduler does not re-dispatch them.
+    manager restart), those jobs are restored to in-flight state so the
+    scheduler does not re-dispatch them.
     """
     resuming_map: dict[str, dict[str, Any]] = {r["run_id"]: r for r in msg.resuming}
     resumed_jobs: list[tuple[JobRecord, list[int]]] = []
 
+    # Look up the DB rows for any resuming runs before taking the lock.  On
+    # manager restart, reset_dispatched_running_to_pending moved these jobs back
+    # to 'pending'; we pull them by run_id (the worker's resume payload has no
+    # experiment_id) and restore in-flight state so the scheduler skips them.
+    resume_records: dict[str, JobRecord] = {}
+    if resuming_map:
+        for jr in await list_jobs_by_run_ids(db, list(resuming_map)):
+            resume_records.setdefault(jr.run_id, jr)
+
     async with state.scheduler_lock:
         wc.gpus = msg.gpus
         wc.topo = msg.topo
+        wc.max_jobs_per_gpu = msg.max_jobs_per_gpu
         wc.scratch_dir = msg.scratch_dir
-
-        # Initialise GPU occupancy tracking
-        wc.gpu_occupancy = {g: 0 for g in wc.gpus}
 
         # Mark connected
         wc.status = "connected"
         wc.connected_at = datetime.now(timezone.utc)
 
-        # Restore in-flight state for jobs the worker is already running.
-        # On manager restart, reset_dispatched_running_to_pending moved these
-        # jobs back to pending.  Remove them from state.pending and add them to
-        # state.in_flight so the scheduler does not re-dispatch them.
-        if resuming_map:
-            new_pending: list[JobRecord] = []
-            for job in state.pending:
-                if job.run_id in resuming_map and job.run_id not in state.in_flight:
-                    # Assign GPU slots for occupancy tracking (exact GPU
-                    # assignment is unknown post-restart; pick the first N
-                    # available to prevent over-scheduling).
-                    gpus_needed = job.gpus_per_run
-                    gpu_ids: list[int] = []
-                    for g in wc.gpus:
-                        if len(gpu_ids) >= gpus_needed:
-                            break
-                        if wc.gpu_occupancy[g] < job.jobs_per_gpu:
-                            gpu_ids.append(g)
-                            wc.gpu_occupancy[g] += 1
+        # Restore in-flight state for jobs the worker is already running.  The
+        # exact GPUs are unknown post-restart; pick the first N free (occupancy
+        # is derived from wc.in_flight, so adding the entry reserves them).
+        for run_id, job in resume_records.items():
+            if run_id in state.in_flight:
+                continue
+            occ = _worker_occupancy(wc)
+            cap = wc.max_jobs_per_gpu  # 0 = unlimited
+            gpu_ids: list[int] = []
+            for g in wc.gpus:
+                if len(gpu_ids) >= job.gpus_per_run:
+                    break
+                if cap <= 0 or occ.get(g, 0) < cap:
+                    gpu_ids.append(g)
+                    occ[g] = occ.get(g, 0) + 1
 
-                    combo = json.loads(job.combo) if isinstance(job.combo, str) else (job.combo or {})
-                    in_flight_job = InFlightJob(
-                        run_id=job.run_id,
-                        worker_id=wc.worker_id,
-                        experiment_id=job.experiment_id,
-                        dispatch_time=datetime.now(timezone.utc),
-                        gpu_ids=gpu_ids,
-                        worker_ids=[wc.worker_id],
-                        combo=combo,
-                    )
-                    state.add_in_flight(in_flight_job)
-                    wc.in_flight[job.run_id] = in_flight_job
-                    resumed_jobs.append((job, gpu_ids))
-                else:
-                    new_pending.append(job)
-            if resumed_jobs:
-                state.pending = new_pending
+            combo = json.loads(job.combo) if isinstance(job.combo, str) else (job.combo or {})
+            in_flight_job = InFlightJob(
+                run_id=job.run_id,
+                worker_id=wc.worker_id,
+                experiment_id=job.experiment_id,
+                dispatch_time=datetime.now(timezone.utc),
+                gpu_ids=gpu_ids,
+                worker_ids=[wc.worker_id],
+                combo=combo,
+            )
+            state.add_in_flight(in_flight_job)
+            wc.in_flight[job.run_id] = in_flight_job
+            resumed_jobs.append((job, gpu_ids))
 
         # Persist to DB
         await state.db_writer.upsert_worker(
@@ -853,81 +861,75 @@ async def _handle_result(
     triggers the DB update, broadcast, artifact sync, and dispatch.
     """
     async with state.scheduler_lock:
-        job = state.get_in_flight(msg.run_id)
+        in_flight = state.get_in_flight(msg.run_id)
 
-        # Job was pre-evicted and re-queued; this result is stale — discard it.
-        if job is None and msg.run_id not in wc.in_flight:
+        # Job was pre-evicted/cancelled and re-queued; this result is stale.
+        if in_flight is None and msg.run_id not in wc.in_flight:
             return
 
-        # Use the per-worker InFlightJob to get this worker's GPU IDs — the
-        # global state.in_flight[run_id] is overwritten by each _dispatch_core
-        # call (last node wins), so it does not reliably reflect this worker's GPUs.
-        local_in_flight = wc.in_flight.get(msg.run_id)
-        if local_in_flight is not None:
-            for gpu_id in local_in_flight.gpu_ids:
-                wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
+        # Identify the experiment before we drop tracking.
+        local = wc.in_flight.get(msg.run_id)
+        experiment_id = (
+            in_flight.experiment_id if in_flight is not None
+            else (local.experiment_id if local is not None else "")
+        )
 
+        # Drop this worker's record of the run; occupancy is derived from
+        # wc.in_flight, so this is what frees the GPUs (no counter to decrement).
         wc.in_flight.pop(msg.run_id, None)
 
-        is_multinode: bool
-        if job is not None:
-            is_multinode = len(job.worker_ids) > 1
-        else:
-            is_multinode = False
+    # ── Multi-node aggregation (durable, restart-safe) ─────────────────
+    # Multi-node-ness is decided by the presence of job_nodes rows, not by
+    # len(worker_ids): after a manager restart each worker resumes its own node
+    # as a separate in-flight entry, but the node rows still tie them together.
+    multinode = await is_multinode_run(db, msg.run_id, experiment_id)
 
-        if not is_multinode:
-            job = state.remove_in_flight(msg.run_id)
+    if multinode:
+        # Record this node's result in the DB and free this worker's local run.
+        await state.db_writer.mark_job_node_result(
+            msg.run_id, experiment_id, wc.worker_id, msg.success, msg.elapsed,
+        )
+        await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
 
-    # ── Multi-node aggregation ─────────────────────────────────────────
+        remaining, all_success, max_elapsed = await multinode_progress(
+            db, msg.run_id, experiment_id,
+        )
+        if remaining > 0:
+            # Other nodes are still running; this worker is now free for work.
+            if state.dispatch_callback is not None:
+                await state.dispatch_callback()
+            return
 
-    if is_multinode:
+        # Last node in — finalise exactly once.
         async with state.scheduler_lock:
-            assert job is not None
-            agg = state.multinode_pending.get(msg.run_id)
-            if agg is None:
-                # First result for this run — initialise remaining count
-                agg = {
-                    "remaining": len(job.worker_ids),
-                    "success": True,
-                    "elapsed": 0.0,
-                }
-                state.multinode_pending[msg.run_id] = agg
-
-            agg["remaining"] -= 1
-            if not msg.success:
-                agg["success"] = False
-            if msg.elapsed > agg["elapsed"]:
-                agg["elapsed"] = msg.elapsed
-
-            if agg["remaining"] > 0:
-                return
-
-            del state.multinode_pending[msg.run_id]
             job = state.remove_in_flight(msg.run_id)
-            final_success = agg["success"]
-            final_elapsed = agg["elapsed"]
+        await state.db_writer.delete_job_nodes(msg.run_id, experiment_id)
+        final_success = all_success
+        final_elapsed = max_elapsed
     else:
+        async with state.scheduler_lock:
+            job = state.remove_in_flight(msg.run_id)
         final_success = msg.success
         final_elapsed = msg.elapsed
 
     # Persist to DB
     await state.db_writer.finish_job(
         msg.run_id,
-        job.experiment_id if job else "",
+        experiment_id,
         success=final_success,
         exit_code=msg.exit_code,
         elapsed=final_elapsed,
     )
 
-    # Retroactively reclassify singular-probe failures as xfailed
+    # Retroactively reclassify singular-probe failures as xfailed (needs combo).
     xfailed_ids: list[str] = []
     if final_success and job is not None:
-        xfailed_ids = await state.db_writer.reclassify_singular_xfails(job.experiment_id, job.combo)
+        xfailed_ids = await state.db_writer.reclassify_singular_xfails(experiment_id, job.combo)
 
     # Broadcast
-    if job:
+    if experiment_id:
         state.broadcast(
-            job.experiment_id,
+            experiment_id,
             {
                 "type": "job_done",
                 "run_id": msg.run_id,
@@ -940,9 +942,9 @@ async def _handle_result(
         )
 
     # Sync artifacts after run completes
-    if job is not None:
-        run_scratch = os.path.join(wc.scratch_dir, job.experiment_id, msg.run_id)
-        run_dir = os.path.join(state.output_dir, job.experiment_id, msg.run_id)
+    if experiment_id:
+        run_scratch = os.path.join(wc.scratch_dir, experiment_id, msg.run_id)
+        run_dir = os.path.join(state.output_dir, experiment_id, msg.run_id)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
@@ -955,35 +957,34 @@ async def _handle_result(
             wc.ssh_key,
         )
 
-    # Send cleanup after sync
-    await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
+    # Send cleanup after sync. For multi-node, each node already received
+    # MsgCleanup as its result arrived, so don't double-send to this worker.
+    if not multinode:
+        await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
 
     # Trigger dispatch
     if state.dispatch_callback is not None:
         await state.dispatch_callback()
 
     # ── Check if experiment is complete ─────────────────────────────────
-    # Fast in-memory pre-check (under lock, no DB I/O) to skip the DB
-    # count query when jobs are obviously still running or pending.
-    # The DB count is the authoritative guard; TOCTOU between the two is
-    # acceptable because update_experiment_status is idempotent.
-    if job is not None:
-        experiment_id = job.experiment_id
-        async with state.scheduler_lock:
-            has_active = any(
-                j.experiment_id == experiment_id
-                for j in state.in_flight.values()
-            )
-            has_pending = any(
-                j.experiment_id == experiment_id
-                for j in state.pending
-            )
-        if has_active or has_pending:
-            return
-
-        # DB reads and write outside the lock — no need to hold it here.
+    # Authoritative DB check: an experiment is complete once it has no jobs in a
+    # non-terminal state (pending / dispatched / running).  Reading from the DB
+    # (rather than an in-memory mirror) means a deleted/cancelled job can never
+    # leave a phantom that blocks completion.  update_experiment_status is
+    # idempotent, so any TOCTOU is harmless.
+    if experiment_id:
         exp = await get_experiment(db, experiment_id)
         if exp is None:
+            return
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE experiment_id = ? "
+            "AND status IN ('pending', 'dispatched', 'running')",
+            (experiment_id,),
+        )
+        row = await cursor.fetchone()
+        active_count: int = row[0] if row else 0
+        if active_count > 0:
             return
 
         cursor = await db.execute(
@@ -1181,6 +1182,10 @@ async def _reconnect_worker(
     for _ in range(max_attempts):
         if shutdown_event is not None and shutdown_event.is_set():
             return
+        # If the worker was explicitly deleted while we were backing off, stop
+        # trying — otherwise a successful reconnect would resurrect it.
+        if wc.status == "dead":
+            return
 
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30.0)
@@ -1218,21 +1223,8 @@ async def _reconnect_worker(
 
             print(f"  {_GREEN}OK{_RESET}    Worker {wc.host} reconnected")
 
-            # Reconstruct gpu_occupancy from DB for resuming runs (single batch query)
-            if msg.resuming:
-                resuming_ids = [r["run_id"] for r in msg.resuming]
-                placeholders = ",".join("?" * len(resuming_ids))
-                cursor = await db.execute(
-                    f"SELECT run_id, dispatched_gpu_ids FROM jobs WHERE run_id IN ({placeholders})",
-                    resuming_ids,
-                )
-                rows = await cursor.fetchall()
-                async with state.scheduler_lock:
-                    for row in rows:
-                        if row["dispatched_gpu_ids"] is not None:
-                            gpu_ids = json.loads(row["dispatched_gpu_ids"])
-                            for gpu_id in gpu_ids:
-                                wc.gpu_occupancy[gpu_id] += 1
+            # Occupancy needs no reconstruction: wc.in_flight is preserved across
+            # the reconnect and occupancy is derived from it.
 
             # Replace the send queue so messages queued for the dead connection
             # (stale MsgRun, old heartbeats, etc.) cannot bleed onto the new one.
@@ -1273,7 +1265,6 @@ async def _reconnect_worker(
     # All attempts exhausted
     async with state.scheduler_lock:
         wc.status = "dead"
-        wc.gpu_occupancy.clear()
 
     await state.db_writer.update_worker_status(wc.worker_id, "dead")
 
@@ -1301,19 +1292,13 @@ async def _handle_orphaned_run(
     job = await state.db_writer.increment_retry(run_id, experiment_id)
 
     async with state.scheduler_lock:
-        # Free GPU occupancy for the orphaned run
-        in_flight_job = wc.in_flight.get(run_id)
-        if in_flight_job is not None:
-            for gpu_id in in_flight_job.gpu_ids:
-                wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
-
+        # Drop in-flight tracking (frees derived occupancy for this run).
         wc.in_flight.pop(run_id, None)
         in_flight_job = state.remove_in_flight(run_id)
 
     if job is not None:
-        # Successfully retried — re-insert into pending
-        async with state.scheduler_lock:
-            state.insert_pending(job)
+        # Successfully retried — increment_retry already reset the DB row to
+        # 'pending', so the next scheduling pass will pick it up.
         print(f"  {_YELLOW}RETRY{_RESET} {run_id} (attempt {job.retry_count}/{job.max_retries})")
     else:
         # Max retries exceeded — mark as failed
@@ -1493,7 +1478,9 @@ async def connect_workers(
         w_key = cfg.get("ssh_key")
         w_venv = cfg.get("venv")
         w_port = cfg.get("port", 0)
-        w_max_jobs = cfg.get("jobs") or 1
+        w_max_jobs = cfg.get("jobs")
+        if w_max_jobs is None:
+            w_max_jobs = 1  # default 1 job/GPU; 0 means unlimited
 
         worker_id = f"{host}:{w_port or 'ephemeral'}:{idx}"
 
@@ -1557,6 +1544,7 @@ async def connect_single_worker(
             token=state.token,
             scratch_dir=scratch_dir,
             devices=devices,
+            max_jobs_per_gpu=max_jobs_per_gpu,
             password=password,
             ssh_key=ssh_key,
             venv=venv,
@@ -1681,11 +1669,17 @@ async def dispatch_to_worker(
     )
 
     # Update in-memory state and send.
-    return await _dispatch_core(
+    ok = await _dispatch_core(
         state, wc, job,
         gpu_ids=gpu_ids,
         run_msg=run_msg,
     )
+    if not ok:
+        # We claimed the row (dispatch_job succeeded) but couldn't hand it to
+        # the worker; return it to pending so the next pass retries it.  Without
+        # this the row would be stuck in 'dispatched' with nothing tracking it.
+        await state.db_writer.reset_job_to_pending(job.run_id, job.experiment_id)
+    return ok
 
 
 # ===============================================================================
@@ -1729,16 +1723,13 @@ async def _dispatch_core(
         )
         state.add_in_flight(in_flight)
         wc.in_flight[job.run_id] = in_flight
-
-        for gpu_id in gpu_ids:
-            wc.gpu_occupancy[gpu_id] += 1
+        # Occupancy is derived from wc.in_flight (see _worker_occupancy); adding
+        # the entry above is what marks these GPUs busy. No counter to bump.
 
     # Send MsgRun (outside the lock — I/O)
     success = await _send_to_worker(wc, encode(run_msg))
     if not success:
         async with state.scheduler_lock:
-            for gpu_id in gpu_ids:
-                wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
             wc.in_flight.pop(job.run_id, None)
             state.remove_in_flight(job.run_id)
         return False
@@ -1762,20 +1753,37 @@ async def _dispatch_core(
 # ===============================================================================
 
 
+def _worker_occupancy(wc: WorkerConn) -> dict[int, int]:
+    """Derive per-GPU job counts for *wc* from its in-flight jobs.
+
+    Occupancy is never stored as a mutable counter; it is recomputed from
+    ``wc.in_flight`` (each entry carries this worker's ``gpu_ids`` for one run).
+    Removing a run from ``wc.in_flight`` therefore frees its GPUs automatically,
+    with no decrement to forget — this is what eliminates the occupancy-leak
+    bug class (a cancelled/deleted run can no longer permanently consume a slot).
+    """
+    occ = {g: 0 for g in wc.gpus}
+    for ifj in wc.in_flight.values():
+        for g in ifj.gpu_ids:
+            if g in occ:
+                occ[g] += 1
+    return occ
+
+
 def _find_gpu_group(
     wc: WorkerConn,
     gpus_needed: int,
     topo: dict[tuple[int, int], int] | None = None,
     *,
     occupancy: dict[int, int] | None = None,
-    jobs_per_gpu: int = 1,
 ) -> list[int] | None:
     """Find an available GPU group of size *gpus_needed* on this worker.
 
-    Uses *occupancy* if given (for tentative planning), otherwise reads
-    ``wc.gpu_occupancy`` directly.
+    Uses *occupancy* if given (for tentative planning), otherwise derives it
+    from ``wc.in_flight`` via ``_worker_occupancy``.
 
-    *jobs_per_gpu* is the per-job concurrency limit (from the job record).
+    Per-GPU packing is bounded by the worker's ``max_jobs_per_gpu`` cap
+    (0 = unlimited).
 
     Returns a list of GPU device indices, or ``None`` if unavailable.
     CPU-only jobs (``gpus_needed == 0``) return ``[]``.
@@ -1783,14 +1791,13 @@ def _find_gpu_group(
     if gpus_needed == 0:
         return []
 
-    occ = occupancy if occupancy is not None else wc.gpu_occupancy
-    worker_cap = wc.max_jobs_per_gpu if wc.max_jobs_per_gpu > 0 else jobs_per_gpu
-    capacity = min(jobs_per_gpu, worker_cap)
+    occ = occupancy if occupancy is not None else _worker_occupancy(wc)
+    cap = wc.max_jobs_per_gpu  # 0 = unlimited
 
     # Filter GPUs that have room for another job
     available = [
         g for g in wc.gpus
-        if occ[g] < capacity
+        if cap <= 0 or occ[g] < cap
     ]
     if len(available) < gpus_needed:
         return None
@@ -1806,8 +1813,38 @@ def _find_gpu_group(
 
 
 # ===============================================================================
-# Eviction
+# Cancellation / eviction — one path for taking a run off the workers
 # ===============================================================================
+
+
+async def _detach_in_flight(
+    state: ManagerState,
+    run_ids: list[str],
+) -> tuple[list[InFlightJob], list[tuple[WorkerConn, str]]]:
+    """Remove in-flight tracking for *run_ids*; return (detached, cancel_targets).
+
+    Occupancy is derived from ``wc.in_flight``, so popping the entry frees the
+    run's GPUs with nothing to decrement.  Pre-removing also means any stale
+    ``MsgResult`` that arrives afterwards hits the discard guard in
+    ``_handle_result``.  Caller is responsible for sending ``MsgCancel`` to the
+    returned targets and for the DB write (reset-to-pending or cancel).
+    """
+    detached: list[InFlightJob] = []
+    cancel_targets: list[tuple[WorkerConn, str]] = []
+    async with state.scheduler_lock:
+        for run_id in run_ids:
+            in_flight = state.get_in_flight(run_id)
+            if in_flight is None:
+                continue
+            for wid in in_flight.worker_ids:
+                wc = state.workers.get(wid)
+                if wc is None:
+                    continue
+                wc.in_flight.pop(run_id, None)
+                cancel_targets.append((wc, run_id))
+            state.remove_in_flight(run_id)
+            detached.append(in_flight)
+    return detached, cancel_targets
 
 
 async def evict_jobs(
@@ -1815,60 +1852,68 @@ async def evict_jobs(
     state: ManagerState,
     run_ids: list[str],
 ) -> None:
-    """Pre-evict jobs and re-queue them without consuming a retry.
+    """Take in-flight runs off their workers and re-queue them (no retry spent).
 
-    For each run_id:
-      - Moves the job from in_flight back to pending in DB and in memory.
-      - Frees GPU occupancy on all workers involved (including multi-node).
-      - Sends MsgCancel to each worker holding the job.
-
-    The stale MsgResult that arrives after SIGTERM is discarded by the
-    early-return guard in _handle_result.
+    Detaches in-memory (frees derived occupancy), resets the DB rows to
+    'pending', and sends ``MsgCancel`` so the workers SIGTERM the processes.
+    The next scheduling pass picks the jobs back up from the DB.
     """
-    # Phase 1: collect targets and pre-remove from in-flight state so that
-    # any stale MsgResult arriving during the DB write is discarded by
-    # the early-return guard in _handle_result.
-    to_evict: list[tuple[InFlightJob, list[tuple[WorkerConn, str]]]] = []
-    async with state.scheduler_lock:
-        for run_id in run_ids:
-            in_flight = state.get_in_flight(run_id)
-            if in_flight is None:
-                continue
-            cancel_targets: list[tuple[WorkerConn, str]] = []
-            for wid in in_flight.worker_ids:
-                wc = state.workers.get(wid)
-                if wc is None:
-                    continue
-                wc.in_flight.pop(run_id, None)
-                for gpu_id in in_flight.gpu_ids:
-                    if gpu_id in wc.gpu_occupancy:
-                        wc.gpu_occupancy[gpu_id] = max(0, wc.gpu_occupancy[gpu_id] - 1)
-                cancel_targets.append((wc, run_id))
-            state.remove_in_flight(run_id)
-            to_evict.append((in_flight, cancel_targets))
-
-    if not to_evict:
+    detached, cancel_targets = await _detach_in_flight(state, run_ids)
+    if not detached:
         return
 
-    # Phase 2: batch DB reset — one transaction for all evicted jobs
-    pairs = [(inf.run_id, inf.experiment_id) for inf, _ in to_evict]
-    jobs = await state.db_writer.reset_jobs_to_pending_batch(pairs)
-    job_map = {job.run_id: job for job in jobs}
+    # One transaction resets all evicted jobs to pending in the DB.
+    pairs = [(inf.run_id, inf.experiment_id) for inf in detached]
+    await state.db_writer.reset_jobs_to_pending_batch(pairs)
 
-    # Phase 3: insert successfully-reset jobs into pending
-    to_cancel: list[tuple[WorkerConn, str]] = []
-    async with state.scheduler_lock:
-        for in_flight, cancel_targets in to_evict:
-            if in_flight.run_id not in job_map:
-                continue
-            state.insert_pending(job_map[in_flight.run_id])
-            to_cancel.extend(cancel_targets)
+    # Drop any multi-node placement rows; a re-dispatch re-records them. (No-op
+    # for single-node runs.)
+    for run_id, experiment_id in pairs:
+        await state.db_writer.delete_job_nodes(run_id, experiment_id)
 
-    # Phase 4: send MsgCancel outside the lock (non-blocking queue put)
-    for wc, run_id in to_cancel:
+    for wc, run_id in cancel_targets:
         await _send_to_worker(wc, encode(MsgCancel(run_id=run_id)))
 
-    if to_cancel and state.dispatch_callback is not None:
+    if state.dispatch_callback is not None:
+        await state.dispatch_callback()
+
+
+async def cancel_runs(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    pairs: list[tuple[str, str]],
+) -> None:
+    """Cancel jobs — the single cancellation path for every route.
+
+    Works uniformly whether a job is pending or running: any in-flight run is
+    stopped on its worker(s) (``MsgCancel`` → SIGTERM), every job row is marked
+    'cancelled', and ``job_done`` is broadcast.  Because the run leaves
+    ``wc.in_flight``, its GPUs are freed automatically — there is no separate
+    occupancy counter to leak.  *pairs* is a list of ``(run_id, experiment_id)``.
+    """
+    run_ids = [run_id for run_id, _ in pairs]
+    _, cancel_targets = await _detach_in_flight(state, run_ids)
+
+    for wc, run_id in cancel_targets:
+        await _send_to_worker(wc, encode(MsgCancel(run_id=run_id)))
+
+    for run_id, experiment_id in pairs:
+        await state.db_writer.update_job_status(run_id, experiment_id, "cancelled")
+        # Remove any multi-node placement rows for the cancelled run (no-op for
+        # single-node).
+        await state.db_writer.delete_job_nodes(run_id, experiment_id)
+        state.broadcast(
+            experiment_id,
+            {
+                "type": "job_done",
+                "run_id": run_id,
+                "status": "cancelled",
+                "success": False,
+            },
+        )
+
+    # Freed capacity — let other work fill it.
+    if cancel_targets and state.dispatch_callback is not None:
         await state.dispatch_callback()
 
 
@@ -1916,7 +1961,23 @@ async def _do_schedule_pending(
     db: aiosqlite.Connection,
     state: ManagerState,
 ) -> int:
-    """Single scheduling pass — called only by ``schedule_pending``."""
+    """Single scheduling pass — called only by ``schedule_pending``.
+
+    The candidate set comes straight from the database
+    (``list_schedulable_jobs``), not an in-memory mirror.  This makes the DB the
+    single source of truth: a job that was cancelled, whose experiment was
+    paused/aborted, or that was already claimed simply does not appear here (or
+    its ``dispatch_job`` CAS fails), so control verbs take effect with no
+    in-memory reconciliation to get wrong.
+    """
+    # ── Phase 0: read candidates + caps from the DB (before the lock) ──
+    # The dispatch_job CAS makes any TOCTOU safe: a job that changes out from
+    # under us fails to claim and is skipped this pass.
+    pending = await list_schedulable_jobs(db)
+    if not pending:
+        return 0
+    caps = await experiment_concurrency_caps(db)
+
     # ── Phase 1: find assignments under lock ───────────────────────────
     async with state.scheduler_lock:
         connected = [
@@ -1924,39 +1985,48 @@ async def _do_schedule_pending(
             for wc in state.workers.values()
             if wc.status == "connected"
         ]
-        if not connected or not state.pending:
+        if not connected:
             return 0
 
-        # Snapshot occupancy per worker so tentative assignments within
-        # this planning pass don't double-book the same GPUs.
-        tentative_occ: dict[str, dict[int, int]] = {}
-        for wc in connected:
-            tentative_occ[wc.worker_id] = dict(wc.gpu_occupancy)
+        # Derive occupancy per worker from in-flight jobs; tentative bumps
+        # within this pass prevent double-booking the same GPUs.
+        tentative_occ: dict[str, dict[int, int]] = {
+            wc.worker_id: _worker_occupancy(wc) for wc in connected
+        }
+
+        # Count running jobs per experiment so we can honour max_concurrent.
+        exp_running: dict[str, int] = {}
+        for ifj in state.in_flight.values():
+            exp_running[ifj.experiment_id] = exp_running.get(ifj.experiment_id, 0) + 1
 
         # Plan: list of (job, [(worker, gpu_ids), ...])
         plan: list[tuple[JobRecord, list[tuple[WorkerConn, list[int]]]]] = []
-        remaining: list[JobRecord] = []
 
-        for job in state.pending:
+        for job in pending:
+            # Per-experiment concurrency cap (0 = unlimited).
+            cap = caps.get(job.experiment_id, 0)
+            if cap and exp_running.get(job.experiment_id, 0) >= cap:
+                continue
+
             if job.nodes_per_run <= 1:
                 # ── Single-node ────────────────────────────────────────
-                assigned = False
                 for wc in connected:
                     gpus = _find_gpu_group(
                         wc, job.gpus_per_run,
                         topo=_parse_topo_wire(wc.topo),
                         occupancy=tentative_occ[wc.worker_id],
-                        jobs_per_gpu=job.jobs_per_gpu,
                     )
                     if gpus is not None:
                         plan.append((job, [(wc, gpus)]))
                         occ = tentative_occ[wc.worker_id]
                         for g in gpus:
                             occ[g] += 1
-                        assigned = True
+                        exp_running[job.experiment_id] = (
+                            exp_running.get(job.experiment_id, 0) + 1
+                        )
                         break
-                if not assigned:
-                    remaining.append(job)
+                # If unassigned, the job just stays 'pending' in the DB and is
+                # reconsidered on the next pass — there is no in-memory list.
             else:
                 # ── Multi-node ─────────────────────────────────────────
                 node_assignments: list[tuple[WorkerConn, list[int]]] = []
@@ -1968,7 +2038,6 @@ async def _do_schedule_pending(
                         wc, job.gpus_per_run,
                         topo=_parse_topo_wire(wc.topo),
                         occupancy=tentative_occ[wc.worker_id],
-                        jobs_per_gpu=job.jobs_per_gpu,
                     )
                     if gpus is not None:
                         node_assignments.append((wc, gpus))
@@ -1980,23 +2049,26 @@ async def _do_schedule_pending(
                             break
                 if len(node_assignments) >= job.nodes_per_run:
                     plan.append((job, node_assignments))
+                    exp_running[job.experiment_id] = (
+                        exp_running.get(job.experiment_id, 0) + 1
+                    )
                 else:
-                    remaining.append(job)
-
-        # Replace pending list with only the jobs we couldn't assign
-        state.pending = remaining
+                    # Couldn't place all nodes — roll back the tentative GPU
+                    # reservations so the partial plan doesn't block other jobs
+                    # later in this same pass.
+                    for wc, gpus in node_assignments:
+                        occ = tentative_occ[wc.worker_id]
+                        for g in gpus:
+                            occ[g] = max(0, occ[g] - 1)
 
     # ── Phase 2: dispatch outside the lock ─────────────────────────────
+    # A failed dispatch leaves (or resets) the job 'pending' in the DB, so it is
+    # naturally retried on the next pass; there is nothing to re-insert.
     dispatched_count = 0
-
     for job, assignments in plan:
         ok = await _execute_assignment(db, state, job, assignments)
         if ok:
             dispatched_count += 1
-        else:
-            # Dispatch failed — re-insert into pending
-            async with state.scheduler_lock:
-                state.insert_pending(job)
 
     return dispatched_count
 
@@ -2053,6 +2125,15 @@ async def _execute_assignment(
 
         command, job_env, job_files, job_return_files = _parse_job_fields(dispatched)
 
+    # Record durable per-node placement BEFORE dispatching, so a fast node's
+    # MsgResult can never arrive before the rows exist (which would make
+    # _handle_result mistake the run for single-node and finalise it early).
+    placements = [
+        (rank, wc.worker_id, gpu_ids)
+        for rank, (wc, gpu_ids) in enumerate(assignments)
+    ]
+    await state.db_writer.insert_job_nodes(job.run_id, job.experiment_id, placements)
+
     # Dispatch each node outside the lock, tracking which nodes succeeded so
     # we can roll back cleanly on partial failure.
     dispatched_nodes: list[tuple[WorkerConn, list[int]]] = []
@@ -2099,16 +2180,15 @@ async def _execute_assignment(
             # in in_flight on the successful nodes with no chance of a full result.
             async with state.scheduler_lock:
                 for prev_wc, prev_gpu_ids in dispatched_nodes:
+                    # Dropping the in-flight entry frees this node's derived
+                    # occupancy; no counter to decrement.
                     prev_wc.in_flight.pop(job.run_id, None)
-                    for gpu_id in prev_gpu_ids:
-                        prev_wc.gpu_occupancy[gpu_id] = max(
-                            0, prev_wc.gpu_occupancy[gpu_id] - 1
-                        )
                 state.remove_in_flight(job.run_id)
 
             for prev_wc, _ in dispatched_nodes:
                 await _send_to_worker(prev_wc, encode(MsgCancel(run_id=job.run_id)))
 
+            await state.db_writer.delete_job_nodes(job.run_id, job.experiment_id)
             await state.db_writer.reset_job_to_pending(job.run_id, job.experiment_id)
             return False
 

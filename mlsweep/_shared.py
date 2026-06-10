@@ -186,6 +186,7 @@ class MsgWorkerHello:
     topo: dict[str, int]          # "{gpu_a},{gpu_b}" → score (JSON requires string keys)
     resuming: list[dict[str, Any]]  # [{run_id, log_seq, metric_seq, pid}]
     scratch_dir: str
+    max_jobs_per_gpu: int = 1     # worker's per-GPU packing cap (0 = unlimited)
     t: str = "whello"
 
 

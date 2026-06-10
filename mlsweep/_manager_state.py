@@ -1,32 +1,22 @@
 """In-memory state dataclasses for mlsweep manager.
 
 Provides:
-  - ``MultiNodeState`` — typed dict for multi-node job aggregation
   - ``InFlightJob`` — a job dispatched to workers, tracked in memory
-  - ``WorkerConn`` — live connection to a worker with GPU occupancy
+  - ``WorkerConn`` — live connection to a worker (occupancy derived from in_flight)
   - ``ManagerState`` — central scheduling state with thread-safe helpers
+
+Multi-node aggregation state is **not** held here; it lives in the ``job_nodes``
+table so it survives a manager restart.
 """
 
 from __future__ import annotations
 
 import asyncio
-import bisect
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
-from mlsweep._manager_db import DbWriter, JobRecord
-
-
-# ── Multi-node aggregation state ──────────────────────────────────────────────
-
-
-class MultiNodeState(TypedDict):
-    """Aggregation state for a multi-node job tracked in ``multinode_pending``."""
-
-    remaining: int
-    success: bool
-    elapsed: float
+from mlsweep._manager_db import DbWriter
 
 
 # ── In-flight job ─────────────────────────────────────────────────────────────
@@ -58,7 +48,12 @@ class InFlightJob:
 
 @dataclass
 class WorkerConn:
-    """Live connection to a worker, with GPU occupancy and message queue."""
+    """Live connection to a worker.
+
+    GPU occupancy is **not** stored as a counter here; it is derived on demand
+    from ``in_flight`` (each entry carries this worker's ``gpu_ids``).  This
+    keeps occupancy impossible to leak — there is no decrement to forget.
+    """
 
     worker_id: str
     host: str
@@ -67,7 +62,6 @@ class WorkerConn:
     writer: asyncio.StreamWriter
     gpus: list[int] = field(default_factory=list)
     topo: dict[str, int] = field(default_factory=dict)
-    gpu_occupancy: dict[int, int] = field(default_factory=dict)
     gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
     max_jobs_per_gpu: int = 1
     send_queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
@@ -104,39 +98,18 @@ class ManagerState:
         self.dispatch_callback: Any = None
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
-        self.pending: list[JobRecord] = []
+        # NOTE: there is no in-memory ``pending`` list.  Pending jobs live in
+        # the database; the scheduler reads them fresh each pass via
+        # ``list_schedulable_jobs``.  This makes the DB the single source of
+        # truth, so control verbs (cancel, abort, delete, retry) take effect by
+        # writing the DB and cannot desync an in-memory mirror.
         self.in_flight: dict[str, InFlightJob] = {}
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self.scheduler_lock: asyncio.Lock = asyncio.Lock()
-        self.multinode_pending: dict[str, dict[str, Any]] = {}
         # Coalescing guard for schedule_pending: prevents concurrent scheduling
         # passes and folds rapid re-triggers into a single follow-up pass.
         self._scheduling: bool = False
         self._reschedule: bool = False
-
-    # ── Pending list helpers ──────────────────────────────────────────────
-
-    def _pending_sort_key(self, job: JobRecord) -> tuple[int, datetime]:
-        return (-job.priority, job.submit_time)
-
-    def insert_pending(self, job: JobRecord) -> None:
-        bisect.insort(
-            self.pending, job, key=lambda j: self._pending_sort_key(j)
-        )
-
-    def remove_pending(self, run_id: str) -> JobRecord | None:
-        for i, job in enumerate(self.pending):
-            if job.run_id == run_id:
-                return self.pending.pop(i)
-        return None
-
-    def update_priority(self, run_id: str, new_priority: int) -> bool:
-        job = self.remove_pending(run_id)
-        if job is None:
-            return False
-        job.priority = new_priority
-        self.insert_pending(job)
-        return True
 
     # ── In-flight helpers ─────────────────────────────────────────────────
 
@@ -185,6 +158,5 @@ class ManagerState:
 __all__ = [
     "InFlightJob",
     "ManagerState",
-    "MultiNodeState",
     "WorkerConn",
 ]

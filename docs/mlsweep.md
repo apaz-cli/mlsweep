@@ -19,7 +19,7 @@ Token auth: the manager generates a token on first startup and saves it to `~/.m
 ## What was removed in v1.1 (don't suggest these)
 
 - `mlsweep_viz` — gone. Use the manager web dashboard.
-- `-g`/`--gpus` flag on `mlsweep_run` — gone. GPU count is configured in the workers file or defaulted by the manager.
+- `-g`/`-j` on `mlsweep_run` — gone from the submitter. They were always per-machine settings, so they now live on the **worker**: `mlsweep_worker -g <device-ids> -j <jobs-per-gpu>`, or `devices`/`jobs` in `workers.toml`. The manager passes the `workers.toml` values down to each worker.
 - `--workers` flag on `mlsweep_run` — gone. Workers are configured at manager startup (`mlsweep_manager --workers workers.toml`).
 - `WorkerPool` / `mlsweep.pool` — gone. The manager HTTP API is the replacement.
 
