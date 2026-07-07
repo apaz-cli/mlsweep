@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlsweep"
-version = "1.1.0"
+version = "2.0.0"
 description = "A flexible hyperparameter sweep scheduler for distributed ML training"
 readme = "README.md"
 license = "Apache-2.0"
@@ -12,32 +12,48 @@ authors = [{ name = "Aaron Pazdera", email = "aarpazdera@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "tomli >= 2.0; python_version < '3.11'",
+    "aiohttp",
+    "aiosqlite >= 0.17",
+    "optuna>=3.0",
 ]
 
 [project.optional-dependencies]
 wandb = ["wandb"]
 tensorboard = ["tensorboard"]
-bayes = ["optuna>=3.0"]
-all = ["wandb", "tensorboard", "optuna>=3.0"]
-test = ["torch", "pytest"]
+all = ["wandb", "tensorboard"]
+test = ["torch", "pytest", "paramiko"]
 
 [project.scripts]
 mlsweep_run = "mlsweep.run_sweep:main"
-mlsweep_viz = "mlsweep.visualize:main"
+mlsweep_manager = "mlsweep.manager:main"
 mlsweep_worker = "mlsweep.worker:main"
-mlsweep_export = "mlsweep.export_cmd:main"
 
 [tool.setuptools.packages.find]
 where = [""]
 include = ["mlsweep*"]
 
 [tool.setuptools.package-data]
-mlsweep = ["_bin/.gitkeep"]
+mlsweep = ["_bin/.gitkeep", "webui/*"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["wandb", "wandb.*", "tensorboard", "tensorboard.*", "tensorboardX", "tensorboardX.*", "torch.*", "optuna", "optuna.*"]
+module = ["wandb", "wandb.*", "tensorboard", "tensorboard.*", "tensorboardX", "tensorboardX.*", "torch.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tomli"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short", "--strict-markers"]
+markers = [
+    "gpu: tests that require GPU hardware",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.10"

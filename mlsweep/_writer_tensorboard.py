@@ -21,12 +21,12 @@ class _StandaloneSummaryWriter:
         self._summary_pb2 = summary_pb2
 
     def add_scalar(self, tag: str, scalar_value: float, global_step: int = 0) -> None:
-        summary = self._summary_pb2.Summary()
-        v = summary.value.add()
+        summary = self._summary_pb2.Summary()  # pyright: ignore[reportUnknownMemberType]
+        v = summary.value.add()  # pyright: ignore[reportAttributeAccessIssue]
         v.tag = tag
         v.simple_value = float(scalar_value)
-        event = self._event_pb2.Event(
-            summary=summary, step=global_step, wall_time=time.time()
+        event = self._event_pb2.Event(  # pyright: ignore[reportUnknownMemberType]
+            summary=summary, step=global_step, wall_time=time.time()  # pyright: ignore[reportCallIssue]
         )
         self._writer.add_event(event)
 
@@ -42,18 +42,17 @@ def _import_summary_writer() -> Any:
     except ImportError:
         pass
     try:
-        from tensorboardX import SummaryWriter as _TbxSW
+        from tensorboardX import SummaryWriter as _TbxSW  # pyright: ignore[reportMissingImports]
         return _TbxSW
     except ImportError:
         pass
     try:
-        from tensorboard.summary.writer.event_file_writer import EventFileWriter  # noqa: F401
+        from tensorboard.summary.writer.event_file_writer import EventFileWriter
         return _StandaloneSummaryWriter
     except ImportError:
         pass
     raise ImportError(
-        "TensorBoard writing requires torch, tensorboardX, or the standalone "
-        "tensorboard package. Install with: pip install 'mlsweep[tensorboard]'."
+        "TensorBoard writing requires torch, tensorboardX, or the standalone tensorboard package."
     )
 
 

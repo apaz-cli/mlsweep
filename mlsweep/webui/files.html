@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="/static/favicon.ico">
+<title>mlsweep — Artifacts</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
+  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+  --plot-bg: white; --plot-grid: #eee; --plot-text: #444;
+}
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
+  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa;
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; background: var(--bg); color: var(--text); }
+
+/* ── Nav ──────────────────────────────────────────────────────────────────────── */
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+/* ── Layout ───────────────────────────────────────────────────────────────────── */
+#layout { flex: 1; display: flex; min-height: 0; }
+
+/* ── Sidebar ──────────────────────────────────────────────────────────────────── */
+#sidebar { width: 270px; min-width: 270px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+#sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+.sb-section { display: flex; flex-direction: column; gap: 6px; }
+.sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.sb-row { display: flex; gap: 6px; align-items: center; }
+
+select { flex: 1; padding: 5px 7px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
+select:focus { outline: none; border-color: #4c9be8; }
+
+.icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
+.icon-btn svg { display: block; }
+.icon-btn:hover { background: var(--btn-hover); }
+
+.quick-btns { display: flex; gap: 4px; flex-wrap: wrap; }
+.quick-btn { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.quick-btn:hover { background: var(--btn-hover); }
+.quick-btn.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+
+#run-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+.run-item { display: flex; align-items: flex-start; gap: 6px; padding: 7px 12px; cursor: pointer; user-select: none; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
+.run-item:hover { background: var(--btn-hover); }
+.run-item.browse-hl { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
+.run-item input[type=checkbox] { margin-top: 2px; cursor: pointer; flex-shrink: 0; }
+.run-info { flex: 1; min-width: 0; }
+.run-id-text { font-size: 11px; font-weight: 600; font-family: monospace; color: var(--text-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.run-combo-text { font-size: 10px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+
+/* ── Badges ───────────────────────────────────────────────────────────────────── */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 8px; letter-spacing: .03em; flex-shrink: 0; }
+.badge-done     { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
+.badge-failed   { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-running  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
+.badge-pending  { background: #44444466; color: var(--text-dim); }
+.badge-xfailed  { background: #44444422; color: var(--text-dim); border: 1px solid #44444433; }
+.badge-cancelled { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
+
+/* ── Main area ────────────────────────────────────────────────────────────────── */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+/* ── Tab bar ──────────────────────────────────────────────────────────────────── */
+#tabbar { display: flex; align-items: center; gap: 3px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+.tab { font-size: 11px; padding: 3px 12px; border: 1px solid var(--border-input); border-radius: 4px; cursor: pointer; background: var(--btn-bg); color: var(--btn-text); font-family: inherit; }
+.tab:hover { background: var(--btn-hover); }
+.tab.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+
+/* ── Panes ────────────────────────────────────────────────────────────────────── */
+.pane { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.pane.hidden { display: none !important; }
+
+/* ── Compare pane ─────────────────────────────────────────────────────────────── */
+#compare-toolbar { flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface); flex-wrap: wrap; row-gap: 6px; }
+#compare-toolbar label { font-size: 11px; color: var(--text-label); white-space: nowrap; }
+#file-path-sel { max-width: 380px; }
+#compare-info { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.toolbar-check { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-label); cursor: pointer; }
+.toolbar-check input { cursor: pointer; }
+
+#compare-grid { flex: 1; overflow-y: auto; padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; align-content: start; }
+
+.run-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; }
+.card-header { padding: 6px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; min-width: 0; }
+.card-run-id { font-size: 11px; font-weight: 600; font-family: monospace; color: var(--text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.card-combo { padding: 3px 10px; font-size: 10px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid var(--border); }
+.card-body { padding: 8px; flex: 1; display: flex; align-items: center; justify-content: center; min-height: 80px; }
+.card-body img { max-width: 100%; max-height: 280px; border-radius: 3px; object-fit: contain; cursor: zoom-in; }
+.card-body pre { font-size: 10px; font-family: monospace; white-space: pre; overflow: auto; max-height: 180px; width: 100%; color: var(--text); background: var(--plot-bg); border-radius: 3px; padding: 6px; border: 1px solid var(--border); }
+.card-body .no-file { color: var(--text-muted); font-size: 11px; font-style: italic; }
+.card-footer { padding: 5px 10px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
+
+/* ── Browse pane ──────────────────────────────────────────────────────────────── */
+#browse-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+#browse-run-label { font-size: 11px; color: var(--text-muted); font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#browse-inner { flex: 1; display: flex; min-height: 0; }
+#file-tree { width: 230px; min-width: 230px; flex-shrink: 0; border-right: 1px solid var(--border); overflow-y: auto; padding: 6px 0; }
+.file-row { display: flex; align-items: center; gap: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; overflow: hidden; }
+.file-row:hover { background: var(--btn-hover); }
+.file-row.selected { background: var(--radio-checked-bg); color: var(--radio-checked-color); }
+.file-icon { font-size: 11px; flex-shrink: 0; }
+.file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.file-size { font-size: 10px; color: var(--text-muted); padding-left: 6px; flex-shrink: 0; }
+.file-modified { font-size: 10px; color: var(--text-muted); padding-left: 4px; flex-shrink: 0; }
+.run-elapsed-text { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+
+#preview-pane { flex: 1; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.preview-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex-shrink: 0; }
+.preview-filename { font-size: 13px; font-weight: 600; font-family: monospace; color: var(--text-strong); }
+.preview-meta { font-size: 11px; color: var(--text-muted); }
+.btn-sm { font-size: 11px; padding: 3px 10px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); text-decoration: none; cursor: pointer; }
+.btn-sm:hover { background: var(--btn-hover); }
+#preview-content { flex: 1; }
+#preview-content img { max-width: 100%; height: auto; border-radius: 4px; border: 1px solid var(--border); cursor: zoom-in; display: block; }
+#preview-content pre { font-size: 11px; font-family: monospace; white-space: pre-wrap; word-break: break-all; background: var(--plot-bg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; overflow: auto; max-height: 70vh; color: var(--text); }
+#preview-content .bin-msg { color: var(--text-muted); font-size: 12px; padding: 20px 0; }
+
+/* ── Placeholder ──────────────────────────────────────────────────────────────── */
+.placeholder { color: var(--text-muted); font-size: 13px; text-align: center; padding: 40px 20px; flex: 1; display: flex; align-items: center; justify-content: center; }
+
+/* ── Connection indicator ─────────────────────────────────────────────────────── */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background .3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
+
+/* ── Lightbox ─────────────────────────────────────────────────────────────────── */
+#lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.88); display: flex; align-items: center; justify-content: center; z-index: 200; cursor: zoom-out; }
+#lightbox.hidden { display: none; }
+#lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; border-radius: 4px; }
+</style>
+<script src="dialog.js"></script>
+</head>
+<body>
+
+<nav>
+  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
+  <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
+  <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link" id="nav-logs" href="#">Logs</a>
+  <a class="nav-link active" href="#">Artifacts</a>
+  <a class="nav-link" id="nav-system" href="#">System</a>
+  <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
+  <button id="theme-toggle" title="Toggle theme">☀</button>
+</nav>
+
+<div id="layout">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────────────── -->
+  <div id="sidebar">
+    <div id="sidebar-top">
+      <div class="sb-section">
+        <div class="sb-title">Experiment</div>
+        <div class="sb-row">
+          <select id="exp-sel"></select>
+          <a class="icon-btn" id="exp-dl-all" href="#" style="display:none" title="Download all experiment artifacts"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
+          <button class="icon-btn" id="refresh-btn" title="Refresh experiments">&#8635;</button>
+        </div>
+      </div>
+      <div class="sb-section">
+        <div class="sb-title">Runs</div>
+        <div class="quick-btns">
+          <button class="quick-btn" id="sel-all">all</button>
+          <button class="quick-btn" id="sel-none">none</button>
+          <button class="quick-btn" id="sel-done">done</button>
+          <button class="quick-btn" id="sel-failed">failed</button>
+        </div>
+      </div>
+    </div>
+    <div id="run-list"></div>
+  </div>
+
+  <!-- ── Main ─────────────────────────────────────────────────────────────────── -->
+  <div id="main">
+    <div id="tabbar">
+      <button class="tab active" data-tab="browse">Browse</button>
+      <button class="tab" data-tab="compare">Compare</button>
+    </div>
+
+    <!-- Compare pane -->
+    <div class="pane hidden" id="compare-pane">
+      <div id="compare-toolbar">
+        <label for="file-path-sel">File</label>
+        <select id="file-path-sel"><option value="">— select file path —</option></select>
+        <span id="compare-info"></span>
+        <label class="toolbar-check">
+          <input type="checkbox" id="only-with-file" checked> Only runs with file
+        </label>
+      </div>
+      <div id="compare-grid">
+        <div class="placeholder">Select an experiment and a file path to compare across runs.</div>
+      </div>
+    </div>
+
+    <!-- Browse pane -->
+    <div class="pane" id="browse-pane">
+      <div id="browse-toolbar" style="display:none">
+        <a class="icon-btn" id="run-dl-zip" href="#" title="Download all artifacts for this run"><svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6.5" y1="1" x2="6.5" y2="9"/><polyline points="3,6 6.5,9.5 10,6"/><line x1="1.5" y1="12" x2="11.5" y2="12"/></svg></a>
+        <span id="browse-run-label"></span>
+      </div>
+      <div id="browse-inner">
+        <div id="file-tree"></div>
+        <div id="preview-pane">
+          <div class="placeholder">Click a run in the sidebar, then select a file.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Lightbox -->
+<div id="lightbox" class="hidden"><img id="lightbox-img" src="" alt=""></div>
+
+<script>
+// ── Auth & URL params ──────────────────────────────────────────────────────────
+const _p       = new URLSearchParams(location.search);
+const TOKEN    = _p.get("token") || localStorage.getItem("mlsweep_token") || "";
+if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+if (_p.get("token")) history.replaceState(null, "", location.pathname + location.hash);
+const INIT_EXP  = _p.get("experiment") || "";
+const INIT_RUN  = _p.get("run")  || "";
+const INIT_FILE = _p.get("file") || "";
+let _initDone = false;
+
+function apiFetch(path, opts = {}) {
+  return fetch(path, { ...opts, headers: { ...(opts.headers||{}), Authorization: `Bearer ${TOKEN}` } });
+}
+function authURL(path) {
+  if (!TOKEN) return path;
+  return path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+}
+function pageHref(page, extra = {}) {
+  const q = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
+  for (const [k, v] of Object.entries(extra)) q.set(k, v);
+  const s = q.toString();
+  return page + (s ? "?" + s : "");
+}
+
+// ── Nav links ──────────────────────────────────────────────────────────────────
+document.getElementById("nav-experiments").href = pageHref("experiments.html");
+document.getElementById("nav-results").href     = pageHref("results.html");
+document.getElementById("nav-logs").href        = pageHref("logs.html");
+document.getElementById("nav-system").href      = pageHref("system.html");
+
+// ── Theme ──────────────────────────────────────────────────────────────────────
+(function () {
+  const btn = document.getElementById("theme-toggle"), root = document.documentElement;
+  const apply = dark => { dark ? root.setAttribute("data-theme","dark") : root.removeAttribute("data-theme"); btn.textContent = dark ? "☀" : "☾"; };
+  apply(localStorage.getItem("theme") !== "light");
+  btn.addEventListener("click", () => { const dark = root.getAttribute("data-theme") !== "dark"; localStorage.setItem("theme", dark?"dark":"light"); apply(dark); });
+})();
+
+// ── Connection status ──────────────────────────────────────────────────────────
+function setConnStatus(s) {
+  const dot = document.getElementById("conn-dot"), lbl = document.getElementById("conn-label");
+  dot.className = s === "connected" ? "" : s;
+  lbl.textContent = s === "disconnected" ? "Disconnected" : s === "reconnecting" ? "Reconnecting…" : "";
+}
+
+// ── State ──────────────────────────────────────────────────────────────────────
+let jobs        = [];           // JobRecord[] for current experiment
+let fileCache   = {};           // run_id → [{path, size, modified}]
+let checkedRuns = new Set();    // run_ids selected in sidebar
+let browseRun   = null;         // run_id shown in Browse tab
+let browseFile  = null;         // file path highlighted in Browse tree
+let compareFile = null;         // file path shown in Compare grid
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+function runName(j) {
+  if (!j.label) return esc(j.run_id);
+  return `${esc(j.label)} <span style="color:var(--text-muted);font-size:9px">${esc(j.run_id)}</span>`;
+}
+function fmtSize(b) {
+  if (b == null) return "";
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b/1024).toFixed(1) + " KB";
+  return (b/1048576).toFixed(1) + " MB";
+}
+function fmtElapsed(s) {
+  if (s == null) return "";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
+}
+function fmtModified(iso) {
+  if (!iso) return "";
+  const d = new Date(iso), now = Date.now(), diff = now - d.getTime();
+  if (diff < 60e3) return "just now";
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
+  if (diff < 7 * 86400e3) return Math.floor(diff / 86400e3) + "d ago";
+  return d.toLocaleDateString();
+}
+function comboStr(job) {
+  try { const c = typeof job.combo==="string" ? JSON.parse(job.combo) : (job.combo||{}); return Object.entries(c).map(([k,v])=>`${k}=${v}`).join("  "); }
+  catch { return ""; }
+}
+function fileIcon(p) {
+  const e = (p.split(".").pop()||"").toLowerCase();
+  if (/^(png|jpg|jpeg|gif|svg|webp|bmp)$/.test(e)) return "🖼";
+  if (/^(pth|pt|ckpt|safetensors|bin|npz|npy)$/.test(e)) return "🧠";
+  if (/^(json|yaml|yml|toml|cfg|ini|conf)$/.test(e)) return "⚙";
+  if (/^(csv|tsv)$/.test(e)) return "📊";
+  if (/^(py|sh|bash)$/.test(e)) return "📝";
+  if (/^(txt|log|md)$/.test(e)) return "📄";
+  if (/^(zip|tar|gz|bz2)$/.test(e)) return "📦";
+  return "📎";
+}
+const isImage = p => /\.(png|jpg|jpeg|gif|svg|webp|bmp)$/i.test(p);
+const isText  = p => /\.(txt|log|json|yaml|yml|toml|cfg|ini|conf|csv|tsv|md|py|sh|bash|xml)$/i.test(p);
+
+function artifactURL(expId, runId, filePath) {
+  return `/api/experiments/${encodeURIComponent(expId)}/jobs/${encodeURIComponent(runId)}/artifacts/${filePath.split("/").map(encodeURIComponent).join("/")}`;
+}
+function runZipURL(expId, runId) {
+  return authURL(`/api/experiments/${encodeURIComponent(expId)}/jobs/${encodeURIComponent(runId)}/artifacts.zip`);
+}
+function expZipURL(expId) {
+  return authURL(`/api/experiments/${encodeURIComponent(expId)}/artifacts.zip`);
+}
+
+// ── Tab management ─────────────────────────────────────────────────────────────
+let activeTab = "browse";
+document.querySelectorAll(".tab").forEach(btn =>
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab))
+);
+function switchTab(name) {
+  activeTab = name;
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.getElementById("compare-pane").classList.toggle("hidden", name !== "compare");
+  document.getElementById("browse-pane").classList.toggle("hidden", name !== "browse");
+}
+
+// ── Sidebar: run list ──────────────────────────────────────────────────────────
+function renderRunList() {
+  const list = document.getElementById("run-list");
+  list.innerHTML = "";
+  if (!jobs.length) {
+    list.innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:4px">No runs.</div>`;
+    return;
+  }
+  for (const j of jobs) {
+    const item = document.createElement("div");
+    item.className = "run-item" + (j.run_id === browseRun ? " browse-hl" : "");
+
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = checkedRuns.has(j.run_id);
+    cb.addEventListener("change", e => {
+      e.stopPropagation();
+      cb.checked ? checkedRuns.add(j.run_id) : checkedRuns.delete(j.run_id);
+      if (activeTab === "compare") renderCompareGrid();
+    });
+
+    const info = document.createElement("div");
+    info.className = "run-info";
+    const combo = comboStr(j);
+    const elapsed = fmtElapsed(j.elapsed);
+    info.innerHTML = `<div class="run-id-text">${runName(j)}</div>` +
+      (combo ? `<div class="run-combo-text">${esc(combo)}</div>` : "") +
+      (elapsed ? `<div class="run-elapsed-text">${esc(elapsed)}</div>` : "");
+
+    const bdg = document.createElement("span");
+    bdg.className = `badge badge-${j.status}`;
+    bdg.textContent = j.status;
+
+    item.append(cb, info, bdg);
+    item.addEventListener("click", e => {
+      if (e.target === cb) return;
+      browseRun = j.run_id; browseFile = null;
+      document.querySelectorAll(".run-item").forEach(el => el.classList.remove("browse-hl"));
+      item.classList.add("browse-hl");
+      switchTab("browse");
+      loadBrowse(j.run_id);
+    });
+    list.appendChild(item);
+  }
+}
+
+document.getElementById("sel-all").onclick = () => {
+  jobs.forEach(j => checkedRuns.add(j.run_id)); renderRunList();
+  if (activeTab === "compare") renderCompareGrid();
+};
+document.getElementById("sel-none").onclick = () => {
+  checkedRuns.clear(); renderRunList();
+  if (activeTab === "compare") renderCompareGrid();
+};
+document.getElementById("sel-done").onclick = () => {
+  checkedRuns.clear();
+  jobs.filter(j => j.status === "done").forEach(j => checkedRuns.add(j.run_id));
+  renderRunList(); if (activeTab === "compare") renderCompareGrid();
+};
+document.getElementById("sel-failed").onclick = () => {
+  const FAILED_STATUSES = new Set(["failed", "xfailed", "cancelled"]);
+  checkedRuns.clear();
+  jobs.filter(j => FAILED_STATUSES.has(j.status)).forEach(j => checkedRuns.add(j.run_id));
+  renderRunList(); if (activeTab === "compare") renderCompareGrid();
+};
+
+// ── File list loading ──────────────────────────────────────────────────────────
+function expId() { return document.getElementById("exp-sel").value; }
+
+async function fetchFileList(runId) {
+  if (fileCache[runId] !== undefined) return fileCache[runId];
+  try {
+    const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId())}/jobs/${encodeURIComponent(runId)}/artifacts`);
+    fileCache[runId] = r.ok ? await r.json() : [];
+  } catch { fileCache[runId] = []; }
+  return fileCache[runId];
+}
+
+async function fetchFileLists(runIds) {
+  await Promise.all(runIds.map(id => fetchFileList(id)));
+}
+
+// ── File path selector ─────────────────────────────────────────────────────────
+function rebuildFileSel() {
+  const all = new Set();
+  for (const fs of Object.values(fileCache)) for (const f of fs) all.add(f.path);
+
+  const sel = document.getElementById("file-path-sel");
+  const prev = sel.value;
+  sel.innerHTML = `<option value="">— select file path —</option>`;
+  for (const p of [...all].sort()) {
+    const opt = document.createElement("option");
+    opt.value = p; opt.textContent = p;
+    sel.appendChild(opt);
+  }
+  const target = prev || compareFile;
+  if (target && [...all].has(target)) sel.value = target;
+}
+
+document.getElementById("file-path-sel").addEventListener("change", e => {
+  compareFile = e.target.value || null;
+  renderCompareGrid();
+});
+document.getElementById("only-with-file").addEventListener("change", () => renderCompareGrid());
+
+// ── Compare grid ───────────────────────────────────────────────────────────────
+async function renderCompareGrid() {
+  const grid = document.getElementById("compare-grid");
+  const info = document.getElementById("compare-info");
+
+  if (!compareFile) {
+    grid.innerHTML = `<div class="placeholder">Choose a file path above to compare across runs.</div>`;
+    info.textContent = ""; return;
+  }
+
+  const selected = jobs.filter(j => checkedRuns.has(j.run_id));
+  if (!selected.length) {
+    grid.innerHTML = `<div class="placeholder">No runs selected — check some runs in the sidebar.</div>`;
+    info.textContent = ""; return;
+  }
+
+  await fetchFileLists(selected.map(j => j.run_id));
+
+  const hasFile  = j => (fileCache[j.run_id]||[]).some(f => f.path === compareFile);
+  const onlyWith = document.getElementById("only-with-file").checked;
+  const toShow   = onlyWith ? selected.filter(hasFile) : selected;
+  const withCnt  = selected.filter(hasFile).length;
+
+  info.textContent = `${withCnt} / ${selected.length} runs have this file`;
+
+  if (!toShow.length) {
+    grid.innerHTML = `<div class="placeholder">No selected runs have this file.</div>`;
+    return;
+  }
+
+  grid.innerHTML = "";
+  for (const j of toShow) {
+    const found = hasFile(j);
+    const combo = comboStr(j);
+    const card  = document.createElement("div");
+    card.className = "run-card";
+
+    const dlHref = found ? esc(authURL(artifactURL(expId(), j.run_id, compareFile))) : "";
+    const fname  = compareFile.split("/").pop();
+
+    card.innerHTML = `
+      <div class="card-header">
+        <span class="card-run-id" title="${esc(j.run_id)}">${runName(j)}</span>
+        <span class="badge badge-${j.status}">${j.status}</span>
+      </div>
+      ${combo ? `<div class="card-combo" title="${esc(combo)}">${esc(combo)}</div>` : ""}
+      <div class="card-body"></div>
+      <div class="card-footer">
+        ${found ? `<a class="btn-sm" href="${dlHref}" download="${esc(fname)}">Download</a>` : ""}
+      </div>`;
+
+    const body = card.querySelector(".card-body");
+    if (found) renderPreviewInto(expId(), j.run_id, compareFile, body, true);
+    else body.innerHTML = `<span class="no-file">—</span>`;
+
+    grid.appendChild(card);
+  }
+}
+
+// ── Preview rendering ──────────────────────────────────────────────────────────
+function renderPreviewInto(eid, runId, filePath, el, compact) {
+  const url = artifactURL(eid, runId, filePath);
+  el.innerHTML = "";
+
+  if (isImage(filePath)) {
+    const img = document.createElement("img");
+    img.src = authURL(url);
+    img.alt = filePath;
+    img.addEventListener("click", () => openLightbox(authURL(url)));
+    el.appendChild(img);
+  } else if (isText(filePath)) {
+    el.innerHTML = `<pre style="opacity:.4">Loading…</pre>`;
+    apiFetch(url).then(r => r.ok ? r.text() : null).then(text => {
+      if (text === null) { el.innerHTML = `<span class="no-file">Failed to load</span>`; return; }
+      const lines = text.split("\n");
+      const maxL = compact ? 40 : Infinity;
+      const pre = document.createElement("pre");
+      pre.textContent = lines.slice(0, maxL).join("\n") + (lines.length > maxL ? `\n… (${lines.length} lines)` : "");
+      el.innerHTML = ""; el.appendChild(pre);
+    }).catch(() => { el.innerHTML = `<span class="no-file">Error loading file</span>`; });
+  } else {
+    el.innerHTML = `<span class="no-file" style="font-size:11px">Binary — use Download</span>`;
+  }
+}
+
+// ── Lightbox ───────────────────────────────────────────────────────────────────
+function openLightbox(src) {
+  document.getElementById("lightbox-img").src = src;
+  document.getElementById("lightbox").classList.remove("hidden");
+}
+document.getElementById("lightbox").addEventListener("click", () =>
+  document.getElementById("lightbox").classList.add("hidden")
+);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.getElementById("lightbox").classList.add("hidden");
+});
+
+// ── Browse tab ─────────────────────────────────────────────────────────────────
+async function loadBrowse(runId) {
+  const tree = document.getElementById("file-tree");
+  const pane = document.getElementById("preview-pane");
+  const toolbar = document.getElementById("browse-toolbar");
+  toolbar.style.display = "flex";
+  document.getElementById("run-dl-zip").href = runZipURL(expId(), runId);
+  const _browseJob = jobs.find(j => j.run_id === runId);
+  document.getElementById("browse-run-label").innerHTML = _browseJob ? runName(_browseJob) : esc(runId);
+  tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">Loading…</div>`;
+  pane.innerHTML = `<div class="placeholder">Loading files…</div>`;
+
+  const files = await fetchFileList(runId);
+  rebuildFileSel();
+
+  tree.innerHTML = "";
+  if (!files.length) {
+    tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">No artifact files.</div>`;
+    pane.innerHTML = `<div class="placeholder">This run has no artifact files.</div>`;
+    return;
+  }
+
+  pane.innerHTML = `<div class="placeholder">Select a file on the left to preview it.</div>`;
+
+  for (const f of files) {
+    const row = document.createElement("div");
+    row.className = "file-row" + (f.path === browseFile ? " selected" : "");
+    row.dataset.path = f.path;
+    row.innerHTML = `<span class="file-icon">${fileIcon(f.path)}</span><span class="file-name" title="${esc(f.path)}">${esc(f.path)}</span><span class="file-size">${fmtSize(f.size)}</span><span class="file-modified">${fmtModified(f.modified)}</span>`;
+    row.addEventListener("click", () => {
+      browseFile = f.path;
+      tree.querySelectorAll(".file-row").forEach(r => r.classList.remove("selected"));
+      row.classList.add("selected");
+      showBrowsePreview(runId, f);
+    });
+    tree.appendChild(row);
+  }
+
+  // Auto-open browseFile if set (e.g. from INIT_FILE)
+  if (browseFile) {
+    const f = files.find(f => f.path === browseFile);
+    if (f) {
+      tree.querySelector(`[data-path="${CSS.escape(browseFile)}"]`)?.classList.add("selected");
+      showBrowsePreview(runId, f);
+    }
+  }
+}
+
+function showBrowsePreview(runId, file) {
+  const pane = document.getElementById("preview-pane");
+  const eid  = expId();
+  const url  = artifactURL(eid, runId, file.path);
+  const fname = file.path.split("/").pop();
+
+  pane.innerHTML = `
+    <div class="preview-header">
+      <span class="preview-filename">${esc(file.path)}</span>
+      <span class="preview-meta">${fmtSize(file.size)}${file.modified ? ` · ${fmtModified(file.modified)}` : ""}</span>
+      <a class="btn-sm" href="${esc(authURL(url))}" download="${esc(fname)}">Download</a>
+    </div>
+    <div id="preview-content"></div>`;
+
+  renderPreviewInto(eid, runId, file.path, document.getElementById("preview-content"), false);
+}
+
+// ── Experiment loading ─────────────────────────────────────────────────────────
+async function loadExperiment(eid) {
+  if (!eid) return;
+  jobs = []; fileCache = {}; checkedRuns.clear();
+  browseRun = null; browseFile = null; compareFile = null;
+
+  document.getElementById("file-path-sel").innerHTML = `<option value="">— select file path —</option>`;
+  document.getElementById("compare-info").textContent = "";
+  document.getElementById("compare-grid").innerHTML = `<div class="placeholder">Loading runs…</div>`;
+  document.getElementById("browse-toolbar").style.display = "none";
+  document.getElementById("file-tree").innerHTML = "";
+  document.getElementById("preview-pane").innerHTML = `<div class="placeholder">Click a run in the sidebar, then select a file.</div>`;
+  document.getElementById("run-list").innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:4px">Loading…</div>`;
+
+  // Keep Results nav link in sync
+  document.getElementById("nav-results").href = pageHref("results.html", { experiment: eid });
+
+  const expDl = document.getElementById("exp-dl-all");
+  expDl.href = expZipURL(eid);
+  expDl.style.display = "flex";
+
+  try {
+    const r = await apiFetch(`/api/experiments/${encodeURIComponent(eid)}/jobs`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    jobs = await r.json();
+    setConnStatus("connected");
+  } catch (e) {
+    setConnStatus("disconnected");
+    document.getElementById("run-list").innerHTML = `<div style="color:#d62728;font-size:12px;padding:4px">Error loading runs</div>`;
+    return;
+  }
+
+  // Default selection: done runs
+  jobs.filter(j => j.status === "done").forEach(j => checkedRuns.add(j.run_id));
+  renderRunList();
+
+  // Apply init params once
+  if (!_initDone) {
+    _initDone = true;
+    if (INIT_RUN && jobs.find(j => j.run_id === INIT_RUN)) {
+      browseRun = INIT_RUN;
+      switchTab("browse");
+      loadBrowse(INIT_RUN);
+    } else if (INIT_FILE) {
+      compareFile = INIT_FILE;
+    }
+  }
+
+  // Eagerly fetch file lists for terminal runs, then populate selector + grid
+  const doneIds = jobs.filter(j => ["done","failed","xfailed","cancelled"].includes(j.status)).map(j => j.run_id);
+  fetchFileLists(doneIds).then(() => {
+    rebuildFileSel();
+    if (activeTab === "compare") {
+      if (compareFile) {
+        document.getElementById("file-path-sel").value = compareFile;
+        renderCompareGrid();
+      } else {
+        document.getElementById("compare-grid").innerHTML = `<div class="placeholder">Choose a file path above to compare across runs.</div>`;
+      }
+    }
+  });
+}
+
+// ── Experiment selector ────────────────────────────────────────────────────────
+async function fetchExperiments() {
+  try {
+    const r = await apiFetch("/api/experiments");
+    if (!r.ok) { setConnStatus("disconnected"); return; }
+    const exps = await r.json();
+    setConnStatus("connected");
+    const sel = document.getElementById("exp-sel");
+    const prev = sel.value || INIT_EXP;
+    sel.innerHTML = "";
+    for (const e of exps) {
+      const opt = document.createElement("option");
+      opt.value = e.experiment_id; opt.textContent = e.name || e.experiment_id;
+      if (e.experiment_id === prev) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    if (!sel.dataset.loaded) {
+      sel.dataset.loaded = "1";
+      if (sel.value) loadExperiment(sel.value);
+    }
+  } catch { setConnStatus("disconnected"); }
+}
+
+document.getElementById("exp-sel").addEventListener("change", e => loadExperiment(e.target.value));
+document.getElementById("refresh-btn").addEventListener("click", fetchExperiments);
+
+document.getElementById("run-dl-zip").addEventListener("click", async e => {
+  if (browseRun && fileCache[browseRun]?.length === 0) {
+    e.preventDefault();
+    if (await mlConfirm("This run has no artifact files. Download anyway?", { confirmLabel: "Download", danger: false }))
+      window.location.href = e.currentTarget.href;
+  }
+});
+
+document.getElementById("exp-dl-all").addEventListener("click", async e => {
+  const cached = Object.values(fileCache);
+  if (cached.length > 0 && !cached.some(fs => fs.length > 0)) {
+    e.preventDefault();
+    if (await mlConfirm("No runs in this experiment have artifact files. Download anyway?", { confirmLabel: "Download", danger: false }))
+      window.location.href = e.currentTarget.href;
+  }
+});
+
+fetchExperiments();
+</script>
+</body>
+</html>

@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import socket
@@ -41,11 +42,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, IO
+from urllib.request import urlopen
 
 from mlsweep._shared import (
     MsgCancel,
     MsgCleaned,
     MsgCleanup,
+    MsgGpuStats,
     MsgHello,
     MsgLog,
     MsgMetric,
@@ -58,10 +61,12 @@ from mlsweep._shared import (
     MsgStarted,
     MsgSyncReq,
     MsgWorkerHello,
+    _resolve_safe_subpath,
     decode,
     encode,
+    read_msg,
 )
-from mlsweep._topology import _gpu_topology, _visible_devices
+from mlsweep._topology import _gpu_topology, visible_devices
 
 # ── Run state ──────────────────────────────────────────────────────────────────
 
@@ -101,31 +106,39 @@ _scratch_dir: str = "/tmp/mlsweep"
 _remote_dir: str = ""
 _token: str = ""
 _device_override: list[int] | None = None  # None = use all visible
+_max_jobs_per_gpu: int = 1  # per-GPU packing cap reported to the manager (0 = unlimited)
+_ipc_sock_path: str = "/tmp/mlsweep/.worker.sock"  # set to port-specific path at startup
+
+
+# ── Artifact download serialisation ──────────────────────────────────────────
+
+_artifact_locks: dict[str, threading.Lock] = {}
+_artifact_lock_refs: dict[str, int] = {}
+
+def _artifact_lock_for(artifact_id: str) -> threading.Lock:
+    """Return a per-artifact lock so concurrent runs do not clobber downloads."""
+    with _lock:
+        lock = _artifact_locks.get(artifact_id)
+        if lock is None:
+            lock = threading.Lock()
+            _artifact_locks[artifact_id] = lock
+            _artifact_lock_refs[artifact_id] = 0
+        _artifact_lock_refs[artifact_id] += 1
+        return lock
+
+def _artifact_lock_done(artifact_id: str) -> None:
+    with _lock:
+        refs = _artifact_lock_refs.get(artifact_id, 0)
+        if refs <= 1:
+            _artifact_locks.pop(artifact_id, None)
+            _artifact_lock_refs.pop(artifact_id, None)
+        else:
+            _artifact_lock_refs[artifact_id] = refs - 1
 
 
 # ── Wire I/O helpers ───────────────────────────────────────────────────────────
 
 
-class _LineReader:
-    """Buffer TCP data and yield complete newline-terminated lines."""
-
-    def __init__(self, sock: socket.socket) -> None:
-        self._sock = sock
-        self._buf = b""
-
-    def readline(self) -> bytes | None:
-        """Return the next complete line (including \\n), or None on EOF/error."""
-        while True:
-            if b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                return line + b"\n"
-            try:
-                chunk = self._sock.recv(4096)
-            except OSError:
-                return None
-            if not chunk:
-                return None
-            self._buf += chunk
 
 
 # ── Write thread (one per connection) ─────────────────────────────────────────
@@ -158,15 +171,13 @@ def _write_thread(conn: ConnState) -> None:
 
 def _read_thread(conn: ConnState) -> None:
     """Read protocol messages from a controller connection and dispatch them."""
-    reader = _LineReader(conn.sock)
-
     # First message must be MsgHello
-    line = reader.readline()
-    if not line:
+    payload = read_msg(conn.sock)
+    if not payload:
         conn.send_queue.put(None)
         return
     try:
-        msg = decode(line)
+        msg = decode(payload)
     except (ValueError, json.JSONDecodeError, TypeError):
         conn.send_queue.put(None)
         return
@@ -178,7 +189,7 @@ def _read_thread(conn: ConnState) -> None:
         return
 
     # Build and send MsgWorkerHello
-    gpus = _visible_devices()
+    gpus = visible_devices()
     if _device_override is not None:
         gpus = [g for g in _device_override if g in gpus]
     topo_internal = _gpu_topology()
@@ -200,16 +211,17 @@ def _read_thread(conn: ConnState) -> None:
         topo=topo_wire,
         resuming=resuming,
         scratch_dir=_scratch_dir,
+        max_jobs_per_gpu=_max_jobs_per_gpu,
     )
     conn.send_queue.put(encode(hello_resp))
 
     # Main message loop
     while not _shutdown_event.is_set():
-        line = reader.readline()
-        if not line:
+        payload = read_msg(conn.sock)
+        if not payload:
             break
         try:
-            msg = decode(line)
+            msg = decode(payload)
         except (ValueError, json.JSONDecodeError, TypeError):
             continue
         _handle_msg(msg, conn)
@@ -228,7 +240,12 @@ def _read_thread(conn: ConnState) -> None:
 
 def _handle_msg(msg: Any, conn: ConnState) -> None:
     if isinstance(msg, MsgRun):
-        _handle_run(msg, conn)
+        t = threading.Thread(
+            target=_handle_run, args=(msg, conn),
+            daemon=True,
+            name=f"setup-{msg.run_id}",
+        )
+        t.start()
     elif isinstance(msg, MsgCancel):
         _handle_cancel(msg)
     elif isinstance(msg, MsgCleanup):
@@ -242,8 +259,31 @@ def _handle_msg(msg: Any, conn: ConnState) -> None:
             conn.send_queue.put(encode(MsgPong()))
 
 
+def _download_file(url: str, dest: str, timeout: int = 300) -> None:
+    """Download a file from *url* to *dest* via HTTP GET."""
+    with urlopen(url, timeout=timeout) as resp:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+
 def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     """Spawn one training subprocess per GPU in the run's GPU group."""
+    try:
+        _handle_run_inner(msg, conn)
+    except Exception as exc:
+        print(f"[worker] ERROR in run {msg.run_id}: {exc}", file=sys.stderr, flush=True)
+        if not conn.closed:
+            conn.send_queue.put(encode(MsgResult(
+                run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1
+            )))
+
+
+def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
     scratch_path = os.path.join(_scratch_dir, msg.experiment, msg.run_id)
     log_path = os.path.join(scratch_path, "training.log")
     metrics_path = os.path.join(scratch_path, "metrics.jsonl")
@@ -257,24 +297,67 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     # Workspace creation from file payload
     if msg.files:
         workspace = os.path.join(scratch_path, "workspace")
-        base_dir = msg.remote_dir or _remote_dir
-        if base_dir and os.path.isdir(base_dir):
-            # Hard-link copy: large staged files cost no extra disk space
-            subprocess.run(
-                ["rsync", "-a", "--link-dest", base_dir + "/", base_dir + "/", workspace + "/"],
-                check=True,
-            )
-        else:
-            os.makedirs(workspace, exist_ok=True)
+        os.makedirs(workspace, exist_ok=True)
         for rel_path, content in msg.files.items():
-            abs_path = os.path.join(workspace, rel_path)
+            abs_path = _resolve_safe_subpath(workspace, rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             Path(abs_path).write_text(content, encoding="utf-8")
         cwd = workspace
     else:
         workspace = None
         remote_dir = msg.remote_dir or _remote_dir
-        cwd = os.path.join(remote_dir, msg.run_from) if msg.run_from else remote_dir
+        cwd = _resolve_safe_subpath(remote_dir, msg.run_from) if msg.run_from else remote_dir
+
+    # ── Artifact download & extraction ───────────────────────────────────────
+    if msg.artifact_id and msg.artifact_url:
+        with _artifact_lock_for(msg.artifact_id):
+            if workspace is None:
+                workspace = os.path.join(scratch_path, "workspace")
+                os.makedirs(workspace, exist_ok=True)
+            tarball_url = msg.artifact_url
+            tarball_path = os.path.join(scratch_path, "artifact.tar.gz")
+            _download_file(tarball_url, tarball_path)
+            try:
+                subprocess.run(
+                    ["tar", "-xzf", tarball_path, "-C", workspace],
+                    check=True,
+                )
+            finally:
+                try:
+                    os.unlink(tarball_path)
+                except OSError:
+                    pass
+            cwd = workspace
+        _artifact_lock_done(msg.artifact_id)
+
+    # ── Optional setup command ───────────────────────────────────────────────
+    if msg.setup_command:
+        if workspace is None:
+            workspace = os.path.join(scratch_path, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+            cwd = workspace
+        cmd = msg.setup_command
+        use_shell = isinstance(cmd, str)
+        result = subprocess.run(
+            cmd,
+            shell=use_shell,
+            cwd=workspace,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        setup_output = result.stdout or ""
+        if result.returncode != 0:
+            setup_output += f"[mlsweep] setup_command exited {result.returncode}\n"
+        if setup_output:
+            with open(log_path, "a") as _lf:
+                _lf.write(setup_output)
+            if not conn.closed:
+                conn.send_queue.put(encode(MsgLog(
+                    run_id=msg.run_id, seq=len(setup_output), data=setup_output
+                )))
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
 
     # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)
@@ -284,10 +367,22 @@ def _handle_run(msg: MsgRun, conn: ConnState) -> None:
     base_env["MLSWEEP_RUN_DIR"] = artifacts_path
     base_env["MLSWEEP_RUN_NAME"] = msg.run_id
     base_env["EXP_EXPERIMENT"] = msg.experiment
-    base_env["MLSWEEP_WORKER_SOCKET"] = os.path.join(_scratch_dir, ".worker.sock")
+    base_env["MLSWEEP_WORKER_SOCKET"] = _ipc_sock_path
     if workspace is not None:
         base_env["MLSWEEP_WORKSPACE"] = workspace
+        existing = base_env.get("PYTHONPATH", "")
+        base_env["PYTHONPATH"] = workspace + (os.pathsep + existing if existing else "")
     base_env.pop("EXP_SERVER", None)
+
+    # Activate .venv if present: workspace first, then remote_dir fallback
+    _venv_bin = os.path.join(cwd, ".venv", "bin")
+    if not os.path.isdir(_venv_bin) and _remote_dir:
+        _venv_bin = os.path.join(_remote_dir, ".venv", "bin")
+    if os.path.isdir(_venv_bin):
+        _old_path = base_env.get("PATH", os.environ.get("PATH", ""))
+        base_env["PATH"] = _venv_bin + os.pathsep + _old_path
+        base_env["VIRTUAL_ENV"] = os.path.dirname(_venv_bin)
+        base_env.pop("PYTHONHOME", None)
 
     # Pre-compute dist env values if SET_DIST_ENV is requested
     _dist_base: dict[str, str] = {}
@@ -401,15 +496,23 @@ def _run_thread(
     # run_dir is the workspace (when files={...}) or the cwd (when files={}).
     if return_files:
         for rel_path in return_files:
-            src = os.path.join(run_dir, rel_path)
+            src = _resolve_safe_subpath(run_dir, rel_path)
             if os.path.isfile(src):
-                dst = os.path.join(artifacts_path, rel_path)
+                dst = _resolve_safe_subpath(artifacts_path, rel_path)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
 
     with _lock:
         _in_flight.pop(state.run_id, None)
         _busy_gpus.difference_update(state.gpu_ids)
+
+    # Free the workspace (large extracted artifact copy); keep logs and output artifacts.
+    workspace_dir = os.path.join(state.scratch_path, "workspace")
+    if os.path.isdir(workspace_dir):
+        try:
+            shutil.rmtree(workspace_dir)
+        except OSError:
+            pass
 
     if not conn.closed:
         conn.send_queue.put(encode(MsgResult(
@@ -602,6 +705,93 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
             conn.send_queue.put(wire)
 
 
+# ── GPU stats polling ─────────────────────────────────────────────────────────
+
+
+def _query_gpu_stats() -> list[dict[str, Any]]:
+    """Return per-GPU utilization stats from nvidia-smi or rocm-smi."""
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                stats: list[dict[str, Any]] = []
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        stats.append({
+                            "gpu": int(parts[0]),
+                            "util_pct": int(parts[1]),
+                            "mem_used_mb": int(parts[2]),
+                            "mem_total_mb": int(parts[3]),
+                        })
+                    except ValueError:
+                        continue
+                return stats
+        except Exception:
+            pass
+
+    if shutil.which("rocm-smi"):
+        try:
+            r = subprocess.run(
+                ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                stats = []
+                for key, val in sorted(data.items()):
+                    if not isinstance(val, dict):
+                        continue
+                    try:
+                        gpu_id = int(key.lstrip("card"))
+                        used_str = val.get("VRAM Total Used Memory (B)", "0")
+                        total_str = val.get("VRAM Total Memory (B)", "0")
+                        util_str = val.get("GPU use (%)", "0")
+                        stats.append({
+                            "gpu": gpu_id,
+                            "util_pct": int(float(util_str)),
+                            "mem_used_mb": int(int(used_str) / 1024 / 1024),
+                            "mem_total_mb": int(int(total_str) / 1024 / 1024),
+                        })
+                    except (ValueError, KeyError):
+                        continue
+                return stats
+        except Exception:
+            pass
+
+    return []
+
+
+def _gpu_stats_thread() -> None:
+    """Periodically poll GPU stats and broadcast to all manager connections."""
+    while not _shutdown_event.wait(5.0):
+        stats = _query_gpu_stats()
+        if not stats:
+            continue
+        # Filter to our assigned GPUs only
+        if _device_override is not None:
+            our_gpus = set(_device_override)
+            stats = [s for s in stats if s["gpu"] in our_gpus]
+        if not stats:
+            continue
+        wire = encode(MsgGpuStats(stats=stats))
+        with _lock:
+            conns = list(_connections)
+        for conn in conns:
+            if not conn.closed:
+                try:
+                    conn.send_queue.put_nowait(wire)
+                except Exception:
+                    pass
+
+
 # ── Accept loop ────────────────────────────────────────────────────────────────
 
 
@@ -633,7 +823,7 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 def main() -> None:
     try:
-        global _scratch_dir, _remote_dir, _token, _device_override
+        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu
 
         parser = argparse.ArgumentParser(description="mlsweep worker daemon")
         parser.add_argument("--token", default="", help="Authentication token")
@@ -641,8 +831,12 @@ def main() -> None:
                             help="Base scratch directory for run buffers (default: /tmp/mlsweep)")
         parser.add_argument("--remote-dir", default="",
                             help="Project directory on this machine (cwd for training scripts)")
-        parser.add_argument("--devices", default=None,
-                            help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7")
+        parser.add_argument("-g", "--devices", default=None,
+                            help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7 "
+                                 "(default: all visible)")
+        parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                            help="Max concurrent jobs per GPU on this worker "
+                                 "(0 = unlimited, default: 1)")
         parser.add_argument("--port", type=int, default=7890,
                             help="TCP port to bind (0 = ephemeral, default: 7890)")
         args = parser.parse_args()
@@ -650,6 +844,7 @@ def main() -> None:
         _scratch_dir = args.scratch_dir
         _remote_dir = args.remote_dir or os.getcwd()
         _token = args.token
+        _max_jobs_per_gpu = args.jobs
         if args.devices:
             _device_override = [int(x) for x in args.devices.split(",")]
 
@@ -695,10 +890,16 @@ def main() -> None:
         # Print port so the controller can read it and connect
         print(f"PORT={port}", flush=True)
 
-        # Start IPC thread for logger.py connections
-        sock_path = os.path.join(_scratch_dir, ".worker.sock")
-        ipc_t = threading.Thread(target=_ipc_thread, args=(sock_path,), daemon=True)
+        # Start IPC thread for logger.py connections.
+        # Use a port-specific socket name so multiple workers on the same host
+        # (e.g., concurrent test workers) don't clobber each other's sockets.
+        global _ipc_sock_path
+        _ipc_sock_path = os.path.join(_scratch_dir, f".worker-{port}.sock")
+        ipc_t = threading.Thread(target=_ipc_thread, args=(_ipc_sock_path,), daemon=True)
         ipc_t.start()
+
+        gpu_t = threading.Thread(target=_gpu_stats_thread, daemon=True)
+        gpu_t.start()
 
         # Enter accept loop (blocks until _shutdown_event is set)
         _accept_loop(server_sock)

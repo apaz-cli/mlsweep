@@ -38,7 +38,7 @@ header() {
     echo "════════════════════════════════════════════════════════"
 }
 
-# Mirrors the IP-resolution logic in mlsweep_viz: open a UDP socket toward
+# Mirrors the IP-resolution logic in the visualizer: open a UDP socket toward
 # 8.8.8.8 to discover which local interface the OS would use, then return
 # that IP if it is not loopback.
 public_ip() {

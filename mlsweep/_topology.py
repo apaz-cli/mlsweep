@@ -13,7 +13,7 @@ import subprocess
 from typing import Any
 
 
-def _visible_devices() -> list[int]:
+def visible_devices() -> list[int]:
     """Get list of visible GPU device indices."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "") or os.environ.get("HIP_VISIBLE_DEVICES", "")
     if cvd:
@@ -142,6 +142,17 @@ def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
         pass
 
     return {}
+
+
+def _parse_topo_wire(wire_topo: dict[str, int]) -> dict[tuple[int, int], int]:
+    """Convert wire-format topology (string keys ``"gpu_a,gpu_b"`` → score)
+    to the internal format ``{(gpu_a, gpu_b): score}`` used by ``_best_gpu_groups``.
+    """
+    result: dict[tuple[int, int], int] = {}
+    for k, v in wire_topo.items():
+        a_str, b_str = k.split(",")
+        result[(int(a_str), int(b_str))] = v
+    return result
 
 
 def _best_gpu_groups(devices: list[int], group_size: int, n_groups: int,

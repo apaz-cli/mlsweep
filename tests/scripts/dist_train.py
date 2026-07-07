@@ -17,7 +17,7 @@ import torch.distributed as dist
 from mlsweep.logger import MLSweepLogger
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -34,7 +34,6 @@ def main() -> None:
     dist.all_gather(gathered, src)
     values = [t.item() for t in gathered]
 
-    # Every rank 0..world_size-1 must have contributed exactly its index
     assert values == list(range(world_size)), f"allgather mismatch: {values}"
 
     print(f"rank={rank}/{world_size} seed={args.seed} gathered={values}", flush=True)

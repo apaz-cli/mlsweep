@@ -1,13 +1,39 @@
 """Shared utilities and wire protocol for mlsweep worker ↔ controller communication."""
 
+import asyncio
 import json
+import os
+import socket
+import struct
 import subprocess
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from secrets import token_hex as _token_hex
 from typing import Any
 
 
-# ── Utilities (from _utils.py) ─────────────────────────────────────────────────
+# ── Utilities ──────────────────────────────────────────────────────────────────
+
+# ANSI escape codes
+_GREEN = "\033[32m"
+_RED = "\033[31m"
+_YELLOW = "\033[33m"
+_CYAN = "\033[36m"
+_MAGENTA = "\033[35m"
+_BLUE = "\033[34m"
+_RESET = "\033[0m"
+
+
+def _resolve_safe_subpath(base: str | Path, sub: str | None) -> str:
+    """Join *base* and relative *sub*; raise ValueError if *sub* escapes *base*."""
+    base = str(base)
+    if not sub:
+        return base
+    resolved = os.path.realpath(os.path.join(base, sub))
+    base_resolved = os.path.realpath(base)
+    if os.path.commonpath([resolved, base_resolved]) != base_resolved:
+        raise ValueError(f"path {sub!r} escapes base directory {base!r}")
+    return resolved
 
 
 def _git_root(path: str) -> str | None:
@@ -106,11 +132,19 @@ class MsgRun:
     set_dist_env: bool = False
     files: dict[str, str] = field(default_factory=dict)
     # {workspace-relative path: text content}. Worker creates an isolated
-    # workspace, hard-links from remote_dir, then writes these files.
+    # workspace directory and writes these files into it.
     # Sets MLSWEEP_WORKSPACE; cwd becomes workspace instead of remote_dir.
     return_files: list[str] = field(default_factory=list)
     # Workspace-relative paths copied into artifacts/ after the run,
     # before the normal artifact rsync.
+    artifact_id: str = ""
+    # Opaque identifier for the artifact tarball (used as download subpath).
+    artifact_url: str = ""
+    # Base URL of the artifact manager (e.g. "http://host:port").
+    # Worker fetches {artifact_url}/{artifact_id}.tar.gz if both are set.
+    setup_command: list[str] = field(default_factory=list)
+    # Command list executed in the workspace after artifact extraction
+    # and before training. Run without shell for safety.
     t: str = "run"
 
 
@@ -152,6 +186,7 @@ class MsgWorkerHello:
     topo: dict[str, int]          # "{gpu_a},{gpu_b}" → score (JSON requires string keys)
     resuming: list[dict[str, Any]]  # [{run_id, log_seq, metric_seq, pid}]
     scratch_dir: str
+    max_jobs_per_gpu: int = 1     # worker's per-GPU packing cap (0 = unlimited)
     t: str = "whello"
 
 
@@ -204,6 +239,13 @@ class MsgPong:
     t: str = "pong"
 
 
+@dataclass
+class MsgGpuStats:
+    stats: list[dict[str, Any]] = field(default_factory=list)
+    # Each entry: {"gpu": int, "util_pct": int, "mem_used_mb": int, "mem_total_mb": int}
+    t: str = "gpu_stats"
+
+
 _MSG_TYPES: dict[str, type] = {
     "hello": MsgHello,
     "run": MsgRun,
@@ -220,19 +262,49 @@ _MSG_TYPES: dict[str, type] = {
     "result": MsgResult,
     "cleaned": MsgCleaned,
     "pong": MsgPong,
+    "gpu_stats": MsgGpuStats,
 }
 
 
 def encode(msg: Any) -> bytes:
-    """Encode a protocol message dataclass to a wire line (JSON + newline)."""
-    return (json.dumps(asdict(msg)) + "\n").encode()
+    """Encode a protocol message to a length-prefixed frame: 4-byte big-endian length + JSON payload."""
+    payload = json.dumps(asdict(msg)).encode()
+    return struct.pack(">I", len(payload)) + payload
 
 
-def decode(line: bytes) -> Any:
-    """Decode a wire line to the appropriate protocol message dataclass."""
-    obj: dict[str, Any] = json.loads(line)
+def decode(payload: bytes) -> Any:
+    """Decode a JSON payload bytes to the appropriate protocol message dataclass."""
+    obj: dict[str, Any] = json.loads(payload)
     t = obj.get("t")
     cls = _MSG_TYPES.get(t)  # type: ignore[arg-type]
     if cls is None:
         raise ValueError(f"Unknown message type: {t!r}")
     return cls(**obj)
+
+
+async def aread_msg(reader: asyncio.StreamReader) -> bytes:
+    """Read one length-prefixed message from an asyncio StreamReader."""
+    hdr = await reader.readexactly(4)
+    (n,) = struct.unpack(">I", hdr)
+    return await reader.readexactly(n)
+
+
+def read_msg(sock: socket.socket) -> bytes | None:
+    """Read one length-prefixed message from a blocking socket. Returns None on EOF/error."""
+    def _recv_exactly(n: int) -> bytes | None:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return bytes(buf)
+
+    hdr = _recv_exactly(4)
+    if hdr is None:
+        return None
+    (n,) = struct.unpack(">I", hdr)
+    return _recv_exactly(n)

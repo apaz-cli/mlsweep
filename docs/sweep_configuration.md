@@ -165,7 +165,7 @@ When `flags` is a dict, `"values"` is optional — the values are inferred from 
 }
 ```
 
-**Boolean values:** The `str` shorthand converts values with `str(v)`, so Python `True` becomes the token `"True"` and `False` becomes `"False"` (capital T/F). This works for frameworks that accept Python-style booleans (e.g. hydra). If your framework expects lowercase `true`/`false`, a different convention, or a flag with no value argument, use the `dict` form or use string values instead of Python booleans:
+The `str` shorthand converts values with `str(v)`, so Python `True` becomes the token `"True"` and `False` becomes `"False"` (capital T/F). This works for frameworks that accept Python-style booleans (e.g. hydra). If your framework expects lowercase `true`/`false`, a different convention, or a flag with no value argument, use the `dict` form or use string values instead of Python booleans:
 
 ```python
 # hydra-compatible (default str shorthand works):
@@ -219,7 +219,7 @@ GPUS_PER_RUN = 4
 
 When set, the runner divides the available GPUs into non-overlapping groups of `GPUS_PER_RUN` and assigns one group per concurrent run.  For each run, mlsweep spawns `GPUS_PER_RUN` copies of `COMMAND` — one per GPU — and sets `CUDA_VISIBLE_DEVICES` to the full group and `MLSWEEP_GPU_RANK` to each process's 0-based local rank.  Your training script uses `MLSWEEP_GPU_RANK` as its device index and distributed rank.
 
-The `-g N` flag still controls the **total** number of GPUs to use. With `GPUS_PER_RUN=4` and `-g 8`, you get 2 parallel slots (2 concurrent runs). `-g 0` uses all visible GPUs, divided into as many slots as fit.
+The total GPUs available to a worker is set via `devices` or `gpus` in workers.toml, or autodetected when running locally. With `GPUS_PER_RUN=4` and 8 available GPUs, you get 2 parallel slots (2 concurrent runs).
 
 GPU groups are chosen to maximise interconnect quality using `nvidia-smi topo -m`. If topology data is unavailable, groups are assigned sequentially.
 
@@ -279,7 +279,7 @@ COMMAND = ["bash", "-c", """
 """, "--"]
 ```
 
-**Requirements:** `NODES_PER_RUN > 1` requires `--workers` with at least `NODES_PER_RUN` connected worker entries. Logs and metrics are streamed from all nodes but only artifacts from rank 0's scratch directory are rsynced to the output directory. If your training script writes artifacts on all ranks, use a shared filesystem or handle aggregation in the script itself.
+`NODES_PER_RUN > 1` requires at least `NODES_PER_RUN` connected workers. Logs and metrics are streamed from all nodes, but only artifacts from rank 0's scratch directory are rsynced to the output directory. If your training script writes artifacts on all ranks, use a shared filesystem or handle aggregation in the script itself.
 
 ### `SET_DIST_ENV`
 
@@ -373,15 +373,11 @@ Use `"decreasing"` when your values are naturally written largest-first and you 
 
 Both examples above produce identical behavior. The choice is purely about which order is more natural to write.
 
-**Important:** Both monotonic and singular skipping work **only in sequential mode** (`-g 1 -j 1`). In parallel mode, results are recorded but skipping does not happen dynamically because runs are launched concurrently.
+Both monotonic and singular skipping work only in sequential mode (one job at a time per slot). In parallel mode, results are recorded but skipping does not happen dynamically.
 
 ## Singular Skipping (Skip on Success)
 
-When a dimension has `"singular": True` and a run **succeeds**, the sweep will automatically skip **all other values** in that dimension (with all other dimensions held constant).
-
-- **Use case**: Dimensions where you only need ONE working value. Values are tried in declaration order; the first success wins and the rest are skipped.
-- **Dimension ordering**: Singular dimensions vary **slowest** in the cartesian product (diagonal order), so other dimensions are fully explored first. This maximizes parallelism when using `-g`/`-j`.
-- **Expected run count**: The sweep displays "expected" runs treating singular dimensions as contributing only 1 value.
+When a dimension has `"singular": True` and a run **succeeds**, the sweep will automatically skip all other values in that dimension (with all other dimensions held constant). Values are tried in declaration order; the first success locks in the value and the rest are skipped. Singular dimensions vary slowest in the cartesian product so other dimensions are fully explored first. The sweep displays "expected" runs treating singular dimensions as contributing only 1 value.
 
 Use `singular` when you want to find the first working value and stop. Put the value you most want to use first:
 
@@ -398,8 +394,7 @@ This is the right pattern for "run the fastest config that fits in memory": OOMs
 
 These address different situations and are **not meant to be combined**:
 
-- **`monotonic`** is for finding a boundary — e.g. discovering which batch sizes fit in memory before committing to any of them. Tries values in order; stops at the first failure.
-- **`singular`** is for committing to the first success — e.g. finding the largest batch size that fits and running only that one. Tries values in order; stops at the first success.
+`monotonic` is for finding a boundary — e.g. discovering which batch sizes fit in memory before committing to any of them. It stops at the first failure. `singular` is for committing to the first success — e.g. finding the largest batch size that fits and running only that one. It stops at the first success.
 
 If you combine them, `singular` fires on the first success (the first value tried, if it works) and `monotonic` fires on the first failure — whichever comes first ends the search. In practice, `singular` alone is simpler and sufficient for the "find and commit" use case.
 
@@ -416,8 +411,6 @@ OPTIMIZE = {
     "n_initial": 5,          # combos to queue upfront before the event loop starts (default: max(5, n_params*2))
 }
 ```
-
-Requires `optuna`: `pip install 'mlsweep[bayes]'`
 
 ### `OPTIMIZE` fields
 
@@ -465,7 +458,7 @@ OPTIONS = {
 | `"uniform"` | `suggest_float(log=False)` | Dropout, clip norm |
 | `"int_uniform"` | `suggest_int()` | Integer params |
 
-**Grid mode with continuous dims:** Add `"samples": N` to pre-sample N values at load time. The dimension then behaves like a discrete value dim. The `"samples"` key is forbidden in bayes mode.
+To use a continuous dim in grid mode, add `"samples": N` to pre-sample N values at load time. The dimension then behaves like a discrete value dim. The `"samples"` key is forbidden in bayes mode.
 
 ```python
 # Grid mode — pre-samples 8 random LR values at load time:
@@ -570,8 +563,12 @@ OPTIONS = {
 
 Run with:
 ```bash
-mlsweep_run sweeps/bayes_sweep.py -g 4
+mlsweep_run sweeps/bayes_sweep.py
 ```
+
+The GPUs jobs run on are owned by the workers, not the submitter: configure each
+machine's GPUs with `devices`/`gpus` and per-GPU packing with `jobs` in
+`workers.toml` (or live from the system UI). See the workers configuration below.
 
 ## Run Naming
 
@@ -599,14 +596,18 @@ The `.` signals "this segment is a subdim of the preceding segment." For three-l
 
 ## Invocation
 
+`mlsweep_run` submits a sweep to a running `mlsweep_manager` daemon. Start the manager first, then submit:
+
 ```bash
-mlsweep_run sweeps/beta.py [options] [-- extra_overrides...]
+mlsweep_manager                                             # start manager (local GPUs)
+mlsweep_manager --workers workers.toml                      # start manager (remote workers)
+mlsweep_run sweeps/beta.py --manager http://localhost:7891 [options] [-- extra_overrides...]
 ```
 
 Example:
 
 ```bash
-mlsweep_run sweeps/beta.py -g 4 -j 2 -- --training.steps 1000
+mlsweep_run sweeps/beta.py --manager http://localhost:7891 -- --training.steps 1000
 ```
 
 ### Shebang Mode
@@ -615,7 +616,7 @@ Make the sweep file executable and run it directly:
 
 ```bash
 chmod +x sweeps/beta.py
-./sweeps/beta.py -g 4 -j 2
+./sweeps/beta.py --manager http://localhost:7891
 ```
 
 The shebang line to use is:
@@ -624,21 +625,51 @@ The shebang line to use is:
 #!/usr/bin/env mlsweep_run
 ```
 
+### Subcommands
+
+`mlsweep_run` also supports two subcommands for interacting with submitted experiments:
+
+```bash
+mlsweep_run fetch --manager http://host:port --experiment EXP_ID            # download artifacts/results
+mlsweep_run fetch --manager http://host:port --experiment EXP_ID --status done  # filter by status
+mlsweep_run watch EXP_ID --manager http://host:port                         # stream live status to terminal
+```
+
+`fetch --status` accepts: `done`, `failed`, `pending`, `running`, `dispatched`.
+
 ## Command-Line Options
+
+### `mlsweep_manager`
 
 | Option | Description |
 |--------|-------------|
-| `--output_dir <dir>` | Directory where run outputs will be stored. Default: `<git-root>/outputs/sweeps`. |
-| `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>`. |
-| `-g [N]`, `--gpus [N]` | GPUs to use (local mode only). `-g` alone = all visible GPUs. `-g N` = N GPUs. Default: one slot (`GPUS_PER_RUN` GPUs). Cannot be combined with `--workers`. |
-| `-j N`, `--jobs-per-gpu N` | Concurrent jobs per GPU (local mode only). Default: 1. Cannot be combined with `--workers`; set `jobs` per machine in the workers file instead. |
-| `--workers <file>` | Path to a TOML workers file for remote dispatch (see [Remote Execution](#remote-execution)). |
-| `--resume` | Skip runs already recorded as completed in `sweep_status.json`. |
+| `--port N` | HTTP/WebSocket port (default: 7891). |
+| `--host <name>` | Externally-reachable hostname used to construct artifact download URLs (default: `localhost`). Set this to your server's hostname or IP when clients access the manager from other machines. Does not affect the bind address (always `0.0.0.0`). |
+| `--mlsweep-dir <dir>` | State directory for the DB, token file, PID file, and experiment outputs (env: `MLSWEEP_DIR`, default: `~/.mlsweep`). |
+| `--workers <file>` | Path to a TOML workers file. If omitted, a local worker using all visible GPUs is started. |
+| `--token <tok>` | Auth token. Auto-generated and saved to `<mlsweep-dir>/manager.token` if not provided. |
+| `--db <path>` | SQLite database path (env: `MLSWEEP_DB_PATH`, default: `<mlsweep-dir>/manager.db`). |
+
+### `mlsweep_run`
+
+| Option | Description |
+|--------|-------------|
+| `--manager <url>` | Manager URL (required, e.g. `http://localhost:7891`). |
+| `--token <tok>` | Auth token for the manager. Auto-read from `~/.mlsweep/manager.token` for local managers, or set `MLSWEEP_TOKEN` env var. |
+| `--output-dir <dir>` | Directory where local sweep manifests are stored. Default: `<git-root>/outputs/sweeps`. |
+| `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. |
+| `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
+| `--priority N` | Job priority — higher values run sooner (default: 0). |
+| `--stream` | Subscribe to the manager's WebSocket event stream for live terminal status. |
+| `--fetch` | Fetch and display results after submission (when `--stream` is not used). |
 | `--dry-run` | Print the commands that would be executed without running them. |
-| `--validate` | Validate sweep config, print all combinations, and exit (no jobs launched). |
-| `--note <text>` | Human-readable note stored in `sweep_manifest.json`. |
-| `--max-retries N` | Max retry attempts for orphaned runs (default: 2). |
-| `--scratch-dir <dir>` | Worker scratch directory for run buffers (default: `/tmp/mlsweep`). |
+| `--validate` | Validate sweep config, print all combinations, and exit (no jobs submitted). |
+| `--note <text>` | Human-readable note stored with the experiment. |
+| `--max-retries N` | Max retry attempts for failed jobs (default: 2). |
+| `--setup-command <cmd>` | Shell command executed before training in the worker workspace. |
+| `--wandb-project P` | W&B project name (enables W&B logging). |
+| `--wandb-entity E` | W&B entity/team. |
+| `--tensorboard-dir D` | TensorBoard output directory (enables TensorBoard logging). |
 | `--` | Pass extra arguments to every training run (e.g., `-- --training.steps 1000`). |
 
 ## GPU Management
@@ -647,11 +678,19 @@ The controller respects `CUDA_VISIBLE_DEVICES`. If the environment variable is s
 
 ## Remote Execution
 
-Use `--workers` to dispatch jobs to remote machines via SSH (passwordless key-based auth required):
+Remote workers are configured when the manager starts. Pass a `--workers` file to `mlsweep_manager`:
 
 ```bash
-mlsweep_run sweeps/beta.py --workers workers.toml
+mlsweep_manager --workers workers.toml
 ```
+
+Then submit sweeps normally:
+
+```bash
+mlsweep_run sweeps/beta.py --manager http://localhost:7891
+```
+
+The manager bootstraps mlsweep on remote machines automatically over SSH — no manual install required. It builds wheels from the local source at startup, SCPs them to each remote, and installs them into `/tmp/mlsweep_venv/`.
 
 The workers file is TOML with one `[[workers]]` entry per machine. `remote_dir` is the repo root on that machine — the directory training commands run from.
 
@@ -683,16 +722,14 @@ venv = "/home/user/myproject/.venv"
 | `host` | string | SSH target (required) |
 | `remote_dir` | string | Repo root on the remote machine (required) |
 | `gpus` | int | Total GPU count to use (default: all visible) |
-| `jobs` | int | Concurrent jobs per GPU slot (default: 1) |
-| `devices` | list of ints | Specific GPU device IDs to use |
+| `jobs` | int | Worker-level cap: max concurrent jobs per GPU on this machine (worker CLI: `-j`). Default 1; set to 0 for unlimited. |
+| `devices` | list of ints | Specific GPU device IDs to use (worker CLI: `-g`). Default: all visible. |
 | `ssh_key` | string | Path to SSH identity file (passed as `-i`) |
 | `pass` | string | SSH password. Requires `sshpass` to be installed. Falls back to `MLSWEEP_SSH_PASS` env var if omitted. |
-| `venv` | string | Path used to locate the `mlsweep_worker` binary. Defaults to `remote_dir`. Accepts a project root (tries `venv/`, `.venv/`), a venv root, a `bin/` dir, an `activate` script, or a python binary — all resolved to the same `bin/` directory. |
-| `port` | int | TCP port the worker listens on (default: 7890; `0` = ephemeral). With a fixed port, if a worker is already listening on that port it is reused rather than launched — this lets `mlsweep_run` and `WorkerPool` share the same worker process and queue jobs against the same GPU slots. Workers started without `--token` accept connections from any controller. |
+| `venv` | string | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root (tries `venv/`, `.venv/`), a venv root, a `bin/` dir, an `activate` script, or a python binary. If omitted, the manager bootstraps mlsweep automatically. |
+| `port` | int | TCP port the worker listens on (default: 7890; `0` = ephemeral). |
 
-The `-g` and `-j` flags cannot be passed on the command line when `--workers` is specified — use the per-machine entries in the workers file instead.
-
-The controller starts a worker process on each machine via SSH (`python -m mlsweep.worker`). The worker ignores SIGHUP so SSH disconnects do not kill it. If the controller exits cleanly it sends a shutdown signal; if the controller crashes, the worker keeps any in-flight runs running to completion and then exits. Run logs and metrics are streamed back to the controller over a persistent TCP connection and written to disk immediately. Artifacts are rsynced at the end of each run.
+The manager starts a worker process on each machine via SSH (`python -m mlsweep.worker`). The worker ignores SIGHUP so SSH disconnects do not kill it. If the manager exits cleanly it sends a shutdown signal; if the manager crashes, the worker keeps any in-flight runs running to completion and then exits. Run logs and metrics are streamed back to the manager over a persistent TCP connection and written to disk immediately. Artifacts are rsynced at the end of each run.
 
 ## Metrics API
 
@@ -757,7 +794,7 @@ The experiment directory also contains:
 ```
 {output_dir}/{experiment_name}/
     sweep.log          # plain-text copy of the sweep runner's terminal output
-    sweep_manifest.json  # dims, combos, and run list (written before dispatch)
+    sweep_manifest.json  # run list with dimension values (written before dispatch)
     sweep_status.json    # per-run completion status (used by --resume)
 ```
 
@@ -913,23 +950,26 @@ device = torch.device(f"cuda:{local_rank}")
 # pass local_rank as rank when initialising your process group
 ```
 
-Run with 8 GPUs to get 2 parallel 4-GPU jobs:
+With `gpus_per_run = 4` in the sweep file, a worker exposing 8 GPUs runs two of
+these jobs in parallel (8 / 4):
 
 ```bash
-mlsweep_run sweeps/my_sweep.py -g 8
+mlsweep_run sweeps/my_sweep.py
 ```
 
-The runner sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first slot and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second; GPU groups are chosen to maximise NVLink connectivity.  `MLSweepLogger` is a no-op on all ranks except `MLSWEEP_GPU_RANK=0`.
+The worker sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first job and `CUDA_VISIBLE_DEVICES=4,5,6,7` for the second; GPU groups are chosen to maximise NVLink connectivity.  `MLSweepLogger` is a no-op on all ranks except `MLSWEEP_GPU_RANK=0`.
 
 ## Troubleshooting
 
-- **`COMMAND is required`** — Add `COMMAND = ["python", "train.py"]` to the sweep file.
-- **`Dimension key '...' must start with '.'`** — All keys in `OPTIONS` (and in subdim specs) must begin with `.`. Metadata keys inside a dim spec (`name`, `flags`, `values`, `singular`, `monotonic`) do not.
-- **`has both 'values' and subdimensions`** — A dim can be either a value dim (`values` list) or a subdim (dot-prefixed subdim keys), not both.
-- **Monotonic/singular skipping not working** — These only work in sequential mode (`-g 1 -j 1`). In parallel mode results are recorded but skipping is not applied dynamically.
-- **Remote jobs not connecting** — Ensure passwordless SSH key-based authentication is configured for each worker. Test with `ssh -o BatchMode=yes <worker> nvidia-smi`.
-- **`need at least GPUS_PER_RUN GPUs`** — The requested GPU count (`-g N`) is less than `GPUS_PER_RUN`. Either increase `-g` or reduce `GPUS_PER_RUN`.
-- **Remote worker skipped with `need N per run`** — A remote worker has fewer GPUs than `GPUS_PER_RUN`. That worker is skipped; other workers with enough GPUs are still used.
+| Symptom | Fix |
+|---------|-----|
+| `COMMAND is required` | Add `COMMAND = ["python", "train.py"]` to the sweep file. |
+| `Dimension key '...' must start with '.'` | All keys in `OPTIONS` (and subdim specs) must begin with `.`. Metadata keys (`name`, `flags`, `values`, `singular`, `monotonic`) do not. |
+| `has both 'values' and subdimensions` | A dim can have a value list or subdim branches; it cannot have both. |
+| Monotonic/singular not skipping | These only work with one job at a time per slot. In parallel mode results are recorded but skipping is not applied dynamically. |
+| Remote jobs not connecting | Ensure passwordless SSH is configured. Test with `ssh -o BatchMode=yes <worker> nvidia-smi`. |
+| `need at least GPUS_PER_RUN GPUs` | A worker has fewer GPUs than `GPUS_PER_RUN`. Increase the worker's GPU count or reduce `GPUS_PER_RUN`. |
+| Remote worker skipped with `need N per run` | That worker has fewer GPUs than `GPUS_PER_RUN` and is skipped; other workers with enough GPUs are still used. |
 
 ## See Also
 

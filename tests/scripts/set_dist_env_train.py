@@ -18,7 +18,7 @@ import torch.distributed as dist
 from mlsweep.logger import MLSweepLogger
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -31,8 +31,6 @@ def main() -> None:
         f"LOCAL_RANK={local_rank} != MLSWEEP_GPU_RANK={os.environ['MLSWEEP_GPU_RANK']}"
     )
 
-    # MASTER_ADDR and MASTER_PORT are already in the environment; init_process_group
-    # picks them up automatically via the default env:// init method.
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
     src = torch.tensor([float(rank)])
