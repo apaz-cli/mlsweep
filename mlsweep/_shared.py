@@ -23,6 +23,13 @@ _MAGENTA = "\033[35m"
 _BLUE = "\033[34m"
 _RESET = "\033[0m"
 
+DEFAULT_MANAGER_URL = "http://localhost:7891"
+
+
+def _mlsweep_dir() -> Path:
+    """mlsweep state directory ($MLSWEEP_DIR, default ~/.mlsweep)."""
+    return Path(os.environ.get("MLSWEEP_DIR", "~/.mlsweep")).expanduser()
+
 
 def _resolve_safe_subpath(base: str | Path, sub: str | None) -> str:
     """Join *base* and relative *sub*; raise ValueError if *sub* escapes *base*."""

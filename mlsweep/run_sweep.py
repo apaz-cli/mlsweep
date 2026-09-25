@@ -43,7 +43,10 @@ from mlsweep._writers import (
     MultiWriterFactory,
     WriterFactory,
 )
-from mlsweep._shared import _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET, _git_root
+from mlsweep._shared import (
+    DEFAULT_MANAGER_URL, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET,
+    _git_root, _mlsweep_dir,
+)
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = _git_root(os.getcwd()) or os.getcwd()
@@ -67,6 +70,34 @@ def fmt_time(s: float) -> str:
     if s < 3600:
         return f"{s / 60:.0f}m"
     return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
+
+
+def _resolve_token(token_arg: str | None) -> str:
+    """Resolve the manager token from explicit arg, env, or $MLSWEEP_DIR/manager.token."""
+    token = token_arg if token_arg else os.environ.get("MLSWEEP_TOKEN", "")
+    if not token:
+        token_file = _mlsweep_dir() / "manager.token"
+        if token_file.exists():
+            token = token_file.read_text().strip()
+    return token
+
+
+def _require_token(token_arg: str | None) -> str:
+    """Like _resolve_token, but exit with an error if no token is found."""
+    token = _resolve_token(token_arg)
+    if not token:
+        sweep_print(f"{_RED}Error: --token is required (or set MLSWEEP_TOKEN env, "
+                    f"or place token in {_mlsweep_dir() / 'manager.token'}){_RESET}")
+        sys.exit(1)
+    return token
+
+
+def _add_manager_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared --manager / --token flags."""
+    parser.add_argument("--manager", default=os.environ.get("MLSWEEP_MANAGER", DEFAULT_MANAGER_URL),
+                        help=f"Manager URL (env: MLSWEEP_MANAGER, default: {DEFAULT_MANAGER_URL})")
+    parser.add_argument("--token", default=None,
+                        help="Manager auth token (or set MLSWEEP_TOKEN env)")
 
 
 # ===============================================================================
@@ -1121,21 +1152,17 @@ def _build_job_payloads(
 # ===============================================================================
 
 
-def _watch_cmd(args: list[str]) -> None:
+def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
     """Watch an experiment's progress via WebSocket event stream."""
     parser = argparse.ArgumentParser(
-        prog="run_sweep.py watch",
+        prog=prog,
         description="Watch experiment progress via WebSocket",
     )
     parser.add_argument("experiment_id", help="Experiment ID to watch")
-    parser.add_argument("--manager", required=True, help="Manager URL (http://host:port)")
-    parser.add_argument("--token", default=None, help="Manager auth token (or set MLSWEEP_TOKEN env)")
+    _add_manager_args(parser)
     parsed = parser.parse_args(args)
 
-    token = parsed.token or os.environ.get("MLSWEEP_TOKEN", "")
-    if not token:
-        sweep_print(f"{_RED}Error: --token is required (or set MLSWEEP_TOKEN env){_RESET}")
-        sys.exit(1)
+    token = _require_token(parsed.token)
 
     manager = parsed.manager.rstrip("/")
 
@@ -1242,23 +1269,19 @@ def _watch_cmd(args: list[str]) -> None:
 # ===============================================================================
 
 
-def _fetch_cmd(args: list[str]) -> None:
+def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
     """Fetch experiment results from a manager and print summary."""
     parser = argparse.ArgumentParser(
-        prog="run_sweep.py fetch",
+        prog=prog,
         description="Fetch experiment results from mlsweep manager",
     )
-    parser.add_argument("--manager", required=True, help="Manager URL (http://host:port)")
+    _add_manager_args(parser)
     parser.add_argument("--experiment", required=True, help="Experiment ID to fetch")
-    parser.add_argument("--token", default=None, help="Manager auth token (or set MLSWEEP_TOKEN env)")
     parser.add_argument("--output-dir", default=None, help="Directory to download artifacts (optional)")
     parser.add_argument("--status", default=None, help="Filter jobs by status (done, failed, pending, etc.)")
     parsed = parser.parse_args(args)
 
-    token = parsed.token or os.environ.get("MLSWEEP_TOKEN", "")
-    if not token:
-        sweep_print(f"{_RED}Error: --token is required (or set MLSWEEP_TOKEN env){_RESET}")
-        sys.exit(1)
+    token = _require_token(parsed.token)
 
     manager = parsed.manager.rstrip("/")
 
@@ -1308,8 +1331,13 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Extra args after -- are passed to every training run.\n\n"
+            "Subcommands:\n"
+            "  mlsweep_run fetch --manager URL --experiment EXP_ID   fetch results + summary\n"
+            "  mlsweep_run watch EXP_ID --manager URL                live status\n\n"
             "Environment variables:\n"
-            "  MLSWEEP_TOKEN  Authentication token for manager\n"
+            "  MLSWEEP_MANAGER  Manager URL for fetch/watch (default: http://localhost:7891)\n"
+            "  MLSWEEP_TOKEN    Authentication token for manager\n"
+            "  MLSWEEP_DIR      Local state dir holding manager.token (default: ~/.mlsweep)\n"
         ),
     )
     parser.add_argument("sweep_file", help="Path to sweep .py file")
@@ -1317,8 +1345,9 @@ def main() -> None:
                         help="Manager URL (http://host:port)")
     parser.add_argument("--token", default=None,
                         help="Manager auth token (or set MLSWEEP_TOKEN env)")
-    parser.add_argument("--output-dir", default=os.path.join(_PROJECT_ROOT, "outputs", "sweeps"),
-                        help="Output directory for local artifacts")
+    parser.add_argument("--output-dir", default=str(_mlsweep_dir() / "submissions"),
+                        help="Directory for local submit-side artifacts (submit log + manifest). "
+                             "Results themselves live on the manager under ~/.mlsweep/experiments/.")
     parser.add_argument("--experiment", default=None,
                         help="Experiment name (default: <sweep>_<timestamp>)")
     parser.add_argument("--resume", default=None,
@@ -1497,20 +1526,11 @@ def main() -> None:
     # ── Manager required ───────────────────────────────────────────────────
     if not args.manager:
         sweep_print(f"\n{_RED}Error: --manager URL is required.{_RESET}")
-        sweep_print(f"Usage: run_sweep.py <sweep.py> --manager http://host:port [--stream]")
+        sweep_print(f"Usage: mlsweep_run <sweep.py> --manager http://host:port [--stream]")
         sys.exit(1)
 
     manager = args.manager.rstrip("/")
-    token = args.token or os.environ.get("MLSWEEP_TOKEN", "")
-    if not token:
-        # Auto-detect token from local manager file
-        token_file = Path("~/.mlsweep/manager.token").expanduser()
-        if token_file.exists():
-            token = token_file.read_text().strip()
-        if not token:
-            sweep_print(f"\n{_RED}Error: --token is required (or set MLSWEEP_TOKEN env, "
-                        f"or place token in ~/.mlsweep/manager.token){_RESET}")
-            sys.exit(1)
+    token = _require_token(args.token)
 
     sweep_print(f"\n{'=' * 80}")
     sweep_print(f"Connecting to manager: {manager}")

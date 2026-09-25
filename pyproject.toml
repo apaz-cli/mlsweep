@@ -24,6 +24,7 @@ all = ["wandb", "tensorboard"]
 test = ["torch", "pytest", "paramiko"]
 
 [project.scripts]
+mlsweep = "mlsweep.cli:main"
 mlsweep_run = "mlsweep.run_sweep:main"
 mlsweep_manager = "mlsweep.manager:main"
 mlsweep_worker = "mlsweep.worker:main"
@@ -33,7 +34,7 @@ where = [""]
 include = ["mlsweep*"]
 
 [tool.setuptools.package-data]
-mlsweep = ["_bin/.gitkeep", "webui/*"]
+mlsweep = ["_bin/.gitkeep", "webui/*", "docs/*.md"]
 
 [tool.mypy]
 python_version = "3.10"
