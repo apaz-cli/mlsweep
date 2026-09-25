@@ -1303,7 +1303,7 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
         sys.exit(1)
 
     # Download experiment artifacts
-    output_dir = parsed.output_dir or os.path.join(os.getcwd(), "mlsweep_downloads", parsed.experiment)
+    output_dir = parsed.output_dir or os.path.join(Path.home(), ".mlsweep", "downloads", parsed.experiment)
     manager_download_experiment(manager, token, parsed.experiment, output_dir)
 
 
