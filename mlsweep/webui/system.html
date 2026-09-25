@@ -62,6 +62,7 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .worker-host { font-size: 13px; font-weight: 600; color: var(--text-strong); font-family: monospace; }
 .worker-detail { font-size: 11px; color: var(--text-muted); }
 .worker-detail span { color: var(--text-dim); }
+.worker-error { font-size: 11px; color: #d62728; background: #d6272814; border: 1px solid #d6272833; border-radius: 4px; padding: 6px 8px; word-break: break-word; white-space: pre-wrap; }
 .worker-actions { display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 8px; }
 .worker-last-seen { font-size: 10px; color: var(--text-muted); }
 .btn-disconnect { font-size: 11px; padding: 2px 8px; border-radius: 3px; border: 1px solid #c0392b44; background: var(--btn-bg); color: #c0392b; cursor: pointer; }
@@ -189,12 +190,14 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
         <input id="fw-host" type="text" placeholder="user@hostname" autocomplete="off">
       </div>
       <div class="form-row">
-        <label for="fw-remote-dir">Remote directory <span style="color:#d62728">*</span></label>
+        <label for="fw-remote-dir">Project dir <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
         <input id="fw-remote-dir" type="text" placeholder="/home/user/project" autocomplete="off">
+        <span class="form-hint">Only needed for artifact-less runs or a project <code>.venv</code>. Your code ships automatically.</span>
       </div>
       <div class="form-row">
-        <label for="fw-venv">Venv path <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+        <label for="fw-venv">Worker venv <span style="color:var(--text-muted);font-weight:400">(optional, advanced)</span></label>
         <input id="fw-venv" type="text" placeholder="/home/user/venv" autocomplete="off">
+        <span class="form-hint">Locates the mlsweep worker binary only — not your training environment.</span>
       </div>
       <div class="form-row">
         <label for="fw-ssh-key">SSH key path <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
@@ -264,6 +267,10 @@ function badge(cls, label) {
   return `<span class="badge badge-${cls}">${label}</span>`;
 }
 
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
 function relTime(iso) {
   if (!iso) return "—";
   const diff = Date.now() - new Date(iso).getTime();
@@ -291,10 +298,6 @@ function fmtElapsed(s) {
 
   // Workers fetched on open; keyed by worker_id for reconnect lookups.
   let _knownWorkers = [];
-
-  function escHtml(s) {
-    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-  }
 
   function clearForm() {
     ["fw-host","fw-remote-dir","fw-venv","fw-ssh-key","fw-devices"].forEach(id => {
@@ -397,8 +400,8 @@ function fmtElapsed(s) {
     const devStr     = document.getElementById("fw-devices").value.trim();
     const devices    = devStr ? devStr.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)) : null;
 
-    if (!host || !remote_dir) {
-      errEl.textContent = "Host and remote directory are required.";
+    if (!host) {
+      errEl.textContent = "Host is required.";
       errEl.classList.remove("hidden");
       return;
     }
@@ -553,6 +556,7 @@ function renderWorkers(workers) {
         <span class="worker-host">${w.host}${w.port ? `:${w.port}` : ""}</span>
         ${badge(status, status)}
       </div>
+      ${w.last_error ? `<div class="worker-error">${escHtml(w.last_error)}</div>` : ""}
       ${renderGpuList(gpus, occ, gpuStats)}
       ${isLive ? `<div class="worker-controls">
         <div class="worker-control-row">

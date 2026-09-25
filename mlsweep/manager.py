@@ -253,6 +253,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     state.output_dir = os.path.join(str(mlsweep_dir), "experiments")
     state.artifact_base_url = f"http://{args.host}:{args.port}"
     state.token = token
+    state.manager_port = args.port
     state.dispatch_callback = lambda: schedule_pending(read_db, state)
 
     app = create_app(read_db, state, token, mlsweep_dir=mlsweep_dir)

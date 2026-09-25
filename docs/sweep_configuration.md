@@ -322,7 +322,7 @@ RUN_FROM = "/abs/path/to/dir"   # absolute
 RUN_FROM = "subdir"             # relative — resolved from git root
 ```
 
-This is useful when the sweep file lives outside the project root, or when the training command uses paths relative to a specific directory. Relative paths are resolved against the git root for local runs and against the worker's `remote_dir` for remote runs.
+This is useful when the sweep file lives outside the project root, or when the training command uses paths relative to a specific directory. Relative paths are resolved against the copy of your project that `mlsweep_run` uploads to each worker. If a job has no uploaded project, they are resolved against the worker's `remote_dir` instead. Absolute paths are used as-is.
 
 ### `EXTRA_FLAGS`
 

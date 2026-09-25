@@ -1266,7 +1266,10 @@ async def _reconnect_worker(
     async with state.scheduler_lock:
         wc.status = "dead"
 
-    await state.db_writer.update_worker_status(wc.worker_id, "dead")
+    await state.db_writer.update_worker_status(
+        wc.worker_id, "dead",
+        last_error=f"unreachable after {max_attempts} reconnect attempts",
+    )
 
     print(f"  {_RED}FAIL{_RESET}  Worker {wc.host} unreachable; re-queuing runs")
 
@@ -1535,7 +1538,7 @@ async def connect_single_worker(
     """Launch and connect to a single worker, register in state, and start tasks.
 
     Returns the ``WorkerConn`` on success, or ``None`` if the launch failed.
-    Callers should handle the ``None`` case (log, mark dead, etc.).
+    On failure the worker is marked dead with the reason as ``last_error``.
     """
     try:
         reader, writer, actual_port = await launch_worker(
@@ -1552,6 +1555,10 @@ async def connect_single_worker(
         )
     except Exception as e:
         print(f"  {_RED}WARN{_RESET}  Cannot start worker on {host}: {e}")
+        if worker_id is not None:
+            await state.db_writer.update_worker_status(
+                worker_id, "dead", last_error=str(e)
+            )
         return None
 
     # Determine worker_id if not provided.

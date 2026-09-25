@@ -1124,9 +1124,12 @@ async def handle_get_worker(request: web.Request) -> web.Response:
 async def handle_add_worker(request: web.Request) -> web.Response:
     """Add a new worker dynamically.
 
-    Accepts JSON body: {host (required), remote_dir (required), ssh_key?, venv?,
+    Accepts JSON body: {host (required), remote_dir?, ssh_key?, venv?,
     port?, devices?}.  Generates a worker_id from the host, upserts into the DB,
     and spawns a background task to connect to the worker.
+
+    ``remote_dir`` is optional: the training code is shipped as an artifact and
+    the worker falls back to its own working directory when it is empty.
     """
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
@@ -1137,9 +1140,9 @@ async def handle_add_worker(request: web.Request) -> web.Response:
         return _error_response("invalid JSON body")
 
     host = body.get("host")
-    remote_dir = body.get("remote_dir")
-    if not host or not remote_dir:
-        return _error_response("'host' and 'remote_dir' are required")
+    remote_dir = body.get("remote_dir") or ""
+    if not host:
+        return _error_response("'host' is required")
 
     ssh_key = body.get("ssh_key")
     venv = body.get("venv")
@@ -1694,12 +1697,12 @@ async def _connect_worker(
         venv=venv,
         port=port,
         devices=devices,
+        manager_port=state.manager_port,
     )
     if wc is None:
-        await state.db_writer.update_worker_status(worker_id, "dead")
         return
 
-    # Update DB status
+    # Update DB status (clears any previous last_error)
     await state.db_writer.update_worker_status(worker_id, "connected")
 
     logger.info("Dynamic worker %s connected on %s:%d", worker_id, host, wc.port)

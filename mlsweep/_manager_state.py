@@ -95,6 +95,7 @@ class ManagerState:
         self.output_dir: str = output_dir
         self.artifact_base_url: str = artifact_base_url
         self.token: str = token
+        self.manager_port: int = 0
         self.dispatch_callback: Any = None
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}

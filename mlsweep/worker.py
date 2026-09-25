@@ -306,7 +306,7 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
     else:
         workspace = None
         remote_dir = msg.remote_dir or _remote_dir
-        cwd = _resolve_safe_subpath(remote_dir, msg.run_from) if msg.run_from else remote_dir
+        cwd = remote_dir
 
     # ── Artifact download & extraction ───────────────────────────────────────
     if msg.artifact_id and msg.artifact_url:
@@ -358,6 +358,16 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
                 )))
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    # ── RUN_FROM: working directory for the run ────────────────────────────
+    # Resolve against the run's base cwd (the extracted workspace when a file
+    # payload or artifact was shipped, otherwise remote_dir).  Relative paths
+    # must stay within the base; absolute paths are used as-is.
+    if msg.run_from:
+        if os.path.isabs(msg.run_from):
+            cwd = msg.run_from
+        else:
+            cwd = _resolve_safe_subpath(cwd, msg.run_from)
 
     # Build base env shared by all ranks
     device_str = ",".join(str(g) for g in msg.gpu_ids)

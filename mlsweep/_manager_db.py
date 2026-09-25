@@ -74,6 +74,7 @@ class WorkerRecord:
     ssh_key: str | None = None
     venv: str | None = None
     devices: str | None = None  # JSON list of ints
+    last_error: str | None = None  # human-readable reason for the last failure
 
 
 @dataclass(order=False)
@@ -216,6 +217,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         ssh_key=row["ssh_key"],
         venv=row["venv"],
         devices=row["devices"],
+        last_error=row["last_error"],
     )
 
 
@@ -355,7 +357,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
             port          INTEGER NOT NULL DEFAULT 7890,
             ssh_key       TEXT,
             venv          TEXT,
-            devices       TEXT
+            devices       TEXT,
+            last_error    TEXT
         );
     """)
 
@@ -577,6 +580,7 @@ async def upsert_worker(
     venv: str | None = None,
     devices: str | None = None,
     status: WorkerStatus = "connected",
+    last_error: str | None = None,
 ) -> WorkerRecord:
     """Insert or update a worker row; set last_seen = now."""
     now = _now_epoch()
@@ -584,8 +588,8 @@ async def upsert_worker(
         db,
         """
         INSERT INTO workers (worker_id, host, remote_dir, status, last_seen,
-                             scratch_dir, port, ssh_key, venv, devices)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             scratch_dir, port, ssh_key, venv, devices, last_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (worker_id) DO UPDATE SET
             host = EXCLUDED.host,
             remote_dir = EXCLUDED.remote_dir,
@@ -595,11 +599,12 @@ async def upsert_worker(
             port = EXCLUDED.port,
             ssh_key = EXCLUDED.ssh_key,
             venv = EXCLUDED.venv,
-            devices = EXCLUDED.devices
+            devices = EXCLUDED.devices,
+            last_error = EXCLUDED.last_error
         RETURNING *;
         """,
         (worker_id, host, remote_dir, status, now,
-         scratch_dir, port, ssh_key, venv, devices),
+         scratch_dir, port, ssh_key, venv, devices, last_error),
     )
     await db.commit()
     assert row is not None
@@ -623,13 +628,19 @@ async def update_worker_status(
     db: aiosqlite.Connection,
     worker_id: str,
     status: WorkerStatus,
+    last_error: str | None = None,
 ) -> WorkerRecord | None:
-    """Update a worker's status and last_seen. Returns updated row or None."""
+    """Update a worker's status and last_seen. Returns updated row or None.
+
+    ``last_error`` records a human-readable failure reason when moving to a
+    failed state.  Passing ``None`` (the default) clears any previous error.
+    """
     now = _now_epoch()
     row = await _exec_one(
         db,
-        "UPDATE workers SET status = ?, last_seen = ? WHERE worker_id = ? RETURNING *",
-        (status, now, worker_id),
+        "UPDATE workers SET status = ?, last_seen = ?, last_error = ? "
+        "WHERE worker_id = ? RETURNING *",
+        (status, now, last_error, worker_id),
     )
     await db.commit()
     return _row_to_worker(row) if row else None
@@ -1866,19 +1877,22 @@ class DbWriter:
         venv: str | None = None,
         devices: str | None = None,
         status: WorkerStatus = "connected",
+        last_error: str | None = None,
     ) -> WorkerRecord:
         db = self._db
         return await self._enqueue(lambda: upsert_worker(
             db, worker_id=worker_id, host=host, remote_dir=remote_dir,
             scratch_dir=scratch_dir, port=port, ssh_key=ssh_key,
-            venv=venv, devices=devices, status=status,
+            venv=venv, devices=devices, status=status, last_error=last_error,
         ))
 
     async def update_worker_status(
-        self, worker_id: str, status: WorkerStatus
+        self, worker_id: str, status: WorkerStatus, last_error: str | None = None
     ) -> WorkerRecord | None:
         db = self._db
-        return await self._enqueue(lambda: update_worker_status(db, worker_id, status))
+        return await self._enqueue(
+            lambda: update_worker_status(db, worker_id, status, last_error)
+        )
 
     async def touch_worker(self, worker_id: str) -> None:
         db = self._db
