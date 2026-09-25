@@ -20,7 +20,7 @@ pip install 'mlsweep[all]'
 
 That's it. Remote workers get mlsweep bootstrapped automatically over SSH, no install needed.
 
-You don't need to run the manager, client, or worker on separate machines — by default they all run on the same machine. The single `mlsweep` command gives you all of them (`mlsweep manager` / `mlsweep run` / `mlsweep worker`), and the individual `mlsweep_manager` / `mlsweep_run` / `mlsweep_worker` binaries still work.
+You don't need to run the manager, client, or worker on separate machines. By default they all run on the same machine. The single `mlsweep` command gives you all of them (`mlsweep manager` / `mlsweep run` / `mlsweep worker`), and the individual `mlsweep_manager` / `mlsweep_run` / `mlsweep_worker` binaries still work.
 
 ## Add logging to your training script
 
@@ -151,15 +151,25 @@ mlsweep run sweeps/my_sweep.py --dry-run                                 # print
 
 Every client command resolves the token the same way, in order: `--token`, then `MLSWEEP_TOKEN`, then `~/.mlsweep/manager.token` (saved there by the manager on startup).
 
-### 3. Monitor and fetch results
+### 3. Monitor, rank, and fetch results
 
 ```sh
 mlsweep status                                       # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                                 # live terminal status
-mlsweep fetch --experiment EXP_ID                    # summary + download results
+mlsweep ls                                           # list experiments (`mlsweep ls EXP_ID` lists runs)
+mlsweep logs RUN_ID --experiment EXP_ID              # tail a run's training.log
+mlsweep best --experiment EXP_ID                     # top runs by metric (leaderboard)
+mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
 
-`watch`, `fetch`, and `status` default `--manager` to `http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`); `run` requires `--manager`.
+`watch`, `fetch`, `status`, `ls`, `logs`, and `best` default `--manager` to
+`http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`). `run`
+requires `--manager`. Add `--json` to `status`, `ls`, `best`, or `fetch` for
+machine-readable output.
+
+Control a running sweep with `mlsweep cancel EXP --failed`, `mlsweep retry EXP --failed`,
+`mlsweep resume EXP`, `mlsweep pause EXP`, `mlsweep unpause EXP`, or `mlsweep stop EXP --yes`.
+`cancel`, `retry`, and `resume` exit non-zero if any targeted run fails.
 
 For a project-local interface, run `mlsweep gen_makefile` in your repo to add `make sweep-run` / `sweep-watch` / `sweep-fetch` / `sweep-status` targets.
 
@@ -214,14 +224,24 @@ All flags below assume `--manager http://localhost:7891`:
 | `--wandb-project P` | Stream metrics to W&B |
 | `--tensorboard-dir D` | Write TensorBoard logs |
 
-Subcommands (`mlsweep <subcommand>`):
+Subcommands (`mlsweep <subcommand>`, or `mlsweep --help` for the full grouped list):
 
 ```sh
-mlsweep fetch --experiment EXP_ID    # download results + summary
-mlsweep watch EXP_ID                 # live status
-mlsweep status                       # manager / token / GPU / result-path diagnostics
-mlsweep docs                         # read the bundled runbook
-mlsweep gen_makefile                 # write a standard Makefile (make sweep-run / sweep-watch / ...)
+# run
+mlsweep manager / run / worker / gen_makefile
+
+# monitor
+mlsweep watch EXP_ID                 mlsweep fetch --experiment EXP_ID
+mlsweep best  --experiment EXP_ID    mlsweep ls [EXP_ID]
+mlsweep logs RUN_ID --experiment EXP_ID    mlsweep status
+
+# control
+mlsweep cancel EXP --failed          mlsweep retry EXP --failed
+mlsweep resume EXP                   mlsweep pause EXP
+mlsweep unpause EXP                  mlsweep stop EXP --yes
+
+# docs
+mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, skill
 ```
 
 ### Using with W&B

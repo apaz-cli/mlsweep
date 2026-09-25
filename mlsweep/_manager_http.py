@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import importlib.metadata
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ from mlsweep._manager_workers import (
 from mlsweep._shared import MsgCancel, MsgShutdown, _resolve_safe_subpath, encode
 
 logger = logging.getLogger(__name__)
+
+_VERSION = importlib.metadata.version("mlsweep")
 
 # ===============================================================================
 # JSON helpers
@@ -1594,6 +1597,7 @@ async def handle_health(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
     return _json_response({
         "status": "ok",
+        "version": _VERSION,
         "workers_connected": len(state.workers),
         "jobs_pending": await count_pending_jobs(db),
         "jobs_in_flight": len(state.in_flight),

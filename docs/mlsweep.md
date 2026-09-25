@@ -12,7 +12,7 @@ mlsweep has three components:
 
 **`mlsweep_run`** is a thin HTTP client. Loads a sweep file, generates the run combinations, and POSTs them to the manager. It does not launch anything itself.
 
-All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `status`/`doctor`, `docs`, and `gen_makefile`.
+All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, and the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`.
 
 The manager bootstraps mlsweep on remote workers automatically over SSH (builds wheels locally, SCPs them, installs into `/tmp/mlsweep_venv/`). No manual install is needed on workers.
 
@@ -39,12 +39,23 @@ mlsweep manager --workers workers.toml    # remote workers
 mlsweep run sweeps/my_sweep.py --manager http://localhost:7891 --stream
 mlsweep run sweeps/my_sweep.py --validate   # or: print all combos without submitting
 
-# 3. Monitor / fetch
+# 3. Monitor / rank / fetch
 mlsweep status                             # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                       # live terminal status
-mlsweep fetch --experiment EXP_ID          # summary + download results
+mlsweep ls                                 # list experiments (`mlsweep ls EXP_ID` lists runs)
+mlsweep logs RUN_ID --experiment EXP_ID    # tail a run's training.log
+mlsweep best --experiment EXP_ID           # top runs by metric (leaderboard)
+mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
 
-# 4. View results in the browser
+# 4. Control a running sweep
+mlsweep cancel EXP_ID --failed             # cancel jobs (--running / --all --yes)
+mlsweep retry  EXP_ID --failed             # re-queue failed jobs
+mlsweep resume EXP_ID                      # continue an experiment
+mlsweep pause EXP_ID                       # stop dispatching new jobs
+mlsweep unpause EXP_ID                     # resume dispatching
+mlsweep stop EXP_ID --yes                  # abort a sweep
+
+# 5. View results in the browser
 # URL is printed at manager startup: http://localhost:7891/?token=...
 ```
 
@@ -309,3 +320,4 @@ The manager bootstraps mlsweep on remote machines automatically; no manual insta
 
 - `docs/sweep_configuration.md` — complete reference: all dim types, flags behavior, CLI options, output layout
 - `docs/examples.md` — DDP, multi-node, TorchTitan, Prime-RL patterns
+- `docs/SKILL.md` — the agent-facing quick reference (readable via `mlsweep --help skill`)

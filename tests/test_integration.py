@@ -119,6 +119,7 @@ def test_grid_end_to_end(manager_with_worker, tmp_path):
     result = _run("tests/sweeps/integration_grid.py", tmp_path,
                   "--fetch", manager_url=url)
     assert result.returncode == 0, result.stderr
+    assert "LEADERBOARD" in result.stdout
 
     # Check manifest written locally
     manifest = _manifest(tmp_path)

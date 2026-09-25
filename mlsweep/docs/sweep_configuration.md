@@ -627,35 +627,56 @@ The shebang line to use is:
 
 ### Subcommands
 
-`mlsweep_run` also supports two subcommands for interacting with submitted experiments:
+`mlsweep_run` also supports subcommands for interacting with submitted experiments:
 
 ```bash
-mlsweep_run fetch --manager http://host:port --experiment EXP_ID            # download artifacts/results
+mlsweep_run fetch --manager http://host:port --experiment EXP_ID            # download + summarize + rank results
 mlsweep_run fetch --manager http://host:port --experiment EXP_ID --status done  # filter by status
+mlsweep_run fetch --manager http://host:port --experiment EXP_ID --wait     # block until settled, then rank
 mlsweep_run watch EXP_ID --manager http://host:port                         # stream live status to terminal
 ```
 
 `fetch --status` accepts: `done`, `failed`, `pending`, `running`, `dispatched`.
+`fetch` ranks runs by `--metric` (default `loss`) and `--goal` (`minimize` or
+`maximize`). Use `mlsweep best --experiment EXP_ID` for just the leaderboard, or add
+`--json` to either for machine-readable output.
 
 ## Command-Line Options
 
 ### `mlsweep`
 
-The unified entry point (`mlsweep --help` prints the workflow). Individual binaries remain as aliases.
+The unified entry point (`mlsweep --help` prints the workflow, grouped into Run /
+Monitor / Control / Docs). Individual binaries remain as aliases.
 
 | Subcommand | Description |
 |-----------|-------------|
 | `manager` | Start the manager daemon (alias of `mlsweep_manager`). |
 | `run` | Submit a sweep (alias of `mlsweep_run`). |
 | `worker` | Start a worker daemon (alias of `mlsweep_worker`). |
-| `watch <exp_id>` | Live terminal status for an experiment. |
-| `fetch` | Download + summarize an experiment's results. |
-| `status` (`doctor`) | Diagnose manager / token / GPUs / result paths. |
-| `docs [topic]` | Print the bundled runbook. |
 | `gen_makefile` | Write a standard `Makefile` (adds `make sweep-*` targets). |
+| `watch <exp_id>` | Live terminal status for an experiment. |
+| `fetch` | Download + summarize + rank an experiment's results (leaderboard). |
+| `best` | Show the top runs of an experiment by metric. |
+| `status` (`doctor`) | Diagnose manager / token / GPUs / results / disk. |
+| `ls [exp_id]` | List experiments, or the runs within one experiment. |
+| `logs <run_id>` | Print (and optionally follow) a run's training log. |
+| `cancel <exp_id>` | Cancel runs (`--failed` / `--running` / `--all`). |
+| `retry <exp_id>` | Re-queue failed runs. |
+| `resume <exp_id>` | Continue an experiment. |
+| `stop <exp_id>` | Abort a sweep (requires `--yes`). |
+| `pause <exp_id>` | Stop dispatching new jobs. |
+| `unpause <exp_id>` | Resume dispatching. |
+| `docs [topic]` | Print the bundled runbook. |
 | `version` | Print the mlsweep version. |
 
-`watch`, `fetch`, and `status` default `--manager` to `http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`); `run` requires `--manager`.
+`watch`, `fetch`, `best`, `status`, `ls`, and `logs` default `--manager` to
+`http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`). `run`
+requires `--manager`. `fetch` and `best` rank by `--metric` (default `loss`) with
+`--goal` (`minimize` or `maximize`). `fetch` supports `--wait`, `--top`, and `--json`.
+`status`, `ls`, `best`, and `fetch` also accept `--json`.
+
+`cancel`, `retry`, and `resume` exit non-zero if any targeted run fails, so
+scripts can detect partial failures.
 
 ### `mlsweep_manager`
 

@@ -7,6 +7,7 @@ imported lazily so ``mlsweep --help`` stays fast.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections.abc import Callable
@@ -57,32 +58,53 @@ def _build_help() -> str:
         (f"4. {_GREEN}mlsweep fetch --experiment <id>{_RESET}", "download results + summary"),
         (f"5. {_GREEN}mlsweep status{_RESET}", "manager / token / GPU / result paths"),
     ]
-    subcommands = [
-        ("manager [args...]", "start the manager daemon (mlsweep_manager)"),
-        ("run SWEEP.py [flags]", "submit a sweep (mlsweep_run)"),
-        ("worker [args...]", "start a worker daemon (mlsweep_worker)"),
-        ("watch EXP_ID", "live status for an experiment"),
-        ("fetch", "download + summarize an experiment's results"),
-        ("status | doctor", "diagnose the environment"),
-        ("docs [topic]", "read the bundled runbook (README by default)"),
-        ("gen_makefile", "write a standard Makefile into the current directory"),
-        ("version", "print the version"),
+    sections = [
+        ("Run", [
+            ("manager [args...]", "start the manager daemon (mlsweep_manager)"),
+            ("run SWEEP.py [flags]", "submit a sweep (mlsweep_run)"),
+            ("worker [args...]", "start a worker daemon (mlsweep_worker)"),
+            ("gen_makefile", "write a standard Makefile into the current directory"),
+        ]),
+        ("Monitor", [
+            ("watch EXP_ID", "live status for an experiment"),
+            ("fetch", "download + summarize an experiment's results (leaderboard)"),
+            ("best", "top runs by metric"),
+            ("status | doctor", "diagnose the environment"),
+            ("ls [EXP]", "list experiments / runs"),
+            ("logs RUN", "tail a run's training.log"),
+        ]),
+        ("Control", [
+            ("cancel EXP", "cancel runs (--failed/--running/--all)"),
+            ("retry EXP", "re-queue failed runs"),
+            ("resume EXP", "continue an experiment"),
+            ("stop EXP", "abort a sweep"),
+            ("pause EXP", "stop dispatching new jobs"),
+            ("unpause EXP", "resume dispatching"),
+        ]),
+        ("Docs", [
+            ("docs [topic]", "read the bundled runbook (README by default)"),
+            ("version", "print the version"),
+        ]),
     ]
-    return "\n".join([
-        f"{_CYAN}mlsweep{_RESET} — experiment sweep engine.",
+    lines = [
+        f"{_CYAN}mlsweep{_RESET}, an experiment sweep engine.",
         "",
         "Workflow:",
         _align(workflow),
         "",
-        "Subcommands:",
-        _align(subcommands),
-        "",
-        "watch/fetch/status default --manager to $MLSWEEP_MANAGER or http://localhost:7891;",
+    ]
+    for header, rows in sections:
+        lines.append(f"{header}:")
+        lines.append(_align(rows))
+        lines.append("")
+    lines += [
+        "watch/fetch/best/status/ls/logs default --manager to $MLSWEEP_MANAGER or http://localhost:7891.",
         "`run` requires --manager explicitly.",
         "Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
-        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples)",
-        f"      or {_CYAN}mlsweep docs{_RESET}; {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
-    ]) + "\n"
+        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, skill)",
+        f"      or {_CYAN}mlsweep docs{_RESET}. {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 _HELP = _build_help()
@@ -96,7 +118,7 @@ _DOC_ALIASES = {
     "configuration": "sweep_configuration.md",
     "sweeps": "sweep_configuration.md",
     "mlsweep": "mlsweep.md",
-    "skill": "mlsweep.md",
+    "skill": "SKILL.md",
     "examples": "examples.md",
 }
 
@@ -108,7 +130,14 @@ def _build_makefile_template() -> str:
         ("make sweep-dry-run", "S=<path>", "print commands without running"),
         ("make sweep-run", "S=<path>", "submit + stream live status"),
         ("make sweep-watch", "E=<id>", "watch an experiment"),
-        ("make sweep-fetch", "E=<id>", "fetch results + summary"),
+        ("make sweep-fetch", "E=<id>", "fetch results + leaderboard"),
+        ("make sweep-best", "E=<id>", "top runs by metric"),
+        ("make sweep-ls", "E=<id>", "list experiments / runs"),
+        ("make sweep-logs", "R=<id> E=<id>", "tail a run's training.log"),
+        ("make sweep-cancel", "E=<id>", "cancel failed runs"),
+        ("make sweep-retry", "E=<id>", "re-queue failed runs"),
+        ("make sweep-resume", "E=<id>", "continue an experiment"),
+        ("make sweep-stop", "E=<id>", "abort a sweep (destructive)"),
         ("make sweep-docs", "", "read the full runbook"),
     ]
     help_block = "\n".join(f'\t@echo "{line}"' for line in _align3(help_rows).split("\n"))
@@ -119,8 +148,9 @@ def _build_makefile_template() -> str:
         "MLSWEEP_MANAGER ?= http://localhost:7891\n"
         "S ?=\n"
         "E ?=\n"
+        "R ?=\n"
         "\n"
-        ".PHONY: help sweep-manager sweep-status sweep-docs sweep-validate sweep-dry-run sweep-run sweep-watch sweep-fetch sweep-gen\n"
+        ".PHONY: help sweep-manager sweep-status sweep-docs sweep-validate sweep-dry-run sweep-run sweep-watch sweep-fetch sweep-best sweep-ls sweep-logs sweep-cancel sweep-retry sweep-resume sweep-stop sweep-gen\n"
         "\n"
         "help:\n"
         '\t@echo "mlsweep targets:"\n'
@@ -150,6 +180,27 @@ def _build_makefile_template() -> str:
         "sweep-fetch:\n"
         "\tmlsweep fetch --manager $(MLSWEEP_MANAGER) --experiment $(E)\n"
         "\n"
+        "sweep-best:\n"
+        "\tmlsweep best --manager $(MLSWEEP_MANAGER) --experiment $(E)\n"
+        "\n"
+        "sweep-ls:\n"
+        "\tmlsweep ls $(E) --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
+        "sweep-logs:\n"
+        "\tmlsweep logs $(R) --experiment $(E) --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
+        "sweep-cancel:\n"
+        "\tmlsweep cancel $(E) --failed --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
+        "sweep-retry:\n"
+        "\tmlsweep retry $(E) --failed --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
+        "sweep-resume:\n"
+        "\tmlsweep resume $(E) --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
+        "sweep-stop:\n"
+        "\tmlsweep stop $(E) --yes --manager $(MLSWEEP_MANAGER)\n"
+        "\n"
         "sweep-gen:\n"
         "\tmlsweep gen_makefile --force\n"
     )
@@ -162,7 +213,15 @@ _MAKEFILE_TEMPLATE = _build_makefile_template()
 
 
 def _status_cmd(argv: list[str]) -> None:
-    from mlsweep.run_sweep import _add_manager_args, _http_request, _manager_url, _resolve_token
+    import shutil
+    from importlib.metadata import version as _pkg_version
+    from mlsweep.run_sweep import (
+        _add_manager_args,
+        _http_request,
+        _manager_url,
+        _resolve_token,
+        manager_list_experiments,
+    )
     from mlsweep.worker import _query_gpu_stats
 
     parser = argparse.ArgumentParser(
@@ -170,12 +229,46 @@ def _status_cmd(argv: list[str]) -> None:
         description="Check the mlsweep environment: manager, token, GPUs, results.",
     )
     _add_manager_args(parser)
+    parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args(argv)
 
     manager = args.manager.rstrip("/")
     token = _resolve_token(args.token)
     mlsweep_dir = _mlsweep_dir()
     token_file = mlsweep_dir / "manager.token"
+    local_version = _pkg_version("mlsweep")
+
+    status, resp = _http_request("GET", _manager_url(manager, "/api/health"), token, timeout=10)
+    health = resp if isinstance(resp, dict) else {}
+    manager_up = status not in (0, 401)
+    manager_version = health.get("version")
+
+    gpus = _query_gpu_stats()
+    disk = shutil.disk_usage(mlsweep_dir)
+
+    exps = (manager_list_experiments(manager, token) or []) if manager_up else []
+    experiments = [e["experiment_id"] for e in exps if isinstance(e, dict) and e.get("experiment_id")]
+
+    if args.json:
+        print(json.dumps({
+            "manager": manager,
+            "results_dir": str(mlsweep_dir / "experiments"),
+            "dashboard": f"{manager}/?token=<token>",
+            "mlsweep_dir": str(mlsweep_dir),
+            "local_version": local_version,
+            "manager_up": manager_up,
+            "manager_status": status,
+            "manager_version": manager_version,
+            "workers_connected": health.get("workers_connected"),
+            "jobs_pending": health.get("jobs_pending"),
+            "jobs_in_flight": health.get("jobs_in_flight"),
+            "token_present": bool(token),
+            "gpus": gpus,
+            "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+            "recent_experiments": experiments[-5:],
+            "n_experiments": len(experiments),
+        }, indent=2))
+        return
 
     print(f"{_CYAN}mlsweep status{_RESET}")
     print(f"  {_label('manager:')}{manager}")
@@ -183,30 +276,31 @@ def _status_cmd(argv: list[str]) -> None:
     print(f"  {_label('dashboard:')}{manager}/?token=<token>")
     print()
 
-    # ── Manager health ─────────────────────────────────────────────────────
-    status, resp = _http_request("GET", _manager_url(manager, "/api/health"), token, timeout=10)
     if status == 0:
-        print(f"  {_label('manager:')}{_RED}DOWN{_RESET} — no response from {manager}")
+        print(f"  {_label('manager:')}{_RED}DOWN{_RESET}, no response from {manager}")
         print(f"{_CONT}start it with: {_GREEN}mlsweep manager{_RESET}")
     elif status == 401:
-        print(f"  {_label('manager:')}{_YELLOW}UP{_RESET} — but rejected the token (401)")
+        print(f"  {_label('manager:')}{_YELLOW}UP{_RESET}, but rejected the token (401)")
         if not token:
             print(f"{_CONT}no token found; expected at {token_file}")
         else:
             print(f"{_CONT}token present but wrong; check {token_file}")
     else:
-        h = resp if isinstance(resp, dict) else {}
-        print(f"  {_label('manager:')}{_GREEN}UP{_RESET}  workers={h.get('workers_connected', '?')}"
-              f"  jobs_pending={h.get('jobs_pending', '?')}  jobs_in_flight={h.get('jobs_in_flight', '?')}")
+        print(f"  {_label('manager:')}{_GREEN}UP{_RESET}  workers={health.get('workers_connected', '?')}"
+              f"  jobs_pending={health.get('jobs_pending', '?')}  jobs_in_flight={health.get('jobs_in_flight', '?')}")
 
-    # ── Token ──────────────────────────────────────────────────────────────
     if token:
         print(f"  {_label('token:')}present ({len(token)} chars)")
     else:
-        print(f"  {_label('token:')}{_RED}missing{_RESET} — set MLSWEEP_TOKEN or write {token_file}")
+        print(f"  {_label('token:')}{_RED}missing{_RESET}, set MLSWEEP_TOKEN or write {token_file}")
 
-    # ── GPUs (best effort) ──────────────────────────────────────────────────
-    gpus = _query_gpu_stats()
+    ver = local_version
+    if manager_version and manager_version != local_version:
+        ver = f"{_YELLOW}{local_version} (manager {manager_version}){_RESET}"
+    print(f"  {_label('version:')}{ver}")
+
+    print(f"  {_label('disk:')}{disk.free / 1e9:.1f}G free of {disk.total / 1e9:.1f}G on {mlsweep_dir}")
+
     if gpus:
         print(f"  {_label('gpus:')}{len(gpus)} visible")
         for g in gpus:
@@ -214,19 +308,13 @@ def _status_cmd(argv: list[str]) -> None:
     else:
         print(f"  {_label('gpus:')}{_YELLOW}none visible{_RESET} (no nvidia-smi / rocm-smi output)")
 
-    # ── Recent experiments (if authorized) ─────────────────────────────────
-    if status not in (0, 401):
-        e_status, experiments = _http_request("GET", _manager_url(manager, "/api/experiments"), token, timeout=10)
-        if e_status == 200 and isinstance(experiments, list):
-            ids = [e["experiment_id"] for e in experiments if isinstance(e, dict) and e.get("experiment_id")]
-            if ids:
-                print(f"  {_label('recent:')}{len(ids)} experiments; latest:")
-                for eid in ids[-5:]:
-                    print(f"{_CONT}{eid}")
-        else:
-            print(f"  {_label('recent:')}{_YELLOW}could not list{_RESET} (HTTP {e_status})")
+    if manager_up and experiments:
+        print(f"  {_label('recent:')}{len(experiments)} experiments; latest:")
+        for eid in experiments[-5:]:
+            print(f"{_CONT}{eid}")
+    elif manager_up:
+        print(f"  {_label('recent:')}none")
 
-    # ── Quick start ────────────────────────────────────────────────────────
     print()
     print(f"{_CYAN}Quick start:{_RESET}")
     print("  mlsweep manager")
@@ -308,6 +396,10 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 # ── dispatch ───────────────────────────────────────────────────────────────────
 
 
+# Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
+_CTL_CMDS = frozenset({"ls", "logs", "cancel", "retry", "resume", "stop", "pause", "unpause", "best"})
+
+
 def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:
     sys.argv = [prog, *argv]
     fn()
@@ -369,6 +461,11 @@ def main() -> None:
 
     if cmd == "gen_makefile":
         _gen_makefile_cmd(rest)
+        return
+
+    if cmd in _CTL_CMDS:
+        import mlsweep.ctl
+        getattr(mlsweep.ctl, f"{cmd}_cmd")(rest)
         return
 
     print(f"{_RED}Unknown subcommand: {cmd}{_RESET}\n")

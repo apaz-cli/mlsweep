@@ -13,6 +13,7 @@ import base64
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -526,6 +528,8 @@ def manager_get_experiment_summary(
     manager: str,
     token: str,
     experiment_id: str,
+    *,
+    quiet: bool = False,
 ) -> dict[str, Any] | None:
     """Get experiment summary from manager."""
     status, resp = _http_request(
@@ -535,7 +539,23 @@ def manager_get_experiment_summary(
     )
     if status == 200 and isinstance(resp, dict):
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Get summary: {resp}")
+    if not quiet:
+        sweep_print(f"  {_RED}FAIL{_RESET}  Get summary: {resp}")
+    return None
+
+
+def manager_list_experiments(
+    manager: str,
+    token: str,
+    status_filter: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """List experiments on the manager."""
+    path = "/api/experiments"
+    if status_filter:
+        path += f"?status={status_filter}"
+    status, resp = _http_request("GET", _manager_url(manager, path), token, timeout=10)
+    if status == 200 and isinstance(resp, list):
+        return resp
     return None
 
 
@@ -588,6 +608,158 @@ def manager_retry_job(
     if status == 200 and isinstance(resp, dict):
         return resp
     return None
+
+
+def manager_set_experiment_status(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    status: str,
+) -> dict[str, Any] | None:
+    """Update an experiment's status (running | paused | completed | aborted)."""
+    s, resp = _http_request(
+        "PUT",
+        _manager_url(manager, f"/api/experiments/{experiment_id}/status"),
+        token,
+        json_data={"status": status},
+    )
+    if s == 200 and isinstance(resp, dict):
+        return resp
+    sweep_print(f"  {_RED}FAIL{_RESET}  set status {status}: {resp}")
+    return None
+
+
+def manager_get_job_logs(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    run_id: str,
+) -> str | None:
+    """Return a run's training log as text."""
+    status, resp = _http_request(
+        "GET",
+        _manager_url(manager, f"/api/experiments/{experiment_id}/jobs/{run_id}/logs"),
+        token,
+    )
+    if status == 200 and isinstance(resp, str):
+        return resp
+    return None
+
+
+_ACTIVE_JOB_STATUSES = ("pending", "dispatched", "running")
+_STATUS_ORDER = {"pending": 0, "dispatched": 1, "running": 2, "failed": 3, "cancelled": 4, "done": 5, "xfailed": 6}
+
+
+def _parse_combo(raw: Any) -> dict[str, Any] | None:
+    """Decode a job's combo, which the manager may send as a JSON string."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _combo_str(combo: Any) -> str:
+    """Render a job combo dict as `k=v` pairs."""
+    if not isinstance(combo, dict):
+        return ""
+    return "  ".join(f"{k}={v}" for k, v in combo.items())
+
+
+def build_leaderboard(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    metric: str = "loss",
+    goal: str = "minimize",
+    jobs: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Compute a ranked list of run results, best-first by *metric*.
+
+    Each row: {run_id, status, combo, value, final, elapsed, exit_code}.
+    """
+    if jobs is None:
+        jobs = manager_list_experiment_jobs(manager, token, experiment_id) or []
+
+    # Metrics are per-run requests; fetch them concurrently.
+    done_ids = [j.get("run_id") or "" for j in jobs if j.get("status") == "done"]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        all_metrics = dict(zip(done_ids, pool.map(
+            lambda rid: manager_get_job_metrics(manager, token, experiment_id, rid), done_ids)))
+
+    rows: list[dict[str, Any]] = []
+    for j in jobs:
+        st = j.get("status") or "?"
+        run_id = j.get("run_id") or ""
+        value = final = None
+        if st == "done":
+            metrics = all_metrics.get(run_id)
+            vals = [
+                float(r[metric])
+                for r in (metrics or [])
+                if isinstance(r, dict) and isinstance(r.get(metric), (int, float))
+                and math.isfinite(float(r[metric]))
+            ]
+            if vals:
+                value = min(vals) if goal == "minimize" else max(vals)
+                final = vals[-1]
+        rows.append({
+            "run_id": run_id,
+            "status": st,
+            "combo": _parse_combo(j.get("combo")),
+            "value": value,
+            "final": final,
+            "elapsed": j.get("elapsed"),
+            "exit_code": j.get("exit_code"),
+        })
+
+    def _key(r: dict[str, Any]) -> tuple[int, Any]:
+        if r["value"] is not None:
+            return (0, r["value"] if goal == "minimize" else -r["value"])
+        return (1, _STATUS_ORDER.get(r["status"], 9))
+
+    rows.sort(key=_key)
+    return rows
+
+
+def print_leaderboard(
+    rows: list[dict[str, Any]],
+    metric: str = "loss",
+    goal: str = "minimize",
+    top: int = 10,
+) -> None:
+    """Print the ranked runs."""
+    done = [r for r in rows if r["value"] is not None]
+    sweep_print(f"\n{'=' * 80}")
+    sweep_print(f"LEADERBOARD: {metric} ({goal}), {len(done)} completed runs")
+    sweep_print(f"{'=' * 80}")
+    if not done:
+        sweep_print("  (no completed runs with a metric value)")
+        return
+    shown = done[:top] if top else done
+    for i, r in enumerate(shown, 1):
+        final = f"  final={r['final']:.6f}" if isinstance(r["final"], (int, float)) else ""
+        sweep_print(f"  {i:>3}. {r['value']:>12.6f}{final}  {_GREEN}{r['run_id']}{_RESET}  {_combo_str(r['combo'])}")
+
+
+def _wait_until_settled(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    interval: int = 10,
+) -> None:
+    """Block until an experiment has no pending/dispatched/running jobs."""
+    sweep_print(f"Waiting for {experiment_id} to settle (Ctrl+C to stop)...")
+    while True:
+        resp = manager_get_experiment_summary(manager, token, experiment_id, quiet=True)
+        if resp:
+            counts = resp.get("job_counts") or {}
+            active = sum(int(counts.get(s, 0)) for s in _ACTIVE_JOB_STATUSES)
+            if active == 0:
+                sweep_print("  experiment settled.")
+                return
+        time.sleep(interval)
 
 
 def manager_check_artifact(
@@ -985,7 +1157,7 @@ def _stream_status_live(
     sweep_print(f"\n{'=' * 80}")
     ok = sum(1 for s in job_status.values() if s["status"] == "done")
     failed = sum(1 for s in job_status.values() if s["status"] == "failed")
-    running = sum(1 for s in job_status.values() if s["status"] in ("pending", "dispatched", "running"))
+    running = sum(1 for s in job_status.values() if s["status"] in _ACTIVE_JOB_STATUSES)
     sweep_print(f"Final: {ok} OK, {failed} failed, {running} pending/running")
     sweep_print(f"{'=' * 80}")
 
@@ -1063,7 +1235,7 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
 
     n_ok = sum(1 for j in jobs if j["status"] == "done")
     n_fail = sum(1 for j in jobs if j["status"] == "failed")
-    n_pending = sum(1 for j in jobs if j["status"] in ("pending", "dispatched", "running"))
+    n_pending = sum(1 for j in jobs if j["status"] in _ACTIVE_JOB_STATUSES)
     n_cancelled = sum(1 for j in jobs if j["status"] == "cancelled")
     total = len(jobs)
 
@@ -1083,7 +1255,7 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
         elif status == "failed":
             exit_code = j["exit_code"]
             sweep_print(f"  {_RED} FAIL{_RESET}  {run_id} (exit {exit_code}){elapsed_str}")
-        elif status in ("pending", "dispatched", "running"):
+        elif status in _ACTIVE_JOB_STATUSES:
             sweep_print(f"  {_YELLOW}{status.upper()}{_RESET}  {run_id}")
         elif status == "cancelled":
             sweep_print(f"  {_YELLOW}CANCEL{_RESET}  {run_id}")
@@ -1270,7 +1442,7 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
 
 
 def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
-    """Fetch experiment results from a manager and print summary."""
+    """Fetch experiment results from a manager and print summary + leaderboard."""
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Fetch experiment results from mlsweep manager",
@@ -1279,28 +1451,50 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
     parser.add_argument("--experiment", required=True, help="Experiment ID to fetch")
     parser.add_argument("--output-dir", default=None, help="Directory to download artifacts (optional)")
     parser.add_argument("--status", default=None, help="Filter jobs by status (done, failed, pending, etc.)")
+    parser.add_argument("--metric", default="loss", help="Metric to rank runs by")
+    parser.add_argument("--goal", default="minimize", choices=["minimize", "maximize"], help="Rank direction")
+    parser.add_argument("--top", type=int, default=10, help="Show top N runs in the leaderboard (0 = all)")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON (skips download)")
+    parser.add_argument("--wait", action="store_true", help="Block until the experiment settles")
+    parser.add_argument("--wait-interval", type=int, default=10, help="Seconds between --wait polls")
     parsed = parser.parse_args(args)
 
     token = _require_token(parsed.token)
-
     manager = parsed.manager.rstrip("/")
 
-    # Get experiment summary
-    summary = manager_get_experiment_summary(manager, token, parsed.experiment)
+    if parsed.wait:
+        _wait_until_settled(manager, token, parsed.experiment, parsed.wait_interval)
+
+    summary = manager_get_experiment_summary(manager, token, parsed.experiment) or {}
+    jobs = manager_list_experiment_jobs(manager, token, parsed.experiment, status_filter=parsed.status)
+    if jobs is None:
+        sys.exit(1)
+
+    rows = build_leaderboard(manager, token, parsed.experiment, parsed.metric, parsed.goal, jobs=jobs)
+
+    if parsed.json:
+        out = {
+            "experiment_id": parsed.experiment,
+            "name": summary.get("name"),
+            "status": summary.get("status"),
+            "job_counts": summary.get("job_counts"),
+            "metric": parsed.metric,
+            "goal": parsed.goal,
+            "runs": rows,
+        }
+        print(json.dumps(out, indent=2))
+        return
+
     if summary:
         sweep_print(f"Experiment: {summary['name']}")
         sweep_print(f"Status:     {summary['status']}")
         counts = summary["job_counts"]
         if counts:
             sweep_print(f"Jobs:       {counts}")
-        sweep_print("")
 
-    # Get jobs
-    jobs = manager_list_experiment_jobs(manager, token, parsed.experiment, status_filter=parsed.status)
-    if jobs is not None:
+    if jobs:
         print_jobs_summary(jobs)
-    else:
-        sys.exit(1)
+    print_leaderboard(rows, parsed.metric, parsed.goal, parsed.top)
 
     # Download experiment artifacts
     output_dir = parsed.output_dir or os.path.join(Path.home(), ".mlsweep", "downloads", parsed.experiment)
@@ -1557,13 +1751,8 @@ def main() -> None:
         goal = optimize_cfg["goal"]
         told_count = 0
         for job in done_jobs:
-            combo = job["combo"]
-            if isinstance(combo, str):
-                try:
-                    combo = json.loads(combo)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-            if not isinstance(combo, dict):
+            combo = _parse_combo(job["combo"])
+            if combo is None:
                 continue
             run_id = job["run_id"]
             metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id)
@@ -1799,14 +1988,7 @@ def main() -> None:
                         tok,
                     )
                     if status_code == 200 and isinstance(job_resp, dict):
-                        combo_raw = job_resp["combo"]
-                        if isinstance(combo_raw, str):
-                            try:
-                                combo = json.loads(combo_raw)
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                        elif isinstance(combo_raw, dict):
-                            combo = combo_raw
+                        combo = _parse_combo(job_resp["combo"])
 
                 if combo is None:
                     return
@@ -1858,16 +2040,20 @@ def main() -> None:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"Fetching results...")
         sweep_print(f"{'=' * 80}")
+        metric = optimize_cfg.get("metric", "loss")
+        goal = optimize_cfg.get("goal", "minimize")
         jobs = manager_list_experiment_jobs(manager, token, experiment_id)
         if jobs is not None:
             print_jobs_summary(jobs)
+            print_leaderboard(build_leaderboard(manager, token, experiment_id, metric, goal, jobs=jobs), metric, goal)
         # Download experiment artifacts
         manager_download_experiment(manager, token, experiment_id, exp_dir)
     else:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"{n} jobs submitted.")
-        sweep_print(f"Monitor: {manager}/?token={token}")
-        sweep_print(f"Or use: run_sweep.py fetch --manager {manager} --experiment {experiment_id}")
+        sweep_print(f"Watch:   mlsweep watch {experiment_id} --manager {manager}")
+        sweep_print(f"Fetch:   mlsweep fetch --experiment {experiment_id} --manager {manager} --wait")
+        sweep_print(f"Results: ~/.mlsweep/experiments/{experiment_id}/")
         sweep_print(f"{'=' * 80}")
 
     if _log_file:
