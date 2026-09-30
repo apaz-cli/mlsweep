@@ -8,10 +8,13 @@ the manager API and share helpers with ``mlsweep.run_sweep``.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from mlsweep._shared import _GREEN, _RED, _RESET
@@ -24,6 +27,7 @@ from mlsweep.run_sweep import (
     build_leaderboard,
     manager_cancel_job,
     manager_get_job_logs,
+    manager_get_job_metrics,
     manager_list_experiment_jobs,
     manager_list_experiments,
     manager_retry_job,
@@ -159,6 +163,144 @@ def logs_cmd(argv: list[str]) -> None:
                     seen = len(newer)
         except KeyboardInterrupt:
             sweep_print("\n  interrupted.")
+
+
+# ── metrics ────────────────────────────────────────────────────────────────────
+#
+# A read-only view of what runs already logged.  Everything is fetched and
+# reshaped per invocation; nothing is stored or cached.
+
+
+def _sort_key(v: str) -> tuple[int, Any]:
+    try:
+        return (0, float(v))
+    except ValueError:
+        return (1, v)
+
+
+def _fmt(v: Any) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:.6g}"
+    return str(v)
+
+
+def _print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(headers)]
+    print("  ".join(h.rjust(w) for h, w in zip(headers, widths)))
+    for r in rows:
+        print("  ".join(c.rjust(w) for c, w in zip(r, widths)))
+
+
+def select_metrics(rows: list[dict[str, Any]], pattern: re.Pattern[str] | None) -> list[dict[str, Any]]:
+    """Keep only keys matching *pattern* (plus ``step``); drop steps with none left."""
+    out = []
+    for row in rows:
+        kept = {k: v for k, v in row.items()
+                if k != "step" and (pattern is None or pattern.search(k))}
+        if kept:
+            out.append({"step": row.get("step"), **kept})
+    return out
+
+
+def pivot_metrics(rows: list[dict[str, Any]], pattern: re.Pattern[str],
+                  step: int | None) -> tuple[int | None, dict[str, Any]]:
+    """For a pattern with one capture group, return ``(step, {capture: value})`` from the
+    latest logged step at or before *step* (the latest overall if None) that has any
+    matching key.  Turns flat keys like ``val/nll@r16`` into a curve over the capture."""
+    chosen = None
+    for row in sorted(rows, key=lambda r: r.get("step") or 0):
+        if step is not None and (row.get("step") or 0) > step:
+            break
+        if any(k != "step" and pattern.search(k) for k in row):
+            chosen = row
+    if chosen is None:
+        return None, {}
+    vals = {}
+    for k, v in chosen.items():
+        m = pattern.search(k) if k != "step" else None
+        if m:
+            vals[m.group(1)] = v
+    return chosen.get("step"), vals
+
+
+def metrics_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep metrics",
+        "Print what runs logged, filtered and reshaped on demand (nothing is stored).",
+    )
+    parser.add_argument("--experiment", required=True, help="Experiment ID")
+    parser.add_argument("runs", nargs="*", help="Run IDs (default: every run in the experiment)")
+    parser.add_argument("--keys", default=None, help="Regex selecting metric keys")
+    parser.add_argument("--pivot", action="store_true",
+                        help="Turn keys into rows using --keys' first capture group, e.g. "
+                             "--keys 'val/nll@r(\\d+)' --pivot prints value vs. r, one column "
+                             "per run (a curve from flat keys)")
+    parser.add_argument("--step", type=int, default=None,
+                        help="With --pivot: use this step (latest at or before it; default: latest)")
+    parser.add_argument("--tail", type=int, default=10,
+                        help="Steps per run in the table view (default 10; 0 = all)")
+    fmt = parser.add_mutually_exclusive_group()
+    fmt.add_argument("--json", action="store_true", help="Emit the selected metrics as JSON")
+    fmt.add_argument("--csv", action="store_true", help="Emit long-format CSV: run,step,key,value")
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+
+    try:
+        pattern = re.compile(args.keys) if args.keys else None
+    except re.error as e:
+        sweep_print(f"{_RED}Bad --keys regex{_RESET}: {e}")
+        sys.exit(2)
+
+    run_ids = list(args.runs)
+    if not run_ids:
+        jobs = manager_list_experiment_jobs(manager, token, args.experiment) or []
+        run_ids = [j["run_id"] for j in jobs]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = pool.map(lambda rid: manager_get_job_metrics(manager, token, args.experiment, rid),
+                           run_ids)
+        per_run = {rid: select_metrics(rows or [], pattern) for rid, rows in zip(run_ids, fetched)}
+    per_run = {rid: rows for rid, rows in per_run.items() if rows}
+    if not per_run:
+        sweep_print(f"{_RED}No metrics{_RESET} in {args.experiment}"
+                    + (f" matching {args.keys!r}" if args.keys else ""))
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(per_run, indent=2))
+        return
+    if args.csv:
+        w = csv.writer(sys.stdout)
+        w.writerow(["run", "step", "key", "value"])
+        for rid, rows in per_run.items():
+            for row in rows:
+                for k, v in row.items():
+                    if k != "step":
+                        w.writerow([rid, row["step"], k, v])
+        return
+
+    if args.pivot:
+        if pattern is None or pattern.groups < 1:
+            sweep_print(f"{_RED}--pivot needs --keys with a capture group{_RESET}, "
+                        "e.g. --keys 'val/nll@r(\\d+)'")
+            sys.exit(2)
+        cols = []
+        for rid, rows in per_run.items():
+            step, vals = pivot_metrics(rows, pattern, args.step)
+            if vals:
+                cols.append((f"{rid} @{step}", vals))
+        xs = sorted({x for _, vals in cols for x in vals}, key=_sort_key)
+        _print_table(["x"] + [c for c, _ in cols],
+                     [[x] + [_fmt(vals.get(x)) for _, vals in cols] for x in xs])
+        return
+
+    for rid, rows in per_run.items():
+        keys = sorted({k for r in rows for k in r if k != "step"})
+        shown = rows[-args.tail:] if args.tail else rows
+        print(f"== {rid}  ({len(rows)} steps)")
+        _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(k)) for k in keys] for r in shown])
+        print()
 
 
 # ── cancel / retry ─────────────────────────────────────────────────────────────

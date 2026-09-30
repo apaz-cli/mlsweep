@@ -50,6 +50,25 @@ def _label(label: str) -> str:
     return _pad(label, _LABEL_WIDTH) + "  "
 
 
+_BANNER_ART = r"""           ___
+          /\_ \
+  ___ ___ \//\ \     ____  __  __  __     __     __   _____
+/' __` __`\ \ \ \   /',__\/\ \/\ \/\ \  /'__`\ /'__`\/\ '__`\
+/\ \/\ \/\ \ \_\ \_/\__, `\ \ \_/ \_/ \/\  __//\  __/\ \ \L\ \
+\ \_\ \_\ \_\/\____\/\____/\ \___x___/'\ \____\ \____\\ \ ,__/
+ \/_/\/_/\/_/\/____/\/___/  \/__//__/   \/____/\/____/ \ \ \/
+                                                        \ \_\
+                                                         \/_/"""
+_BANNER_TAGLINE = "      an experiment sweep engine"
+
+# Color only when writing to a terminal; piped/redirected --help stays plain.
+# Bright green for the figlet, bright blue for the tagline.
+if sys.stdout.isatty():
+    BANNER = f"\033[92m{_BANNER_ART}\n\033[94m{_BANNER_TAGLINE}{_RESET}"
+else:
+    BANNER = f"{_BANNER_ART}\n{_BANNER_TAGLINE}"
+
+
 def _build_help() -> str:
     workflow = [
         (f"1. {_GREEN}mlsweep manager{_RESET}", "start the persistent manager (once)"),
@@ -72,6 +91,7 @@ def _build_help() -> str:
             ("status | doctor", "diagnose the environment"),
             ("ls [EXP]", "list experiments / runs"),
             ("logs RUN", "tail a run's training.log"),
+            ("metrics", "print runs' logged metrics as tables (--keys, --json, --csv)"),
         ]),
         ("Control", [
             ("cancel EXP", "cancel runs (--failed/--running/--all)"),
@@ -87,7 +107,7 @@ def _build_help() -> str:
         ]),
     ]
     lines = [
-        f"{_CYAN}mlsweep{_RESET}, an experiment sweep engine.",
+        BANNER,
         "",
         "Workflow:",
         _align(workflow),
@@ -397,7 +417,7 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
-_CTL_CMDS = frozenset({"ls", "logs", "cancel", "retry", "resume", "stop", "pause", "unpause", "best"})
+_CTL_CMDS = frozenset({"ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best"})
 
 
 def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:
@@ -464,7 +484,11 @@ def main() -> None:
         return
 
     if cmd in _CTL_CMDS:
+        import signal
+
         import mlsweep.ctl
+        # Exit quietly when piped into `head` and the like.
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         getattr(mlsweep.ctl, f"{cmd}_cmd")(rest)
         return
 

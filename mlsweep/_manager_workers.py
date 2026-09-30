@@ -13,6 +13,7 @@ asyncio tasks.  Provides:
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import os
 import shlex
@@ -32,6 +33,7 @@ from mlsweep._manager_db import (
     experiment_concurrency_caps,
     get_experiment,
     is_multinode_run,
+    list_job_nodes,
     list_jobs_by_run_ids,
     list_schedulable_jobs,
     multinode_progress,
@@ -237,31 +239,50 @@ async def _bootstrap_worker_venv(
 ) -> bool:
     """Ensure ``/tmp/mlsweep_venv/bin/mlsweep_worker`` exists on *host*.
 
-    If the binary already exists this returns ``True`` immediately.
-    Otherwise it SCPs the bundled wheels to ``/tmp/mlsweep_wheels/``,
-    creates the venv, and pip-installs ``mlsweep`` into it.
+    If the binary is already present and its version matches the local
+    mlsweep, returns ``True`` immediately.  If it is present but outdated,
+    raises ``RuntimeError`` (we never silently reinstall).  Otherwise it
+    SCPs the bundled wheels to ``/tmp/mlsweep_wheels/``, creates the venv,
+    and pip-installs ``mlsweep`` into it.
 
-    Returns ``True`` on success, ``False`` if any step fails.
+    Returns ``True`` on success, ``False`` if any install step fails.
     """
     key_args = ["-i", ssh_key] if ssh_key else []
     ssh_opts = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
     sshpass_args, sshpass_env = _sshpass_args(password)
 
-    # 1. Quick check: is the binary already present?
+    # 1. Quick check: is the binary already present and up to date?
+    local_version = importlib.metadata.version("mlsweep")
+    check_cmd = (
+        "if [ -x /tmp/mlsweep_venv/bin/mlsweep_worker ]; then "
+        "/tmp/mlsweep_venv/bin/mlsweep_worker --version 2>/dev/null; "
+        "else echo MISSING; fi"
+    )
     try:
         proc = await asyncio.create_subprocess_exec(
             *sshpass_args,
             "ssh", *ssh_opts,
             *key_args,
             host,
-            "test -x /tmp/mlsweep_venv/bin/mlsweep_worker && echo OK || echo MISSING",
+            check_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=sshpass_env,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        if b"OK" in stdout:
-            return True
+        out = stdout.decode(errors="replace").strip()
+        if out == "MISSING":
+            pass  # not installed — fall through to a fresh bootstrap
+        elif local_version in out:
+            return True  # present and matching — reuse it
+        else:
+            remote_ver = out.split()[-1] if out else "older (no --version flag)"
+            raise RuntimeError(
+                f"worker on {host} is outdated "
+                f"(remote: {remote_ver}, expected: {local_version}); "
+                f"update mlsweep on {host}, e.g. 'rm -rf /tmp/mlsweep_venv' "
+                f"and reconnect to force a fresh install"
+            )
     except (OSError, asyncio.TimeoutError):
         pass  # fall through to bootstrap
 
@@ -485,6 +506,8 @@ async def launch_worker(
             hint = "\n  hint: hostname not found — check the host field in workers.toml"
         elif "No module named mlsweep" in stderr_out:
             hint = "\n  hint: mlsweep is not installed on the remote machine"
+        elif "unrecognized arguments" in stderr_out:
+            hint = "\n  hint: the worker on the remote machine is outdated — update mlsweep there"
         elif "python: command not found" in stderr_out or "python3: command not found" in stderr_out:
             hint = "\n  hint: python not found on remote — is it in PATH?"
         elif "UNPROTECTED PRIVATE KEY" in stderr_out:
@@ -590,6 +613,8 @@ async def _handle_worker_hello(
     scheduler does not re-dispatch them.
     """
     resuming_map: dict[str, dict[str, Any]] = {r["run_id"]: r for r in msg.resuming}
+    completed_map: dict[str, dict[str, Any]] = {r["run_id"]: r for r in msg.completed}
+    reported: dict[str, dict[str, Any]] = {**completed_map, **resuming_map}
     resumed_jobs: list[tuple[JobRecord, list[int]]] = []
 
     # Look up the DB rows for any resuming runs before taking the lock.  On
@@ -597,8 +622,12 @@ async def _handle_worker_hello(
     # to 'pending'; we pull them by run_id (the worker's resume payload has no
     # experiment_id) and restore in-flight state so the scheduler skips them.
     resume_records: dict[str, JobRecord] = {}
-    if resuming_map:
-        for jr in await list_jobs_by_run_ids(db, list(resuming_map)):
+    if reported:
+        for jr in await list_jobs_by_run_ids(db, list(reported)):
+            want = reported[jr.run_id]
+            # Prefer the row for the experiment the worker says the run belongs to.
+            if want.get("experiment") and jr.experiment_id != want["experiment"]:
+                continue
             resume_records.setdefault(jr.run_id, jr)
 
     async with state.scheduler_lock:
@@ -611,21 +640,27 @@ async def _handle_worker_hello(
         wc.status = "connected"
         wc.connected_at = datetime.now(timezone.utc)
 
-        # Restore in-flight state for jobs the worker is already running.  The
-        # exact GPUs are unknown post-restart; pick the first N free (occupancy
-        # is derived from wc.in_flight, so adding the entry reserves them).
+        # Restore in-flight state for jobs the worker is already running (and for
+        # jobs whose result it is holding, so the result can be processed below).
+        # Use the GPUs the worker reports the run is actually on.  Older workers
+        # don't report them; for those, fall back to the first N free GPUs
+        # (occupancy is derived from wc.in_flight, so adding the entry reserves them).
         for run_id, job in resume_records.items():
             if run_id in state.in_flight:
                 continue
-            occ = _worker_occupancy(wc)
-            cap = wc.max_jobs_per_gpu  # 0 = unlimited
-            gpu_ids: list[int] = []
-            for g in wc.gpus:
-                if len(gpu_ids) >= job.gpus_per_run:
-                    break
-                if cap <= 0 or occ.get(g, 0) < cap:
-                    gpu_ids.append(g)
-                    occ[g] = occ.get(g, 0) + 1
+            reported_gpus = reported[run_id].get("gpu_ids")
+            if reported_gpus is not None and all(g in wc.gpus for g in reported_gpus):
+                gpu_ids = [int(g) for g in reported_gpus]
+            else:
+                occ = _worker_occupancy(wc)
+                cap = wc.max_jobs_per_gpu  # 0 = unlimited
+                gpu_ids = []
+                for g in wc.gpus:
+                    if len(gpu_ids) >= job.gpus_per_run:
+                        break
+                    if cap <= 0 or occ.get(g, 0) < cap:
+                        gpu_ids.append(g)
+                        occ[g] = occ.get(g, 0) + 1
 
             combo = json.loads(job.combo) if isinstance(job.combo, str) else (job.combo or {})
             in_flight_job = InFlightJob(
@@ -670,17 +705,23 @@ async def _handle_worker_hello(
     # replays any logs/metrics the manager missed while it was down.
     # Done outside the scheduler lock to avoid holding it during I/O.
     for job, gpu_ids in resumed_jobs:
-        rinfo = resuming_map[job.run_id]
         dispatched = await state.db_writer.dispatch_job(
             job.run_id, job.experiment_id, wc.worker_id, gpu_ids
         )
         if dispatched is not None:
             await state.db_writer.mark_job_running(job.run_id, job.experiment_id)
-        await _send_to_worker(wc, encode(MsgReplay(
-            run_id=job.run_id,
-            log_seq=rinfo.get("log_seq", 0),
-            metric_seq=rinfo.get("metric_seq", 0),
-        )))
+        rinfo = resuming_map.get(job.run_id)
+        if rinfo is not None:
+            await _send_to_worker(wc, encode(MsgReplay(
+                run_id=job.run_id,
+                log_seq=rinfo.get("log_seq", 0),
+                metric_seq=rinfo.get("metric_seq", 0),
+            )))
+
+    # Runs that finished while no manager was connected: process the results the
+    # worker kept (finish in DB, sync artifacts, clean up, free GPUs).
+    if completed_map:
+        await _handle_completed_results(db, state, wc, list(completed_map.values()))
 
     # Broadcast worker-connected event
     state.broadcast(
@@ -697,6 +738,35 @@ async def _handle_worker_hello(
     # get dispatched now that we have capacity.
     if state.dispatch_callback is not None:
         asyncio.create_task(state.dispatch_callback())
+
+
+async def _handle_completed_results(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    wc: WorkerConn,
+    completed: list[dict[str, Any]],
+) -> None:
+    """Process results the worker held because no manager received them.
+
+    Results for runs this manager tracks go through ``_handle_result`` (finish,
+    sync, clean up, dispatch).  Results for runs it does not track were already
+    handled or cancelled; they are acknowledged with a non-final cleanup so the
+    worker stops re-reporting them.
+    """
+    for r in completed:
+        run_id = r["run_id"]
+        tracked = run_id in wc.in_flight or state.get_in_flight(run_id) is not None
+        if tracked:
+            await _handle_result(db, state, wc, MsgResult(
+                run_id=run_id,
+                success=bool(r.get("success", False)),
+                elapsed=float(r.get("elapsed", 0.0)),
+                exit_code=int(r.get("exit_code", -1)),
+            ))
+        else:
+            await _send_to_worker(wc, encode(MsgCleanup(
+                run_id=run_id, experiment=r.get("experiment", ""), final=False,
+            )))
 
 
 async def _handle_started(
@@ -795,8 +865,12 @@ async def _handle_sync_req(
         wc.ssh_key,
     )
 
-    # After sync, send MsgCleanup
-    await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
+    # After sync, send MsgCleanup.  This is a mid-run sync, so final=False:
+    # the worker must keep its scratch directory (the run is still executing).
+    await _send_to_worker(
+        wc,
+        encode(MsgCleanup(run_id=msg.run_id, experiment=job.experiment_id, final=False)),
+    )
 
 
 def _rsync_sync(
@@ -806,8 +880,9 @@ def _rsync_sync(
     run_id: str,
     password: str | None = None,
     ssh_key: str | None = None,
-) -> None:
-    """Synchronous artifact sync (runs in executor thread)."""
+) -> bool:
+    """Synchronous artifact sync (runs in executor thread).  Returns True on success."""
+    ok = True
     if worker_host == "localhost":
         os.makedirs(local_run_dir, exist_ok=True)
         src_artifacts = os.path.join(remote_scratch, "artifacts")
@@ -818,6 +893,7 @@ def _rsync_sync(
                     shutil.rmtree(dst_artifacts)
                 shutil.copytree(src_artifacts, dst_artifacts)
             except OSError as e:
+                ok = False
                 print(f"  {_YELLOW}WARN{_RESET}  parsync failed for {run_id}: {e}")
         for fname in ("metrics.jsonl", "training.log"):
             src_f = os.path.join(remote_scratch, fname)
@@ -826,6 +902,7 @@ def _rsync_sync(
                 try:
                     shutil.copy2(src_f, dst_f)
                 except OSError as e:
+                    ok = False
                     print(f"  {_YELLOW}WARN{_RESET}  copy {fname} failed for {run_id}: {e}")
     else:
         env = os.environ.copy()
@@ -842,10 +919,66 @@ def _rsync_sync(
             env=env,
         )
         if result.returncode != 0:
+            ok = False
             print(
                 f"  {_YELLOW}WARN{_RESET}  parsync failed for {run_id}: "
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
+    return ok
+
+
+async def _sync_and_cleanup(
+    state: ManagerState,
+    wc: WorkerConn,
+    run_id: str,
+    experiment_id: str,
+    subdir: str | None = None,
+) -> None:
+    """Sync *wc*'s scratch for a finished run into the output dir, then clean it up.
+
+    *subdir* (e.g. ``node1``) places the files under a subdirectory of the run's
+    output dir.  The worker is told to delete its scratch (``final=True``) only
+    when the sync succeeds.
+    """
+    run_scratch = os.path.join(wc.scratch_dir, experiment_id, run_id)
+    run_dir = os.path.join(state.output_dir, experiment_id, run_id)
+    if subdir is not None:
+        run_dir = os.path.join(run_dir, subdir)
+
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(
+        None,
+        _rsync_sync,
+        wc.host,
+        run_scratch,
+        run_dir,
+        run_id,
+        wc.password,
+        wc.ssh_key,
+    )
+    if ok:
+        await _send_to_worker(
+            wc,
+            encode(MsgCleanup(run_id=run_id, experiment=experiment_id, final=True)),
+        )
+
+
+async def _sync_node_scratch(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    wc: WorkerConn,
+    run_id: str,
+    experiment_id: str,
+) -> None:
+    """Sync one multi-node node's scratch into node{rank}/ and clean it up.
+
+    Every node owns a separate scratch directory on its own worker, so each is
+    synced into a per-rank subdirectory (nodes don't overwrite each other).
+    """
+    nodes = await list_job_nodes(db, run_id, experiment_id)
+    node_rank = next((n.node_rank for n in nodes if n.worker_id == wc.worker_id), None)
+    subdir = f"node{node_rank}" if node_rank is not None else None
+    await _sync_and_cleanup(state, wc, run_id, experiment_id, subdir)
 
 
 async def _handle_result(
@@ -889,7 +1022,10 @@ async def _handle_result(
         await state.db_writer.mark_job_node_result(
             msg.run_id, experiment_id, wc.worker_id, msg.success, msg.elapsed,
         )
-        await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
+        # Sync this node's scratch into node{rank}/ and clean it up.  Each
+        # node owns a separate scratch dir on its own worker, so sync + cleanup
+        # must happen per node (not only for the last node to report).
+        await _sync_node_scratch(db, state, wc, msg.run_id, experiment_id)
 
         remaining, all_success, max_elapsed = await multinode_progress(
             db, msg.run_id, experiment_id,
@@ -941,26 +1077,11 @@ async def _handle_result(
             },
         )
 
-    # Sync artifacts after run completes
-    if experiment_id:
-        run_scratch = os.path.join(wc.scratch_dir, experiment_id, msg.run_id)
-        run_dir = os.path.join(state.output_dir, experiment_id, msg.run_id)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            _rsync_sync,
-            wc.host,
-            run_scratch,
-            run_dir,
-            msg.run_id,
-            wc.password,
-            wc.ssh_key,
-        )
-
-    # Send cleanup after sync. For multi-node, each node already received
-    # MsgCleanup as its result arrived, so don't double-send to this worker.
-    if not multinode:
-        await _send_to_worker(wc, encode(MsgCleanup(run_id=msg.run_id)))
+    # Sync artifacts after run completes, then ask the worker to delete its
+    # scratch.  Multi-node nodes were each synced (and cleaned up) as their
+    # results arrived, so this final sync + cleanup is single-node only.
+    if experiment_id and not multinode:
+        await _sync_and_cleanup(state, wc, msg.run_id, experiment_id)
 
     # Trigger dispatch
     if state.dispatch_callback is not None:
@@ -1075,30 +1196,37 @@ async def _worker_read_task(
     *,
     workers_ready: asyncio.Event | None = None,
     shutdown_event: asyncio.Event | None = None,
+    hello_received: bool = False,
 ) -> None:
     """Read lines from *wc.reader*, decode, and dispatch to handlers.
 
     This task runs until the connection is lost or the shutdown event is set.
     On disconnect, it triggers the reconnect logic.
+
+    *hello_received*: the caller already read and handled this connection's
+    ``MsgWorkerHello`` (the reconnect path does).  The worker sends exactly one
+    hello per connection, so waiting for another would treat the next ordinary
+    message as a protocol error and drop the connection again.
     """
-    # First message MUST be MsgWorkerHello
-    try:
-        payload = await asyncio.wait_for(aread_msg(wc.reader), timeout=30.0)
-    except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
-        await _on_worker_lost(db, state, wc, shutdown_event)
-        return
+    if not hello_received:
+        # First message MUST be MsgWorkerHello
+        try:
+            payload = await asyncio.wait_for(aread_msg(wc.reader), timeout=30.0)
+        except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
+            await _on_worker_lost(db, state, wc, shutdown_event)
+            return
 
-    try:
-        msg = decode(payload)
-    except (ValueError, json.JSONDecodeError, TypeError):
-        await _on_worker_lost(db, state, wc, shutdown_event)
-        return
+        try:
+            msg = decode(payload)
+        except (ValueError, json.JSONDecodeError, TypeError):
+            await _on_worker_lost(db, state, wc, shutdown_event)
+            return
 
-    if not isinstance(msg, MsgWorkerHello):
-        await _on_worker_lost(db, state, wc, shutdown_event)
-        return
+        if not isinstance(msg, MsgWorkerHello):
+            await _on_worker_lost(db, state, wc, shutdown_event)
+            return
 
-    await _handle_worker_hello(db, state, wc, msg, workers_ready=workers_ready)
+        await _handle_worker_hello(db, state, wc, msg, workers_ready=workers_ready)
 
     # Main message loop
     while True:
@@ -1131,6 +1259,13 @@ async def _worker_read_task(
     await _on_worker_lost(db, state, wc, shutdown_event)
 
 
+def _close_writer(writer: Any) -> None:
+    try:
+        writer.close()
+    except Exception:
+        pass
+
+
 async def _on_worker_lost(
     db: aiosqlite.Connection,
     state: ManagerState,
@@ -1150,6 +1285,10 @@ async def _on_worker_lost(
     # Signal the write task to stop draining the now-dead connection.
     # The write task returns when it dequeues this sentinel.
     wc.send_queue.put_nowait(None)
+
+    # Close the abandoned socket.  Otherwise the worker keeps the connection open
+    # and may keep sending run traffic on it that nobody will ever read.
+    _close_writer(wc.writer)
 
     await state.db_writer.update_worker_status(wc.worker_id, "reconnecting")
 
@@ -1204,12 +1343,12 @@ async def _reconnect_worker(
             try:
                 payload = await asyncio.wait_for(aread_msg(reader), timeout=10.0)
             except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError):
-                writer.close()
+                _close_writer(writer)
                 continue
 
             msg = decode(payload)
             if not isinstance(msg, MsgWorkerHello):
-                writer.close()
+                _close_writer(writer)
                 continue
 
             # Success — attach new streams
@@ -1242,20 +1381,27 @@ async def _reconnect_worker(
                     )),
                 )
 
-            # Handle orphaned runs (were in-flight but worker isn't resuming them).
-            # Collect both keys and values under the lock to avoid reading stale data
-            # between iterations.
+            # Restart read/write/heartbeat tasks for the reconnected worker.  The
+            # hello was consumed above, so the read task must not wait for another.
+            _start_worker_tasks(db, state, wc, shutdown_event, hello_received=True)
+
+            # Runs that ended while we were disconnected: the worker kept their
+            # results.  Process them like any result (finish, sync, clean up).
+            await _handle_completed_results(db, state, wc, msg.completed)
+
+            # Handle orphaned runs (in flight here, but the worker neither resumes
+            # nor reports a result for them).  Collect keys and values under the
+            # lock to avoid reading stale data between iterations.
+            resuming_ids = {r["run_id"] for r in msg.resuming}
+            completed_ids = {r["run_id"] for r in msg.completed}
             orphaned: list[tuple[str, str]] = []
             async with state.scheduler_lock:
                 for run_id, ifj in list(wc.in_flight.items()):
-                    if run_id not in {r["run_id"] for r in msg.resuming}:
+                    if run_id not in resuming_ids and run_id not in completed_ids:
                         orphaned.append((run_id, ifj.experiment_id))
 
             for run_id, exp_id in orphaned:
                 await _handle_orphaned_run(db, state, wc, run_id, experiment_id=exp_id)
-
-            # Restart read/write/heartbeat tasks for the reconnected worker
-            _start_worker_tasks(db, state, wc, shutdown_event)
 
             return
 
@@ -1341,10 +1487,12 @@ def _start_worker_tasks(
     shutdown_event: asyncio.Event | None = None,
     *,
     workers_ready: asyncio.Event | None = None,
+    hello_received: bool = False,
 ) -> None:
     """Spawn read, write, and heartbeat tasks for *wc*."""
     asyncio.create_task(
-        _worker_read_task(db, state, wc, shutdown_event=shutdown_event, workers_ready=workers_ready)
+        _worker_read_task(db, state, wc, shutdown_event=shutdown_event,
+                          workers_ready=workers_ready, hello_received=hello_received)
     )
     asyncio.create_task(
         _worker_write_task(wc, shutdown_event or asyncio.Event())

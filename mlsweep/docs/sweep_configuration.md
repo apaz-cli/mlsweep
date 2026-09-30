@@ -660,6 +660,7 @@ Monitor / Control / Docs). Individual binaries remain as aliases.
 | `status` (`doctor`) | Diagnose manager / token / GPUs / results / disk. |
 | `ls [exp_id]` | List experiments, or the runs within one experiment. |
 | `logs <run_id>` | Print (and optionally follow) a run's training log. |
+| `metrics` | Print runs' logged metrics as tables, fetched on demand. `--keys REGEX` selects keys; `--pivot` turns keys into rows using the regex's capture group (e.g. `val/nll@r(\d+)` becomes value vs. r, one column per run); `--step`, `--tail`, `--json`, `--csv`. |
 | `cancel <exp_id>` | Cancel runs (`--failed` / `--running` / `--all`). |
 | `retry <exp_id>` | Re-queue failed runs. |
 | `resume <exp_id>` | Continue an experiment. |

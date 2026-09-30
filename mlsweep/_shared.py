@@ -6,7 +6,7 @@ import os
 import socket
 import struct
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from secrets import token_hex as _token_hex
 from typing import Any
@@ -164,6 +164,8 @@ class MsgCancel:
 @dataclass
 class MsgCleanup:
     run_id: str
+    experiment: str = ""   # experiment the run belongs to (needed to locate scratch dir)
+    final: bool = False     # True = run finished and artifacts synced; safe to delete scratch
     t: str = "cleanup"
 
 
@@ -194,6 +196,10 @@ class MsgWorkerHello:
     resuming: list[dict[str, Any]]  # [{run_id, log_seq, metric_seq, pid}]
     scratch_dir: str
     max_jobs_per_gpu: int = 1     # worker's per-GPU packing cap (0 = unlimited)
+    # Results of runs that ended but that no manager has acknowledged yet:
+    # [{run_id, success, elapsed, exit_code, experiment}].  Re-sent on every hello so a
+    # result produced while the manager was disconnected (or restarting) is not lost.
+    completed: list[dict[str, Any]] = field(default_factory=list)
     t: str = "whello"
 
 
@@ -271,6 +277,9 @@ _MSG_TYPES: dict[str, type] = {
     "pong": MsgPong,
     "gpu_stats": MsgGpuStats,
 }
+_MSG_FIELDS: dict[type, frozenset[str]] = {
+    cls: frozenset(f.name for f in fields(cls)) for cls in _MSG_TYPES.values()
+}
 
 
 def encode(msg: Any) -> bytes:
@@ -286,7 +295,10 @@ def decode(payload: bytes) -> Any:
     cls = _MSG_TYPES.get(t)  # type: ignore[arg-type]
     if cls is None:
         raise ValueError(f"Unknown message type: {t!r}")
-    return cls(**obj)
+    # Ignore fields this version doesn't know, so a newer peer that adds a field
+    # (e.g. MsgWorkerHello.completed) can still talk to an older one.
+    known = _MSG_FIELDS[cls]
+    return cls(**{k: v for k, v in obj.items() if k in known})
 
 
 async def aread_msg(reader: asyncio.StreamReader) -> bytes:

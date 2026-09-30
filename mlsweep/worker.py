@@ -29,6 +29,7 @@ import argparse
 import dataclasses
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
 import queue
@@ -99,6 +100,10 @@ _lock = threading.Lock()
 _in_flight: dict[str, RunState] = {}        # run_id → RunState
 _busy_gpus: set[int] = set()
 _connections: list[ConnState] = []
+# Results the manager has not acknowledged yet (it acks with MsgCleanup).  A result
+# sent while the manager is disconnected, or on a connection it has abandoned, would
+# otherwise be lost; these are re-reported in every MsgWorkerHello as ``completed``.
+_unacked_results: dict[str, tuple[MsgResult, str]] = {}   # run_id → (result, experiment)
 _shutdown_event = threading.Event()
 
 # Set by main() from CLI args
@@ -139,6 +144,36 @@ def _artifact_lock_done(artifact_id: str) -> None:
 # ── Wire I/O helpers ───────────────────────────────────────────────────────────
 
 
+
+
+# ── Sending run traffic ───────────────────────────────────────────────────────
+
+
+def _current_connection() -> "ConnState | None":
+    """The most recently accepted connection that is still open.
+
+    Run messages (started / log / result) go here rather than to the connection that
+    dispatched the run: after a reconnect, the dispatching connection is one the
+    manager no longer reads, and anything sent on it is silently lost."""
+    with _lock:
+        for conn in reversed(_connections):
+            if not conn.closed:
+                return conn
+    return None
+
+
+def _send_run_msg(data: bytes) -> None:
+    conn = _current_connection()
+    if conn is not None:
+        conn.send_queue.put(data)
+
+
+def _report_result(result: MsgResult, experiment: str) -> None:
+    """Record *result* as unacknowledged, then send it.  It is re-sent in the next
+    MsgWorkerHello until the manager acknowledges it with MsgCleanup."""
+    with _lock:
+        _unacked_results[result.run_id] = (result, experiment)
+    _send_run_msg(encode(result))
 
 
 # ── Write thread (one per connection) ─────────────────────────────────────────
@@ -203,8 +238,14 @@ def _read_thread(conn: ConnState) -> None:
                 "log_seq": rs.log_seq,
                 "metric_seq": rs.metric_seq,
                 "pid": rs.pids[0],
+                "gpu_ids": list(rs.gpu_ids),
+                "experiment": rs.experiment,
             }
             for rs in _in_flight.values()
+        ]
+        completed = [
+            {**dataclasses.asdict(res), "experiment": exp}
+            for res, exp in _unacked_results.values()
         ]
     hello_resp = MsgWorkerHello(
         gpus=gpus,
@@ -212,6 +253,7 @@ def _read_thread(conn: ConnState) -> None:
         resuming=resuming,
         scratch_dir=_scratch_dir,
         max_jobs_per_gpu=_max_jobs_per_gpu,
+        completed=completed,
     )
     conn.send_queue.put(encode(hello_resp))
 
@@ -228,9 +270,12 @@ def _read_thread(conn: ConnState) -> None:
 
     # Connection closed — signal write thread to drain and exit
     conn.send_queue.put(None)
-    # If no runs are in flight, shut down so the worker exits when the controller disconnects
+    # If no runs are in flight and no other controller connection is open, shut down so
+    # the worker exits when the controller disconnects.  (A manager that reconnected
+    # closes its stale connection afterwards; that must not stop the worker.)
     with _lock:
-        no_work = not _in_flight
+        others = any(c is not conn and not c.closed for c in _connections)
+        no_work = not _in_flight and not others
     if no_work:
         _shutdown_event.set()
 
@@ -241,7 +286,7 @@ def _read_thread(conn: ConnState) -> None:
 def _handle_msg(msg: Any, conn: ConnState) -> None:
     if isinstance(msg, MsgRun):
         t = threading.Thread(
-            target=_handle_run, args=(msg, conn),
+            target=_handle_run, args=(msg,),
             daemon=True,
             name=f"setup-{msg.run_id}",
         )
@@ -271,19 +316,17 @@ def _download_file(url: str, dest: str, timeout: int = 300) -> None:
 
 
 
-def _handle_run(msg: MsgRun, conn: ConnState) -> None:
+def _handle_run(msg: MsgRun) -> None:
     """Spawn one training subprocess per GPU in the run's GPU group."""
     try:
-        _handle_run_inner(msg, conn)
+        _handle_run_inner(msg)
     except Exception as exc:
         print(f"[worker] ERROR in run {msg.run_id}: {exc}", file=sys.stderr, flush=True)
-        if not conn.closed:
-            conn.send_queue.put(encode(MsgResult(
-                run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1
-            )))
+        _report_result(MsgResult(run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1),
+                       msg.experiment)
 
 
-def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
+def _handle_run_inner(msg: MsgRun) -> None:
     scratch_path = os.path.join(_scratch_dir, msg.experiment, msg.run_id)
     log_path = os.path.join(scratch_path, "training.log")
     metrics_path = os.path.join(scratch_path, "metrics.jsonl")
@@ -352,10 +395,9 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
         if setup_output:
             with open(log_path, "a") as _lf:
                 _lf.write(setup_output)
-            if not conn.closed:
-                conn.send_queue.put(encode(MsgLog(
-                    run_id=msg.run_id, seq=len(setup_output), data=setup_output
-                )))
+            _send_run_msg(encode(MsgLog(
+                run_id=msg.run_id, seq=len(setup_output), data=setup_output
+            )))
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd)
 
@@ -442,9 +484,8 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
                 p.kill()
             except OSError:
                 pass
-        conn.send_queue.put(encode(MsgResult(
-            run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1
-        )))
+        _report_result(MsgResult(run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1),
+                       msg.experiment)
         return
 
     with _lock:
@@ -458,11 +499,11 @@ def _handle_run_inner(msg: MsgRun, conn: ConnState) -> None:
         _in_flight[msg.run_id] = state
         _busy_gpus.update(msg.gpu_ids)
 
-    conn.send_queue.put(encode(MsgStarted(run_id=msg.run_id, pid=pids[0])))
+    _send_run_msg(encode(MsgStarted(run_id=msg.run_id, pid=pids[0])))
 
     t = threading.Thread(
         target=_run_thread,
-        args=(procs, state, log_path, artifacts_path, workspace or cwd, msg.return_files, conn),
+        args=(procs, state, log_path, artifacts_path, workspace or cwd, msg.return_files),
         daemon=True,
         name=f"run-{msg.run_id}",
     )
@@ -476,7 +517,6 @@ def _run_thread(
     artifacts_path: str,
     run_dir: str,
     return_files: list[str],
-    conn: ConnState,
 ) -> None:
     """Monitor all per-GPU subprocesses: stream rank-0 logs, send MsgResult when all exit."""
     t0 = time.time()
@@ -490,12 +530,11 @@ def _run_thread(
                 log_fh.write(line_str)
                 log_fh.flush()
                 state.log_seq = log_fh.tell()
-            if not conn.closed:
-                conn.send_queue.put(encode(MsgLog(
-                    run_id=state.run_id,
-                    seq=state.log_seq,
-                    data=line_str,
-                )))
+            _send_run_msg(encode(MsgLog(
+                run_id=state.run_id,
+                seq=state.log_seq,
+                data=line_str,
+            )))
 
     # Wait for all ranks to finish
     rcs = [procs[0].wait()] + [p.wait() for p in procs[1:]]
@@ -512,9 +551,18 @@ def _run_thread(
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
 
+    result = MsgResult(
+        run_id=state.run_id,
+        success=(exit_code == 0),
+        elapsed=elapsed,
+        exit_code=exit_code,
+    )
+    # Move the run from in-flight to unacknowledged in one step, so a hello snapshot
+    # taken at any moment reports it as either resuming or completed.
     with _lock:
         _in_flight.pop(state.run_id, None)
         _busy_gpus.difference_update(state.gpu_ids)
+        _unacked_results[state.run_id] = (result, state.experiment)
 
     # Free the workspace (large extracted artifact copy); keep logs and output artifacts.
     workspace_dir = os.path.join(state.scratch_path, "workspace")
@@ -524,17 +572,33 @@ def _run_thread(
         except OSError:
             pass
 
-    if not conn.closed:
-        conn.send_queue.put(encode(MsgResult(
-            run_id=state.run_id,
-            success=(exit_code == 0),
-            elapsed=elapsed,
-            exit_code=exit_code,
-        )))
+    _send_run_msg(encode(result))
 
 
 def _handle_cleanup(msg: MsgCleanup, conn: ConnState) -> None:
-    """Acknowledge a cleanup request (artifacts already rsynced by controller)."""
+    """Handle a cleanup request.
+
+    The controller sends ``final=True`` only after it has rsynced the run's
+    artifacts, logs, and metrics into the persistent output directory, so the
+    scratch directory is safe to delete at that point.  Mid-run syncs arrive
+    with ``final=False`` and must leave the scratch intact.
+    """
+    # Any MsgCleanup for a run means the manager has processed its result.
+    with _lock:
+        _unacked_results.pop(msg.run_id, None)
+    if msg.final and msg.experiment:
+        try:
+            exp_dir = _resolve_safe_subpath(_scratch_dir, msg.experiment)
+            run_dir = _resolve_safe_subpath(exp_dir, msg.run_id)
+        except ValueError:
+            run_dir = ""
+        else:
+            # Only remove when run_dir is a single component directly under
+            # exp_dir (guards against path traversal in the message fields).
+            if os.path.dirname(run_dir) != exp_dir or not os.path.isdir(run_dir):
+                run_dir = ""
+        if run_dir:
+            shutil.rmtree(run_dir, ignore_errors=True)
     if not conn.closed:
         conn.send_queue.put(encode(MsgCleaned(run_id=msg.run_id)))
 
@@ -849,6 +913,8 @@ def main() -> None:
                                  "(0 = unlimited, default: 1)")
         parser.add_argument("--port", type=int, default=7890,
                             help="TCP port to bind (0 = ephemeral, default: 7890)")
+        parser.add_argument("--version", action="version",
+                            version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
         args = parser.parse_args()
 
         _scratch_dir = args.scratch_dir

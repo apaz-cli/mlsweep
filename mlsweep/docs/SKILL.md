@@ -21,6 +21,7 @@ mlsweep fetch --experiment <id> --wait          # block until done, then leaderb
 mlsweep best  --experiment <id>                 # top runs by metric (--json for machines)
 mlsweep ls                                      # list experiments (`mlsweep ls <id>` lists runs)
 mlsweep logs <run_id> --experiment <id>         # tail a run's training.log
+mlsweep metrics --experiment <id> [runs] --keys REGEX [--pivot] [--json|--csv]  # logged metrics, on demand
 mlsweep cancel <id> --failed                    # cancel jobs (also --running / --all --yes)
 mlsweep retry  <id> --failed                    # re-queue failed jobs
 mlsweep stop   <id> --yes                       # abort a sweep

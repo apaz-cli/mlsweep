@@ -158,6 +158,7 @@ mlsweep status                                       # manager / token / GPUs / 
 mlsweep watch EXP_ID                                 # live terminal status
 mlsweep ls                                           # list experiments (`mlsweep ls EXP_ID` lists runs)
 mlsweep logs RUN_ID --experiment EXP_ID              # tail a run's training.log
+mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics as tables (--pivot, --json, --csv)
 mlsweep best --experiment EXP_ID                     # top runs by metric (leaderboard)
 mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
