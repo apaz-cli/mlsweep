@@ -1,6 +1,7 @@
 """Shared utilities and wire protocol for mlsweep worker ↔ controller communication."""
 
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -14,14 +15,25 @@ from typing import Any
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
-# ANSI escape codes
-_GREEN = "\033[32m"
-_RED = "\033[31m"
-_YELLOW = "\033[33m"
-_CYAN = "\033[36m"
-_MAGENTA = "\033[35m"
-_BLUE = "\033[34m"
-_RESET = "\033[0m"
+# ANSI color support.  The constants are sentinels whose rendering depends on
+# the global toggle in mlsweep._colors; import them from here for backwards
+# compatibility.  Color is off unless an entry point receives --color.
+from mlsweep._colors import (  # noqa: F401
+    _BLUE as _BLUE,
+    _BOLD as _BOLD,
+    _BRIGHT_BLUE as _BRIGHT_BLUE,
+    _BRIGHT_GREEN as _BRIGHT_GREEN,
+    _CYAN as _CYAN,
+    _DIM as _DIM,
+    _GREEN as _GREEN,
+    _MAGENTA as _MAGENTA,
+    _RED as _RED,
+    _RESET as _RESET,
+    _YELLOW as _YELLOW,
+    color_enabled as color_enabled,
+    set_color as set_color,
+    strip_color_flag as strip_color_flag,
+)
 
 DEFAULT_MANAGER_URL = "http://localhost:7891"
 
@@ -53,23 +65,6 @@ def _git_root(path: str) -> str | None:
         return None
 
 
-def _parse_tag_value(s: str) -> bool | int | float | str:
-    """Convert a tag value string to a typed Python value."""
-    if s == "True":
-        return True
-    if s == "False":
-        return False
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
-
-
 def _val_sort_key(v: Any) -> tuple[int, Any]:
     """Sort key for dim values: bools first, then numbers, then strings."""
     if isinstance(v, bool):
@@ -79,41 +74,39 @@ def _val_sort_key(v: Any) -> tuple[int, Any]:
     return (2, str(v))
 
 
-def _detect_sub_dims(
-    runs: list[dict[str, Any]],
-    dims: dict[str, list[Any]],
-) -> dict[str, dict[str, Any]]:
-    """Detect dims that only appear when a parent dim has a specific value.
+def dist_master_port(experiment: str, run_id: str) -> int:
+    """Deterministic torch.distributed master port for a run, in [20000, 30000)."""
+    return 20000 + int(hashlib.md5(f"{experiment}/{run_id}".encode()).hexdigest()[:4], 16) % 10000
 
-    runs:  list of dicts with "hash" and "combo" keys.
-    dims:  {dim_name: [sorted values]}.
-    Returns {child_dim: {"parentDim": ..., "parentValue": ...}}.
-    """
-    all_names = {r["hash"] for r in runs}
-    names_with = {dim: {r["hash"] for r in runs if dim in r["combo"]} for dim in dims}
-    sub_dims: dict[str, dict[str, Any]] = {}
-    for dim in dims:
-        if names_with[dim] == all_names:
-            continue  # universal dim — not a subdim
-        for parent_dim in dims:
-            if parent_dim == dim:
-                continue
-            for parent_val in dims[parent_dim]:
-                names_with_parent = {
-                    r["hash"] for r in runs if r["combo"].get(parent_dim) == parent_val
-                }
-                if names_with_parent == names_with[dim]:
-                    sub_dims[dim] = {"parentDim": parent_dim, "parentValue": parent_val}
-                    break
-            if dim in sub_dims:
-                break
-    return sub_dims
+
+# ── Run logs ──────────────────────────────────────────────────────────────────
+
+# A stored or sent log chunk is at most this many bytes of whole lines.
+LOG_CHUNK_BYTES = 64 * 1024
+
+
+def line_chunks(data: bytes) -> list[bytes]:
+    """Split *data* into pieces of at most LOG_CHUNK_BYTES, at line ends where possible."""
+    view = memoryview(data)
+    chunks = []
+    start = 0
+    while start < len(data):
+        end = min(start + LOG_CHUNK_BYTES, len(data))
+        if end < len(data):
+            end = data.rfind(b"\n", start, end) + 1 or end
+        chunks.append(bytes(view[start:end]))
+        start = end
+    return chunks
 
 
 # ── Protocol messages ──────────────────────────────────────────────────────────
-# One JSON object per line over TCP, terminated by \n.  All messages have a "t" field.
-# Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","bye","shutdown","ping"}.
-# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong"}.
+# Each message is a length-prefixed JSON object with a "t" field.  A worker
+# whose PROTOCOL_VERSION differs from the manager's is refused at hello.
+PROTOCOL_VERSION = 2
+# A run is identified by (experiment, run_id).  Run names are derived from the
+# sweep, so two experiments of the same sweep use the same run_ids.
+# Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","shutdown","ping"}.
+# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong","gpu_stats"}.
 
 # ── Controller → Worker ────────────────────────────────────────────────────────
 
@@ -158,22 +151,24 @@ class MsgRun:
 @dataclass
 class MsgCancel:
     run_id: str
+    experiment: str
     t: str = "cancel"
 
 
 @dataclass
 class MsgCleanup:
     run_id: str
-    experiment: str = ""   # experiment the run belongs to (needed to locate scratch dir)
+    experiment: str
     final: bool = False     # True = run finished and artifacts synced; safe to delete scratch
     t: str = "cleanup"
 
 
 @dataclass
 class MsgReplay:
+    """Re-send the run's log from byte *log_seq* on, and all of its metrics."""
     run_id: str
+    experiment: str
     log_seq: int
-    metric_seq: int
     t: str = "replay"
 
 
@@ -193,13 +188,14 @@ class MsgPing:
 class MsgWorkerHello:
     gpus: list[int]
     topo: dict[str, int]          # "{gpu_a},{gpu_b}" → score (JSON requires string keys)
-    resuming: list[dict[str, Any]]  # [{run_id, log_seq, metric_seq, pid}]
+    resuming: list[dict[str, Any]]  # [{run_id, experiment, pid, gpu_ids}]
     scratch_dir: str
     max_jobs_per_gpu: int = 1     # worker's per-GPU packing cap (0 = unlimited)
     # Results of runs that ended but that no manager has acknowledged yet:
     # [{run_id, success, elapsed, exit_code, experiment}].  Re-sent on every hello so a
     # result produced while the manager was disconnected (or restarting) is not lost.
     completed: list[dict[str, Any]] = field(default_factory=list)
+    protocol: int = 0             # PROTOCOL_VERSION of the worker
     t: str = "whello"
 
 
@@ -207,14 +203,17 @@ class MsgWorkerHello:
 class MsgStarted:
     run_id: str
     pid: int
+    experiment: str
     t: str = "started"
 
 
 @dataclass
 class MsgLog:
     run_id: str
-    seq: int
-    data: str
+    seq: int                # byte offset in training.log just past this chunk
+    data: str               # whole lines
+    start: int              # byte offset in training.log where this chunk begins
+    experiment: str
     t: str = "log"
 
 
@@ -223,12 +222,14 @@ class MsgMetric:
     run_id: str
     step: int
     data: dict[str, Any]
+    experiment: str
     t: str = "metric"
 
 
 @dataclass
 class MsgSyncReq:
     run_id: str
+    experiment: str
     t: str = "syncreq"
 
 
@@ -238,12 +239,14 @@ class MsgResult:
     success: bool
     elapsed: float
     exit_code: int
+    experiment: str
     t: str = "result"
 
 
 @dataclass
 class MsgCleaned:
     run_id: str
+    experiment: str
     t: str = "cleaned"
 
 
@@ -290,7 +293,11 @@ def encode(msg: Any) -> bytes:
 
 def decode(payload: bytes) -> Any:
     """Decode a JSON payload bytes to the appropriate protocol message dataclass."""
-    obj: dict[str, Any] = json.loads(payload)
+    return from_obj(json.loads(payload))
+
+
+def from_obj(obj: dict[str, Any]) -> Any:
+    """Build the protocol message dataclass for a decoded JSON object."""
     t = obj.get("t")
     cls = _MSG_TYPES.get(t)  # type: ignore[arg-type]
     if cls is None:

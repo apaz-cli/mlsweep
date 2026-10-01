@@ -62,6 +62,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path to workers config file (default: local worker with visible GPUs)",
     )
+    parser.add_argument(
+        "--color",
+        action="store_true",
+        help="Enable ANSI color in human-readable output (default: off)",
+    )
     return parser.parse_args(argv)
 
 
@@ -82,42 +87,6 @@ def _check_pid_file(pid_file: Path) -> None:
                 pid_file.unlink(missing_ok=True)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(str(os.getpid()))
-
-
-async def _rebuild_state(
-    read_db: aiosqlite.Connection,
-    write_db: aiosqlite.Connection,
-) -> "ManagerState":  # noqa: F821
-    """Rebuild in-memory state from the database on startup.
-
-    Called before the DbWriter actor starts, so writes go directly to
-    write_db via the module-level functions.
-    """
-    from mlsweep._manager_db import (
-        count_pending_jobs,
-        list_workers,
-        reset_dispatched_running_to_pending,
-    )
-
-    state = ManagerState()
-
-    # Reset any jobs that were left in dispatched/running state by a
-    # previous manager crash.  Actor is not running yet — call directly.
-    n = await reset_dispatched_running_to_pending(write_db)
-    if n:
-        print(f"Reset {n} dispatched/running jobs to pending")
-
-    # Pending jobs live in the DB; the scheduler reads them each pass. Nothing
-    # to load into memory — just report the backlog for visibility.
-    n_pending = await count_pending_jobs(read_db)
-    print(f"{n_pending} pending job(s) in database")
-
-    # Workers are loaded from DB for reference; WorkerConn objects are
-    # created on-demand when workers actually connect over TCP.
-    db_workers = await list_workers(read_db)
-    print(f"Found {len(db_workers)} known workers in database")
-
-    return state
 
 
 async def _find_reachable_urls(port: int, token: str) -> list[tuple[str, str]]:
@@ -227,17 +196,22 @@ async def _async_main(args: argparse.Namespace) -> None:
     writer = DbWriter(write_db)
     writer_task = asyncio.create_task(writer.run(), name="db-writer")
 
-    # ── Rebuild state ────────────────────────────────────────────────────
-    state = await _rebuild_state(read_db, write_db)
+    # ── State ────────────────────────────────────────────────────────────
+    # Jobs a previous manager left dispatched/running stay that way.  Each
+    # worker's hello reports what it is still running, and the jobs of
+    # workers that do not come back are requeued (see _handle_worker_hello).
+    from mlsweep._manager_db import count_pending_jobs
+
+    state = ManagerState()
     state.db_writer = writer
+    print(f"{await count_pending_jobs(read_db)} pending job(s) in database")
 
     # ── Shutdown coordination ────────────────────────────────────────────
-    shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
     def _shutdown_signal() -> None:
         print("\nShutting down...")
-        shutdown_event.set()
+        state.shutdown_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -248,13 +222,18 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     # ── HTTP server ──────────────────────────────────────────────────────
     from mlsweep._manager_http import create_app
-    from mlsweep._manager_workers import connect_workers, schedule_pending
+    from mlsweep._manager_workers import (
+        connect_workers,
+        reconnect_known_workers,
+        requeue_jobs_of_unknown_workers,
+        scheduler_loop,
+    )
 
     state.output_dir = os.path.join(str(mlsweep_dir), "experiments")
     state.artifact_base_url = f"http://{args.host}:{args.port}"
     state.token = token
     state.manager_port = args.port
-    state.dispatch_callback = lambda: schedule_pending(read_db, state)
+    scheduler_task = asyncio.create_task(scheduler_loop(read_db, state), name="scheduler")
 
     app = create_app(read_db, state, token, mlsweep_dir=mlsweep_dir)
 
@@ -265,47 +244,40 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     # ── Startup message ──────────────────────────────────────────────────
     print(f"mlsweep manager ready — dir {mlsweep_dir}")
-    reachable = await _find_reachable_urls(args.port, token)
-    if len(reachable) == 1:
-        print(f"Dashboard: {reachable[0][0]}")
-    else:
-        print("Dashboard:")
-        for url, label in reachable:
-            suffix = f"  ({label})" if label else ""
-            print(f"  {url}{suffix}")
+
+    async def _print_dashboard() -> None:
+        reachable = await _find_reachable_urls(args.port, token)
+        if len(reachable) == 1:
+            print(f"Dashboard: {reachable[0][0]}")
+        else:
+            print("Dashboard:")
+            for url, label in reachable:
+                suffix = f"  ({label})" if label else ""
+                print(f"  {url}{suffix}")
+
+    # Probing addresses takes seconds; do it while the workers start.
+    dashboard_task = asyncio.create_task(_print_dashboard())
 
     # ── Worker connections ───────────────────────────────────────────────
-    # Connect to workers (local or via workers file).  Workers register
-    # their GPUs asynchronously; we use an event to wait for all hello
-    # handshakes before the initial scheduling pass.
-    workers_ready = asyncio.Event()
-
+    # Each worker becomes schedulable once its hello is handled; the
+    # scheduler task is already running and picks them up as they arrive.
     workers = await connect_workers(
         read_db, state,
         workers_file=args.workers,
         manager_port=args.port,
-        shutdown_event=shutdown_event,
-        workers_ready=workers_ready,
     )
-    print(f"Connected to {len(workers)} worker(s)")
+    print(f"Started {len(workers)} worker(s)")
+    n_reconnect = await reconnect_known_workers(read_db, state, manager_port=args.port)
+    if n_reconnect:
+        print(f"Reconnecting {n_reconnect} known worker(s)")
+    await requeue_jobs_of_unknown_workers(read_db, state)
 
-    # Wait for all workers to complete their hello handshake (GPU registration)
-    # before the initial scheduling pass, with a generous timeout.
-    try:
-        await asyncio.wait_for(workers_ready.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        print("Warning: timed out waiting for worker hello handshakes")
-
-    # Initial scheduling pass — dispatch any pending jobs loaded at startup.
-    n = await schedule_pending(read_db, state)
-    if n:
-        print(f"Initial dispatch: {n} job(s) started")
-
-    # Wait for shutdown
-    await shutdown_event.wait()
+    await state.shutdown_event.wait()
 
     # ── Cleanup ──────────────────────────────────────────────────────────
     print("Shutting down HTTP server...")
+    scheduler_task.cancel()
+    dashboard_task.cancel()
     await runner.cleanup()
     writer_task.cancel()
     print("Closing database...")
@@ -319,6 +291,9 @@ async def _async_main(args: argparse.Namespace) -> None:
 def main() -> None:
     """Synchronous entry point for console_scripts."""
     args = _parse_args()
+    from mlsweep._colors import set_color
+    if args.color:
+        set_color(True)
     from mlsweep._manager_workers import _ensure_worker_wheels
     _ensure_worker_wheels()
     asyncio.run(_async_main(args))

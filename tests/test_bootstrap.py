@@ -21,13 +21,15 @@ def _remove_sentinel():
     """Remove .complete sentinel so tests always trigger a build check."""
     wheels_dir = Path(__file__).resolve().parent.parent / "mlsweep" / "_wheels"
     sentinel = wheels_dir / ".complete"
-    sentinel_exists = sentinel.exists()
-    if sentinel_exists:
+    if sentinel.exists():
+        original = sentinel.read_text(encoding="utf-8")
         sentinel.unlink()
+    else:
+        original = None
     yield
-    # Restore sentinel if we removed it
-    if sentinel_exists:
-        sentinel.touch()
+    # Restore the sentinel (and its version content) if we removed it.
+    if original is not None:
+        sentinel.write_text(original, encoding="utf-8")
 
 
 def test_ensure_worker_wheels_handles_outcome():
@@ -43,15 +45,15 @@ def test_ensure_worker_wheels_handles_outcome():
     except Exception as exc:
         pytest.fail(f"_ensure_worker_wheels raised unexpectedly: {exc}")
 
-    # After the call, either the sentinel + wheels exist (success),
+    # After the call, either the sentinel + wheel exist (success),
     # or the sentinel is absent and no orphaned mlsweep wheels remain
-    # (pip download failure handled gracefully).
+    # (pip wheel failure handled gracefully).
     if (wheels_dir / ".complete").exists():
         whls = list(wheels_dir.glob("mlsweep-*.whl"))
         assert len(whls) >= 1, f"sentinel present but no mlsweep wheel in {wheels_dir}"
     else:
-        # pip download may have failed (e.g. Python version mismatch);
-        # verify orphaned mlsweep wheel was cleaned up.
+        # pip wheel may have failed; verify no orphaned mlsweep wheel was
+        # left behind.
         orphaned = list(wheels_dir.glob("mlsweep-*.whl"))
         assert len(orphaned) == 0, (
             f"orphaned mlsweep wheels left behind in {wheels_dir}: {orphaned}"

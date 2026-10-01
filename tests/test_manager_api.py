@@ -15,6 +15,7 @@ import pytest
 from conftest import (
     _api_get,
     _api_post,
+    _api_request,
     _wait_for_job,
 )
 
@@ -22,27 +23,11 @@ _TOKEN = "test-token"
 
 
 def _api_put(url, token, path, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        f"{url}{path}", data=body, headers=headers, method="PUT",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+    return _api_request(url, token, "PUT", path, data)
 
 
 def _api_delete(url, token, path, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        f"{url}{path}", data=body, headers=headers, method="DELETE",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+    return _api_request(url, token, "DELETE", path, data)
 
 
 def _api_head(url, token, path):
@@ -232,6 +217,57 @@ def test_experiment_summary(manager_server):
     summary = _api_get(url, _TOKEN, "/api/experiments/e_summ/summary")
     assert summary["name"] == "summary_test"
     assert "job_counts" in summary
+
+
+def test_create_experiment_stores_metric_and_goal(manager_server):
+    _, url = manager_server
+    data = _api_post(url, _TOKEN, "/api/experiments",
+                     {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+    assert data["metric"] == "val_acc"
+    assert data["goal"] == "maximize"
+
+    exp = _api_get(url, _TOKEN, "/api/experiments/e_rank")
+    assert (exp["metric"], exp["goal"]) == ("val_acc", "maximize")
+
+    summary = _api_get(url, _TOKEN, "/api/experiments/e_rank/summary")
+    assert (summary["metric"], summary["goal"]) == ("val_acc", "maximize")
+    assert summary["stalled_jobs"] == 0
+
+    # The jobs listing stays valid alongside the summary output.
+    assert _api_get(url, _TOKEN, "/api/experiments/e_rank/jobs") == []
+
+
+def test_create_experiment_rejects_bad_goal(manager_server):
+    _, url = manager_server
+    try:
+        _api_post(url, _TOKEN, "/api/experiments",
+                  {"experiment_id": "e_bad_goal", "goal": "sideways"})
+        pytest.fail("expected 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+
+
+def test_stall_helpers_use_last_progress():
+    from types import SimpleNamespace
+
+    from mlsweep._manager_http import (
+        MANAGER_STALL_THRESHOLD_SECONDS,
+        _experiment_runs,
+        _stall_seconds,
+    )
+    from mlsweep._manager_state import ManagerState
+
+    run = SimpleNamespace(experiment_id="e", last_progress=1000.0)
+    assert _stall_seconds(run, 1005.0) == 5.0
+    assert _stall_seconds(run, 1000.0 + MANAGER_STALL_THRESHOLD_SECONDS + 1) \
+        > MANAGER_STALL_THRESHOLD_SECONDS
+    # Unknown progress never counts as stalled.
+    assert _stall_seconds(SimpleNamespace(last_progress=0.0), 1e9) == 0.0
+
+    state = ManagerState()
+    state.runs[("e", "r1")] = run  # type: ignore[index]
+    state.runs[("other", "r2")] = SimpleNamespace(experiment_id="other")  # type: ignore[index]
+    assert [r.experiment_id for r in _experiment_runs(state, "e")] == ["e"]
 
 
 # ── Jobs ────────────────────────────────────────────────────────────────────────

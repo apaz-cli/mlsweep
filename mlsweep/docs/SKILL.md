@@ -17,8 +17,12 @@ mlsweep status                                  # manager / token / GPU / result
 mlsweep run sweeps/my_sweep.py --validate       # list all combos, no submission
 mlsweep run sweeps/my_sweep.py --stream         # submit + live status
 mlsweep watch <experiment_id>                   # live terminal status
-mlsweep fetch --experiment <id> --wait          # block until done, then leaderboard
+mlsweep fetch --experiment <id> --wait          # block until done, then leaderboard (exits 1 on failure)
 mlsweep best  --experiment <id>                 # top runs by metric (--json for machines)
+mlsweep wait  <id> --until done                 # exit 0 clean, 1 failure, 2 timeout, 3 stalled
+mlsweep wait  <id> --until any-failure          # return as soon as any run fails
+mlsweep wait  <id> --until stalled --stalled-after 900
+mlsweep watch <id> --events                     # one JSON event per line (alias: --json)
 mlsweep ls                                      # list experiments (`mlsweep ls <id>` lists runs)
 mlsweep logs <run_id> --experiment <id>         # tail a run's training.log
 mlsweep metrics --experiment <id> [runs] --keys REGEX [--pivot] [--json|--csv]  # logged metrics, on demand
@@ -34,6 +38,9 @@ mlsweep stop   <id> --yes                       # abort a sweep
 - Results: `~/.mlsweep/experiments/<experiment_id>/<run>/{metrics.jsonl, training.log, artifacts/}`.
 - `watch`/`fetch`/`best`/`status`/`ls`/`logs` default `--manager` to `http://localhost:7891` (or `$MLSWEEP_MANAGER`). `run` requires `--manager`.
 - Sweep files are `COMMAND` + `OPTIONS` dicts. CLI flags use dashes.
+- `METRIC = "val_loss"` / `GOAL = "minimize"` at the top of a sweep file record the ranking metric. `fetch`/`best` default `--metric`/`--goal` to the experiment's stored values (OPTIMIZE wins if both are present), then `loss`/`minimize`.
 - Bayesian sweeps declare `OPTIMIZE = {"metric": ..., "goal": ...}`. The leaderboard ranks by that metric.
+- `mlsweep wait EXP --until done|any-failure|stalled` exits `0` clean, `1` failure, `2` timeout, `3` stalled (`--timeout`, `--interval`, `--stalled-after`). `fetch --wait`/`best --wait` exit `1` if the experiment settled with failures.
+- Colored terminal output is off by default; pass `--color` to `mlsweep` (or `mlsweep run`/`manager`/`worker`) to enable it. `--json`/`--csv` and raw `logs`/`metrics` stay plain.
 
 Full reference: `mlsweep docs` or `mlsweep --help <topic>` (readme, sweep_configuration, mlsweep, examples).

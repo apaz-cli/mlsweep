@@ -312,7 +312,7 @@ The manager bootstraps mlsweep on remote machines automatically; no manual insta
 | `has both 'values' and subdimensions` | A dim can have a value list or subdim branches; it cannot have both |
 | `--manager URL is required` | Pass `--manager http://host:7891` — `mlsweep_run` is a submission client and needs a running manager |
 | Token errors | Check `~/.mlsweep/manager.token` or pass `--token` / set `MLSWEEP_TOKEN` |
-| Singular/monotonic not skipping | Only works with one job at a time per slot; no dynamic skipping in parallel mode |
+| Singular/monotonic not skipping | Only jobs still pending when a result arrives are skipped; lower `--max-concurrent` so fewer run at once |
 | Remote not connecting | Test SSH: `ssh -o BatchMode=yes user@host nvidia-smi` |
 | `need at least GPUS_PER_RUN GPUs` | Worker has fewer GPUs than `GPUS_PER_RUN`; adjust worker config or reduce `GPUS_PER_RUN` |
 | No metrics plots | Script must use `MLSweepLogger`; stdout/stderr are still captured without it |

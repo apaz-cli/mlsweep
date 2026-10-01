@@ -57,6 +57,7 @@ class MLSweepLogger:
                             ``False`` to log from every rank.
         """
         self._run_id: str = run_name if run_name is not None else os.environ.get("MLSWEEP_RUN_NAME", "")
+        self._experiment: str = os.environ.get("EXP_EXPERIMENT", "")
         _is_lead = (
             os.environ.get("MLSWEEP_GPU_RANK", "0") == "0"
             and os.environ.get("MLSWEEP_NODE_RANK", "0") == "0"
@@ -110,13 +111,14 @@ class MLSweepLogger:
         self._send({
             "type": "metric",
             "run_id": self._run_id,
+            "experiment": self._experiment,
             "step": self.step,
             "data": metrics,
         })
 
     def sync(self) -> None:
         """Fire-and-forget: signal the worker to rsync artifacts to the controller."""
-        self._send({"type": "sync", "run_id": self._run_id})
+        self._send({"type": "sync", "run_id": self._run_id, "experiment": self._experiment})
 
     def close(self) -> None:
         """Close the unix socket connection."""

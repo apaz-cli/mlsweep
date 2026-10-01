@@ -25,8 +25,30 @@ SET_DIST_ENV = False  # (default: False) auto-set standard dist env vars
 RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
 EXTRA_FLAGS = ["--seed", "42"]
 
+# Optional ranking defaults (stored on the experiment; see below)
+METRIC = "val_loss"   # metric name used to rank runs
+GOAL = "minimize"     # "minimize" or "maximize"
+
 def EXCLUDE(combo: dict) -> bool: ...
 ```
+
+### `METRIC` and `GOAL`
+
+Optional top-level strings that record which metric should rank this sweep's
+runs and in which direction. They are stored on the experiment when the sweep is
+submitted, and `mlsweep fetch` / `mlsweep best` use them as defaults for
+`--metric` / `--goal` (an explicit CLI flag still wins; when neither is set the
+fallback is `loss` / `minimize`). This makes the ranking decision part of the
+sweep definition for grid and Bayesian sweeps alike:
+
+```python
+METRIC = "val_loss"
+GOAL = "minimize"   # or "maximize"
+```
+
+If `OPTIMIZE` is also present it takes precedence: its `metric`/`goal` are used
+(and required, for `method="bayes"`). Top-level `METRIC`/`GOAL` are then only a
+fallback for sweeps that do not declare `OPTIMIZE`.
 
 ### `COMMAND`
 
@@ -373,7 +395,7 @@ Use `"decreasing"` when your values are naturally written largest-first and you 
 
 Both examples above produce identical behavior. The choice is purely about which order is more natural to write.
 
-Both monotonic and singular skipping work only in sequential mode (one job at a time per slot). In parallel mode, results are recorded but skipping does not happen dynamically.
+The manager applies both rules whenever a run finishes. Jobs still pending that a rule makes unnecessary are marked `xfailed` and never run. Jobs already running are left to finish, so the fewer that run at once (`--max-concurrent`, or fewer GPUs), the more skipping saves. Skipping applies to grid sweeps; Bayesian sweeps handle `singular` themselves.
 
 ## Singular Skipping (Skip on Success)
 
@@ -634,12 +656,39 @@ mlsweep_run fetch --manager http://host:port --experiment EXP_ID            # do
 mlsweep_run fetch --manager http://host:port --experiment EXP_ID --status done  # filter by status
 mlsweep_run fetch --manager http://host:port --experiment EXP_ID --wait     # block until settled, then rank
 mlsweep_run watch EXP_ID --manager http://host:port                         # stream live status to terminal
+mlsweep_run watch EXP_ID --manager http://host:port --events                # one JSON event per line
 ```
 
 `fetch --status` accepts: `done`, `failed`, `pending`, `running`, `dispatched`.
-`fetch` ranks runs by `--metric` (default `loss`) and `--goal` (`minimize` or
-`maximize`). Use `mlsweep best --experiment EXP_ID` for just the leaderboard, or add
-`--json` to either for machine-readable output.
+`fetch` and `best` rank runs by `--metric` and `--goal`; when those flags are
+omitted they default to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`),
+falling back to `loss` / `minimize`. Use `mlsweep best --experiment EXP_ID` for
+just the leaderboard, or add `--json` to either for machine-readable output.
+
+### Waiting for a sweep
+
+`mlsweep wait EXP` blocks until an experiment reaches a requested state. It is
+built for scripts and agents: the result is reported through distinct exit codes
+rather than text that must be parsed.
+
+```bash
+mlsweep wait EXP --until done            # no pending/dispatched/running jobs
+mlsweep wait EXP --until any-failure     # return as soon as any run failed
+mlsweep wait EXP --until stalled         # return when a running run stops progressing
+mlsweep wait EXP --until done --timeout 3600 --interval 15
+mlsweep wait EXP --until stalled --stalled-after 900
+```
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Settled cleanly (no failed runs), or the requested condition was met with no failure. |
+| `1` | At least one run finished as `failed`. |
+| `2` | `--timeout` elapsed before the condition was met (`0` = wait forever). |
+| `3` | `--until stalled` and a running run made no log/metric progress for `--stalled-after` seconds (default `900`). |
+
+`--interval` controls the poll period (default `10` seconds). `mlsweep fetch
+--wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
+with failures.
 
 ## Command-Line Options
 
@@ -654,9 +703,10 @@ Monitor / Control / Docs). Individual binaries remain as aliases.
 | `run` | Submit a sweep (alias of `mlsweep_run`). |
 | `worker` | Start a worker daemon (alias of `mlsweep_worker`). |
 | `gen_makefile` | Write a standard `Makefile` (adds `make sweep-*` targets). |
-| `watch <exp_id>` | Live terminal status for an experiment. |
+| `watch <exp_id>` | Live terminal status for an experiment (`--events` / `--json` stream one JSON event per line). |
 | `fetch` | Download + summarize + rank an experiment's results (leaderboard). |
 | `best` | Show the top runs of an experiment by metric. |
+| `wait <exp_id>` | Block until an experiment settles, fails, or stalls. Exit codes: `0` clean, `1` failure, `2` timeout, `3` stalled. |
 | `status` (`doctor`) | Diagnose manager / token / GPUs / results / disk. |
 | `ls [exp_id]` | List experiments, or the runs within one experiment. |
 | `logs <run_id>` | Print (and optionally follow) a run's training log. |
@@ -672,9 +722,11 @@ Monitor / Control / Docs). Individual binaries remain as aliases.
 
 `watch`, `fetch`, `best`, `status`, `ls`, and `logs` default `--manager` to
 `http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`). `run`
-requires `--manager`. `fetch` and `best` rank by `--metric` (default `loss`) with
-`--goal` (`minimize` or `maximize`). `fetch` supports `--wait`, `--top`, and `--json`.
-`status`, `ls`, `best`, and `fetch` also accept `--json`.
+requires `--manager`. `fetch` and `best` rank by `--metric` / `--goal`, defaulting
+to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`) and finally
+`loss`/`minimize`. `fetch` supports `--wait`, `--top`, and `--json`.
+`status`, `ls`, `best`, and `fetch` also accept `--json`. `watch` accepts
+`--events` (alias `--json`) for a machine-readable event stream.
 
 `cancel`, `retry`, and `resume` exit non-zero if any targeted run fails, so
 scripts can detect partial failures.
@@ -1006,7 +1058,7 @@ The worker sets `CUDA_VISIBLE_DEVICES=0,1,2,3` for the first job and `CUDA_VISIB
 | `COMMAND is required` | Add `COMMAND = ["python", "train.py"]` to the sweep file. |
 | `Dimension key '...' must start with '.'` | All keys in `OPTIONS` (and subdim specs) must begin with `.`. Metadata keys (`name`, `flags`, `values`, `singular`, `monotonic`) do not. |
 | `has both 'values' and subdimensions` | A dim can have a value list or subdim branches; it cannot have both. |
-| Monotonic/singular not skipping | These only work with one job at a time per slot. In parallel mode results are recorded but skipping is not applied dynamically. |
+| Monotonic/singular not skipping | Only jobs still pending when a result arrives are skipped; jobs already running finish. Lower `--max-concurrent` to run fewer at once. |
 | Remote jobs not connecting | Ensure passwordless SSH is configured. Test with `ssh -o BatchMode=yes <worker> nvidia-smi`. |
 | `need at least GPUS_PER_RUN GPUs` | A worker has fewer GPUs than `GPUS_PER_RUN`. Increase the worker's GPU count or reduce `GPUS_PER_RUN`. |
 | Remote worker skipped with `need N per run` | That worker has fewer GPUs than `GPUS_PER_RUN` and is skipped; other workers with enough GPUs are still used. |

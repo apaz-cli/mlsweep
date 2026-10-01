@@ -10,7 +10,6 @@ import json
 import os
 import re
 import subprocess
-from typing import Any
 
 
 def visible_devices() -> list[int]:

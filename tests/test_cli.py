@@ -1,13 +1,28 @@
 """Unit tests for the mlsweep CLI helpers, help text, and Makefile template."""
 
+from collections.abc import Iterator
 from importlib.resources import files
 
+import pytest
+
 from mlsweep import cli
+from mlsweep import ctl
+from mlsweep._colors import color_enabled, set_color, strip_color_flag
 from mlsweep._shared import _GREEN, _RESET
 
 
+@pytest.fixture(autouse=True)
+def _reset_color() -> Iterator[None]:
+    """Keep the global color toggle from leaking between tests."""
+    set_color(False)
+    yield
+    set_color(False)
+
+
 def test_visible_width_strips_ansi():
+    set_color(True)
     assert cli._visible_width(f"{_GREEN}mlsweep{_RESET}") == 7
+    set_color(False)
     assert cli._visible_width("plain") == 5
     assert cli._visible_width("") == 0
 
@@ -45,13 +60,18 @@ def test_label_pads_to_shared_column():
 def test_help_lists_all_subcommands():
     h = cli._build_help()
     for cmd in [
-        "manager", "run", "worker", "watch", "fetch", "best", "status",
+        "manager", "run", "worker", "watch", "fetch", "best", "wait", "status",
         "ls", "logs", "cancel", "retry", "resume", "stop", "pause",
         "unpause", "docs", "gen_makefile", "version",
     ]:
         assert cmd in h, cmd
     # skill is referenced as a docs topic
     assert "skill" in h
+
+
+def test_wait_registered_as_ctl_command():
+    assert "wait" in cli._CTL_CMDS
+    assert callable(ctl.wait_cmd)
 
 
 def test_doc_aliases():
@@ -88,32 +108,51 @@ def test_skill_doc_is_shipped():
     assert "mlsweep run" in text
 
 
-def test_main_help(capsys, monkeypatch):
-    monkeypatch.setattr("sys.argv", ["mlsweep", "--help"])
-    cli.main()
+def test_main_help(capsys):
+    cli.main(["--help"])
+    out = capsys.readouterr().out
+    # The banner is only for a bare `mlsweep`; --help must not print it.
+    assert "experiment sweep engine" not in out
+    assert "Control:" in out
+    assert "\033[" not in out
+
+
+def test_main_bare_prints_banner(capsys):
+    cli.main([])
     out = capsys.readouterr().out
     assert "experiment sweep engine" in out
     assert "Control:" in out
 
 
-def test_main_help_topic_skill(capsys, monkeypatch):
-    monkeypatch.setattr("sys.argv", ["mlsweep", "--help", "skill"])
-    cli.main()
+def test_color_flag_enables_ansi(capsys):
+    cli.main(["--color", "--help"])
+    out = capsys.readouterr().out
+    assert "\033[" in out
+    assert "experiment sweep engine" not in out  # still no banner for --help
+
+
+def test_strip_color_flag_preserves_run_passthrough():
+    assert not color_enabled()
+    rest = strip_color_flag(["--color", "run", "sweep.py", "--", "--color"])
+    assert rest == ["run", "sweep.py", "--", "--color"]
+    assert color_enabled()
+
+
+def test_main_help_topic_skill(capsys):
+    cli.main(["--help", "skill"])
     out = capsys.readouterr().out
     assert "mlsweep" in out
 
 
-def test_main_version(capsys, monkeypatch):
+def test_main_version(capsys):
     from importlib.metadata import version
-    monkeypatch.setattr("sys.argv", ["mlsweep", "version"])
-    cli.main()
+    cli.main(["version"])
     assert capsys.readouterr().out.strip() == version("mlsweep")
 
 
-def test_main_unknown_subcommand(capsys, monkeypatch):
+def test_main_unknown_subcommand(capsys):
     import pytest
-    monkeypatch.setattr("sys.argv", ["mlsweep", "definitely-not-a-command"])
     with pytest.raises(SystemExit):
-        cli.main()
+        cli.main(["definitely-not-a-command"])
     out = capsys.readouterr().out
     assert "Unknown subcommand" in out

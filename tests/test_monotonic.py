@@ -126,3 +126,57 @@ def test_increasing_trial_order_in_variations():
     vars_ = generate_variations("s", opts)
     names = [v["name"] for v in vars_]
     assert names == ["s_bs8", "s_bs16", "s_bs32", "s_bs64"]
+
+
+def _should_skip_reference(combo, failed, succeeded, options):
+    """The original pairwise definition of the skip rules, which SkipIndex must match."""
+    for fc in failed:
+        for key, opt in options.items():
+            if not opt.get("monotonic"):
+                continue
+            if not all(fc.get(k) == combo.get(k) for k in options if k != key):
+                continue
+            vals = opt["_values"]
+            try:
+                fi, ci = vals.index(fc[key]), vals.index(combo[key])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if fi <= ci:
+                return True
+    for sc in succeeded:
+        for key, opt in options.items():
+            if not opt.get("singular"):
+                continue
+            if not all(sc.get(k) == combo.get(k)
+                       for k in options if k != key and not options[k].get("singular")):
+                continue
+            if sc.get(key) != combo.get(key):
+                return True
+    return False
+
+
+def test_skip_index_matches_the_pairwise_definition():
+    import random
+    from mlsweep._sweep import SkipIndex
+    rng = random.Random(7)
+    values = [0, 1, 2, 3, "a", [1, 2], {"x": 1}, None, 1.5]
+    for _ in range(300):
+        dims = rng.sample(["a", "b", "c", "d"], rng.randint(1, 4))
+        options = {}
+        for d in dims:
+            kind = rng.choice(["monotonic", "singular", "plain"])
+            options[d] = {"monotonic": kind == "monotonic", "singular": kind == "singular",
+                          "_values": rng.sample(values, rng.randint(1, 4))}
+
+        def combo():
+            c = {d: rng.choice(options[d]["_values"] + [rng.choice(values)]) for d in dims}
+            if rng.random() < 0.1:
+                c.pop(rng.choice(dims))  # a combo may lack a dim
+            return c
+        failed = [combo() for _ in range(rng.randint(0, 6))]
+        succeeded = [combo() for _ in range(rng.randint(0, 6))]
+        index = SkipIndex(failed, succeeded, options)
+        for _ in range(20):
+            c = combo()
+            assert index.skips(c) == _should_skip_reference(c, failed, succeeded, options), \
+                (c, failed, succeeded, options)

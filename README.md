@@ -224,6 +224,12 @@ All flags below assume `--manager http://localhost:7891`:
 | `--priority N` | Higher values run sooner (default: 0) |
 | `--wandb-project P` | Stream metrics to W&B |
 | `--tensorboard-dir D` | Write TensorBoard logs |
+| `--color` | Enable ANSI color in human-readable output (default: off) |
+
+Colored output is **off by default** so piping and logging stay clean. Pass
+`--color` to any entry point (`mlsweep`, `mlsweep run`, `mlsweep manager`,
+`mlsweep worker`) to turn it on. Machine-readable output (`--json`, `--csv`) and
+raw `logs`/`metrics` text are never colorized.
 
 Subcommands (`mlsweep <subcommand>`, or `mlsweep --help` for the full grouped list):
 

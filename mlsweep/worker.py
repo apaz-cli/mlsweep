@@ -28,12 +28,10 @@ Startup behaviour:
 import argparse
 import dataclasses
 import fcntl
-import hashlib
 import importlib.metadata
 import json
 import os
 import queue
-import shlex
 import shutil
 import signal
 import socket
@@ -42,7 +40,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, IO
+from typing import Any
 from urllib.request import urlopen
 
 from mlsweep._shared import (
@@ -62,10 +60,15 @@ from mlsweep._shared import (
     MsgStarted,
     MsgSyncReq,
     MsgWorkerHello,
+    LOG_CHUNK_BYTES,
+    PROTOCOL_VERSION,
     _resolve_safe_subpath,
     decode,
+    dist_master_port,
     encode,
+    line_chunks,
     read_msg,
+    set_color,
 )
 from mlsweep._topology import _gpu_topology, visible_devices
 
@@ -74,14 +77,27 @@ from mlsweep._topology import _gpu_topology, visible_devices
 
 @dataclasses.dataclass
 class RunState:
+    """A run this worker has accepted, from MsgRun until its result is recorded.
+
+    Registered before setup (artifact download, setup_command) so that a cancel
+    or a reconnect during setup sees the run.  ``pids`` stays empty until the
+    training processes are spawned.
+    """
     run_id: str
-    pids: list[int]         # per-GPU PIDs; pids[0] is rank-0
     scratch_path: str       # {scratch_dir}/{experiment}/{run_id}/
     gpu_ids: list[int]
     experiment: str
-    log_seq: int = 0        # byte offset into training.log after last write
-    metric_seq: int = 0     # byte offset into metrics.jsonl after last write
+    pids: list[int] = dataclasses.field(default_factory=list)  # per-GPU; pids[0] is rank-0
+    setup_proc: "subprocess.Popen[bytes] | None" = None
+    cancelled: bool = False
+    # Bytes of training.log written and sent to the manager, and the lines in between.
+    log_seq: int = 0
+    sent_seq: int = 0
+    pending_log: list[bytes] = dataclasses.field(default_factory=list)
+    log_fh: Any = None
     log_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    # Open logger (IPC) connections of this run; its result waits for them to drain.
+    ipc_conns: int = 0
 
 
 # ── Connection state ────────────────────────────────────────────────────────────
@@ -97,14 +113,21 @@ class ConnState:
 # ── Global worker state (protected by _lock) ───────────────────────────────────
 
 _lock = threading.Lock()
-_in_flight: dict[str, RunState] = {}        # run_id → RunState
-_busy_gpus: set[int] = set()
+# Runs are keyed by (experiment, run_id) because run names repeat across experiments.
+RunKey = tuple[str, str]
+_in_flight: dict[RunKey, RunState] = {}
 _connections: list[ConnState] = []
 # Results the manager has not acknowledged yet (it acks with MsgCleanup).  A result
 # sent while the manager is disconnected, or on a connection it has abandoned, would
 # otherwise be lost; these are re-reported in every MsgWorkerHello as ``completed``.
-_unacked_results: dict[str, tuple[MsgResult, str]] = {}   # run_id → (result, experiment)
+_unacked_results: dict[RunKey, MsgResult] = {}
 _shutdown_event = threading.Event()
+# Signalled when an IPC connection is attributed to its run or closes.
+_ipc_cond = threading.Condition(_lock)
+# IPC connections accepted but not yet attributed to a run (no message read yet).
+_ipc_unclaimed = 0
+# How long a finished run's result waits for its loggers' last messages.
+_IPC_DRAIN_TIMEOUT = 10.0
 
 # Set by main() from CLI args
 _scratch_dir: str = "/tmp/mlsweep"
@@ -168,12 +191,57 @@ def _send_run_msg(data: bytes) -> None:
         conn.send_queue.put(data)
 
 
-def _report_result(result: MsgResult, experiment: str) -> None:
+def _report_result(result: MsgResult) -> None:
     """Record *result* as unacknowledged, then send it.  It is re-sent in the next
     MsgWorkerHello until the manager acknowledges it with MsgCleanup."""
     with _lock:
-        _unacked_results[result.run_id] = (result, experiment)
+        _unacked_results[(result.experiment, result.run_id)] = result
     _send_run_msg(encode(result))
+
+
+# ── Run logs ─────────────────────────────────────────────────────────────────
+#
+# A run's output is appended to its training.log and sent as chunks of whole
+# lines, each carrying its exact byte range, so the manager can tell a gap (a
+# chunk lost with a dropped connection) from a duplicate.  It asks for a
+# replay from where its copy ends when it sees a gap.
+
+_LOG_FLUSH_INTERVAL = 0.25
+
+
+def _append_log(rs: RunState, raw: bytes) -> None:
+    """Append whole lines to training.log; they are sent within _LOG_FLUSH_INTERVAL."""
+    with rs.log_lock:
+        if rs.log_fh is None:
+            rs.log_fh = open(os.path.join(rs.scratch_path, "training.log"), "ab", buffering=0)
+        rs.log_fh.write(raw)
+        rs.log_seq += len(raw)
+        rs.pending_log.append(raw)
+        if rs.log_seq - rs.sent_seq >= LOG_CHUNK_BYTES:
+            _flush_log_locked(rs)
+
+
+def _log_msg(rs: RunState, start: int, raw: bytes) -> bytes:
+    return encode(MsgLog(run_id=rs.run_id, experiment=rs.experiment, start=start,
+                         seq=start + len(raw), data=raw.decode("utf-8", errors="replace")))
+
+
+def _flush_log_locked(rs: RunState) -> None:
+    """Send the lines written since the last send.  Caller holds ``rs.log_lock``."""
+    if rs.pending_log:
+        _send_run_msg(_log_msg(rs, rs.sent_seq, b"".join(rs.pending_log)))
+        rs.pending_log.clear()
+        rs.sent_seq = rs.log_seq
+
+
+def _log_flush_thread() -> None:
+    """Send every run's buffered log lines at least every _LOG_FLUSH_INTERVAL."""
+    while not _shutdown_event.wait(_LOG_FLUSH_INTERVAL):
+        with _lock:
+            runs = list(_in_flight.values())
+        for rs in runs:
+            with rs.log_lock:
+                _flush_log_locked(rs)
 
 
 # ── Write thread (one per connection) ─────────────────────────────────────────
@@ -235,18 +303,13 @@ def _read_thread(conn: ConnState) -> None:
         resuming = [
             {
                 "run_id": rs.run_id,
-                "log_seq": rs.log_seq,
-                "metric_seq": rs.metric_seq,
-                "pid": rs.pids[0],
+                "pid": rs.pids[0] if rs.pids else 0,
                 "gpu_ids": list(rs.gpu_ids),
                 "experiment": rs.experiment,
             }
             for rs in _in_flight.values()
         ]
-        completed = [
-            {**dataclasses.asdict(res), "experiment": exp}
-            for res, exp in _unacked_results.values()
-        ]
+        completed = [dataclasses.asdict(res) for res in _unacked_results.values()]
     hello_resp = MsgWorkerHello(
         gpus=gpus,
         topo=topo_wire,
@@ -254,6 +317,7 @@ def _read_thread(conn: ConnState) -> None:
         scratch_dir=_scratch_dir,
         max_jobs_per_gpu=_max_jobs_per_gpu,
         completed=completed,
+        protocol=PROTOCOL_VERSION,
     )
     conn.send_queue.put(encode(hello_resp))
 
@@ -285,8 +349,19 @@ def _read_thread(conn: ConnState) -> None:
 
 def _handle_msg(msg: Any, conn: ConnState) -> None:
     if isinstance(msg, MsgRun):
+        key = (msg.experiment, msg.run_id)
+        with _lock:
+            if key in _in_flight:
+                return  # duplicate dispatch of a run we are already executing
+            _unacked_results.pop(key, None)
+            rs = _in_flight[key] = RunState(
+                run_id=msg.run_id,
+                scratch_path=os.path.join(_scratch_dir, msg.experiment, msg.run_id),
+                gpu_ids=list(msg.gpu_ids),
+                experiment=msg.experiment,
+            )
         t = threading.Thread(
-            target=_handle_run, args=(msg,),
+            target=_handle_run, args=(msg, rs),
             daemon=True,
             name=f"setup-{msg.run_id}",
         )
@@ -316,18 +391,42 @@ def _download_file(url: str, dest: str, timeout: int = 300) -> None:
 
 
 
-def _handle_run(msg: MsgRun) -> None:
-    """Spawn one training subprocess per GPU in the run's GPU group."""
+def _handle_run(msg: MsgRun, rs: RunState) -> None:
+    """Set up the run, then spawn one training subprocess per GPU in its group."""
     try:
-        _handle_run_inner(msg)
+        _setup_and_spawn(msg, rs)
+    except _Cancelled:
+        _finish_unstarted(msg, exit_code=-int(signal.SIGTERM))
     except Exception as exc:
         print(f"[worker] ERROR in run {msg.run_id}: {exc}", file=sys.stderr, flush=True)
-        _report_result(MsgResult(run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1),
-                       msg.experiment)
+        _finish_unstarted(msg, exit_code=-1)
 
 
-def _handle_run_inner(msg: MsgRun) -> None:
-    scratch_path = os.path.join(_scratch_dir, msg.experiment, msg.run_id)
+class _Cancelled(Exception):
+    """The run was cancelled before its training processes started."""
+
+
+def _finish_unstarted(msg: MsgRun, exit_code: int) -> None:
+    """Report a failed result for a run that never spawned its training processes."""
+    result = MsgResult(run_id=msg.run_id, experiment=msg.experiment,
+                       success=False, elapsed=0.0, exit_code=exit_code)
+    with _lock:
+        _in_flight.pop((msg.experiment, msg.run_id), None)
+    _report_result(result)
+
+
+def _check_cancelled_locked(rs: RunState) -> None:
+    if rs.cancelled:
+        raise _Cancelled
+
+
+def _check_cancelled(rs: RunState) -> None:
+    with _lock:
+        _check_cancelled_locked(rs)
+
+
+def _setup_and_spawn(msg: MsgRun, rs: RunState) -> None:
+    scratch_path = rs.scratch_path
     log_path = os.path.join(scratch_path, "training.log")
     metrics_path = os.path.join(scratch_path, "metrics.jsonl")
     artifacts_path = os.path.join(scratch_path, "artifacts")
@@ -353,25 +452,28 @@ def _handle_run_inner(msg: MsgRun) -> None:
 
     # ── Artifact download & extraction ───────────────────────────────────────
     if msg.artifact_id and msg.artifact_url:
-        with _artifact_lock_for(msg.artifact_id):
-            if workspace is None:
-                workspace = os.path.join(scratch_path, "workspace")
-                os.makedirs(workspace, exist_ok=True)
-            tarball_url = msg.artifact_url
-            tarball_path = os.path.join(scratch_path, "artifact.tar.gz")
-            _download_file(tarball_url, tarball_path)
-            try:
-                subprocess.run(
-                    ["tar", "-xzf", tarball_path, "-C", workspace],
-                    check=True,
-                )
-            finally:
+        try:
+            with _artifact_lock_for(msg.artifact_id):
+                if workspace is None:
+                    workspace = os.path.join(scratch_path, "workspace")
+                    os.makedirs(workspace, exist_ok=True)
+                tarball_url = msg.artifact_url
+                tarball_path = os.path.join(scratch_path, "artifact.tar.gz")
+                _download_file(tarball_url, tarball_path)
                 try:
-                    os.unlink(tarball_path)
-                except OSError:
-                    pass
-            cwd = workspace
-        _artifact_lock_done(msg.artifact_id)
+                    subprocess.run(
+                        ["tar", "-xzf", tarball_path, "-C", workspace],
+                        check=True,
+                    )
+                finally:
+                    try:
+                        os.unlink(tarball_path)
+                    except OSError:
+                        pass
+                cwd = workspace
+        finally:
+            _artifact_lock_done(msg.artifact_id)
+    _check_cancelled(rs)
 
     # ── Optional setup command ───────────────────────────────────────────────
     if msg.setup_command:
@@ -381,25 +483,27 @@ def _handle_run_inner(msg: MsgRun) -> None:
             cwd = workspace
         cmd = msg.setup_command
         use_shell = isinstance(cmd, str)
-        result = subprocess.run(
-            cmd,
-            shell=use_shell,
-            cwd=workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        setup_output = result.stdout or ""
-        if result.returncode != 0:
-            setup_output += f"[mlsweep] setup_command exited {result.returncode}\n"
+        with _lock:
+            _check_cancelled_locked(rs)
+            setup_proc = rs.setup_proc = subprocess.Popen(
+                cmd,
+                shell=use_shell,
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # so a cancel can signal the whole group
+            )
+        setup_output, _ = setup_proc.communicate()
+        with _lock:
+            rs.setup_proc = None
+        _check_cancelled(rs)
+        setup_output = setup_output or b""
+        if setup_proc.returncode != 0:
+            setup_output += f"[mlsweep] setup_command exited {setup_proc.returncode}\n".encode()
         if setup_output:
-            with open(log_path, "a") as _lf:
-                _lf.write(setup_output)
-            _send_run_msg(encode(MsgLog(
-                run_id=msg.run_id, seq=len(setup_output), data=setup_output
-            )))
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd)
+            _append_log(rs, setup_output)
+        if setup_proc.returncode != 0:
+            raise subprocess.CalledProcessError(setup_proc.returncode, cmd)
 
     # ── RUN_FROM: working directory for the run ────────────────────────────
     # Resolve against the run's base cwd (the extracted workspace when a file
@@ -449,14 +553,14 @@ def _handle_run_inner(msg: MsgRun) -> None:
             master_port = base_env["MLSWEEP_MASTER_PORT"]
         else:
             master_addr = "localhost"
-            master_port = str(
-                20000 + int(hashlib.md5(msg.run_id.encode()).hexdigest()[:4], 16) % 10000
-            )
+            master_port = str(dist_master_port(msg.experiment, msg.run_id))
         _dist_base = {
             "WORLD_SIZE": str(world_size),
             "MASTER_ADDR": master_addr,
             "MASTER_PORT": master_port,
         }
+
+    _check_cancelled(rs)
 
     # Spawn one process per GPU rank (or one process for CPU-only runs)
     n_ranks = max(1, len(msg.gpu_ids))
@@ -484,26 +588,21 @@ def _handle_run_inner(msg: MsgRun) -> None:
                 p.kill()
             except OSError:
                 pass
-        _report_result(MsgResult(run_id=msg.run_id, success=False, elapsed=0.0, exit_code=-1),
-                       msg.experiment)
+        _finish_unstarted(msg, exit_code=-1)
         return
 
+    # A cancel that raced with the spawn found no pids to signal; honour it now.
     with _lock:
-        state = RunState(
-            run_id=msg.run_id,
-            pids=pids,
-            scratch_path=scratch_path,
-            gpu_ids=list(msg.gpu_ids),
-            experiment=msg.experiment,
-        )
-        _in_flight[msg.run_id] = state
-        _busy_gpus.update(msg.gpu_ids)
+        rs.pids = pids
+        cancelled = rs.cancelled
+    if cancelled:
+        _signal_pids(pids)
 
-    _send_run_msg(encode(MsgStarted(run_id=msg.run_id, pid=pids[0])))
+    _send_run_msg(encode(MsgStarted(run_id=msg.run_id, experiment=msg.experiment, pid=pids[0])))
 
     t = threading.Thread(
         target=_run_thread,
-        args=(procs, state, log_path, artifacts_path, workspace or cwd, msg.return_files),
+        args=(procs, rs, artifacts_path, workspace or cwd, msg.return_files),
         daemon=True,
         name=f"run-{msg.run_id}",
     )
@@ -513,7 +612,6 @@ def _handle_run_inner(msg: MsgRun) -> None:
 def _run_thread(
     procs: "list[subprocess.Popen[bytes]]",
     state: RunState,
-    log_path: str,
     artifacts_path: str,
     run_dir: str,
     return_files: list[str],
@@ -522,19 +620,14 @@ def _run_thread(
     t0 = time.time()
 
     # Stream rank-0 stdout to the log
-    with open(log_path, "a", buffering=1) as log_fh:
-        assert procs[0].stdout is not None
-        for raw_line in procs[0].stdout:
-            line_str = raw_line.decode("utf-8", errors="replace")
-            with state.log_lock:
-                log_fh.write(line_str)
-                log_fh.flush()
-                state.log_seq = log_fh.tell()
-            _send_run_msg(encode(MsgLog(
-                run_id=state.run_id,
-                seq=state.log_seq,
-                data=line_str,
-            )))
+    assert procs[0].stdout is not None
+    for raw_line in procs[0].stdout:
+        _append_log(state, raw_line)
+    with state.log_lock:
+        _flush_log_locked(state)
+        if state.log_fh is not None:
+            state.log_fh.close()
+            state.log_fh = None
 
     # Wait for all ranks to finish
     rcs = [procs[0].wait()] + [p.wait() for p in procs[1:]]
@@ -553,16 +646,21 @@ def _run_thread(
 
     result = MsgResult(
         run_id=state.run_id,
+        experiment=state.experiment,
         success=(exit_code == 0),
         elapsed=elapsed,
         exit_code=exit_code,
     )
+    # The processes are gone, but their loggers' last metrics may still be unread
+    # in the IPC sockets.  Record them before the result, which ends the run.
+    with _ipc_cond:
+        _ipc_cond.wait_for(lambda: state.ipc_conns == 0 and _ipc_unclaimed == 0,
+                           timeout=_IPC_DRAIN_TIMEOUT)
     # Move the run from in-flight to unacknowledged in one step, so a hello snapshot
     # taken at any moment reports it as either resuming or completed.
     with _lock:
-        _in_flight.pop(state.run_id, None)
-        _busy_gpus.difference_update(state.gpu_ids)
-        _unacked_results[state.run_id] = (result, state.experiment)
+        _in_flight.pop((state.experiment, state.run_id), None)
+        _unacked_results[(state.experiment, state.run_id)] = result
 
     # Free the workspace (large extracted artifact copy); keep logs and output artifacts.
     workspace_dir = os.path.join(state.scratch_path, "workspace")
@@ -585,7 +683,7 @@ def _handle_cleanup(msg: MsgCleanup, conn: ConnState) -> None:
     """
     # Any MsgCleanup for a run means the manager has processed its result.
     with _lock:
-        _unacked_results.pop(msg.run_id, None)
+        _unacked_results.pop((msg.experiment, msg.run_id), None)
     if msg.final and msg.experiment:
         try:
             exp_dir = _resolve_safe_subpath(_scratch_dir, msg.experiment)
@@ -600,30 +698,43 @@ def _handle_cleanup(msg: MsgCleanup, conn: ConnState) -> None:
         if run_dir:
             shutil.rmtree(run_dir, ignore_errors=True)
     if not conn.closed:
-        conn.send_queue.put(encode(MsgCleaned(run_id=msg.run_id)))
+        conn.send_queue.put(encode(MsgCleaned(run_id=msg.run_id, experiment=msg.experiment)))
+
+
+def _signal_pids(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
 
 
 def _handle_cancel(msg: MsgCancel) -> None:
-    """SIGTERM all per-GPU processes for the run."""
+    """Cancel a run: SIGTERM its processes, or stop it before they start."""
     with _lock:
-        state = _in_flight.get(msg.run_id)
-    if state is not None:
-        for pid in state.pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        state = _in_flight.get((msg.experiment, msg.run_id))
+        if state is None:
+            return
+        state.cancelled = True
+        pids = list(state.pids)
+        setup_proc = state.setup_proc
+    if setup_proc is not None:
+        try:
+            os.killpg(setup_proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    _signal_pids(pids)
 
 
 def _handle_replay(msg: MsgReplay, conn: ConnState) -> None:
-    """Replay buffered log and metric lines from given byte offsets."""
+    """Re-send a running run's log from the requested offset, and its metrics."""
     with _lock:
-        state = _in_flight.get(msg.run_id)
+        state = _in_flight.get((msg.experiment, msg.run_id))
     if state is None:
         return
     t = threading.Thread(
         target=_replay_thread,
-        args=(msg.run_id, state, msg.log_seq, msg.metric_seq, conn),
+        args=(msg.run_id, state, msg.log_seq, conn),
         daemon=True,
         name=f"replay-{msg.run_id}",
     )
@@ -634,35 +745,34 @@ def _replay_thread(
     run_id: str,
     state: RunState,
     log_seq: int,
-    metric_seq: int,
     conn: ConnState,
 ) -> None:
-    """Re-send log/metric lines the controller missed during a disconnect."""
+    """Re-send the log from *log_seq* on, and every metric line.
+
+    The log is re-sent up to what was written so far, which supersedes the
+    lines still waiting to be sent; later lines continue from there.
+    """
     log_path = os.path.join(state.scratch_path, "training.log")
     metrics_path = os.path.join(state.scratch_path, "metrics.jsonl")
 
     with state.log_lock:
-        # Replay log lines from log_seq offset
         try:
             with open(log_path, "rb") as f:
                 f.seek(log_seq)
-                while True:
-                    raw = f.readline()
-                    if not raw:
-                        break
-                    if not conn.closed:
-                        conn.send_queue.put(encode(MsgLog(
-                            run_id=run_id,
-                            seq=f.tell(),
-                            data=raw.decode("utf-8", errors="replace"),
-                        )))
+                missed = f.read(max(0, state.log_seq - log_seq))
         except OSError:
-            pass
+            missed = b""
+        start = log_seq
+        for chunk in line_chunks(missed):
+            if not conn.closed:
+                conn.send_queue.put(_log_msg(state, start, chunk))
+            start += len(chunk)
+        state.pending_log.clear()
+        state.sent_seq = state.log_seq
 
-        # Replay metric lines from metric_seq offset
+        # Replay every metric line; the manager ignores steps it already has.
         try:
             with open(metrics_path, "rb") as f:
-                f.seek(metric_seq)
                 while True:
                     raw = f.readline()
                     if not raw:
@@ -673,7 +783,8 @@ def _replay_thread(
                         data = {k: v for k, v in rec.items() if k != "step"}
                         if not conn.closed:
                             conn.send_queue.put(encode(MsgMetric(
-                                run_id=run_id, step=step, data=data
+                                run_id=run_id, experiment=state.experiment,
+                                step=step, data=data,
                             )))
                     except json.JSONDecodeError:
                         pass
@@ -716,7 +827,16 @@ def _ipc_thread(sock_path: str) -> None:
 
 
 def _ipc_conn_thread(sock: socket.socket) -> None:
-    """Handle one IPC connection from a training script."""
+    """Handle one IPC connection from a training script.
+
+    The connection counts toward its run's ``ipc_conns`` from its first message
+    until it closes, so the run's result is only sent once it has drained.
+    """
+    global _ipc_unclaimed
+    with _lock:
+        _ipc_unclaimed += 1
+    claimed = False
+    rs: RunState | None = None
     buf = b""
     try:
         while True:
@@ -733,6 +853,14 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
                     msg: dict[str, Any] = json.loads(line_bytes)
                 except json.JSONDecodeError:
                     continue
+                if not claimed:
+                    with _ipc_cond:
+                        claimed = True
+                        _ipc_unclaimed -= 1
+                        rs = _ipc_run_state_locked(msg)
+                        if rs is not None:
+                            rs.ipc_conns += 1
+                        _ipc_cond.notify_all()
                 _handle_ipc_msg(msg)
     except OSError:
         pass
@@ -741,6 +869,22 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
             sock.close()
         except OSError:
             pass
+        with _ipc_cond:
+            if not claimed:
+                _ipc_unclaimed -= 1
+            elif rs is not None:
+                rs.ipc_conns -= 1
+            _ipc_cond.notify_all()
+
+
+def _ipc_run_state_locked(msg: dict[str, Any]) -> RunState | None:
+    """The in-flight run an IPC message belongs to.  The caller holds ``_lock``."""
+    run_id = msg.get("run_id", "")
+    experiment = msg.get("experiment", "")
+    if experiment:
+        return _in_flight.get((experiment, run_id))
+    # Loggers from older mlsweep versions send only the run name.
+    return next((rs for rs in _in_flight.values() if rs.run_id == run_id), None)
 
 
 def _handle_ipc_msg(msg: dict[str, Any]) -> None:
@@ -749,8 +893,7 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
     msg_type = msg.get("type")
 
     with _lock:
-        state = _in_flight.get(run_id)
-        conns = [c for c in _connections if not c.closed]
+        state = _ipc_run_state_locked(msg)
 
     if state is None:
         return
@@ -763,20 +906,15 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
         record: dict[str, Any] = {"step": step, **data}
         line = json.dumps(record) + "\n"
         try:
-            with open(metrics_path, "a", buffering=1) as f:
+            with open(metrics_path, "a") as f:
                 f.write(line)
-                f.flush()
-                state.metric_seq = f.tell()
         except OSError:
             pass
-        wire = encode(MsgMetric(run_id=run_id, step=step, data=data))
-        for conn in conns:
-            conn.send_queue.put(wire)
+        _send_run_msg(encode(MsgMetric(
+            run_id=run_id, experiment=state.experiment, step=step, data=data)))
 
     elif msg_type == "sync":
-        wire = encode(MsgSyncReq(run_id=run_id))
-        for conn in conns:
-            conn.send_queue.put(wire)
+        _send_run_msg(encode(MsgSyncReq(run_id=run_id, experiment=state.experiment)))
 
 
 # ── GPU stats polling ─────────────────────────────────────────────────────────
@@ -913,9 +1051,14 @@ def main() -> None:
                                  "(0 = unlimited, default: 1)")
         parser.add_argument("--port", type=int, default=7890,
                             help="TCP port to bind (0 = ephemeral, default: 7890)")
+        parser.add_argument("--color", action="store_true",
+                            help="Enable ANSI color in human-readable output (default: off)")
         parser.add_argument("--version", action="version",
                             version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
         args = parser.parse_args()
+
+        if args.color:
+            set_color(True)
 
         _scratch_dir = args.scratch_dir
         _remote_dir = args.remote_dir or os.getcwd()
@@ -976,6 +1119,7 @@ def main() -> None:
 
         gpu_t = threading.Thread(target=_gpu_stats_thread, daemon=True)
         gpu_t.start()
+        threading.Thread(target=_log_flush_thread, daemon=True).start()
 
         # Enter accept loop (blocks until _shutdown_event is set)
         _accept_loop(server_sock)

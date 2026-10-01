@@ -17,12 +17,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from mlsweep._shared import _GREEN, _RED, _RESET
+from mlsweep._shared import _BOLD, _CYAN, _GREEN, _RED, _RESET, _YELLOW
 from mlsweep.run_sweep import (
     _add_manager_args,
     _combo_str,
+    _manager_token,
     _parse_combo,
-    _require_token,
     _wait_until_settled,
     build_leaderboard,
     manager_cancel_job,
@@ -33,13 +33,9 @@ from mlsweep.run_sweep import (
     manager_retry_job,
     manager_set_experiment_status,
     print_leaderboard,
+    resolve_ranking,
     sweep_print,
 )
-
-
-def _manager_token(args: argparse.Namespace) -> tuple[str, str]:
-    """Return (manager, token) resolved from parsed args."""
-    return args.manager.rstrip("/"), _require_token(args.token)
 
 
 def _select_jobs(
@@ -57,6 +53,22 @@ def _select_jobs(
 
 def _report(ok: object, msg: str) -> None:
     sweep_print(f"  {'OK' if ok else _RED + 'FAIL' + _RESET}  {msg}")
+
+
+_STATUS_COLORS = {
+    "done": _GREEN,
+    "failed": _RED,
+    "running": _CYAN,
+    "dispatched": _YELLOW,
+    "pending": _YELLOW,
+    "cancelled": _YELLOW,
+}
+
+
+def _color_status(text: str, status: str) -> str:
+    """Wrap an already-width-formatted status field in its status color."""
+    color = _STATUS_COLORS.get(status)
+    return f"{color}{text}{_RESET}" if color else text
 
 
 def _apply(
@@ -107,10 +119,12 @@ def ls_cmd(argv: list[str]) -> None:
         if not jobs:
             sweep_print("  No jobs found.")
             return
-        sweep_print(f"{args.experiment} — {len(jobs)} runs:")
+        sweep_print(f"{_BOLD}{_CYAN}{args.experiment}{_RESET} — {len(jobs)} runs:")
         for j in jobs:
             combo_s = _combo_str(_parse_combo(j.get("combo")))
-            sweep_print(f"  {j.get('status','?'):>11}  {_GREEN}{j.get('run_id')}{_RESET}  {combo_s}")
+            status = j.get("status", "?")
+            sweep_print(f"  {_color_status(f'{status:>11}', status)}  "
+                        f"{_GREEN}{j.get('run_id')}{_RESET}  {combo_s}")
         return
 
     exps = manager_list_experiments(manager, token, status_filter=args.status)
@@ -120,13 +134,15 @@ def ls_cmd(argv: list[str]) -> None:
     if args.json:
         print(json.dumps(exps, indent=2))
         return
-    sweep_print(f"{len(exps)} experiments:")
+    sweep_print(f"{_BOLD}{_CYAN}{len(exps)}{_RESET} experiments:")
     for e in exps:
         c = e.get("job_counts") or {}
         counts = f"{c.get('done',0)} done / {c.get('failed',0)} fail / {c.get('running',0)} run / {c.get('pending',0)} pend"
         name = e.get("name") or ""
         note = f"  # {e.get('note')}" if e.get("note") else ""
-        sweep_print(f"  {e.get('status','?'):>10}  {_GREEN}{e.get('experiment_id')}{_RESET}  {name}{note}")
+        status = e.get("status", "?")
+        sweep_print(f"  {_color_status(f'{status:>10}', status)}  "
+                    f"{_GREEN}{e.get('experiment_id')}{_RESET}  {name}{note}")
         sweep_print(f"             {counts}")
 
 
@@ -188,7 +204,7 @@ def _fmt(v: Any) -> str:
 
 def _print_table(headers: list[str], rows: list[list[str]]) -> None:
     widths = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(headers)]
-    print("  ".join(h.rjust(w) for h, w in zip(headers, widths)))
+    print("  ".join(f"{_BOLD}{_CYAN}{h.rjust(w)}{_RESET}" for h, w in zip(headers, widths)))
     for r in rows:
         print("  ".join(c.rjust(w) for c, w in zip(r, widths)))
 
@@ -298,7 +314,7 @@ def metrics_cmd(argv: list[str]) -> None:
     for rid, rows in per_run.items():
         keys = sorted({k for r in rows for k in r if k != "step"})
         shown = rows[-args.tail:] if args.tail else rows
-        print(f"== {rid}  ({len(rows)} steps)")
+        print(f"{_BOLD}{_CYAN}== {rid}{_RESET}  ({len(rows)} steps)")
         _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(k)) for k in keys] for r in shown])
         print()
 
@@ -382,6 +398,128 @@ def unpause_cmd(argv: list[str]) -> None:
     _set_status_cmd(argv, "unpause", "Resume dispatching a paused experiment.", "running", "resumed")
 
 
+# ── wait ───────────────────────────────────────────────────────────────────────
+
+
+# Exit codes for `mlsweep wait` (documented in its --help).
+WAIT_EXIT_SETTLED = 0   # settled cleanly, or the requested condition was met
+WAIT_EXIT_FAILURE = 1   # at least one run failed
+WAIT_EXIT_TIMEOUT = 2   # --timeout elapsed before the condition was met
+WAIT_EXIT_STALLED = 3   # a running run made no progress for --stalled-after seconds
+
+_WAIT_ACTIVE_STATUSES = ("pending", "dispatched", "running")
+
+
+def _wait_failed(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Runs that finished unsuccessfully."""
+    return [j for j in jobs if j.get("status") == "failed"]
+
+
+def _wait_stalled(
+    jobs: list[dict[str, Any]], stalled_after: float,
+) -> list[dict[str, Any]]:
+    """Running runs that have not logged progress within *stalled_after* seconds."""
+    out = []
+    for j in jobs:
+        if j.get("status") != "running":
+            continue
+        stall = j.get("stall_seconds")
+        if isinstance(stall, (int, float)):
+            # The user's --stalled-after wins over the manager's default flag.
+            if stall >= stalled_after:
+                out.append(j)
+        elif j.get("stalled"):
+            out.append(j)
+    return out
+
+
+def wait_cmd(argv: list[str]) -> None:
+    """Wait for an experiment to finish, fail, or stall.
+
+    Exit codes are part of the interface so scripts and agents can branch on
+    them without parsing text:
+
+    \b
+      0  settled cleanly (no failed runs)
+      1  at least one run failed
+      2  --timeout elapsed first
+      3  --until stalled and a running run stopped making progress
+    """
+    parser = argparse.ArgumentParser(
+        prog="mlsweep wait",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Wait until an experiment settles, fails, or stalls.\n\n"
+            "Exit codes:\n"
+            "  0  settled cleanly\n"
+            "  1  at least one run failed\n"
+            "  2  timed out (--timeout)\n"
+            "  3  a running run stalled (--until stalled)"
+        ),
+    )
+    _add_manager_args(parser)
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument(
+        "--until", choices=("done", "any-failure", "stalled"), default="done",
+        help="Condition to wait for (default: done = no active runs)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=0, metavar="N",
+        help="Seconds to wait before exiting 2 (0 = forever)",
+    )
+    parser.add_argument(
+        "--interval", type=float, default=10, metavar="S",
+        help="Seconds between polls (default: 10)",
+    )
+    parser.add_argument(
+        "--stalled-after", type=float, default=900, metavar="S",
+        help="Seconds without progress before a running run counts as stalled "
+             "for --until stalled (default: 900)",
+    )
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+
+    start = time.monotonic()
+    while True:
+        jobs = manager_list_experiment_jobs(manager, token, args.experiment)
+        if jobs is None:
+            sweep_print(f"{_RED}FAIL{_RESET}  Cannot list jobs for {args.experiment}")
+            sys.exit(WAIT_EXIT_FAILURE)
+
+        failed = _wait_failed(jobs)
+        active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
+
+        if args.until == "any-failure" and failed:
+            names = ", ".join(j.get("run_id", "?") for j in failed)
+            sweep_print(f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}")
+            sys.exit(WAIT_EXIT_FAILURE)
+
+        if not active:
+            # Settled: nothing pending/dispatched/running.
+            if failed:
+                names = ", ".join(j.get("run_id", "?") for j in failed)
+                sweep_print(f"{_RED}FAILURE{_RESET}  {args.experiment} settled with "
+                            f"{len(failed)} failed run(s): {names}")
+                sys.exit(WAIT_EXIT_FAILURE)
+            sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
+            sys.exit(WAIT_EXIT_SETTLED)
+
+        if args.until == "stalled":
+            stalled = _wait_stalled(jobs, args.stalled_after)
+            if stalled:
+                names = ", ".join(j.get("run_id", "?") for j in stalled)
+                sweep_print(f"{_YELLOW}STALLED{_RESET}  {len(stalled)} running run(s) made no "
+                            f"progress in {args.stalled_after:g}s: {names}")
+                sys.exit(WAIT_EXIT_STALLED)
+
+        if args.timeout and time.monotonic() - start >= args.timeout:
+            sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
+                        f"{len(active)} active run(s) after {args.timeout:g}s.")
+            sys.exit(WAIT_EXIT_TIMEOUT)
+
+        time.sleep(args.interval)
+
+
 # ── resume ─────────────────────────────────────────────────────────────────────
 
 
@@ -423,8 +561,10 @@ def resume_cmd(argv: list[str]) -> None:
 def best_cmd(argv: list[str]) -> None:
     parser = _common_parser("mlsweep best", "Show the best runs of an experiment by metric.")
     parser.add_argument("--experiment", required=True, help="Experiment ID")
-    parser.add_argument("--metric", default="loss", help="Metric to rank by")
-    parser.add_argument("--goal", default="minimize", choices=["minimize", "maximize"], help="Rank direction")
+    parser.add_argument("--metric", default=None,
+                        help="Metric to rank by (default: experiment's metric, else loss)")
+    parser.add_argument("--goal", default=None, choices=["minimize", "maximize"],
+                        help="Rank direction (default: experiment's goal, else minimize)")
     parser.add_argument("--top", type=int, default=10, help="Show top N runs (0 = all)")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     parser.add_argument("--wait", action="store_true", help="Block until the experiment settles")
@@ -432,11 +572,15 @@ def best_cmd(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     manager, token = _manager_token(args)
 
+    had_failure = False
     if args.wait:
-        _wait_until_settled(manager, token, args.experiment, args.wait_interval)
+        had_failure = _wait_until_settled(manager, token, args.experiment, args.wait_interval)
 
-    rows = build_leaderboard(manager, token, args.experiment, args.metric, args.goal)
+    metric, goal = resolve_ranking(manager, token, args.experiment, args.metric, args.goal)
+    rows = build_leaderboard(manager, token, args.experiment, metric, goal)
     if args.json:
         print(json.dumps(rows, indent=2))
-        return
-    print_leaderboard(rows, args.metric, args.goal, args.top)
+    else:
+        print_leaderboard(rows, metric, goal, args.top)
+    if had_failure:
+        sys.exit(1)

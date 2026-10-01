@@ -21,22 +21,37 @@ import asyncio
 import json
 import sqlite3
 import dataclasses
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Literal, Sequence, TypeVar
+from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, TypeVar
 
 import aiosqlite
+
+from mlsweep._sweep import SkipIndex
 
 _T = TypeVar("_T")
 
 JobStatus = Literal["pending", "dispatched", "running", "done", "failed", "xfailed", "cancelled"]
 ExperimentStatus = Literal["running", "paused", "completed", "aborted"]
 
+ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
+FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled")
 # Experiment statuses whose pending jobs the scheduler must NOT dispatch.
 # 'paused' is a temporary hold (resumable); 'aborted' is a permanent stop.
 # 'running' and 'completed' remain schedulable so that retrying a job in a
 # finished experiment works without a separate status flip.
 NON_SCHEDULABLE_EXPERIMENT_STATUSES: tuple[str, ...] = ("paused", "aborted")
+
+
+def _sql_in(statuses: Sequence[str]) -> str:
+    """``status IN (...)`` for a fixed tuple of status constants (never user input)."""
+    return "status IN (" + ", ".join(f"'{s}'" for s in statuses) + ")"
+
+
+_ACTIVE_IN = _sql_in(ACTIVE_JOB_STATUSES)
+_UNFINISHED_IN = _sql_in(("pending", *ACTIVE_JOB_STATUSES))
+_FINISHED_IN = _sql_in(FINISHED_JOB_STATUSES)
 WorkerStatus = Literal["offline", "connected", "reconnecting", "dead"]
 
 
@@ -58,6 +73,9 @@ class ExperimentRecord:
     expected_jobs: int = 0
     singular_dims: str = "[]"  # JSON list of dim names that are singular probes
     max_concurrent: int = 0  # max simultaneously-running jobs for this exp; 0 = unlimited
+    skip_rules: str = "{}"  # JSON {dim: {monotonic, singular, _values}} for should_skip; {} = none
+    metric: str | None = None  # ranking metric for this sweep (e.g. "val_loss")
+    goal: str | None = None  # ranking direction: "minimize" | "maximize"
 
 
 @dataclass(order=False)
@@ -111,6 +129,13 @@ class JobRecord:
     combo: str = "{}"  # JSON object
     dispatched_gpu_ids: str | None = None  # JSON list of ints, set on dispatch
     label: str | None = None
+    job_key: int = 0  # integer id used by the logs and metrics tables
+    attempt: int = 0  # number of times the job has been dispatched
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """(experiment_id, run_id), how the manager identifies a run."""
+        return (self.experiment_id, self.run_id)
 
 
 @dataclass(order=False)
@@ -143,27 +168,13 @@ class JobNodeRecord:
 # ===============================================================================
 
 
-def _col(row: sqlite3.Row, key: str, default: Any = None) -> Any:
-    """Get a column value from a sqlite3.Row, returning *default* if NULL or missing.
-
-    Only use for columns that have a NOT NULL DEFAULT constraint in the schema.
-    For columns that legitimately hold NULL, access them directly — this helper
-    would mask intentional NULLs by substituting *default*.
-    """
-    try:
-        v = row[key]
-    except (IndexError, KeyError):
-        return default
-    return v if v is not None else default
-
-
 def _row_to_job(row: sqlite3.Row) -> JobRecord:
     """Map a database row to a JobRecord."""
     return JobRecord(
         run_id=row["run_id"],
         experiment_id=row["experiment_id"],
         priority=row["priority"],
-        submit_time=_ensure_utc(row["submit_time"]),
+        submit_time=_utc(row["submit_time"]),
         command=row["command"],
         status=row["status"],
         dispatch_time=_maybe_utc(row["dispatch_time"]),
@@ -172,20 +183,22 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         elapsed=row["elapsed"],
         exit_code=row["exit_code"],
         worker_id=row["worker_id"],
-        env=_col(row, "env", "{}"),
+        env=row["env"],
         artifact_id=row["artifact_id"],
         setup_command=row["setup_command"],
-        gpus_per_run=_col(row, "gpus_per_run", 1),
-        nodes_per_run=_col(row, "nodes_per_run", 1),
+        gpus_per_run=row["gpus_per_run"],
+        nodes_per_run=row["nodes_per_run"],
         set_dist_env=bool(row["set_dist_env"]),
         run_from=row["run_from"],
-        return_files=_col(row, "return_files", "[]"),
-        files=_col(row, "files", "{}"),
-        retry_count=_col(row, "retry_count", 0),
-        max_retries=_col(row, "max_retries", 2),
-        combo=_col(row, "combo", "{}"),
+        return_files=row["return_files"],
+        files=row["files"],
+        retry_count=row["retry_count"],
+        max_retries=row["max_retries"],
+        combo=row["combo"],
         dispatched_gpu_ids=row["dispatched_gpu_ids"],
-        label=_col(row, "label", None),
+        label=row["label"],
+        job_key=row["job_key"],
+        attempt=row["attempt"],
     )
 
 
@@ -194,13 +207,16 @@ def _row_to_experiment(row: sqlite3.Row) -> ExperimentRecord:
     return ExperimentRecord(
         experiment_id=row["experiment_id"],
         name=row["name"],
-        submit_time=_ensure_utc(row["submit_time"]),
+        submit_time=_utc(row["submit_time"]),
         controller_id=row["controller_id"],
         note=row["note"],
-        status=_col(row, "status", "running"),
-        expected_jobs=_col(row, "expected_jobs", 0),
-        singular_dims=_col(row, "singular_dims", "[]"),
-        max_concurrent=_col(row, "max_concurrent", 0),
+        status=row["status"],
+        expected_jobs=row["expected_jobs"],
+        singular_dims=row["singular_dims"],
+        max_concurrent=row["max_concurrent"],
+        skip_rules=row["skip_rules"],
+        metric=row["metric"],
+        goal=row["goal"],
     )
 
 
@@ -210,10 +226,10 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         worker_id=row["worker_id"],
         host=row["host"],
         remote_dir=row["remote_dir"],
-        status=_col(row, "status", "offline"),
+        status=row["status"],
         last_seen=_maybe_utc(row["last_seen"]),
         scratch_dir=row["scratch_dir"],
-        port=_col(row, "port", 7890),
+        port=row["port"],
         ssh_key=row["ssh_key"],
         venv=row["venv"],
         devices=row["devices"],
@@ -227,39 +243,18 @@ def _row_to_artifact(row: sqlite3.Row) -> ArtifactRecord:
         artifact_id=row["artifact_id"],
         size_bytes=row["size_bytes"],
         stored_at=_maybe_utc(row["stored_at"]),
-        ref_count=_col(row, "ref_count", 0),
+        ref_count=row["ref_count"],
         setup_command=row["setup_command"],
     )
 
 
-def _ensure_utc(dt: float | int | datetime | None) -> datetime:
-    """Return *dt* with tzinfo=UTC.  Assumes naive datetimes are UTC.
-
-    Accepts float/int (epoch seconds) from the DB REAL columns
-    and converts them to timezone-aware datetimes.
-    """
-    if dt is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    if isinstance(dt, (float, int)):
-        dt = datetime.fromtimestamp(dt, tz=timezone.utc)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+def _utc(ts: float) -> datetime:
+    """A REAL epoch-seconds column as a UTC datetime."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def _maybe_utc(dt: float | int | datetime | None) -> datetime | None:
-    """Return *dt* with tzinfo=UTC or None.
-
-    Accepts float/int (epoch seconds) from the DB REAL columns
-    and converts them to timezone-aware datetimes.
-    """
-    if dt is None:
-        return None
-    if isinstance(dt, (float, int)):
-        dt = datetime.fromtimestamp(dt, tz=timezone.utc)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+def _maybe_utc(ts: float | None) -> datetime | None:
+    return None if ts is None else _utc(ts)
 
 
 def _now_epoch() -> float:
@@ -321,13 +316,159 @@ async def _exec_all(
 # ===============================================================================
 
 
+# Jobs are addressed by (experiment_id, run_id) everywhere except in the logs
+# and metrics tables, which hold almost all of the data and so refer to a job
+# by its integer job_key instead of repeating both ids on every row.  Each
+# dispatch of a job is a new attempt; logs and metrics are kept per attempt so
+# a retried run never collides with (or reads back) an earlier attempt's rows.
+_JOBS_TABLE = """
+    CREATE TABLE IF NOT EXISTS jobs (
+        job_key            INTEGER PRIMARY KEY,
+        run_id             TEXT NOT NULL,
+        experiment_id      TEXT NOT NULL REFERENCES experiments(experiment_id),
+        priority           INTEGER NOT NULL DEFAULT 0,
+        status             TEXT NOT NULL DEFAULT 'pending',
+        submit_time        REAL NOT NULL,
+        dispatch_time      REAL,
+        start_time         REAL,
+        finish_time        REAL,
+        elapsed            REAL,
+        exit_code          INTEGER,
+        worker_id          TEXT REFERENCES workers(worker_id),
+        command            TEXT NOT NULL,
+        env                TEXT NOT NULL DEFAULT '{}',
+        artifact_id        TEXT REFERENCES artifacts(artifact_id),
+        setup_command      TEXT,
+        gpus_per_run       INTEGER NOT NULL DEFAULT 1,
+        nodes_per_run      INTEGER NOT NULL DEFAULT 1,
+        set_dist_env       INTEGER NOT NULL DEFAULT 0,
+        run_from           TEXT,
+        return_files       TEXT NOT NULL DEFAULT '[]',
+        files              TEXT NOT NULL DEFAULT '{}',
+        retry_count        INTEGER NOT NULL DEFAULT 0,
+        max_retries        INTEGER NOT NULL DEFAULT 2,
+        combo              TEXT NOT NULL DEFAULT '{}',
+        dispatched_gpu_ids TEXT,
+        label              TEXT,
+        attempt            INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (experiment_id, run_id)
+    )
+"""
+
+# While a run is live each metric step is its own row (data: JSON TEXT).
+# When the run finishes, its rows are packed into one row (data: a zlib BLOB of
+# "step<TAB>json" lines, keyed by the first step), which is several times smaller.
+_METRICS_TABLE = """
+    CREATE TABLE IF NOT EXISTS metrics (
+        job_key  INTEGER NOT NULL,
+        attempt  INTEGER NOT NULL,
+        step     INTEGER NOT NULL,
+        data     NOT NULL,
+        PRIMARY KEY (job_key, attempt, step)
+    ) WITHOUT ROWID
+"""
+
+# A log row is a chunk of whole lines; seq is the byte offset in the run's
+# training.log just past the chunk.  data is TEXT, or zlib-compressed UTF-8
+# as a BLOB when that is smaller.
+_LOGS_TABLE = """
+    CREATE TABLE IF NOT EXISTS logs (
+        job_key  INTEGER NOT NULL,
+        attempt  INTEGER NOT NULL,
+        seq      INTEGER NOT NULL,
+        data     NOT NULL,
+        PRIMARY KEY (job_key, attempt, seq)
+    ) WITHOUT ROWID
+"""
+
+def _pack_log(text: str) -> str | bytes:
+    """Compress a log chunk if that saves at least 10%."""
+    raw = text.encode("utf-8")
+    if len(raw) >= 256:
+        packed = zlib.compress(raw, 6)
+        if len(packed) < len(raw) * 0.9:
+            return packed
+    return text
+
+
+def _unpack_log(data: str | bytes) -> str:
+    if isinstance(data, bytes):
+        return zlib.decompress(data).decode("utf-8", errors="replace")
+    return data
+
+
+def _merge_metric_rows(rows: Sequence[tuple[int, str | bytes]]) -> dict[int, str]:
+    """``{step: json}`` from per-step and packed metric rows.
+
+    A packed row holds the values stored first, so it wins over a per-step row
+    for the same step (a later duplicate that INSERT OR IGNORE let through).
+    """
+    by_step: dict[int, str] = {}
+    for step, data in rows:
+        if isinstance(data, str):
+            by_step.setdefault(step, data)
+    for _, data in rows:
+        if isinstance(data, bytes):
+            for line in zlib.decompress(data).decode("utf-8").split("\n"):
+                s, _, d = line.partition("\t")
+                by_step[int(s)] = d
+    return by_step
+
+
+async def pack_metrics(
+    db: aiosqlite.Connection,
+    job_key: int,
+    attempt: int,
+    extra: Sequence[tuple[int, str]] = (),
+) -> None:
+    """Pack a finished attempt's metrics into one compressed row.
+
+    *extra* holds ``(step, json)`` rows from the run's synced metrics.jsonl;
+    they fill in steps the live stream missed.
+    """
+    rows = [(r[0], r[1]) for r in await _exec_all(
+        db, "SELECT step, data FROM metrics WHERE job_key = ? AND attempt = ?", (job_key, attempt),
+    )]
+    if len(rows) + len(extra) < 2:
+        return  # nothing to merge
+    by_step = dict(extra)
+    by_step.update(_merge_metric_rows(rows))  # what was stored first wins
+    text = "\n".join(f"{s}\t{by_step[s]}" for s in sorted(by_step)).encode("utf-8")
+    packed = await asyncio.to_thread(zlib.compress, text, 6)
+    await db.execute("DELETE FROM metrics WHERE job_key = ? AND attempt = ?", (job_key, attempt))
+    await db.execute(
+        "INSERT INTO metrics (job_key, attempt, step, data) VALUES (?, ?, ?, ?)",
+        (job_key, attempt, min(by_step), packed),
+    )
+    await db.commit()
+
+
+async def _add_missing_columns(
+    db: aiosqlite.Connection, table: str, columns: dict[str, str],
+) -> None:
+    """Add any of *columns* that *table* is missing (idempotent migration).
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the current column names are
+    read from ``PRAGMA table_info`` first.  The table/column names come from
+    module constants, never user input.
+    """
+    async with db.execute(f"PRAGMA table_info({table})") as cursor:
+        existing = {row["name"] for row in await cursor.fetchall()}
+    for name, decl in columns.items():
+        if name not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 async def init_db(db: aiosqlite.Connection) -> None:
     """Create tables and indexes if they do not exist (idempotent).
 
     Enables WAL mode and foreign key enforcement on the connection.
+    synchronous=NORMAL is safe under WAL and avoids an fsync on every
+    commit, which matters because every log line and metric is a commit.
     """
     db.row_factory = sqlite3.Row
     await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
     await db.execute("PRAGMA foreign_keys=ON")
 
     # ── experiments ─────────────────────────────────────────────────
@@ -341,9 +482,14 @@ async def init_db(db: aiosqlite.Connection) -> None:
             status         TEXT NOT NULL DEFAULT 'running',
             expected_jobs  INTEGER NOT NULL DEFAULT 0,
             singular_dims  TEXT NOT NULL DEFAULT '[]',
-            max_concurrent INTEGER NOT NULL DEFAULT 0
+            max_concurrent INTEGER NOT NULL DEFAULT 0,
+            skip_rules     TEXT NOT NULL DEFAULT '{}',
+            metric         TEXT,
+            goal           TEXT
         );
     """)
+    # Idempotent migration for databases created before metric/goal existed.
+    await _add_missing_columns(db, "experiments", {"metric": "TEXT", "goal": "TEXT"})
 
     # ── workers ─────────────────────────────────────────────────────
     await db.execute("""
@@ -373,60 +519,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
-    # ── jobs ────────────────────────────────────────────────────────
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            run_id             TEXT NOT NULL,
-            experiment_id      TEXT NOT NULL REFERENCES experiments(experiment_id),
-            priority           INTEGER NOT NULL DEFAULT 0,
-            status             TEXT NOT NULL DEFAULT 'pending',
-            submit_time        REAL NOT NULL,
-            dispatch_time      REAL,
-            start_time         REAL,
-            finish_time        REAL,
-            elapsed            REAL,
-            exit_code          INTEGER,
-            worker_id          TEXT REFERENCES workers(worker_id),
-            command            TEXT NOT NULL,
-            env                TEXT NOT NULL DEFAULT '{}',
-            artifact_id        TEXT REFERENCES artifacts(artifact_id),
-            setup_command      TEXT,
-            gpus_per_run       INTEGER NOT NULL DEFAULT 1,
-            nodes_per_run      INTEGER NOT NULL DEFAULT 1,
-            set_dist_env       INTEGER NOT NULL DEFAULT 0,
-            run_from           TEXT,
-            return_files       TEXT NOT NULL DEFAULT '[]',
-            files              TEXT NOT NULL DEFAULT '{}',
-            retry_count        INTEGER NOT NULL DEFAULT 0,
-            max_retries        INTEGER NOT NULL DEFAULT 2,
-            combo              TEXT NOT NULL DEFAULT '{}',
-            dispatched_gpu_ids TEXT,
-            label              TEXT,
-            PRIMARY KEY (run_id, experiment_id)
-        );
-    """)
-
-    # ── metrics ─────────────────────────────────────────────────────
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS metrics (
-            run_id        TEXT NOT NULL,
-            experiment_id TEXT NOT NULL,
-            step          INTEGER NOT NULL,
-            data          TEXT NOT NULL,
-            PRIMARY KEY (run_id, experiment_id, step)
-        );
-    """)
-
-    # ── logs ─────────────────────────────────────────────────────────
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            run_id        TEXT NOT NULL,
-            experiment_id TEXT NOT NULL,
-            seq           INTEGER NOT NULL,
-            data          TEXT NOT NULL,
-            PRIMARY KEY (run_id, experiment_id, seq)
-        );
-    """)
+    await db.execute(_JOBS_TABLE)
+    await db.execute(_METRICS_TABLE)
+    await db.execute(_LOGS_TABLE)
 
     # ── job_nodes ────────────────────────────────────────────────────
     # One row per node of a multi-node job (nodes_per_run > 1).  This is the
@@ -450,16 +545,10 @@ async def init_db(db: aiosqlite.Connection) -> None:
 
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_jobs_experiment
-            ON jobs(experiment_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_dispatch
             ON jobs(status, priority DESC, submit_time ASC);
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
             ON jobs(worker_id);
-        CREATE INDEX IF NOT EXISTS idx_metrics_experiment
-            ON metrics(experiment_id);
-        CREATE INDEX IF NOT EXISTS idx_logs_experiment
-            ON logs(experiment_id);
     """)
     await db.commit()
 
@@ -480,6 +569,9 @@ async def create_experiment(
     expected_jobs: int = 0,
     singular_dims: list[str] | None = None,
     max_concurrent: int = 0,
+    skip_rules: dict[str, Any] | None = None,
+    metric: str | None = None,
+    goal: str | None = None,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row."""
     now = _now_epoch()
@@ -487,8 +579,10 @@ async def create_experiment(
     row = await _exec_one(
         db,
         """
-        INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status, expected_jobs, singular_dims, max_concurrent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status,
+                                 expected_jobs, singular_dims, max_concurrent, skip_rules,
+                                 metric, goal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (experiment_id) DO UPDATE SET
             name = EXCLUDED.name,
             controller_id = EXCLUDED.controller_id,
@@ -496,10 +590,14 @@ async def create_experiment(
             status = EXCLUDED.status,
             expected_jobs = EXCLUDED.expected_jobs,
             singular_dims = EXCLUDED.singular_dims,
-            max_concurrent = EXCLUDED.max_concurrent
+            max_concurrent = EXCLUDED.max_concurrent,
+            skip_rules = EXCLUDED.skip_rules,
+            metric = COALESCE(EXCLUDED.metric, experiments.metric),
+            goal = COALESCE(EXCLUDED.goal, experiments.goal)
         RETURNING *;
         """,
-        (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json, max_concurrent),
+        (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json,
+         max_concurrent, json.dumps(skip_rules or {}), metric, goal),
     )
     await db.commit()
     assert row is not None
@@ -516,21 +614,6 @@ async def get_experiment(
     if row is None:
         return None
     return _row_to_experiment(row)
-
-
-async def list_experiments(
-    db: aiosqlite.Connection,
-    status: ExperimentStatus | None = None,
-) -> list[ExperimentRecord]:
-    """List experiments, optionally filtered by status."""
-    if status is not None:
-        cursor = await db.execute(
-            "SELECT * FROM experiments WHERE status = ? ORDER BY submit_time DESC", (status,)
-        )
-    else:
-        cursor = await db.execute("SELECT * FROM experiments ORDER BY submit_time DESC")
-    rows = await cursor.fetchall()
-    return [_row_to_experiment(r) for r in rows]
 
 
 async def update_experiment_status(
@@ -726,35 +809,15 @@ async def insert_job(
     setup_command: str | None = None,
 ) -> JobRecord:
     """Insert a new job row. Returns the created JobRecord."""
-    now = _now_epoch()
-    command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
-        command, combo, env, return_files, files
-    )
-
-    row = await _exec_one(
-        db,
-        """
-        INSERT INTO jobs (
-            run_id, experiment_id, priority, status, submit_time,
-            command, combo, env, gpus_per_run, nodes_per_run,
-            set_dist_env, run_from, return_files, files, max_retries,
-            artifact_id, setup_command
-        ) VALUES (
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?
-        )
-        RETURNING *;
-        """,
-        (run_id, experiment_id, priority, status, now,
-         command_json, combo_json, env_json, gpus_per_run, nodes_per_run,
-         int(set_dist_env), run_from, return_files_json, files_json, max_retries,
-         artifact_id, setup_command),
-    )
-    await db.commit()
-    assert row is not None
-    return _row_to_job(row)
+    [job] = await insert_jobs_bulk(db, [dict(
+        run_id=run_id, experiment_id=experiment_id, priority=priority,
+        command=command, combo=combo, env=env, status=status,
+        gpus_per_run=gpus_per_run, nodes_per_run=nodes_per_run,
+        set_dist_env=set_dist_env, run_from=run_from, return_files=return_files,
+        files=files, max_retries=max_retries, artifact_id=artifact_id,
+        setup_command=setup_command,
+    )])
+    return job
 
 
 async def insert_jobs_bulk(
@@ -802,6 +865,7 @@ async def insert_jobs_bulk(
             )
             assert row is not None
             records.append(_row_to_job(row))
+        await _reopen_experiments(db, {r.experiment_id for r in records if r.status == "pending"})
         await db.commit()
         return records
     except Exception:
@@ -878,9 +942,18 @@ async def list_pending_jobs(
     return [_row_to_job(r) for r in rows]
 
 
+class SchedulableJob(NamedTuple):
+    experiment_id: str
+    run_id: str
+    gpus_per_run: int
+    nodes_per_run: int
+
+
 async def list_schedulable_jobs(
     db: aiosqlite.Connection,
-) -> list[JobRecord]:
+    *,
+    cpu_only: bool = False,
+) -> list[SchedulableJob]:
     """Return pending jobs eligible for dispatch, in scheduling order.
 
     A job is schedulable iff its status is ``pending`` and its experiment is
@@ -888,42 +961,24 @@ async def list_schedulable_jobs(
     is the scheduler's sole input — the in-memory pending mirror is gone, so a
     paused/aborted experiment simply stops producing schedulable jobs.
 
+    With *cpu_only*, only jobs that need no GPU (the scheduler asks for just
+    these when every GPU is full).
+
     Ordered by priority DESC, submit_time ASC to match ``idx_jobs_dispatch``.
     """
     placeholders = ",".join("?" * len(NON_SCHEDULABLE_EXPERIMENT_STATUSES))
     cursor = await db.execute(
         f"""
-        SELECT j.* FROM jobs j
+        SELECT j.experiment_id, j.run_id, j.gpus_per_run, j.nodes_per_run FROM jobs j
         JOIN experiments e ON j.experiment_id = e.experiment_id
         WHERE j.status = 'pending'
           AND e.status NOT IN ({placeholders})
+          {"AND j.gpus_per_run = 0" if cpu_only else ""}
         ORDER BY j.priority DESC, j.submit_time ASC
         """,
         NON_SCHEDULABLE_EXPERIMENT_STATUSES,
     )
-    rows = await cursor.fetchall()
-    return [_row_to_job(r) for r in rows]
-
-
-async def list_jobs_by_run_ids(
-    db: aiosqlite.Connection,
-    run_ids: list[str],
-) -> list[JobRecord]:
-    """Return job rows whose run_id is in *run_ids* (across all experiments).
-
-    Used on worker reconnect/resume, where the worker reports run_ids but not
-    their experiment_id.  Run ids are effectively unique in practice; callers
-    that need to disambiguate take the first match per run_id.
-    """
-    if not run_ids:
-        return []
-    placeholders = ",".join("?" * len(run_ids))
-    cursor = await db.execute(
-        f"SELECT * FROM jobs WHERE run_id IN ({placeholders})",
-        run_ids,
-    )
-    rows = await cursor.fetchall()
-    return [_row_to_job(r) for r in rows]
+    return [SchedulableJob(*r) for r in await cursor.fetchall()]
 
 
 async def experiment_concurrency_caps(
@@ -936,7 +991,7 @@ async def experiment_concurrency_caps(
     """
     cursor = await db.execute("SELECT experiment_id, max_concurrent FROM experiments")
     rows = await cursor.fetchall()
-    return {r["experiment_id"]: _col(r, "max_concurrent", 0) for r in rows}
+    return {r["experiment_id"]: r["max_concurrent"] for r in rows}
 
 
 async def count_pending_jobs(db: aiosqlite.Connection) -> int:
@@ -967,16 +1022,16 @@ async def update_experiment_max_concurrent(
 
 
 def _row_to_job_node(row: sqlite3.Row) -> JobNodeRecord:
-    success = _col(row, "success")
+    success = row["success"]
     return JobNodeRecord(
         run_id=row["run_id"],
         experiment_id=row["experiment_id"],
         node_rank=row["node_rank"],
-        worker_id=_col(row, "worker_id"),
-        gpu_ids=_col(row, "gpu_ids", "[]"),
-        status=_col(row, "status", "dispatched"),
+        worker_id=row["worker_id"],
+        gpu_ids=row["gpu_ids"],
+        status=row["status"],
         success=None if success is None else bool(success),
-        elapsed=_col(row, "elapsed"),
+        elapsed=row["elapsed"],
     )
 
 
@@ -1030,19 +1085,6 @@ async def mark_job_node_result(
          run_id, experiment_id, worker_id),
     )
     await db.commit()
-
-
-async def is_multinode_run(
-    db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
-) -> bool:
-    """True if this run has node rows recorded (i.e. it is multi-node)."""
-    cursor = await db.execute(
-        "SELECT 1 FROM job_nodes WHERE run_id = ? AND experiment_id = ? LIMIT 1",
-        (run_id, experiment_id),
-    )
-    return (await cursor.fetchone()) is not None
 
 
 async def list_job_nodes(
@@ -1129,10 +1171,13 @@ async def update_job_status(
     run_id: str,
     experiment_id: str,
     status: JobStatus,
+    *,
+    only_from: Sequence[str] | None = None,
     **kwargs: Any,
 ) -> JobRecord | None:
     """Generic job status update.  Extra keyword arguments are set as columns
-    (e.g. ``exit_code=0``, ``elapsed=12.3``).
+    (e.g. ``exit_code=0``, ``elapsed=12.3``).  With *only_from*, the row is
+    updated only if its current status is one of those.
 
     Returns the updated row or None.
     """
@@ -1143,11 +1188,17 @@ async def update_job_status(
         values.append(val)
     values.append(run_id)
     values.append(experiment_id)
+    guard = ""
+    if only_from is not None:
+        guard = f" AND status IN ({','.join('?' * len(only_from))})"
+        values.extend(only_from)
     row = await _exec_one(
         db,
-        f"UPDATE jobs SET {', '.join(set_clauses)} WHERE run_id = ? AND experiment_id = ? RETURNING *",
+        f"UPDATE jobs SET {', '.join(set_clauses)} WHERE run_id = ? AND experiment_id = ?{guard} RETURNING *",
         tuple(values),
     )
+    if row is not None and status == "pending":
+        await _reopen_experiments(db, {experiment_id})
     await db.commit()
     return _row_to_job(row) if row else None
 
@@ -1173,7 +1224,8 @@ async def dispatch_job(
         SET status = 'dispatched',
             dispatch_time = ?,
             worker_id = ?,
-            dispatched_gpu_ids = ?
+            dispatched_gpu_ids = ?,
+            attempt = attempt + 1
         WHERE run_id = ? AND experiment_id = ? AND status = 'pending'
         RETURNING *;
         """,
@@ -1218,10 +1270,10 @@ async def finish_job(
     now = _now_epoch()
     row = await _exec_one(
         db,
-        """
+        f"""
         UPDATE jobs
         SET status = ?, finish_time = ?, exit_code = ?, elapsed = ?
-        WHERE run_id = ? AND experiment_id = ? AND status IN ('running', 'dispatched')
+        WHERE run_id = ? AND experiment_id = ? AND {_ACTIVE_IN}
         RETURNING *;
         """,
         (status, now, exit_code, elapsed, run_id, experiment_id),
@@ -1230,127 +1282,211 @@ async def finish_job(
     return _row_to_job(row) if row else None
 
 
-async def reclassify_singular_xfails(
+# Columns cleared whenever a job goes back to 'pending'.
+_CLEAR_DISPATCH = """
+    dispatch_time = NULL,
+    start_time = NULL,
+    finish_time = NULL,
+    elapsed = NULL,
+    exit_code = NULL,
+    worker_id = NULL,
+    dispatched_gpu_ids = NULL
+"""
+
+
+def _keys_clause(keys: Sequence[tuple[str, str]]) -> tuple[str, tuple[str, ...]]:
+    """WHERE clause matching (experiment_id, run_id) *keys*."""
+    where = " OR ".join("(experiment_id = ? AND run_id = ?)" for _ in keys)
+    return f"({where})", tuple(x for key in keys for x in key)
+
+
+async def _reopen_experiments(db: aiosqlite.Connection, experiment_ids: set[str]) -> None:
+    """A completed experiment that gets pending work again is running again."""
+    for eid in experiment_ids:
+        await db.execute(
+            "UPDATE experiments SET status = 'running' WHERE experiment_id = ? AND status = 'completed'",
+            (eid,),
+        )
+
+
+async def cancel_jobs(
+    db: aiosqlite.Connection,
+    keys: Sequence[tuple[str, str]],
+) -> list[JobRecord]:
+    """Cancel jobs that have not finished yet; finished jobs are left alone.
+
+    *keys* are (experiment_id, run_id).  Returns the rows that were cancelled.
+    Also drops their multi-node rows.
+    """
+    if not keys:
+        return []
+    where, params = _keys_clause(keys)
+    rows = await _exec_all(
+        db,
+        f"""
+        UPDATE jobs SET status = 'cancelled'
+        WHERE {where} AND {_UNFINISHED_IN}
+        RETURNING *
+        """,
+        params,
+    )
+    await db.execute(f"DELETE FROM job_nodes WHERE {where}", params)
+    await db.commit()
+    return [_row_to_job(r) for r in rows]
+
+
+async def requeue_jobs(
+    db: aiosqlite.Connection,
+    keys: Sequence[tuple[str, str]],
+    *,
+    spend_retry: bool,
+) -> tuple[list[JobRecord], list[JobRecord]]:
+    """Move dispatched/running jobs back to 'pending'; other rows are left alone.
+
+    With *spend_retry* (the run was lost), each requeue uses one retry and a
+    job with none left is marked failed instead.  Without it (the manager took
+    the run away, e.g. an eviction), no retry is spent.
+
+    *keys* are (experiment_id, run_id).  Returns ``(requeued, failed)``.
+    Also drops their multi-node rows.
+    """
+    if not keys:
+        return [], []
+    where, params = _keys_clause(keys)
+    spend = ", retry_count = retry_count + 1" if spend_retry else ""
+    has_retry = " AND retry_count < max_retries" if spend_retry else ""
+    requeued = await _exec_all(
+        db,
+        f"""
+        UPDATE jobs SET status = 'pending'{spend}, {_CLEAR_DISPATCH}
+        WHERE {where} AND {_ACTIVE_IN}{has_retry}
+        RETURNING *
+        """,
+        params,
+    )
+    failed = []
+    if spend_retry:
+        failed = await _exec_all(
+            db,
+            f"""
+            UPDATE jobs SET status = 'failed', exit_code = -1, elapsed = 0.0, finish_time = ?
+            WHERE {where} AND {_ACTIVE_IN}
+            RETURNING *
+            """,
+            (_now_epoch(), *params),
+        )
+    await db.execute(f"DELETE FROM job_nodes WHERE {where}", params)
+    await db.commit()
+    return [_row_to_job(r) for r in requeued], [_row_to_job(r) for r in failed]
+
+
+async def retry_job(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> JobRecord | None:
+    """Re-queue a finished job, using one retry.
+
+    Returns None if the job is not finished or has no retries left.
+    """
+    row = await _exec_one(
+        db,
+        f"""
+        UPDATE jobs SET status = 'pending', retry_count = retry_count + 1, {_CLEAR_DISPATCH}
+        WHERE run_id = ? AND experiment_id = ?
+          AND {_FINISHED_IN}
+          AND retry_count < max_retries
+        RETURNING *
+        """,
+        (run_id, experiment_id),
+    )
+    if row is not None:
+        await _reopen_experiments(db, {experiment_id})
+    await db.commit()
+    return _row_to_job(row) if row else None
+
+
+async def list_active_jobs(
+    db: aiosqlite.Connection,
+    worker_id: str | None = None,
+) -> list[JobRecord]:
+    """Return dispatched/running jobs, optionally only those with a node on *worker_id*."""
+    rows = await _exec_all(
+        db,
+        f"""
+        SELECT * FROM jobs j
+        WHERE j.{_ACTIVE_IN}
+          AND (? IS NULL OR j.worker_id = ? OR EXISTS (
+                SELECT 1 FROM job_nodes n
+                WHERE n.run_id = j.run_id AND n.experiment_id = j.experiment_id
+                  AND n.worker_id = ?))
+        """,
+        (worker_id, worker_id, worker_id),
+    )
+    return [_row_to_job(r) for r in rows]
+
+
+async def apply_result_rules(
     db: aiosqlite.Connection,
     experiment_id: str,
-    succeeded_combo: dict[str, Any],
+    run_id: str,
+    success: bool,
 ) -> list[str]:
-    """After a job succeeds, reclassify failed singular-probe siblings as xfailed.
+    """After *run_id* finishes, mark the jobs its result makes moot as xfailed.
 
-    A failed job is xfailed if it shares the same lex (non-singular) dim values as the
-    succeeded job but has a different value on at least one singular dim — meaning it was
-    probing above the threshold that the success established.  Returns run_ids reclassified.
+    * A success settles its singular dims, so failed probes of the same
+      non-singular combo at other singular values become xfailed.
+    * The experiment's skip rules (``monotonic`` / ``singular``) then mark
+      pending jobs that no longer need to run as xfailed.
+
+    Returns the run_ids changed.
     """
     exp = await get_experiment(db, experiment_id)
     if exp is None:
         return []
     singular_dims: list[str] = json.loads(exp.singular_dims)
-    if not singular_dims:
+    rules: dict[str, Any] = json.loads(exp.skip_rules)
+    # A failure can only trigger monotonic skips; a success only singular ones.
+    relevant = any(r["singular"] if success else r["monotonic"] for r in rules.values())
+    if not relevant and not (success and singular_dims):
         return []
 
-    singular_set = set(singular_dims)
-    lex_combo = {k: v for k, v in succeeded_combo.items() if k not in singular_set}
+    rows = [(r["run_id"], r["status"], r["exit_code"], json.loads(r["combo"]))
+            for r in await _exec_all(
+                db,
+                "SELECT run_id, status, exit_code, combo FROM jobs WHERE experiment_id = ? "
+                "AND status IN ('pending', 'done', 'failed', 'xfailed')",
+                (experiment_id,),
+            )]
 
-    cursor = await db.execute(
-        "SELECT run_id, combo FROM jobs WHERE experiment_id = ? AND status = 'failed'",
-        (experiment_id,),
-    )
-    rows = await cursor.fetchall()
-
-    to_reclassify: list[str] = []
-    for row in rows:
-        try:
-            combo: dict[str, Any] = json.loads(row["combo"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        row_lex = {k: v for k, v in combo.items() if k not in singular_set}
-        if row_lex != lex_combo:
-            continue
-        if any(combo.get(d) != succeeded_combo.get(d) for d in singular_dims):
-            to_reclassify.append(row["run_id"])
-
-    if not to_reclassify:
+    xfail: list[str] = []
+    if success and singular_dims:
+        this = next((c for rid, _, _, c in rows if rid == run_id), None)
+        if this is not None:
+            singular = set(singular_dims)
+            lex = {k: v for k, v in this.items() if k not in singular}
+            xfail += [
+                rid for rid, status, _, combo in rows
+                if status == "failed"
+                and {k: v for k, v in combo.items() if k not in singular} == lex
+                and any(combo.get(d) != this.get(d) for d in singular_dims)
+            ]
+    if relevant:
+        # A job skipped earlier (xfailed with no exit code) never ran, so it is not a failure.
+        failed = [c for _, status, code, c in rows
+                  if status == "failed" or (status == "xfailed" and code is not None)]
+        succeeded = [c for _, status, _, c in rows if status == "done"]
+        index = SkipIndex(failed, succeeded, rules)
+        xfail += [rid for rid, status, _, combo in rows if status == "pending" and index.skips(combo)]
+    if not xfail:
         return []
-
-    placeholders = ",".join("?" * len(to_reclassify))
     await db.execute(
-        f"UPDATE jobs SET status = 'xfailed' WHERE run_id IN ({placeholders}) AND experiment_id = ?",
-        (*to_reclassify, experiment_id),
+        f"UPDATE jobs SET status = 'xfailed' WHERE experiment_id = ? "
+        f"AND status IN ('pending', 'failed') AND run_id IN ({','.join('?' * len(xfail))})",
+        (experiment_id, *xfail),
     )
     await db.commit()
-    return to_reclassify
-
-
-async def cancel_job(
-    db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
-) -> JobRecord | None:
-    """Mark a pending job as cancelled (does not affect running jobs)."""
-    row = await _exec_one(
-        db,
-        """
-        UPDATE jobs SET status = 'cancelled'
-        WHERE run_id = ? AND experiment_id = ? AND status = 'pending'
-        RETURNING *;
-        """,
-        (run_id, experiment_id),
-    )
-    await db.commit()
-    return _row_to_job(row) if row else None
-
-
-async def reset_dispatched_running_to_pending(
-    db: aiosqlite.Connection,
-) -> int:
-    """On manager restart, move any dispatched/running jobs back to pending.
-
-    Returns the number of jobs reset.
-    """
-    async with db.execute(
-        """
-        UPDATE jobs
-        SET status = 'pending',
-            dispatch_time = NULL,
-            start_time = NULL,
-            worker_id = NULL,
-            dispatched_gpu_ids = NULL
-        WHERE status IN ('dispatched', 'running');
-        """,
-    ) as cursor:
-        rowcount = cursor.rowcount
-    await db.commit()
-    return rowcount
-
-
-async def increment_retry(
-    db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
-) -> JobRecord | None:
-    """Increment retry_count and reset status to pending. Returns None if
-    max_retries already reached.
-    """
-    row = await _exec_one(
-        db,
-        """
-        UPDATE jobs
-        SET retry_count = retry_count + 1,
-            status = 'pending',
-            dispatch_time = NULL,
-            start_time = NULL,
-            finish_time = NULL,
-            elapsed = NULL,
-            exit_code = NULL,
-            worker_id = NULL,
-            dispatched_gpu_ids = NULL
-        WHERE run_id = ? AND experiment_id = ? AND retry_count < max_retries
-        RETURNING *;
-        """,
-        (run_id, experiment_id),
-    )
-    await db.commit()
-    return _row_to_job(row) if row else None
+    return xfail
 
 
 async def update_job_priority(
@@ -1393,63 +1529,6 @@ async def update_job_label(
     return _row_to_job(row) if row else None
 
 
-async def reset_job_to_pending(
-    db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
-) -> JobRecord | None:
-    """Reset a running/dispatched job back to pending without consuming a retry."""
-    row = await _exec_one(
-        db,
-        """
-        UPDATE jobs
-        SET status = 'pending',
-            dispatch_time = NULL,
-            start_time = NULL,
-            finish_time = NULL,
-            elapsed = NULL,
-            exit_code = NULL,
-            worker_id = NULL,
-            dispatched_gpu_ids = NULL
-        WHERE run_id = ? AND experiment_id = ?
-        RETURNING *;
-        """,
-        (run_id, experiment_id),
-    )
-    await db.commit()
-    return _row_to_job(row) if row else None
-
-
-async def reset_jobs_to_pending_batch(
-    db: aiosqlite.Connection,
-    pairs: list[tuple[str, str]],
-) -> list[JobRecord]:
-    """Reset multiple running/dispatched jobs back to pending without consuming retries."""
-    if not pairs:
-        return []
-    where = " OR ".join("(run_id = ? AND experiment_id = ?)" for _ in pairs)
-    params = tuple(x for pair in pairs for x in pair)
-    rows = await _exec_all(
-        db,
-        f"""
-        UPDATE jobs
-        SET status = 'pending',
-            dispatch_time = NULL,
-            start_time = NULL,
-            finish_time = NULL,
-            elapsed = NULL,
-            exit_code = NULL,
-            worker_id = NULL,
-            dispatched_gpu_ids = NULL
-        WHERE {where}
-        RETURNING *;
-        """,
-        params,
-    )
-    await db.commit()
-    return [_row_to_job(r) for r in rows]
-
-
 async def list_jobs_by_status(
     db: aiosqlite.Connection,
     status: JobStatus,
@@ -1471,32 +1550,6 @@ async def list_jobs_by_status(
         )
     rows = await cursor.fetchall()
     return [_row_to_job(r) for r in rows]
-
-
-async def reset_worker_jobs(
-    db: aiosqlite.Connection,
-    worker_id: str,
-) -> list[tuple[str, str]]:
-    """Reset any dispatched/running jobs belonging to *worker_id* back to
-    pending and clear their dispatch metadata.  Returns a list of
-    ``(run_id, experiment_id)`` tuples for the affected jobs.
-    """
-    rows = await _exec_all(
-        db,
-        """
-        UPDATE jobs
-        SET status = 'pending',
-            dispatch_time = NULL,
-            worker_id = NULL,
-            start_time = NULL,
-            dispatched_gpu_ids = NULL
-        WHERE worker_id = ? AND status IN ('dispatched', 'running')
-        RETURNING run_id, experiment_id
-        """,
-        (worker_id,),
-    )
-    await db.commit()
-    return [(r["run_id"], r["experiment_id"]) for r in rows]
 
 
 # Whitelist of column names that can be used with list_jobs_since.
@@ -1615,12 +1668,9 @@ async def count_jobs_by_status(
 
 async def count_active_jobs(db: aiosqlite.Connection, experiment_id: str) -> int:
     """Return the number of jobs in active (non-terminal) states for an experiment."""
-    cursor = await db.execute(
-        "SELECT COUNT(*) FROM jobs WHERE experiment_id = ? "
-        "AND status IN ('pending', 'dispatched', 'running')",
-        (experiment_id,),
+    row = await _exec_one(
+        db, f"SELECT COUNT(*) FROM jobs WHERE experiment_id = ? AND {_UNFINISHED_IN}", (experiment_id,),
     )
-    row = await cursor.fetchone()
     return row[0] if row else 0
 
 
@@ -1637,6 +1687,8 @@ async def experiment_summary(
         "status": exp.status if exp else None,
         "note": exp.note if exp else None,
         "submit_time": exp.submit_time.isoformat() if exp else None,
+        "metric": exp.metric if exp else None,
+        "goal": exp.goal if exp else None,
         "job_counts": counts,
     }
 
@@ -1690,9 +1742,10 @@ async def delete_experiment(
     experiment_id: str,
 ) -> bool:
     """Delete an experiment and all its jobs. Returns True if it existed."""
+    keys = "SELECT job_key FROM jobs WHERE experiment_id = ?"
+    await db.execute(f"DELETE FROM metrics WHERE job_key IN ({keys})", (experiment_id,))
+    await db.execute(f"DELETE FROM logs WHERE job_key IN ({keys})", (experiment_id,))
     await db.execute("DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,))
-    await db.execute("DELETE FROM metrics WHERE experiment_id = ?", (experiment_id,))
-    await db.execute("DELETE FROM logs WHERE experiment_id = ?", (experiment_id,))
     await db.execute("DELETE FROM job_nodes WHERE experiment_id = ?", (experiment_id,))
     row = await _exec_one(
         db,
@@ -1710,15 +1763,15 @@ async def delete_experiment(
 
 async def insert_metric(
     db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
+    job_key: int,
+    attempt: int,
     step: int,
     data: dict[str, Any],
 ) -> None:
-    """Persist a single metric row. Silently ignores duplicate (run_id, experiment_id, step)."""
+    """Persist one metric row.  A duplicate (job_key, attempt, step) is ignored."""
     await db.execute(
-        "INSERT OR IGNORE INTO metrics (run_id, experiment_id, step, data) VALUES (?, ?, ?, ?)",
-        (run_id, experiment_id, step, json.dumps(data)),
+        "INSERT OR IGNORE INTO metrics (job_key, attempt, step, data) VALUES (?, ?, ?, ?)",
+        (job_key, attempt, step, json.dumps(data, separators=(",", ":"))),
     )
     await db.commit()
 
@@ -1728,18 +1781,18 @@ async def get_metrics_for_run(
     run_id: str,
     experiment_id: str,
 ) -> list[dict[str, Any]]:
-    """Return all metric rows for a run as dicts, ordered by step."""
-    async with db.execute(
-        "SELECT step, data FROM metrics WHERE run_id = ? AND experiment_id = ? ORDER BY step",
-        (run_id, experiment_id),
-    ) as cursor:
-        rows = await cursor.fetchall()
-    result = []
-    for row in rows:
-        d = json.loads(row["data"])
-        d["step"] = row["step"]
-        result.append(d)
-    return result
+    """Return the latest attempt's metric rows for a run as dicts, ordered by step."""
+    rows = [(r[0], r[1]) for r in await _exec_all(
+        db,
+        """
+        SELECT m.step, m.data FROM metrics m JOIN jobs j ON m.job_key = j.job_key
+        WHERE j.experiment_id = ? AND j.run_id = ?
+          AND m.attempt = (SELECT MAX(attempt) FROM metrics WHERE job_key = j.job_key)
+        """,
+        (experiment_id, run_id),
+    )]
+    by_step = _merge_metric_rows(rows)
+    return [{**json.loads(by_step[step]), "step": step} for step in sorted(by_step)]
 
 
 # ===============================================================================
@@ -1749,17 +1802,25 @@ async def get_metrics_for_run(
 
 async def insert_log(
     db: aiosqlite.Connection,
-    run_id: str,
-    experiment_id: str,
+    job_key: int,
+    attempt: int,
     seq: int,
     data: str,
 ) -> None:
-    """Persist a single log chunk. Silently ignores duplicate (run_id, experiment_id, seq)."""
+    """Persist one log chunk.  A duplicate (job_key, attempt, seq) is ignored."""
     await db.execute(
-        "INSERT OR IGNORE INTO logs (run_id, experiment_id, seq, data) VALUES (?, ?, ?, ?)",
-        (run_id, experiment_id, seq, data),
+        "INSERT OR IGNORE INTO logs (job_key, attempt, seq, data) VALUES (?, ?, ?, ?)",
+        (job_key, attempt, seq, _pack_log(data)),
     )
     await db.commit()
+
+
+async def last_log_seq(db: aiosqlite.Connection, job_key: int, attempt: int) -> int:
+    """Byte offset in the run's training.log up to which the log is stored."""
+    row = await _exec_one(
+        db, "SELECT MAX(seq) FROM logs WHERE job_key = ? AND attempt = ?", (job_key, attempt),
+    )
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 async def get_logs_for_run(
@@ -1767,13 +1828,28 @@ async def get_logs_for_run(
     run_id: str,
     experiment_id: str,
 ) -> str:
-    """Return the full log text for a run, ordered by seq."""
-    async with db.execute(
-        "SELECT data FROM logs WHERE run_id = ? AND experiment_id = ? ORDER BY seq",
-        (run_id, experiment_id),
-    ) as cursor:
-        rows = await cursor.fetchall()
-    return "".join(row["data"] for row in rows)
+    """Return a run's log text, every attempt in order, each after a header line
+    when there was more than one."""
+    rows = await _exec_all(
+        db,
+        """
+        SELECT l.attempt, l.data FROM logs l JOIN jobs j ON l.job_key = j.job_key
+        WHERE j.experiment_id = ? AND j.run_id = ?
+        ORDER BY l.attempt, l.seq
+        """,
+        (experiment_id, run_id),
+    )
+    multiple = len({row["attempt"] for row in rows}) > 1
+    parts: list[str] = []
+    attempt = None
+    for row in rows:
+        if multiple and row["attempt"] != attempt:
+            attempt = row["attempt"]
+            if parts and not parts[-1].endswith("\n"):
+                parts.append("\n")
+            parts.append(f"[mlsweep] ── attempt {attempt} ──\n")
+        parts.append(_unpack_log(row["data"]))
+    return "".join(parts)
 
 
 # ===============================================================================
@@ -1832,6 +1908,9 @@ class DbWriter:
         expected_jobs: int = 0,
         singular_dims: list[str] | None = None,
         max_concurrent: int = 0,
+        skip_rules: dict[str, Any] | None = None,
+        metric: str | None = None,
+        goal: str | None = None,
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
@@ -1839,6 +1918,7 @@ class DbWriter:
             controller_id=controller_id, note=note,
             status=status, expected_jobs=expected_jobs,
             singular_dims=singular_dims, max_concurrent=max_concurrent,
+            skip_rules=skip_rules, metric=metric, goal=goal,
         ))
 
     async def update_experiment_status(
@@ -1943,10 +2023,13 @@ class DbWriter:
         run_id: str,
         experiment_id: str,
         status: JobStatus,
+        *,
+        only_from: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> JobRecord | None:
         db = self._db
-        return await self._enqueue(lambda: update_job_status(db, run_id, experiment_id, status, **kwargs))
+        return await self._enqueue(lambda: update_job_status(
+            db, run_id, experiment_id, status, only_from=only_from, **kwargs))
 
     async def dispatch_job(
         self,
@@ -1978,23 +2061,11 @@ class DbWriter:
             db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed
         ))
 
-    async def reclassify_singular_xfails(
-        self, experiment_id: str, succeeded_combo: dict[str, Any]
+    async def apply_result_rules(
+        self, experiment_id: str, run_id: str, success: bool,
     ) -> list[str]:
         db = self._db
-        return await self._enqueue(lambda: reclassify_singular_xfails(db, experiment_id, succeeded_combo))
-
-    async def cancel_job(
-        self, run_id: str, experiment_id: str
-    ) -> JobRecord | None:
-        db = self._db
-        return await self._enqueue(lambda: cancel_job(db, run_id, experiment_id))
-
-    async def increment_retry(
-        self, run_id: str, experiment_id: str
-    ) -> JobRecord | None:
-        db = self._db
-        return await self._enqueue(lambda: increment_retry(db, run_id, experiment_id))
+        return await self._enqueue(lambda: apply_result_rules(db, experiment_id, run_id, success))
 
     async def update_job_priority(
         self, run_id: str, experiment_id: str, priority: int
@@ -2008,17 +2079,19 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: update_job_label(db, run_id, experiment_id, label))
 
-    async def reset_job_to_pending(
-        self, run_id: str, experiment_id: str
-    ) -> JobRecord | None:
+    async def cancel_jobs(self, keys: Sequence[tuple[str, str]]) -> list[JobRecord]:
         db = self._db
-        return await self._enqueue(lambda: reset_job_to_pending(db, run_id, experiment_id))
+        return await self._enqueue(lambda: cancel_jobs(db, keys))
 
-    async def reset_jobs_to_pending_batch(
-        self, pairs: list[tuple[str, str]]
-    ) -> list[JobRecord]:
+    async def requeue_jobs(
+        self, keys: Sequence[tuple[str, str]], *, spend_retry: bool
+    ) -> tuple[list[JobRecord], list[JobRecord]]:
         db = self._db
-        return await self._enqueue(lambda: reset_jobs_to_pending_batch(db, pairs))
+        return await self._enqueue(lambda: requeue_jobs(db, keys, spend_retry=spend_retry))
+
+    async def retry_job(self, run_id: str, experiment_id: str) -> JobRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: retry_job(db, run_id, experiment_id))
 
     async def insert_job_nodes(
         self, run_id: str, experiment_id: str,
@@ -2040,12 +2113,6 @@ class DbWriter:
     ) -> None:
         db = self._db
         await self._enqueue(lambda: delete_job_nodes(db, run_id, experiment_id))
-
-    async def reset_worker_jobs(
-        self, worker_id: str
-    ) -> list[tuple[str, str]]:
-        db = self._db
-        return await self._enqueue(lambda: reset_worker_jobs(db, worker_id))
 
     # ── Artifacts ─────────────────────────────────────────────────────────────
 
@@ -2070,21 +2137,17 @@ class DbWriter:
     # ── Metrics and logs ──────────────────────────────────────────────────────
 
     async def insert_metric(
-        self,
-        run_id: str,
-        experiment_id: str,
-        step: int,
-        data: dict[str, Any],
+        self, job_key: int, attempt: int, step: int, data: dict[str, Any],
     ) -> None:
         db = self._db
-        await self._enqueue(lambda: insert_metric(db, run_id, experiment_id, step, data))
+        await self._enqueue(lambda: insert_metric(db, job_key, attempt, step, data))
 
-    async def insert_log(
-        self,
-        run_id: str,
-        experiment_id: str,
-        seq: int,
-        data: str,
+    async def pack_metrics(
+        self, job_key: int, attempt: int, extra: Sequence[tuple[int, str]] = (),
     ) -> None:
         db = self._db
-        await self._enqueue(lambda: insert_log(db, run_id, experiment_id, seq, data))
+        await self._enqueue(lambda: pack_metrics(db, job_key, attempt, extra))
+
+    async def insert_log(self, job_key: int, attempt: int, seq: int, data: str) -> None:
+        db = self._db
+        await self._enqueue(lambda: insert_log(db, job_key, attempt, seq, data))

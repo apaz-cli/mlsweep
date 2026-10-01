@@ -2,7 +2,6 @@
 
 import hashlib
 import io
-import os
 import platform
 import stat
 import tarfile

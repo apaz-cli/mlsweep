@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import base64
+import functools
 import hashlib
 import importlib.metadata
 import json
@@ -28,13 +29,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from mlsweep._sweep import (
-    _append_manifest_run,
     _write_manifest,
     count_expected,
     generate_variations,
@@ -46,8 +46,8 @@ from mlsweep._writers import (
     WriterFactory,
 )
 from mlsweep._shared import (
-    DEFAULT_MANAGER_URL, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET,
-    _git_root, _mlsweep_dir,
+    DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET,
+    _git_root, _mlsweep_dir, set_color, strip_color_flag,
 )
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -64,14 +64,6 @@ def sweep_print(msg: str, end: str = "\n") -> None:
     if _log_file is not None:
         _log_file.write(re.sub(r"\033\[[0-9;]*m", "", msg) + end)
         _log_file.flush()
-
-
-def fmt_time(s: float) -> str:
-    if s < 60:
-        return f"{s:.0f}s"
-    if s < 3600:
-        return f"{s / 60:.0f}m"
-    return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
 
 
 def _resolve_token(token_arg: str | None) -> str:
@@ -92,6 +84,11 @@ def _require_token(token_arg: str | None) -> str:
                     f"or place token in {_mlsweep_dir() / 'manager.token'}){_RESET}")
         sys.exit(1)
     return token
+
+
+def _manager_token(args: argparse.Namespace) -> tuple[str, str]:
+    """Return (manager, token) resolved from parsed args."""
+    return args.manager.rstrip("/"), _require_token(args.token)
 
 
 def _add_manager_args(parser: argparse.ArgumentParser) -> None:
@@ -136,9 +133,11 @@ def _http_request(
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             status = resp.status
+            content_type = resp.headers.get_content_type()
     except HTTPError as e:
         status = e.code
         raw = e.read()
+        content_type = e.headers.get_content_type()
     except URLError as e:
         sweep_print(f"{_RED}Error: cannot reach manager at {url}: {e.reason}{_RESET}")
         return (0, None)
@@ -146,11 +145,14 @@ def _http_request(
         sweep_print(f"{_RED}Error: HTTP request failed: {e}{_RESET}")
         return (0, None)
 
-    # Parse JSON
-    try:
-        return (status, json.loads(raw))
-    except (json.JSONDecodeError, TypeError):
-        return (status, raw.decode("utf-8", errors="replace") if raw else None)
+    # Decode by declared type. Guessing breaks on text bodies that happen to
+    # be valid JSON, such as a one-line metrics.jsonl.
+    if content_type == "application/json":
+        try:
+            return (status, json.loads(raw))
+        except json.JSONDecodeError:
+            pass
+    return (status, raw.decode("utf-8", errors="replace") if raw else None)
 
 
 def _manager_url(manager: str, path: str) -> str:
@@ -187,7 +189,7 @@ class _WebSocket:
         self._token = token
         self._timeout = timeout
         self._sock: socket.socket | None = None
-        self._buf: bytes = b""
+        self._buf = bytearray()
 
     def connect(self) -> None:
         """Establish WebSocket connection (TCP + TLS + upgrade handshake)."""
@@ -228,87 +230,64 @@ class _WebSocket:
 
         # Store any leftover data after headers
         _, leftover = resp.split(b"\r\n\r\n", 1)
-        self._buf = leftover
+        self._buf = bytearray(leftover)
         self._sock = sock
 
     def recv_frame(self) -> tuple[int, bytes] | None:
-        """Read one WebSocket frame. Returns (opcode, payload) or None on close/error."""
-        if not self._sock:
+        """Read one frame. Returns (opcode, payload), or None once the connection is closed.
+
+        Raises TimeoutError if no complete frame arrives within the timeout.
+        Partial frames stay buffered, so calling again resumes where it left off.
+        """
+        while True:
+            frame = self._pop_frame()
+            if frame is not None:
+                return frame
+            if not self._sock:
+                return None
+            try:
+                self._sock.settimeout(self._timeout)
+                chunk = self._sock.recv(65536)
+            except TimeoutError:
+                raise
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+    def _pop_frame(self) -> tuple[int, bytes] | None:
+        """Remove and return one complete frame from the buffer, or None if incomplete."""
+        buf = self._buf
+        if len(buf) < 2:
             return None
-
-        # Read 2-byte header
-        while len(self._buf) < 2:
-            chunk = self._recv_exact(2 - len(self._buf))
-            if chunk is None:
-                return None
-            self._buf += chunk
-
-        b0 = self._buf[0]
-        b1 = self._buf[1]
-        self._buf = self._buf[2:]
-
-        opcode = b0 & 0x0F
-        masked = (b1 & 0x80) != 0  # server frames are NOT masked
-        length = b1 & 0x7F
-
-        # Extended length
+        opcode = buf[0] & 0x0F
+        masked = (buf[1] & 0x80) != 0  # server frames are NOT masked, but be tolerant
+        length = buf[1] & 0x7F
+        pos = 2
         if length == 126:
-            while len(self._buf) < 2:
-                chunk = self._recv_exact(2 - len(self._buf))
-                if chunk is None:
-                    return None
-                self._buf += chunk
-            length = struct.unpack("!H", self._buf[:2])[0]
-            self._buf = self._buf[2:]
-        elif length == 127:
-            while len(self._buf) < 8:
-                chunk = self._recv_exact(8 - len(self._buf))
-                if chunk is None:
-                    return None
-                self._buf += chunk
-            length = struct.unpack("!Q", self._buf[:8])[0]
-            self._buf = self._buf[8:]
-
-        # Masking key (should not be present on server frames, but be tolerant)
-        if masked:
-            while len(self._buf) < 4:
-                chunk = self._recv_exact(4 - len(self._buf))
-                if chunk is None:
-                    return None
-                self._buf += chunk
-            mask_key = self._buf[:4]
-            self._buf = self._buf[4:]
-        else:
-            mask_key = None
-
-        # Payload
-        while len(self._buf) < length:
-            need = length - len(self._buf)
-            chunk = self._recv_exact(need)
-            if chunk is None:
+            if len(buf) < 4:
                 return None
-            self._buf += chunk
-
-        payload = self._buf[:length]
-        self._buf = self._buf[length:]
-
+            length = struct.unpack_from("!H", buf, 2)[0]
+            pos = 4
+        elif length == 127:
+            if len(buf) < 10:
+                return None
+            length = struct.unpack_from("!Q", buf, 2)[0]
+            pos = 10
+        mask_key = b""
+        if masked:
+            if len(buf) < pos + 4:
+                return None
+            mask_key = bytes(buf[pos:pos + 4])
+            pos += 4
+        if len(buf) < pos + length:
+            return None
+        payload = bytes(buf[pos:pos + length])
+        del buf[:pos + length]
         if mask_key:
             payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-
         return (opcode, payload)
-
-    def _recv_exact(self, n: int) -> bytes | None:
-        """Receive exactly n bytes from socket, or None on EOF/error."""
-        if not self._sock:
-            return None
-        try:
-            self._sock.settimeout(self._timeout)
-            data = self._sock.recv(n)
-            if not data:
-                return None
-            return data
-        except (socket.timeout, OSError):
-            return None
 
     def send_frame(self, opcode: int, payload: bytes) -> None:
         """Send a masked WebSocket frame (client must mask)."""
@@ -344,20 +323,64 @@ class _WebSocket:
         self.send_frame(_WS_OP_CLOSE, payload)
 
     def close(self) -> None:
-        if self._sock:
-            try:
-                self.send_close(1000)
-            except Exception:
-                pass
-            try:
-                self._sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                self._sock.close()
-            except OSError:
-                pass
+        sock = self._sock
+        if sock:
+            self.send_close(1000)  # clears self._sock if the peer is already gone
             self._sock = None
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def iter_events(self, *, max_idle: float | None = None) -> Iterator[dict[str, Any]]:
+        """Yield decoded JSON events until the server closes the stream.
+
+        Pings every 20s. A pong counts as activity, so *max_idle* trips only
+        when the server stops answering.  A quiet stream while jobs wait for
+        GPUs keeps the connection open.
+        Closes the socket when the generator finishes or is closed.
+        """
+        stop = threading.Event()
+
+        def _ping_loop() -> None:
+            while not stop.is_set():
+                self.send_ping()
+                stop.wait(20.0)
+
+        heartbeat = threading.Thread(target=_ping_loop, daemon=True)
+        heartbeat.start()
+        last_activity = time.time()
+        try:
+            while True:
+                try:
+                    frame = self.recv_frame()
+                except TimeoutError:
+                    if max_idle is not None and time.time() - last_activity > max_idle:
+                        sweep_print(f"\n  {_YELLOW}No response from manager for {max_idle:.0f}s, disconnecting{_RESET}")
+                        return
+                    continue
+                if frame is None:
+                    return
+                opcode, payload = frame
+                if opcode == _WS_OP_CLOSE:
+                    return
+                last_activity = time.time()
+                if opcode == _WS_OP_PING:
+                    self.send_frame(_WS_OP_PONG, payload)
+                if opcode != _WS_OP_TEXT:
+                    continue
+                try:
+                    yield json.loads(payload.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+        finally:
+            stop.set()
+            heartbeat.join(timeout=1.0)
+            self.close()
 
 
 # ===============================================================================
@@ -375,6 +398,9 @@ def manager_create_experiment(
     expected_jobs: int = 0,
     singular_dims: list[str] | None = None,
     max_concurrent: int = 0,
+    skip_rules: dict[str, Any] | None = None,
+    metric: str | None = None,
+    goal: str | None = None,
 ) -> dict[str, Any] | None:
     """Create an experiment on the manager. Returns the experiment dict or None."""
     status, resp = _http_request(
@@ -390,6 +416,9 @@ def manager_create_experiment(
             "expected_jobs": expected_jobs,
             "singular_dims": singular_dims or [],
             "max_concurrent": max_concurrent,
+            "skip_rules": skip_rules or {},
+            "metric": metric,
+            "goal": goal,
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -479,24 +508,6 @@ def manager_submit_jobs_bulk(
     return None
 
 
-def manager_submit_job(
-    manager: str,
-    token: str,
-    job: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Submit a single job. Returns the created job record."""
-    status, resp = _http_request(
-        "POST",
-        _manager_url(manager, "/api/jobs"),
-        token,
-        json_data=job,
-    )
-    if status in (200, 201) and isinstance(resp, dict):
-        return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Submit job: {resp}")
-    return None
-
-
 def manager_get_job_metrics(
     manager: str,
     token: str,
@@ -509,18 +520,15 @@ def manager_get_job_metrics(
         _manager_url(manager, f"/api/experiments/{experiment_id}/jobs/{run_id}/metrics"),
         token,
     )
-    if status == 200:
-        if isinstance(resp, str):
-            lines: list[dict[str, Any]] = []
-            for line in resp.strip().splitlines():
-                if line.strip():
-                    try:
-                        lines.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-            return lines
-        if isinstance(resp, list):
-            return resp
+    if status == 200 and isinstance(resp, str):
+        lines: list[dict[str, Any]] = []
+        for line in resp.strip().splitlines():
+            if line.strip():
+                try:
+                    lines.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return lines
     return None
 
 
@@ -667,6 +675,24 @@ def _combo_str(combo: Any) -> str:
     return "  ".join(f"{k}={v}" for k, v in combo.items())
 
 
+def _metric_values(metrics: list[dict[str, Any]] | None, metric: str) -> list[float]:
+    """Finite values of *metric* across metric rows, in step order."""
+    return [
+        float(r[metric])
+        for r in (metrics or [])
+        if isinstance(r, dict) and isinstance(r.get(metric), (int, float))
+        and math.isfinite(float(r[metric]))
+    ]
+
+
+def _best_metric(metrics: list[dict[str, Any]] | None, metric: str, goal: str) -> float | None:
+    """Best finite value of *metric* under *goal*, or None if it was never logged."""
+    vals = _metric_values(metrics, metric)
+    if not vals:
+        return None
+    return min(vals) if goal == "minimize" else max(vals)
+
+
 def build_leaderboard(
     manager: str,
     token: str,
@@ -687,20 +713,23 @@ def build_leaderboard(
     with ThreadPoolExecutor(max_workers=8) as pool:
         all_metrics = dict(zip(done_ids, pool.map(
             lambda rid: manager_get_job_metrics(manager, token, experiment_id, rid), done_ids)))
+    return rank_leaderboard(jobs, all_metrics, metric, goal)
 
+
+def rank_leaderboard(
+    jobs: list[dict[str, Any]],
+    all_metrics: dict[str, list[dict[str, Any]] | None],
+    metric: str = "loss",
+    goal: str = "minimize",
+) -> list[dict[str, Any]]:
+    """Rank *jobs* best-first by *metric*, given each run's metric rows by run_id."""
     rows: list[dict[str, Any]] = []
     for j in jobs:
         st = j.get("status") or "?"
         run_id = j.get("run_id") or ""
         value = final = None
         if st == "done":
-            metrics = all_metrics.get(run_id)
-            vals = [
-                float(r[metric])
-                for r in (metrics or [])
-                if isinstance(r, dict) and isinstance(r.get(metric), (int, float))
-                and math.isfinite(float(r[metric]))
-            ]
+            vals = _metric_values(all_metrics.get(run_id), metric)
             if vals:
                 value = min(vals) if goal == "minimize" else max(vals)
                 final = vals[-1]
@@ -731,16 +760,19 @@ def print_leaderboard(
 ) -> None:
     """Print the ranked runs."""
     done = [r for r in rows if r["value"] is not None]
-    sweep_print(f"\n{'=' * 80}")
-    sweep_print(f"LEADERBOARD: {metric} ({goal}), {len(done)} completed runs")
-    sweep_print(f"{'=' * 80}")
+    rule = f"{_CYAN}{'=' * 80}{_RESET}"
+    sweep_print(f"\n{rule}")
+    sweep_print(f"{_BOLD}LEADERBOARD:{_RESET} {_MAGENTA}{metric}{_RESET} ({goal}), "
+                f"{_GREEN}{len(done)}{_RESET} completed runs")
+    sweep_print(rule)
     if not done:
-        sweep_print("  (no completed runs with a metric value)")
+        sweep_print(f"  {_YELLOW}(no completed runs with a metric value){_RESET}")
         return
     shown = done[:top] if top else done
     for i, r in enumerate(shown, 1):
         final = f"  final={r['final']:.6f}" if isinstance(r["final"], (int, float)) else ""
-        sweep_print(f"  {i:>3}. {r['value']:>12.6f}{final}  {_GREEN}{r['run_id']}{_RESET}  {_combo_str(r['combo'])}")
+        sweep_print(f"  {i:>3}. {_MAGENTA}{r['value']:>12.6f}{_RESET}{final}  "
+                    f"{_GREEN}{r['run_id']}{_RESET}  {_combo_str(r['combo'])}")
 
 
 def _wait_until_settled(
@@ -748,18 +780,51 @@ def _wait_until_settled(
     token: str,
     experiment_id: str,
     interval: int = 10,
-) -> None:
-    """Block until an experiment has no pending/dispatched/running jobs."""
-    sweep_print(f"Waiting for {experiment_id} to settle (Ctrl+C to stop)...")
+) -> bool:
+    """Block until an experiment has no pending/dispatched/running jobs.
+
+    Returns True when at least one job finished as ``failed`` (so callers can
+    exit non-zero), False for a clean settle.  Progress goes to stderr so that
+    ``--json`` output on stdout stays parseable.
+    """
+    print(f"Waiting for {experiment_id} to settle (Ctrl+C to stop)...", file=sys.stderr, flush=True)
     while True:
         resp = manager_get_experiment_summary(manager, token, experiment_id, quiet=True)
         if resp:
             counts = resp.get("job_counts") or {}
             active = sum(int(counts.get(s, 0)) for s in _ACTIVE_JOB_STATUSES)
             if active == 0:
-                sweep_print("  experiment settled.")
-                return
+                failed = int(counts.get("failed", 0)) > 0
+                if failed:
+                    print("  experiment settled with failures.", file=sys.stderr, flush=True)
+                else:
+                    print("  experiment settled.", file=sys.stderr, flush=True)
+                return failed
         time.sleep(interval)
+
+
+def resolve_ranking(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    metric: str | None = None,
+    goal: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the ``(metric, goal)`` used to rank an experiment's runs.
+
+    An explicitly supplied value always wins; otherwise fall back to the
+    metric/goal stored on the experiment (from ``METRIC``/``GOAL`` or
+    ``OPTIMIZE``) and finally to ``loss``/``minimize``.
+    """
+    if metric is None or goal is None:
+        summary = manager_get_experiment_summary(manager, token, experiment_id, quiet=True) or {}
+        if metric is None:
+            stored_metric = summary.get("metric")
+            metric = stored_metric if isinstance(stored_metric, str) and stored_metric else "loss"
+        if goal is None:
+            stored_goal = summary.get("goal")
+            goal = stored_goal if stored_goal in ("minimize", "maximize") else "minimize"
+    return metric, goal
 
 
 def manager_check_artifact(
@@ -994,7 +1059,6 @@ def _stream_status_live(
 
     # Track job statuses
     job_status: dict[str, dict[str, Any]] = {}
-    last_event = time.time()
     total_jobs = 0
     done_jobs = 0
 
@@ -1018,44 +1082,8 @@ def _stream_status_live(
                 return v["combo"]  # type: ignore[no-any-return]
         return {}
 
-    # Heartbeat thread
-    stop_heartbeat = threading.Event()
-
-    def _ping_loop() -> None:
-        while not stop_heartbeat.is_set():
-            try:
-                ws.send_ping()
-            except Exception:
-                break
-            stop_heartbeat.wait(20.0)
-
-    heartbeat = threading.Thread(target=_ping_loop, daemon=True)
-    heartbeat.start()
-
     try:
-        while True:
-            frame = ws.recv_frame()
-            if frame is None:
-                break
-
-            opcode, payload = frame
-            if opcode == _WS_OP_CLOSE:
-                break
-            elif opcode == _WS_OP_PONG:
-                last_event = time.time()
-                continue
-            elif opcode == _WS_OP_PING:
-                ws.send_frame(_WS_OP_PONG, payload)
-                continue
-            elif opcode != _WS_OP_TEXT:
-                continue
-
-            try:
-                event = json.loads(payload.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-
-            last_event = time.time()
+        for event in ws.iter_events(max_idle=max_idle):
             event_type = event.get("type", "unknown")
             run_id = event.get("run_id", "")
 
@@ -1124,16 +1152,9 @@ def _stream_status_live(
             # Print current status table
             _render_status_table(job_status, total_jobs)
 
-            # Check idle timeout
-            if time.time() - last_event > max_idle:
-                sweep_print(f"\n  {_YELLOW}Idle for {max_idle:.0f}s — disconnecting{_RESET}")
-                break
-
     except KeyboardInterrupt:
         sweep_print(f"\n  {_YELLOW}Interrupted{_RESET}")
     finally:
-        stop_heartbeat.set()
-        heartbeat.join(timeout=1.0)
         ws.close()
 
     # ── Finish writers ──
@@ -1154,12 +1175,13 @@ def _stream_status_live(
             sweep_print(f"  {_YELLOW}WARN{_RESET}  Writer on_sweep_end failed: {e}")
 
     # Final summary
-    sweep_print(f"\n{'=' * 80}")
+    sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
     ok = sum(1 for s in job_status.values() if s["status"] == "done")
     failed = sum(1 for s in job_status.values() if s["status"] == "failed")
     running = sum(1 for s in job_status.values() if s["status"] in _ACTIVE_JOB_STATUSES)
-    sweep_print(f"Final: {ok} OK, {failed} failed, {running} pending/running")
-    sweep_print(f"{'=' * 80}")
+    sweep_print(f"{_BOLD}Final:{_RESET} {_GREEN}{ok} OK{_RESET}, {_RED}{failed} failed{_RESET}, "
+                f"{_YELLOW}{running} pending/running{_RESET}")
+    sweep_print(f"{_CYAN}{'=' * 80}{_RESET}")
 
 
 def _render_status_table(
@@ -1203,23 +1225,24 @@ def _render_status_table(
     n_run = sum(1 for s in job_status.values() if s["status"] in ("running", "dispatched"))
     n_pend = sum(1 for s in job_status.values() if s["status"] == "pending")
 
-    summary = f"  [{n_ok} ok, {n_fail} fail, {n_run} running, {n_pend} pending]"
+    summary = (f"  [{_GREEN}{n_ok} ok{_RESET}, {_RED}{n_fail} fail{_RESET}, "
+               f"{_CYAN}{n_run} running{_RESET}, {_YELLOW}{n_pend} pending{_RESET}]")
     lines.append(summary)
 
     # Clear and re-print (use \r\033[K for simple overwrite)
     # For multi-line, move cursor up
     output = "\n".join(lines)
-    # Move cursor up by number of previous lines if we've printed before
-    if hasattr(_render_status_table, "_prev_lines"):
-        prev = _render_status_table._prev_lines  # pyright: ignore[reportFunctionMemberAccess]
-        # Move up and clear
-        sys.stdout.write(f"\033[{prev}A\033[J")
+    # Move the cursor up over the previous table, if one was printed, and clear it
+    global _status_table_lines
+    if _status_table_lines:
+        sys.stdout.write(f"\033[{_status_table_lines}A\033[J")
     sys.stdout.write(output + "\n")
     sys.stdout.flush()
-    _render_status_table._prev_lines = len(lines) + 1  # type: ignore[attr-defined]
+    _status_table_lines = len(lines) + 1
 
 
-_render_status_table._prev_lines = 0  # type: ignore[attr-defined]
+# Lines the last _render_status_table printed (0 = none yet).
+_status_table_lines = 0
 
 
 # ===============================================================================
@@ -1239,10 +1262,11 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
     n_cancelled = sum(1 for j in jobs if j["status"] == "cancelled")
     total = len(jobs)
 
-    sweep_print(f"\n{'=' * 80}")
-    sweep_print(f"SUMMARY — {total} jobs: {n_ok} OK, {n_fail} failed, "
-                f"{n_pending} pending, {n_cancelled} cancelled")
-    sweep_print(f"{'=' * 80}")
+    sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
+    sweep_print(f"{_BOLD}SUMMARY{_RESET} — {total} jobs: {_GREEN}{n_ok} OK{_RESET}, "
+                f"{_RED}{n_fail} failed{_RESET}, {_YELLOW}{n_pending} pending{_RESET}, "
+                f"{n_cancelled} cancelled")
+    sweep_print(f"{_CYAN}{'=' * 80}{_RESET}")
 
     for j in jobs:
         status = j["status"]
@@ -1268,6 +1292,30 @@ def print_jobs_summary(jobs: list[dict[str, Any]]) -> bool:
 # ===============================================================================
 # Job payload builder
 # ===============================================================================
+
+
+def _skip_rules(options: dict[str, Any]) -> dict[str, Any]:
+    """The manager's input to ``should_skip``: every dim (subdims included), by name.
+
+    Empty when no dim is monotonic or singular.  Every dim is listed because
+    ``should_skip`` holds all the others fixed when comparing two combos.
+    """
+    rules: dict[str, Any] = {}
+
+    def walk(opts: dict[str, Any]) -> None:
+        for key, opt in opts.items():
+            rules[key[1:]] = {
+                "monotonic": opt.get("monotonic"),
+                "singular": bool(opt.get("singular")),
+                "_values": opt.get("_values", []),
+            }
+            for sub in opt.get("_sub_opts_map", {}).values():
+                walk(sub)
+
+    walk(options)
+    if not any(r["monotonic"] or r["singular"] for r in rules.values()):
+        return {}
+    return rules
 
 
 def _build_job_payloads(
@@ -1332,11 +1380,18 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
     )
     parser.add_argument("experiment_id", help="Experiment ID to watch")
     _add_manager_args(parser)
+    parser.add_argument("--color", action="store_true",
+                        help="Enable ANSI color in human-readable output (default: off)")
+    parser.add_argument("--events", action="store_true",
+                        help="Emit one JSON event per line and nothing else (machine-readable)")
+    parser.add_argument("--json", action="store_true",
+                        help="Alias for --events; stream one JSON event per line")
     parsed = parser.parse_args(args)
+    if parsed.color:
+        set_color(True)
+    emit_json = bool(parsed.events or parsed.json)
 
-    token = _require_token(parsed.token)
-
-    manager = parsed.manager.rstrip("/")
+    manager, token = _manager_token(parsed)
 
     # Connect WebSocket with since=now to only get new events
     ws_url = _ws_stream_url(manager, parsed.experiment_id, token)
@@ -1354,47 +1409,24 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
         sweep_print(f"  {_RED}FAIL{_RESET}  WebSocket connection failed: {e}")
         sys.exit(1)
 
-    sweep_print(f"Watching experiment {_YELLOW}{parsed.experiment_id}{_RESET}")
-    sweep_print(f"Manager: {manager}")
-    sweep_print("")
+    if not emit_json:
+        sweep_print(f"Watching experiment {_YELLOW}{parsed.experiment_id}{_RESET}")
+        sweep_print(f"Manager: {manager}")
+        sweep_print("")
 
-    stop_heartbeat = threading.Event()
-
-    def _ping_loop() -> None:
-        while not stop_heartbeat.is_set():
-            try:
-                ws.send_ping()
-            except Exception:
-                break
-            stop_heartbeat.wait(20.0)
-
-    heartbeat = threading.Thread(target=_ping_loop, daemon=True)
-    heartbeat.start()
-
+    failed = False
     try:
-        while True:
-            frame = ws.recv_frame()
-            if frame is None:
-                break
-
-            opcode, payload = frame
-            if opcode == _WS_OP_CLOSE:
-                break
-            elif opcode == _WS_OP_PONG:
-                continue
-            elif opcode == _WS_OP_PING:
-                ws.send_frame(_WS_OP_PONG, payload)
-                continue
-            elif opcode != _WS_OP_TEXT:
-                continue
-
-            try:
-                event = json.loads(payload.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-
+        for event in ws.iter_events():
             event_type = event.get("type", "unknown")
             run_id = event.get("run_id", "")
+            if event_type in ("job_done", "run_result") and not event.get("success", False):
+                failed = True
+
+            if emit_json:
+                print(json.dumps(event), flush=True)
+                if event_type == "experiment_done":
+                    break
+                continue
 
             if event_type in ("job_started", "run_started"):
                 sweep_print(f"  {_CYAN}▶ START {_RESET} {run_id}")
@@ -1429,11 +1461,13 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
                 sweep_print(f"\n  Experiment status: {event.get('status')}")
 
     except KeyboardInterrupt:
-        sweep_print(f"\n  {_YELLOW}Interrupted{_RESET}")
+        if not emit_json:
+            sweep_print(f"\n  {_YELLOW}Interrupted{_RESET}")
     finally:
-        stop_heartbeat.set()
-        heartbeat.join(timeout=1.0)
         ws.close()
+
+    if failed:
+        sys.exit(1)
 
 
 # ===============================================================================
@@ -1451,26 +1485,33 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
     parser.add_argument("--experiment", required=True, help="Experiment ID to fetch")
     parser.add_argument("--output-dir", default=None, help="Directory to download artifacts (optional)")
     parser.add_argument("--status", default=None, help="Filter jobs by status (done, failed, pending, etc.)")
-    parser.add_argument("--metric", default="loss", help="Metric to rank runs by")
-    parser.add_argument("--goal", default="minimize", choices=["minimize", "maximize"], help="Rank direction")
+    parser.add_argument("--metric", default=None, help="Metric to rank runs by (default: experiment's metric, else loss)")
+    parser.add_argument("--goal", default=None, choices=["minimize", "maximize"],
+                        help="Rank direction (default: experiment's goal, else minimize)")
     parser.add_argument("--top", type=int, default=10, help="Show top N runs in the leaderboard (0 = all)")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON (skips download)")
     parser.add_argument("--wait", action="store_true", help="Block until the experiment settles")
     parser.add_argument("--wait-interval", type=int, default=10, help="Seconds between --wait polls")
+    parser.add_argument("--color", action="store_true",
+                        help="Enable ANSI color in human-readable output (default: off)")
     parsed = parser.parse_args(args)
+    if parsed.color:
+        set_color(True)
 
-    token = _require_token(parsed.token)
-    manager = parsed.manager.rstrip("/")
+    manager, token = _manager_token(parsed)
 
+    had_failure = False
     if parsed.wait:
-        _wait_until_settled(manager, token, parsed.experiment, parsed.wait_interval)
+        had_failure = _wait_until_settled(manager, token, parsed.experiment, parsed.wait_interval)
+
+    metric, goal = resolve_ranking(manager, token, parsed.experiment, parsed.metric, parsed.goal)
 
     summary = manager_get_experiment_summary(manager, token, parsed.experiment) or {}
     jobs = manager_list_experiment_jobs(manager, token, parsed.experiment, status_filter=parsed.status)
     if jobs is None:
         sys.exit(1)
 
-    rows = build_leaderboard(manager, token, parsed.experiment, parsed.metric, parsed.goal, jobs=jobs)
+    rows = build_leaderboard(manager, token, parsed.experiment, metric, goal, jobs=jobs)
 
     if parsed.json:
         out = {
@@ -1478,11 +1519,13 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
             "name": summary.get("name"),
             "status": summary.get("status"),
             "job_counts": summary.get("job_counts"),
-            "metric": parsed.metric,
-            "goal": parsed.goal,
+            "metric": metric,
+            "goal": goal,
             "runs": rows,
         }
         print(json.dumps(out, indent=2))
+        if had_failure:
+            sys.exit(1)
         return
 
     if summary:
@@ -1494,11 +1537,14 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
 
     if jobs:
         print_jobs_summary(jobs)
-    print_leaderboard(rows, parsed.metric, parsed.goal, parsed.top)
+    print_leaderboard(rows, metric, goal, parsed.top)
 
     # Download experiment artifacts
-    output_dir = parsed.output_dir or os.path.join(Path.home(), ".mlsweep", "downloads", parsed.experiment)
+    output_dir = parsed.output_dir or str(_mlsweep_dir() / "downloads" / parsed.experiment)
     manager_download_experiment(manager, token, parsed.experiment, output_dir)
+
+    if had_failure:
+        sys.exit(1)
 
 
 # ===============================================================================
@@ -1509,7 +1555,9 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
 def main() -> None:
     global _log_file
 
-    argv = sys.argv[1:]
+    # Standalone `mlsweep_run` also accepts the global --color flag; consume it
+    # before subcommand dispatch so `mlsweep_run fetch --color ...` works too.
+    argv = strip_color_flag(list(sys.argv[1:]))
 
     # ── subcommands ───────────────────────────────────────────────────────
     if argv and argv[0] == "fetch":
@@ -1575,6 +1623,8 @@ def main() -> None:
         "--max-concurrent", type=int, default=0, metavar="K",
         help="Cap on this sweep's simultaneously-running jobs across the whole "
              "cluster (0 = unlimited). Use it to take only a slice of a shared cluster.")
+    parser.add_argument("--color", action="store_true",
+                        help="Enable ANSI color in human-readable output (default: off)")
 
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
@@ -1634,17 +1684,17 @@ def main() -> None:
         expected = count_expected(options)
         excluded = expected - len(all_variations)
         dim_names = [k[1:] for k in options]
-        sweep_print(f"Sweep: {sweep_name}")
-        sweep_print(f"Dimensions: {', '.join(dim_names) if dim_names else '(none)'}")
+        sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET}")
+        sweep_print(f"{_BOLD}Dimensions:{_RESET} {', '.join(dim_names) if dim_names else '(none)'}")
         for key in options:
             dim_name = key[1:]
             values = options[key].get("_values", [])
             if values != [None]:
-                sweep_print(f"  {dim_name}: {values}")
-        sweep_print(f"\nTotal combinations: {len(all_variations)}")
+                sweep_print(f"  {_CYAN}{dim_name}{_RESET}: {values}")
+        sweep_print(f"\n{_BOLD}Total combinations:{_RESET} {_GREEN}{len(all_variations)}{_RESET}")
         if excluded:
-            sweep_print(f"Excluded by EXCLUDE filter: {excluded}")
-        sweep_print(f"\nRuns:")
+            sweep_print(f"{_YELLOW}Excluded by EXCLUDE filter: {excluded}{_RESET}")
+        sweep_print(f"\n{_BOLD}{_CYAN}Runs:{_RESET}")
         for var in all_variations:
             sweep_print(f"  {var['name']}: {var['combo']}")
         sys.exit(0)
@@ -1684,19 +1734,19 @@ def main() -> None:
         done_jobs = []
 
     # ── Header (before network calls) ──────────────────────────────────────
-    sweep_print(f"Command: {' '.join(command)}")
+    sweep_print(f"{_BOLD}Command:{_RESET} {' '.join(command)}")
     if method == "bayes":
-        sweep_print(f"Sweep: {sweep_name} (bayes, budget={expected})")
+        sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET} (bayes, budget={expected})")
     else:
         n_probes = len(variations)
         n_expected = expected  # count_expected: ignores singular probes
         if n_expected < n_probes:
-            sweep_print(f"Sweep: {sweep_name} ({n_expected}–{n_probes} runs, {n_probes - n_expected} singular probes)")
+            sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET} ({n_expected}–{n_probes} runs, {n_probes - n_expected} singular probes)")
         else:
-            sweep_print(f"Sweep: {sweep_name} ({n_probes} runs)")
-    sweep_print(f"Experiment: {experiment_id}")
+            sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET} ({n_probes} runs)")
+    sweep_print(f"{_BOLD}Experiment:{_RESET} {_CYAN}{experiment_id}{_RESET}")
     if extra:
-        sweep_print(f"Extra overrides: {' '.join(extra)}")
+        sweep_print(f"{_BOLD}Extra overrides:{_RESET} {' '.join(extra)}")
 
     if args.dry_run:
         if method == "bayes":
@@ -1712,9 +1762,9 @@ def main() -> None:
                     colored.append(f"{color}{' '.join(flags)}{_RESET}")
             sweep_print(f"{_GREEN}{var['name']}{_RESET}: {' '.join(colored)}")
             sweep_print(f"{' '.join(list(command) + var['overrides'] + list(extra))}\n")
-        sweep_print(f"\n{'=' * 80}")
-        sweep_print(f"DRY RUN — {len(variations)} runs would be submitted to manager")
-        sweep_print(f"{'=' * 80}")
+        sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
+        sweep_print(f"{_BOLD}DRY RUN{_RESET} — {_GREEN}{len(variations)}{_RESET} runs would be submitted to manager")
+        sweep_print(f"{_CYAN}{'=' * 80}{_RESET}")
         return
 
     # ── Manager required ───────────────────────────────────────────────────
@@ -1723,12 +1773,11 @@ def main() -> None:
         sweep_print(f"Usage: mlsweep_run <sweep.py> --manager http://host:port [--stream]")
         sys.exit(1)
 
-    manager = args.manager.rstrip("/")
-    token = _require_token(args.token)
+    manager, token = _manager_token(args)
 
-    sweep_print(f"\n{'=' * 80}")
-    sweep_print(f"Connecting to manager: {manager}")
-    sweep_print(f"{'=' * 80}\n")
+    sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
+    sweep_print(f"{_BOLD}Connecting to manager:{_RESET} {_CYAN}{manager}{_RESET}")
+    sweep_print(f"{_CYAN}{'=' * 80}{_RESET}\n")
 
     # ── Resume: fetch completed jobs and rebuild optimizer ─────────────────
     if resume:
@@ -1758,14 +1807,7 @@ def main() -> None:
             metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id)
             if metrics_list is None:
                 continue
-            # Extract best metric value
-            best: float | None = None
-            for row in metrics_list:
-                val = row.get(metric_name)
-                if isinstance(val, (int, float)):
-                    best_val = float(val)
-                    if best is None or (goal == "minimize" and best_val < best) or (goal == "maximize" and best_val > best):
-                        best = best_val
+            best = _best_metric(metrics_list, metric_name, goal)
             if best is not None:
                 optimizer.tell(combo, best)
                 told_count += 1
@@ -1838,7 +1880,7 @@ def main() -> None:
             if not manager_register_artifact(
                 manager, token, artifact_id,
                 size_bytes=os.path.getsize(tarball_path),
-                setup_command=getattr(args, "setup_command", None),
+                setup_command=args.setup_command,
             ):
                 os.unlink(tarball_path)
                 sys.exit(1)
@@ -1866,26 +1908,30 @@ def main() -> None:
             expected_jobs=expected if method == "bayes" else 0,
             singular_dims=singular_dim_names,
             max_concurrent=args.max_concurrent,
+            # The Bayes controller handles singular probes itself.
+            skip_rules=_skip_rules(options) if method == "grid" else None,
+            metric=info.get("metric"),
+            goal=info.get("goal"),
         ):
             sys.exit(1)
 
     # ── 3. Build and submit jobs ───────────────────────────────────────────
+    build_payloads = functools.partial(
+        _build_job_payloads,
+        artifact_id=artifact_id or "",
+        command=command,
+        extra_flags=extra_flags,
+        gpus_per_run=gpus_per_run,
+        nodes_per_run=nodes_per_run,
+        set_dist_env=set_dist_env,
+        run_from=run_from,
+        priority=args.priority,
+        max_retries=args.max_retries,
+        setup_command=args.setup_command,
+    )
     if n > 0:
         sweep_print("Submitting jobs...")
-        job_payloads = _build_job_payloads(
-            variations=variations,
-            experiment_id=experiment_id,
-            artifact_id=artifact_id or "",
-            command=command,
-            extra_flags=extra_flags,
-            gpus_per_run=gpus_per_run,
-            nodes_per_run=nodes_per_run,
-            set_dist_env=set_dist_env,
-            run_from=run_from,
-            priority=args.priority,
-            max_retries=args.max_retries,
-            setup_command=args.setup_command,
-        )
+        job_payloads = build_payloads(variations=variations, experiment_id=experiment_id)
 
         records = manager_submit_jobs_bulk(manager, token, job_payloads)
         if records is None:
@@ -1895,8 +1941,6 @@ def main() -> None:
 
     # ── 4. Write local manifest ────────────────────────────────────────────
     _write_manifest(exp_dir, experiment_id, variations, note=args.note)
-    for var in variations:
-        _append_manifest_run(exp_dir, var)
 
     # ── 5. Stream or fetch ─────────────────────────────────────────────────
     if args.stream:
@@ -1934,20 +1978,7 @@ def main() -> None:
                 new_vars = optimizer.suggest(n=1)
                 if not new_vars:
                     return
-                new_job = _build_job_payloads(
-                    variations=new_vars,
-                    experiment_id=eid,
-                    artifact_id=artifact_id or "",
-                    command=command,
-                    extra_flags=extra_flags,
-                    gpus_per_run=gpus_per_run,
-                    nodes_per_run=nodes_per_run,
-                    set_dist_env=set_dist_env,
-                    run_from=run_from,
-                    priority=args.priority,
-                    max_retries=args.max_retries,
-                    setup_command=args.setup_command,
-                )
+                new_job = build_payloads(variations=new_vars, experiment_id=eid)
                 if new_job:
                     submitted = manager_submit_jobs_bulk(manager, token, new_job)
                     if submitted:
@@ -2007,15 +2038,7 @@ def main() -> None:
                     # First success for this lex combo: tell optimizer and
                     # immediately submit a replacement.
                     metrics_list = manager_get_job_metrics(mgr, tok, eid, run_id)
-                    best: float | None = None
-                    if metrics_list:
-                        for row in metrics_list:
-                            val = row.get(metric_name)
-                            if isinstance(val, (int, float)):
-                                best_val = float(val)
-                                if best is None or (goal == "minimize" and best_val < best) or (goal == "maximize" and best_val > best):
-                                    best = best_val
-                    optimizer.tell(combo, best)
+                    optimizer.tell(combo, _best_metric(metrics_list, metric_name, goal))
                     _lex_done.add(lk)
                     _submit_new(eid)
                 elif _lex_pending.get(lk, 0) == 0:
@@ -2040,8 +2063,8 @@ def main() -> None:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"Fetching results...")
         sweep_print(f"{'=' * 80}")
-        metric = optimize_cfg.get("metric", "loss")
-        goal = optimize_cfg.get("goal", "minimize")
+        metric = info.get("metric") or optimize_cfg.get("metric", "loss")
+        goal = info.get("goal") or optimize_cfg.get("goal", "minimize")
         jobs = manager_list_experiment_jobs(manager, token, experiment_id)
         if jobs is not None:
             print_jobs_summary(jobs)

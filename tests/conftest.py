@@ -39,20 +39,20 @@ def _api_get(url, token, path):
         return json.loads(resp.read())
 
 
-def _api_post(url, token, path, data=None):
-    """POST *data* (JSON-serialisable) to *path*, return parsed JSON response."""
+def _api_request(url, token, method, path, data=None):
+    """Send *data* as JSON with *method* to *path*, return the parsed JSON response."""
     body = json.dumps(data).encode() if data is not None else None
     headers = {"Authorization": f"Bearer {token}"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        f"{url}{path}",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
+    req = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read())
+
+
+def _api_post(url, token, path, data=None):
+    """POST *data* (JSON-serialisable) to *path*, return parsed JSON response."""
+    return _api_request(url, token, "POST", path, data)
 
 
 def _experiment_jobs(url, token, experiment_id):

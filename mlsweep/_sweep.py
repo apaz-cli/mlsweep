@@ -1,7 +1,4 @@
-"""Sweep math: loading, variation generation, manifest/status I/O.
-
-Extracted verbatim from run_sweep.py. No logic changes.
-"""
+"""Sweep math: loading, variation generation, manifest I/O."""
 
 import importlib.util
 import itertools
@@ -11,7 +8,6 @@ import os
 import random
 import shlex
 import sys
-import threading
 import types
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
@@ -22,6 +18,10 @@ from mlsweep._shared import _val_sort_key
 # Metadata keys in a dimension spec (no dot prefix). Dot-prefixed keys are subdimensions.
 _METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic",
                   "distribution", "min", "max", "samples"}
+
+# Accepted values for the top-level GOAL / OPTIMIZE goal.  A dict is used so the
+# valid choices have a single definition shared by validation and the docs.
+_GOALS: dict[str, str] = {"minimize": "minimize", "maximize": "maximize"}
 
 
 # ── Sweep loading ──────────────────────────────────────────────────────────────
@@ -72,6 +72,15 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     set_dist_env = getattr(mod, "SET_DIST_ENV", False)
     if not isinstance(set_dist_env, bool):
         raise ValueError(f"{path}: SET_DIST_ENV must be a bool, got {type(set_dist_env).__name__}")
+    metric = getattr(mod, "METRIC", None)
+    if metric is not None and not isinstance(metric, str):
+        raise ValueError(f"{path}: METRIC must be a str, got {type(metric).__name__}")
+    goal = getattr(mod, "GOAL", None)
+    if goal is not None and goal not in _GOALS:
+        raise ValueError(
+            f"{path}: GOAL must be one of {sorted(_GOALS)}, got {goal!r}"
+        )
+
     optimize = getattr(mod, "OPTIMIZE", None)
     method = "grid"
     if optimize is not None:
@@ -84,10 +93,13 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
             for req in ("metric", "goal", "budget"):
                 if req not in optimize:
                     raise ValueError(f"{path}: OPTIMIZE requires '{req}' when method='bayes'")
-            if optimize["goal"] not in ("minimize", "maximize"):
+            if optimize["goal"] not in _GOALS:
                 raise ValueError(f"{path}: OPTIMIZE goal must be 'minimize' or 'maximize'")
             if not isinstance(optimize["budget"], int) or optimize["budget"] < 1:
                 raise ValueError(f"{path}: OPTIMIZE budget must be a positive int")
+        # OPTIMIZE wins over the top-level METRIC/GOAL when both are present.
+        metric = optimize.get("metric", metric)
+        goal = optimize.get("goal", goal)
 
     setup_command = getattr(mod, "SETUP_COMMAND", None)
     if setup_command is not None and not isinstance(setup_command, str):
@@ -105,15 +117,9 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "set_dist_env": set_dist_env,
         "method": method,
         "optimize": optimize,
+        "metric": metric,
+        "goal": goal,
         "setup_command": setup_command,
-    }
-
-
-def load_sweeps() -> dict[str, dict[str, Any]]:
-    """Import all sweep files from sweeps/ directory."""
-    return {
-        f.stem: load_sweep_file(f)
-        for f in sorted((Path(os.getcwd()) / "sweeps").glob("[!_]*.py"))
     }
 
 
@@ -438,11 +444,6 @@ def generate_variations(sweep_name: str, options: dict[str, Any], exclude_fn: Ca
     return variations
 
 
-def _treatment_key(combo: dict[str, Any], options: dict[str, Any]) -> tuple[Any, ...]:
-    """Non-singular dims identify a treatment. Both combo and options use stripped keys (no dot)."""
-    return tuple(combo[k] for k in sorted(options) if not options[k].get("singular"))
-
-
 def count_expected(options: dict[str, Any]) -> int:
     """Expected runs, computed recursively over the options tree.
 
@@ -465,82 +466,87 @@ def count_expected(options: dict[str, Any]) -> int:
     return n
 
 
-def extract_objective_metric(metrics_path: str, metric_name: str, goal: str) -> float | None:
-    """Return best value of metric_name from metrics.jsonl (min or max per goal)."""
-    best: float | None = None
-    try:
-        with open(metrics_path) as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                    val = row.get(metric_name)
-                    if isinstance(val, (int, float)) and math.isfinite(float(val)):
-                        v = float(val)
-                        if best is None or (goal == "minimize" and v < best) or (goal == "maximize" and v > best):
-                            best = v
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    continue
-    except OSError:
-        pass
-    return best
-
-
 # ── Skip logic ─────────────────────────────────────────────────────────────────
 
 
 def should_skip(combo: dict[str, Any], failed: list[dict[str, Any]], succeeded: list[dict[str, Any]], options: dict[str, Any]) -> bool:
     """Check monotonic (skip worse on failure) and singular (skip others on success).
 
-    Both combo and options use stripped keys (no dot prefix).
-
-    Monotonic skip rule: if a value at position fi in _values fails, skip any candidate
-    at position ci >= fi. For "decreasing", _values is reversed during validate_options
-    so that conservative values come first; fi <= ci then correctly skips more aggressive
-    candidates after a conservative failure.
+    Both combo and options use stripped keys (no dot prefix).  To check many
+    combos against the same results, build one ``SkipIndex`` instead.
     """
-    # Monotonic: skip values worse than a known failure (all other dims must match)
-    for fc in failed:
-        for key, opt in options.items():
-            m = opt.get("monotonic")
-            if not m:
-                continue
-            if not all(fc.get(k) == combo.get(k) for k in options if k != key):
-                continue
-            vals = opt["_values"]
-            try:
-                fi, ci = vals.index(fc[key]), vals.index(combo[key])
-            except (ValueError, TypeError, KeyError):
-                continue
-            if fi <= ci:
-                return True
+    return SkipIndex(failed, succeeded, options).skips(combo)
 
-    # Singular: skip different values once one succeeds
-    # Only require non-singular dims to match (multiple singular dims resolve independently)
-    for sc in succeeded:
-        for key, opt in options.items():
-            if not opt.get("singular"):
-                continue
-            if not all(sc.get(k) == combo.get(k)
-                       for k in options if k != key and not options[k].get("singular")):
-                continue
-            if sc.get(key) != combo.get(key):
-                return True
 
-    return False
+def _freeze(v: Any) -> Any:
+    """A hashable stand-in for a JSON value that is equal exactly when the value is."""
+    if isinstance(v, dict):
+        return ("__dict__", tuple(sorted((k, _freeze(x)) for k, x in v.items())))
+    if isinstance(v, list):
+        return ("__list__", tuple(_freeze(x) for x in v))
+    return v
+
+
+class SkipIndex:
+    """The monotonic and singular skip rules over a set of finished combos.
+
+    Monotonic: if a value at position fi in ``_values`` fails, skip any candidate
+    at position ci >= fi whose other dims all match.  For "decreasing",
+    ``_values`` is reversed during validate_options so that conservative values
+    come first; fi <= ci then correctly skips more aggressive candidates after a
+    conservative failure.
+
+    Singular: once a value succeeds, skip the other values of that dim whose
+    non-singular dims match (multiple singular dims resolve independently).
+
+    The results are grouped by the dims that must match, so ``skips`` costs a
+    few lookups however many results there are.
+    """
+
+    def __init__(self, failed: list[dict[str, Any]], succeeded: list[dict[str, Any]], options: dict[str, Any]) -> None:
+        self._options = options
+        self._monotonic = [k for k, o in options.items() if o.get("monotonic")]
+        self._singular = [k for k, o in options.items() if o.get("singular")]
+        self._others = {k: [d for d in options if d != k] for k in self._monotonic}
+        nonsingular = [d for d in options if not options[d].get("singular")]
+        self._others.update({k: [d for d in nonsingular if d != k] for k in self._singular})
+        # (dim, other dims' values) → lowest failing position / set of succeeding values
+        self._first_fail: dict[tuple[str, tuple[Any, ...]], int] = {}
+        self._succeeded: dict[tuple[str, tuple[Any, ...]], set[Any]] = {}
+        for fc in failed:
+            for key in self._monotonic:
+                fi = self._position(key, fc)
+                if fi is not None:
+                    group = (key, self._key(key, fc))
+                    self._first_fail[group] = min(fi, self._first_fail.get(group, fi))
+        for sc in succeeded:
+            for key in self._singular:
+                self._succeeded.setdefault((key, self._key(key, sc)), set()).add(_freeze(sc.get(key)))
+
+    def _key(self, dim: str, combo: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(_freeze(combo.get(d)) for d in self._others[dim])
+
+    def _position(self, dim: str, combo: dict[str, Any]) -> int | None:
+        try:
+            return int(self._options[dim]["_values"].index(combo[dim]))
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def skips(self, combo: dict[str, Any]) -> bool:
+        for key in self._monotonic:
+            fi = self._first_fail.get((key, self._key(key, combo)))
+            if fi is not None:
+                ci = self._position(key, combo)
+                if ci is not None and fi <= ci:
+                    return True
+        for key in self._singular:
+            values = self._succeeded.get((key, self._key(key, combo)))
+            if values and (len(values) > 1 or _freeze(combo.get(key)) not in values):
+                return True
+        return False
 
 
 # ── Display helpers ────────────────────────────────────────────────────────────
-
-
-def _singular_desc(combo: dict[str, Any], options: dict[str, Any]) -> str:
-    """Short description of singular dim values, e.g. 'local_batch_size=64, ac=full'.
-
-    Both combo and options use stripped keys (no dot prefix).
-    """
-    return ", ".join(
-        f"{k}={combo[k]}"
-        for k in sorted(options) if options[k].get("singular")
-    )
 
 
 # ── Manifest & status helpers ──────────────────────────────────────────────────
@@ -592,13 +598,13 @@ def _manifest_dims_from_variations(variations: list[dict[str, Any]]) -> tuple[di
 
 
 def _write_manifest(exp_dir: str, experiment: str, variations: list[dict[str, Any]], note: str | None = None) -> None:
-    """Write the initial sweep_manifest.json before any jobs are dispatched."""
+    """Write sweep_manifest.json with one run entry per variation."""
     dims, sub_dims = _manifest_dims_from_variations(variations)
     manifest = {
         "experiment": experiment,
         "dims": dims,
         "subDims": sub_dims,
-        "runs": [],         # populated as jobs are dispatched
+        "runs": [{"name": v["name"], "hash": v["name"], "combo": v["combo"]} for v in variations],
         "metricNames": [],  # populated dynamically from metrics files
     }
     if note:
@@ -608,54 +614,3 @@ def _write_manifest(exp_dir: str, experiment: str, variations: list[dict[str, An
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
     os.replace(tmp, path)
-
-
-_manifest_lock = threading.Lock()
-_status_lock = threading.Lock()
-
-
-def _append_manifest_run(exp_dir: str, var: dict[str, Any]) -> None:
-    """Append a dispatched run entry to sweep_manifest.json (thread-safe)."""
-    path = os.path.join(exp_dir, "sweep_manifest.json")
-    with _manifest_lock:
-        try:
-            with open(path) as f:
-                manifest = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return
-        manifest["runs"].append({"name": var["name"], "hash": var["name"], "combo": var["combo"]})
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(manifest, f, indent=2)
-        os.replace(tmp, path)
-
-
-def _load_sweep_status(exp_dir: str) -> dict[str, Any]:
-    """Load sweep_status.json if present. Returns {} if missing or corrupt."""
-    path = os.path.join(exp_dir, "sweep_status.json")
-    try:
-        with open(path) as f:
-            return json.load(f)  # type: ignore[no-any-return]
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _update_sweep_status(exp_dir: str, run_name: str, status: str,
-                          elapsed: float, combo: dict[str, Any]) -> None:
-    """Append/update a run's entry in sweep_status.json (thread-safe)."""
-    path = os.path.join(exp_dir, "sweep_status.json")
-    with _status_lock:
-        try:
-            with open(path) as f:
-                status_data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            status_data = {}
-        status_data[run_name] = {
-            "status": status,
-            "elapsed": round(elapsed, 2),
-            "combo": combo,
-        }
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(status_data, f, indent=2)
-        os.replace(tmp, path)

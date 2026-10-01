@@ -1,46 +1,70 @@
-"""In-memory state dataclasses for mlsweep manager.
+"""In-memory state for the mlsweep manager.
 
 Provides:
-  - ``InFlightJob`` — a job dispatched to workers, tracked in memory
-  - ``WorkerConn`` — live connection to a worker (occupancy derived from in_flight)
-  - ``ManagerState`` — central scheduling state with thread-safe helpers
+  - ``InFlightRun`` — a dispatched run and the worker node(s) it occupies
+  - ``WorkerConn`` — live connection to a worker
+  - ``ManagerState`` — the control lock, the in-flight runs, and the workers
 
-Multi-node aggregation state is **not** held here; it lives in the ``job_nodes``
-table so it survives a manager restart.
+Concurrency model
+-----------------
+The database is the source of truth for job status.  The in-memory state
+tracks which runs occupy which worker GPUs.  Every change to either (job
+status transitions, in-flight tracking, worker membership) happens inside one
+``async with state.lock`` block, so no coroutine ever observes the two out of
+step.  Slow I/O (rsync, SSH, launching workers) never runs under the lock.
+
+Jobs are dispatched only by the scheduler task (``scheduler_loop``).  Anything
+that may free capacity or add work calls ``state.request_schedule()``, which
+just wakes that task; the task also runs periodically, so a missed wake-up
+delays scheduling by seconds instead of stalling it.
+
+Multi-node aggregation state lives in the ``job_nodes`` table so it survives a
+manager restart.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, cast
 
-from mlsweep._manager_db import DbWriter
+from mlsweep._manager_db import DbWriter, JobRecord
+
+# A run is identified by (experiment_id, run_id); run names repeat across experiments.
+RunKey = tuple[str, str]
 
 
-# ── In-flight job ─────────────────────────────────────────────────────────────
+# ── In-flight run ─────────────────────────────────────────────────────────────
 
 
 @dataclass
-class InFlightJob:
-    """A job dispatched to one or more workers and currently tracked in memory.
+class InFlightRun:
+    """A run dispatched to one or more workers (one node per worker)."""
 
-    For single-node jobs, ``worker_id`` and ``worker_ids`` contain the same
-    single element.  For multi-node jobs, ``worker_id`` is the primary
-    (coordinating) worker while ``worker_ids`` lists all participating workers.
-    """
-
-    run_id: str
-    worker_id: str
     experiment_id: str
-    dispatch_time: datetime
-    start_time: datetime | None = None
-    gpu_ids: list[int] = field(default_factory=list)
-    worker_ids: list[str] = field(default_factory=list)
-    combo: dict[str, Any] = field(default_factory=dict)
-    log_seq: int = 0
-    metric_seq: int = 0
+    run_id: str
+    job_key: int  # logs and metrics are stored under (job_key, attempt)
+    attempt: int
+    primary: str  # worker running node 0; only its log is stored
+    multinode: bool = False  # nodes are also recorded in the job_nodes table
+    nodes: dict[str, list[int]] = field(default_factory=dict)  # worker_id → GPU ids
+    log_end: int = 0  # training.log is stored up to this byte offset
+    replay_requested: bool = False
+    last_progress: float = 0.0  # epoch seconds of the last log/metric/start event
+
+    @classmethod
+    def from_job(cls, job: JobRecord, primary: str, **kwargs: Any) -> InFlightRun:
+        # A freshly adopted/dispatched run starts its stall clock now.
+        kwargs.setdefault("last_progress", time.time())
+        return cls(
+            experiment_id=job.experiment_id, run_id=job.run_id, job_key=job.job_key,
+            attempt=job.attempt, primary=primary, multinode=job.nodes_per_run > 1, **kwargs,
+        )
+
+    @property
+    def key(self) -> RunKey:
+        return (self.experiment_id, self.run_id)
 
 
 # ── Worker connection ─────────────────────────────────────────────────────────
@@ -50,24 +74,23 @@ class InFlightJob:
 class WorkerConn:
     """Live connection to a worker.
 
-    GPU occupancy is **not** stored as a counter here; it is derived on demand
-    from ``in_flight`` (each entry carries this worker's ``gpu_ids``).  This
-    keeps occupancy impossible to leak — there is no decrement to forget.
+    GPU occupancy is not stored here; ``ManagerState.occupancy`` derives it
+    from the in-flight runs that have a node on this worker.
     """
 
     worker_id: str
     host: str
     port: int
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    writer: asyncio.StreamWriter | None = None  # the current connection's stream
     gpus: list[int] = field(default_factory=list)
     topo: dict[str, int] = field(default_factory=dict)
     gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
     max_jobs_per_gpu: int = 1
     send_queue: asyncio.Queue[bytes | None] = field(default_factory=asyncio.Queue)
-    in_flight: dict[str, InFlightJob] = field(default_factory=dict)
-    status: str = "connected"
-    connected_at: datetime | None = None
+    status: str = "connecting"  # connecting → connected ⇄ reconnecting → dead
+    conn_gen: int = 0  # bumped per TCP connection; tasks of older connections stand down
+    reconnect_attempts: int = 0
+    hello_seen: bool = False  # later hellos keep GPU/concurrency settings changed via the API
     scratch_dir: str = "/tmp/mlsweep"
     remote_dir: str = ""
     password: str | None = None
@@ -80,11 +103,7 @@ class WorkerConn:
 
 
 class ManagerState:
-    """Central in-memory state for the sweep manager.
-
-    Owns all scheduling data structures and provides thread-safe methods
-    for manipulating them.  Uses asyncio.Lock to serialise mutations.
-    """
+    """Central in-memory state for the manager.  See the module docstring."""
 
     def __init__(
         self,
@@ -96,32 +115,48 @@ class ManagerState:
         self.artifact_base_url: str = artifact_base_url
         self.token: str = token
         self.manager_port: int = 0
-        self.dispatch_callback: Any = None
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
-        # NOTE: there is no in-memory ``pending`` list.  Pending jobs live in
-        # the database; the scheduler reads them fresh each pass via
-        # ``list_schedulable_jobs``.  This makes the DB the single source of
-        # truth, so control verbs (cancel, abort, delete, retry) take effect by
-        # writing the DB and cannot desync an in-memory mirror.
-        self.in_flight: dict[str, InFlightJob] = {}
+        self.launching: set[str] = set()  # worker ids with a launch in progress
+        self.runs: dict[RunKey, InFlightRun] = {}
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
-        self.scheduler_lock: asyncio.Lock = asyncio.Lock()
-        # Coalescing guard for schedule_pending: prevents concurrent scheduling
-        # passes and folds rapid re-triggers into a single follow-up pass.
-        self._scheduling: bool = False
-        self._reschedule: bool = False
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.schedule_event: asyncio.Event = asyncio.Event()
+        self.shutdown_event: asyncio.Event = asyncio.Event()
+
+    def request_schedule(self) -> None:
+        """Ask the scheduler task for a pass.  Safe to call from anywhere, any time."""
+        self.schedule_event.set()
 
     # ── In-flight helpers ─────────────────────────────────────────────────
 
-    def add_in_flight(self, job: InFlightJob) -> None:
-        self.in_flight[job.run_id] = job
+    def runs_on(self, worker_id: str) -> list[InFlightRun]:
+        """In-flight runs with a node on *worker_id*."""
+        return [r for r in self.runs.values() if worker_id in r.nodes]
 
-    def remove_in_flight(self, run_id: str) -> InFlightJob | None:
-        return self.in_flight.pop(run_id, None)
+    def runs_of(self, experiment_id: str) -> list[RunKey]:
+        """Keys of the in-flight runs of *experiment_id*."""
+        return [r.key for r in self.runs.values() if r.experiment_id == experiment_id]
 
-    def get_in_flight(self, run_id: str) -> InFlightJob | None:
-        return self.in_flight.get(run_id)
+    def reserve_worker_id(self, worker_id: str) -> bool:
+        """Claim *worker_id* for a launch.  False if it is live or already launching.
+
+        The caller holds ``self.lock``; the launch releases the claim when done.
+        """
+        existing = self.workers.get(worker_id)
+        if worker_id in self.launching or (existing is not None and existing.status != "dead"):
+            return False
+        self.launching.add(worker_id)
+        return True
+
+    def occupancy(self, wc: WorkerConn) -> dict[int, int]:
+        """Number of in-flight runs on each of *wc*'s GPUs."""
+        occ = {g: 0 for g in wc.gpus}
+        for run in self.runs.values():
+            for g in run.nodes.get(wc.worker_id, ()):
+                if g in occ:
+                    occ[g] += 1
+        return occ
 
     # ── Subscriber helpers ────────────────────────────────────────────────
 
@@ -157,7 +192,8 @@ class ManagerState:
 
 
 __all__ = [
-    "InFlightJob",
+    "InFlightRun",
     "ManagerState",
+    "RunKey",
     "WorkerConn",
 ]

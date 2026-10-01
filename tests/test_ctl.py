@@ -6,11 +6,12 @@ real manager subprocess via the ``manager_server`` fixture.
 """
 
 import json
-import urllib.request
+import threading
+import time
 
 import pytest
 
-from conftest import _api_get, _api_post
+from conftest import _api_get, _api_post, _api_request
 
 from mlsweep import ctl
 from mlsweep import run_sweep
@@ -20,13 +21,7 @@ _TOKEN = "test-token"
 
 
 def _api_put(url, token, path, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method="PUT")
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+    return _api_request(url, token, "PUT", path, data)
 
 
 def _mk_exp(url, eid):
@@ -75,7 +70,7 @@ def _job(run_id, status, combo, elapsed=1.0):
             "elapsed": elapsed, "exit_code": 0}
 
 
-def test_build_leaderboard_minimize(monkeypatch):
+def test_rank_leaderboard_minimize():
     jobs = [
         _job("a", "done", {"lr": 0.01}),
         _job("b", "done", {"lr": 0.001}),
@@ -87,9 +82,7 @@ def test_build_leaderboard_minimize(monkeypatch):
         "b": [{"loss": 1.5}, {"loss": 1.0}],
         "d": [{"loss": 2.0}],
     }
-    monkeypatch.setattr(run_sweep, "manager_get_job_metrics",
-                        lambda m, t, e, rid: metrics.get(rid))
-    rows = run_sweep.build_leaderboard("http://x", "t", "exp", "loss", "minimize", jobs=jobs)
+    rows = run_sweep.rank_leaderboard(jobs, metrics, "loss", "minimize")
     assert [r["run_id"] for r in rows] == ["b", "d", "a", "c"]
     assert rows[0]["value"] == 1.0
     assert rows[0]["final"] == 1.0
@@ -98,7 +91,7 @@ def test_build_leaderboard_minimize(monkeypatch):
     assert rows[3]["value"] is None
 
 
-def test_build_leaderboard_maximize(monkeypatch):
+def test_rank_leaderboard_maximize():
     jobs = [
         _job("a", "done", {"lr": 0.01}),
         _job("b", "done", {"lr": 0.001}),
@@ -107,70 +100,76 @@ def test_build_leaderboard_maximize(monkeypatch):
         "a": [{"acc": 0.5}, {"acc": 0.9}],
         "b": [{"acc": 0.7}],
     }
-    monkeypatch.setattr(run_sweep, "manager_get_job_metrics",
-                        lambda m, t, e, rid: metrics.get(rid))
-    rows = run_sweep.build_leaderboard("http://x", "t", "exp", "acc", "maximize", jobs=jobs)
+    rows = run_sweep.rank_leaderboard(jobs, metrics, "acc", "maximize")
     assert [r["run_id"] for r in rows] == ["a", "b"]
     assert rows[0]["value"] == 0.9
     assert rows[0]["final"] == 0.9
 
 
-def test_build_leaderboard_handles_missing_and_non_numeric(monkeypatch):
+def test_rank_leaderboard_handles_missing_and_non_numeric():
     jobs = [
         _job("a", "done", {}),          # no metrics returned
         _job("b", "done", {}),          # metrics with no numeric target
         _job("c", "pending", {}),
         _job("d", "done", {}),          # has a value
     ]
-    monkeypatch.setattr(run_sweep, "manager_get_job_metrics",
-                        lambda m, t, e, rid: {"a": None, "b": [{"loss": "nan"}],
-                                              "c": None, "d": [{"loss": 0.5}]}.get(rid))
-    rows = run_sweep.build_leaderboard("http://x", "t", "exp", "loss", "minimize", jobs=jobs)
+    metrics = {"a": None, "b": [{"loss": "nan"}], "d": [{"loss": 0.5}]}
+    rows = run_sweep.rank_leaderboard(jobs, metrics, "loss", "minimize")
     ids = [r["run_id"] for r in rows]
     assert ids[0] == "d"                # only valued run first
     assert set(ids[1:]) == {"a", "b", "c"}
     assert all(r["value"] is None for r in rows[1:])
 
 
-def test_build_leaderboard_combo_is_string(monkeypatch):
+def test_rank_leaderboard_combo_is_string():
     jobs = [_job("a", "done", {"z": 8})]
-    monkeypatch.setattr(run_sweep, "manager_get_job_metrics",
-                        lambda m, t, e, rid: [{"loss": 1.0}])
-    rows = run_sweep.build_leaderboard("http://x", "t", "exp", "loss", "minimize", jobs=jobs)
+    rows = run_sweep.rank_leaderboard(jobs, {"a": [{"loss": 1.0}]}, "loss", "minimize")
     assert rows[0]["combo"] == {"z": 8}
 
 
-def test_build_leaderboard_skips_nonfinite(monkeypatch):
+def test_rank_leaderboard_skips_nonfinite():
     jobs = [
         _job("nan_run", "done", {}),
         _job("inf_run", "done", {}),
         _job("good", "done", {}),
     ]
-    monkeypatch.setattr(run_sweep, "manager_get_job_metrics",
-                        lambda m, t, e, rid: {
-                            "nan_run": [{"loss": float("nan")}],
-                            "inf_run": [{"loss": float("inf")}],
-                            "good": [{"loss": 1.0}],
-                        }.get(rid))
-    rows = run_sweep.build_leaderboard("http://x", "t", "exp", "loss", "minimize", jobs=jobs)
+    metrics = {
+        "nan_run": [{"loss": float("nan")}],
+        "inf_run": [{"loss": float("inf")}],
+        "good": [{"loss": 1.0}],
+    }
+    rows = run_sweep.rank_leaderboard(jobs, metrics, "loss", "minimize")
     assert rows[0]["run_id"] == "good"
     assert rows[0]["value"] == 1.0
     assert {r["run_id"] for r in rows[1:]} == {"nan_run", "inf_run"}
     assert all(r["value"] is None for r in rows[1:])
 
 
-def test_wait_until_settled(monkeypatch):
-    calls = {"n": 0}
+def _finish_later(url, eid, rid, delay):
+    """Mark a job done from another thread after *delay* seconds."""
+    t = threading.Timer(delay, _set_status, (url, eid, rid, "done"))
+    t.start()
+    return t
 
-    def fake_http(method, url, token, **kw):
-        calls["n"] += 1
-        if calls["n"] < 3:
-            return (200, {"job_counts": {"running": 2, "pending": 1}})
-        return (200, {"job_counts": {"done": 5, "failed": 1}})
 
-    monkeypatch.setattr(run_sweep, "_http_request", fake_http)
-    run_sweep._wait_until_settled("http://x", "t", "exp", interval=0)
-    assert calls["n"] == 3
+def test_wait_until_settled(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    timer = _finish_later(url, "e", "r1", 1.5)
+    start = time.monotonic()
+    assert run_sweep._wait_until_settled(url, server.token, "e", interval=1) is False
+    assert time.monotonic() - start >= 1.4
+    timer.join()
+    assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["status"] == "done"
+
+
+def test_wait_until_settled_reports_failure(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    assert run_sweep._wait_until_settled(url, server.token, "e", interval=1) is True
 
 
 def test_print_leaderboard(capsys):
@@ -333,18 +332,185 @@ def test_best_human_output(manager_server, capsys):
     assert "no completed runs with a metric value" in out  # no worker → no metrics
 
 
-def test_best_wait_calls_settle(manager_server, capsys, monkeypatch):
+def test_best_wait_waits_for_active_jobs(manager_server, capsys):
     server, url = manager_server
     _mk_exp(url, "e")
     _mk_job(url, "e", "r1")
-    _set_status(url, "e", "r1", "done")
-
-    calls = []
-    monkeypatch.setattr(ctl, "_wait_until_settled", lambda m, t, e, i: calls.append((e, i)))
-    ctl.best_cmd(_base(url, server) + ["--experiment", "e", "--wait", "--wait-interval", "3", "--json"])
+    timer = _finish_later(url, "e", "r1", 1.5)
+    ctl.best_cmd(_base(url, server) + ["--experiment", "e", "--wait", "--wait-interval", "1", "--json"])
+    timer.join()
     rows = json.loads(capsys.readouterr().out)
-    assert calls == [("e", 3)]
     assert rows[0]["run_id"] == "r1"
+    assert rows[0]["status"] == "done"
+
+
+# ── wait ────────────────────────────────────────────────────────────────────────
+
+
+def test_wait_done_exits_zero(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    timer = _finish_later(url, "e", "r1", 1.0)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--until", "done", "--interval", "0.25"])
+    timer.join()
+    assert exc.value.code == ctl.WAIT_EXIT_SETTLED
+
+
+def test_wait_done_with_failure_exits_one(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--until", "done", "--interval", "0.25"])
+    assert exc.value.code == ctl.WAIT_EXIT_FAILURE
+
+
+def test_wait_any_failure_returns_immediately(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _mk_job(url, "e", "r2")  # still pending
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--until", "any-failure", "--interval", "0.25"])
+    assert exc.value.code == ctl.WAIT_EXIT_FAILURE
+
+
+def test_wait_timeout_exits_two(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")  # never finishes without a worker
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--timeout", "0.2", "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+
+
+def test_wait_stalled_exits_three(monkeypatch, manager_server):
+    server, url = manager_server
+    jobs = [{"run_id": "r1", "status": "running", "stall_seconds": 120.0, "stalled": False}]
+    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--until", "stalled", "--stalled-after", "60"])
+    assert exc.value.code == ctl.WAIT_EXIT_STALLED
+
+
+def test_wait_stalled_ignores_fresh_runs(monkeypatch, manager_server):
+    server, url = manager_server
+    jobs = [{"run_id": "r1", "status": "running", "stall_seconds": 5.0, "stalled": False}]
+    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--until", "stalled",
+                                           "--stalled-after", "900", "--timeout", "0.1",
+                                           "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+
+
+def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
+    server, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments",
+              {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+    assert run_sweep.resolve_ranking(url, server.token, "e_rank") == ("val_acc", "maximize")
+    assert run_sweep.resolve_ranking(url, server.token, "e_rank", "loss") == ("loss", "maximize")
+    assert run_sweep.resolve_ranking(url, server.token, "e_rank", None, "minimize") == ("val_acc", "minimize")
+
+    _mk_exp(url, "e_plain")
+    assert run_sweep.resolve_ranking(url, server.token, "e_plain") == ("loss", "minimize")
+
+
+def test_fetch_json_uses_experiment_metric_goal(manager_server, capsys):
+    server, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments",
+              {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+    _mk_job(url, "e_rank", "r1")
+    _set_status(url, "e_rank", "r1", "done")
+
+    run_sweep._fetch_cmd(_base(url, server) + ["--experiment", "e_rank", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["metric"] == "val_acc"
+    assert out["goal"] == "maximize"
+
+    # Explicit flags still win over the experiment's stored metric/goal.
+    run_sweep._fetch_cmd(_base(url, server) + ["--experiment", "e_rank",
+                                               "--metric", "loss", "--goal", "minimize", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["metric"] == "loss"
+    assert out["goal"] == "minimize"
+
+
+def test_best_wait_exits_nonzero_on_failure(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    with pytest.raises(SystemExit) as exc:
+        ctl.best_cmd(_base(url, server) + ["--experiment", "e", "--wait",
+                                           "--wait-interval", "1", "--json"])
+    assert exc.value.code == 1
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["run_id"] == "r1"
+
+
+def test_fetch_wait_exits_nonzero_on_failure(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    with pytest.raises(SystemExit) as exc:
+        run_sweep._fetch_cmd(_base(url, server) + ["--experiment", "e", "--wait",
+                                                   "--wait-interval", "1", "--json"])
+    assert exc.value.code == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["runs"][0]["status"] == "failed"
+
+
+class _FakeWS:
+    """Stand-in for run_sweep._WebSocket that replays a fixed event list."""
+
+    def __init__(self, url, token, timeout=10.0):
+        self.url = url
+        self._events = [
+            {"type": "job_started", "run_id": "r1", "worker_id": "w"},
+            {"type": "job_done", "run_id": "r1", "success": True, "elapsed": 1.0},
+            {"type": "experiment_done", "experiment_id": "e"},
+        ]
+
+    def connect(self):
+        pass
+
+    def iter_events(self):
+        yield from self._events
+
+    def close(self):
+        pass
+
+
+def test_watch_events_machine_readable(monkeypatch, capsys):
+    monkeypatch.setattr(run_sweep, "_WebSocket", _FakeWS)
+    run_sweep._watch_cmd(["e", "--events", "--manager", "http://x", "--token", "t"])
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    events = [json.loads(line) for line in lines]
+    assert [e["type"] for e in events] == ["job_started", "job_done", "experiment_done"]
+
+
+def test_watch_json_alias_and_failure_exit(monkeypatch, capsys):
+    class _FailWS(_FakeWS):
+        def __init__(self, url, token, timeout=10.0):
+            super().__init__(url, token, timeout)
+            self._events = [
+                {"type": "job_done", "run_id": "r1", "success": False, "elapsed": 1.0},
+                {"type": "experiment_done", "experiment_id": "e"},
+            ]
+
+    monkeypatch.setattr(run_sweep, "_WebSocket", _FailWS)
+    with pytest.raises(SystemExit) as exc:
+        run_sweep._watch_cmd(["e", "--json", "--manager", "http://x", "--token", "t"])
+    assert exc.value.code == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    events = [json.loads(line) for line in lines]
+    assert events[-1]["type"] == "experiment_done"
 
 
 def test_logs_no_log_exits_nonzero(manager_server, capsys):

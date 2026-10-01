@@ -35,10 +35,10 @@ TOKEN = "reconnect-test-token"
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 
-def _api(url: str, path: str, body: dict | None = None):
+def _api(url: str, path: str, body: dict | None = None, token: str = TOKEN):
     if body is not None:
-        return _api_post(url, TOKEN, path, body)
-    return _api_get(url, TOKEN, path)
+        return _api_post(url, token, path, body)
+    return _api_get(url, token, path)
 
 
 def _jobs(url: str) -> dict[str, dict]:

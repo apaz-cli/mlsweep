@@ -78,10 +78,10 @@ def _build_lex_combo(
 
 
 def _build_effective_options(combo: dict[str, Any], all_options: dict[str, Any]) -> dict[str, Any]:
-    """Build an effective_options dict for use with _treatment_key and should_skip.
+    """Build an effective_options dict for per-combo option lookup.
 
     Keys are stripped (no leading dot). Adds selected subdim children so that
-    _treatment_key and should_skip work correctly across subdim branches.
+    lookups work correctly across subdim branches.
     """
     effective: dict[str, Any] = {k[1:]: v for k, v in all_options.items()}
     # Add the selected subdim branch's children

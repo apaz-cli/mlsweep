@@ -1,6 +1,6 @@
 """Top-level ``mlsweep`` command — one entry point for the whole workflow.
 
-See ``_HELP`` for the subcommand list. This module is intentionally light at import time; heavy subcommands are
+See ``_build_help`` for the subcommand list. This module is intentionally light at import time; heavy subcommands are
 imported lazily so ``mlsweep --help`` stays fast.
 """
 
@@ -13,7 +13,11 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from mlsweep._shared import _CYAN, _GREEN, _RED, _RESET, _YELLOW, _mlsweep_dir
+from mlsweep._colors import (
+    _BOLD, _BRIGHT_BLUE, _BRIGHT_GREEN, _CYAN, _DIM, _GREEN, _RED,
+    _RESET, _YELLOW, set_color, strip_color_flag,
+)
+from mlsweep._shared import _mlsweep_dir
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -47,8 +51,13 @@ _CONT = " " * (2 + _LABEL_WIDTH + 2)
 
 def _label(label: str) -> str:
     """Left-align a `key:` label to the shared label column."""
-    return _pad(label, _LABEL_WIDTH) + "  "
+    return f"{_BOLD}{_pad(label, _LABEL_WIDTH)}{_RESET}  "
 
+
+# ── banner ─────────────────────────────────────────────────────────────────────
+#
+# The banner is shown only for a bare `mlsweep` invocation.  Colors resolve at
+# call time via the global toggle, so `_build_banner` must not be cached.
 
 _BANNER_ART = r"""           ___
           /\_ \
@@ -56,20 +65,32 @@ _BANNER_ART = r"""           ___
 /' __` __`\ \ \ \   /',__\/\ \/\ \/\ \  /'__`\ /'__`\/\ '__`\
 /\ \/\ \/\ \ \_\ \_/\__, `\ \ \_/ \_/ \/\  __//\  __/\ \ \L\ \
 \ \_\ \_\ \_\/\____\/\____/\ \___x___/'\ \____\ \____\\ \ ,__/
- \/_/\/_/\/_/\/____/\/___/  \/__//__/   \/____/\/____/ \ \ \/
-                                                        \ \_\
+ \/_/\/_/\/_/\/____/\/___/  \/__//__/   \/____/\/____/ \ \ \/"""
+_BANNER_TAIL = r"""                                                        \ \_\
                                                          \/_/"""
 _BANNER_TAGLINE = "      an experiment sweep engine"
 
-# Color only when writing to a terminal; piped/redirected --help stays plain.
-# Bright green for the figlet, bright blue for the tagline.
-if sys.stdout.isatty():
-    BANNER = f"\033[92m{_BANNER_ART}\n\033[94m{_BANNER_TAGLINE}{_RESET}"
-else:
-    BANNER = f"{_BANNER_ART}\n{_BANNER_TAGLINE}"
+
+def _build_banner() -> str:
+    """The figlet banner, colored only when the global color toggle is on.
+
+    The tagline sits on the first descender row, to the left of the final
+    "p"'s tail, so the art stays connected while the tagline is inside it.
+    """
+    tail_lines = _BANNER_TAIL.splitlines()
+    first = tail_lines[0]
+    indent = len(first) - len(first.lstrip())
+    tagline_row = (
+        f"{_BRIGHT_BLUE}{_BANNER_TAGLINE}"
+        f"{_BRIGHT_GREEN}{' ' * max(0, indent - len(_BANNER_TAGLINE))}{first.lstrip()}"
+    )
+    rest = "\n".join(tail_lines[1:])
+    return (f"{_BRIGHT_GREEN}{_BANNER_ART}\n"
+            f"{tagline_row}\n"
+            f"{_BRIGHT_GREEN}{rest}{_RESET}")
 
 
-def _build_help() -> str:
+def _build_help(include_banner: bool = False) -> str:
     workflow = [
         (f"1. {_GREEN}mlsweep manager{_RESET}", "start the persistent manager (once)"),
         (f"2. {_GREEN}mlsweep run my_sweep.py --stream{_RESET}", "submit a sweep (validate/dry-run first)"),
@@ -88,6 +109,7 @@ def _build_help() -> str:
             ("watch EXP_ID", "live status for an experiment"),
             ("fetch", "download + summarize an experiment's results (leaderboard)"),
             ("best", "top runs by metric"),
+            ("wait EXP", "block until done/failed/stalled (exit 0/1/2/3)"),
             ("status | doctor", "diagnose the environment"),
             ("ls [EXP]", "list experiments / runs"),
             ("logs RUN", "tail a run's training.log"),
@@ -106,28 +128,28 @@ def _build_help() -> str:
             ("version", "print the version"),
         ]),
     ]
-    lines = [
-        BANNER,
-        "",
-        "Workflow:",
+    lines = []
+    if include_banner:
+        lines += [_build_banner(), ""]
+    lines += [
+        f"{_BOLD}Workflow:{_RESET}",
         _align(workflow),
         "",
     ]
     for header, rows in sections:
-        lines.append(f"{header}:")
+        lines.append(f"{_BOLD}{_CYAN}{header}:{_RESET}")
         lines.append(_align(rows))
         lines.append("")
     lines += [
         "watch/fetch/best/status/ls/logs default --manager to $MLSWEEP_MANAGER or http://localhost:7891.",
         "`run` requires --manager explicitly.",
-        "Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
+        f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
+        f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
         f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, skill)",
         f"      or {_CYAN}mlsweep docs{_RESET}. {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
     ]
     return "\n".join(lines) + "\n"
 
-
-_HELP = _build_help()
 
 _DOC_ALIASES = {
     "readme": "README.md",
@@ -226,9 +248,6 @@ def _build_makefile_template() -> str:
     )
 
 
-_MAKEFILE_TEMPLATE = _build_makefile_template()
-
-
 # ── status / doctor ────────────────────────────────────────────────────────────
 
 
@@ -290,7 +309,7 @@ def _status_cmd(argv: list[str]) -> None:
         }, indent=2))
         return
 
-    print(f"{_CYAN}mlsweep status{_RESET}")
+    print(f"{_BOLD}{_CYAN}mlsweep status{_RESET}")
     print(f"  {_label('manager:')}{manager}")
     print(f"  {_label('results:')}{mlsweep_dir / 'experiments'}")
     print(f"  {_label('dashboard:')}{manager}/?token=<token>")
@@ -336,7 +355,7 @@ def _status_cmd(argv: list[str]) -> None:
         print(f"  {_label('recent:')}none")
 
     print()
-    print(f"{_CYAN}Quick start:{_RESET}")
+    print(f"{_BOLD}{_CYAN}Quick start:{_RESET}")
     print("  mlsweep manager")
     print(f"  mlsweep run sweeps/<file>.py --manager {manager} --stream")
     print(f"  mlsweep watch <experiment_id> --manager {manager}")
@@ -395,14 +414,14 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
     target = Path.cwd() / "Makefile"
     if args.dry_run:
-        sys.stdout.write(_MAKEFILE_TEMPLATE)
+        sys.stdout.write(_build_makefile_template())
         return
 
     if target.exists() and not args.force:
         print(f"{_RED}{target} already exists.{_RESET} Use --force to overwrite.")
         sys.exit(1)
 
-    target.write_text(_MAKEFILE_TEMPLATE)
+    target.write_text(_build_makefile_template())
     print(f"{_GREEN}Wrote {target}{_RESET}")
     print("Now you can use:")
     print(_align([
@@ -417,7 +436,7 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
-_CTL_CMDS = frozenset({"ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best"})
+_CTL_CMDS = frozenset({"ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best", "wait"})
 
 
 def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:
@@ -425,18 +444,23 @@ def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:
     fn()
 
 
-def main() -> None:
-    argv = sys.argv[1:]
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # The unified CLI dispatches to subcommands that parse their own argv, so
+    # consume the global --color flag here and forward the rest untouched.
+    argv = strip_color_flag(list(argv))
 
     if not argv:
-        print(_HELP)
+        print(_build_help(include_banner=True))
         return
 
     if argv[0] in ("-h", "--help", "help"):
         if len(argv) > 1:
             _docs_cmd(argv[1:])
         else:
-            print(_HELP)
+            print(_build_help())
         return
 
     cmd, rest = argv[0], argv[1:]
@@ -493,5 +517,5 @@ def main() -> None:
         return
 
     print(f"{_RED}Unknown subcommand: {cmd}{_RESET}\n")
-    print(_HELP)
+    print(_build_help())
     sys.exit(1)
