@@ -1,13 +1,18 @@
 """HTTP REST API and WebSocket event stream for mlsweep manager.
 
 Provides:
-  - REST endpoints for experiments, jobs, workers, artifacts
+  - REST endpoints for campaigns, experiments, jobs, workers, artifacts
   - WebSocket event stream at ``/ws/experiments/{id}``
   - Static file serving for a web dashboard
 
 All endpoints accept authentication via ``?token=...`` query parameter or
 ``Authorization: Bearer <token>`` header.  The token is the manager token
 stored in ``manager.token``.
+
+Any endpoint also accepts ``?campaign=NAME``.  Listings return only that
+campaign's experiments and jobs, a new experiment is created in it, and a
+request naming an experiment from another campaign is refused with 404 (see
+``campaign_middleware``).  Without the parameter nothing is restricted.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from mlsweep._manager_db import (
     get_logs_for_run,
     get_metrics_for_run,
     get_worker,
+    list_campaigns,
     list_experiments_with_counts,
     list_jobs_by_experiment,
     list_jobs_by_status,
@@ -59,7 +65,7 @@ from mlsweep._manager_workers import (
     requeue_runs_locked,
     worker_id_for,
 )
-from mlsweep._shared import _resolve_safe_subpath
+from mlsweep._shared import DEFAULT_CAMPAIGN, _resolve_safe_subpath, validate_campaign
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +245,65 @@ async def auth_middleware(
     return await handler(request)
 
 
+async def _request_json(request: web.Request) -> Any:
+    """The request's JSON body, reusing the copy ``campaign_middleware`` parsed."""
+    if "json_body" in request:
+        return request["json_body"]
+    return await request.json()
+
+
+async def _named_experiments(request: web.Request) -> set[str]:
+    """Experiment ids a request names in its path, query, or job JSON body."""
+    ids = {request.match_info.get("experiment_id"), request.query.get("experiment_id")}
+    if request.method in ("POST", "PUT", "PATCH") and request.path.startswith("/api/jobs"):
+        try:
+            body = request["json_body"] = await request.json()
+        except Exception:
+            body = None
+        items: list[Any] = []
+        if isinstance(body, list):
+            items = body
+        elif isinstance(body, dict):
+            jobs = body.get("jobs")
+            items = jobs if isinstance(jobs, list) else [body]
+        ids |= {i.get("experiment_id") for i in items if isinstance(i, dict)}
+    return {i for i in ids if isinstance(i, str) and i}
+
+
+def _wrong_campaign(experiment_id: str, actual: str, wanted: str, *, status: int = 404) -> web.Response:
+    """Refuse a request for an experiment that is not in the requested campaign."""
+    return _json_response({
+        "error": f"experiment {experiment_id!r} is in campaign {actual!r}, not {wanted!r}",
+        "campaign": actual,
+    }, status=status)
+
+
+@web.middleware
+async def campaign_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Enforce ``?campaign=``. Every experiment the request names must be in it.
+
+    The check runs before the handler, so it covers every route that takes an
+    experiment id, the WebSocket stream included.  An unknown experiment is
+    left to the handler (usually a 404 of its own).
+    """
+    campaign = request.query.get("campaign")
+    if campaign is None or request.path.startswith("/static/"):
+        return await handler(request)
+    try:
+        validate_campaign(campaign)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    for experiment_id in sorted(await _named_experiments(request)):
+        exp = await get_experiment(db, experiment_id)
+        if exp is not None and exp.campaign != campaign:
+            return _wrong_campaign(experiment_id, exp.campaign, campaign)
+    return await handler(request)
+
+
 # ===============================================================================
 # Route table
 # ===============================================================================
@@ -290,21 +355,66 @@ async def handle_reachable(request: web.Request) -> web.Response:
     return _json_response({"reachable": reachable})
 
 
+# ── Campaigns ──────────────────────────────────────────────────────────────────
+
+
+@routes.get("/api/campaigns")
+async def handle_list_campaigns(request: web.Request) -> web.Response:
+    """List campaigns with experiment and job counts (always includes the default)."""
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    return _json_response(await list_campaigns(db))
+
+
+@routes.put("/api/experiments/{experiment_id}/campaign")
+async def handle_update_experiment_campaign(request: web.Request) -> web.Response:
+    """Move an experiment, with all its runs, to another campaign.
+
+    Body: ``{"campaign": NAME}``.  With ``?campaign=`` the experiment must
+    currently be in that campaign (enforced by ``campaign_middleware``).
+    """
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    experiment_id = request.match_info["experiment_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+    target = body.get("campaign") if isinstance(body, dict) else None
+    if not target:
+        return _error_response("'campaign' is required")
+    try:
+        validate_campaign(target)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    exp = await state.db_writer.update_experiment_campaign(experiment_id, target)
+    if exp is None:
+        return _not_found("experiment")
+    _broadcast_experiment_event(request, experiment_id, "campaign_updated", campaign=target)
+    return _json_response(exp)
+
+
 # ── Experiments ────────────────────────────────────────────────────────────────
 
 
 @routes.get("/api/experiments")
 async def handle_list_experiments(request: web.Request) -> web.Response:
-    """List all experiments with job counts, optionally filtered by status."""
+    """List experiments with job counts, optionally filtered by status and campaign."""
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     status_filter = request.query.get("status")
-    experiments = await list_experiments_with_counts(db, status=status_filter)  # type: ignore[arg-type]
+    experiments = await list_experiments_with_counts(
+        db, status=status_filter, campaign=request.query.get("campaign"),  # type: ignore[arg-type]
+    )
     return _json_response(experiments)
 
 
 @routes.post("/api/experiments")
 async def handle_create_experiment(request: web.Request) -> web.Response:
-    """Create a new experiment."""
+    """Create a new experiment.
+
+    Its campaign comes from the body's ``campaign``, else ``?campaign=``, else
+    the default campaign.  Re-creating an experiment that already exists in
+    another campaign is refused with 409.
+    """
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
     try:
         body = await request.json()
@@ -333,11 +443,24 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     goal = body.get("goal")
     if goal is not None and goal not in ("minimize", "maximize"):
         return _error_response("'goal' must be 'minimize' or 'maximize'")
+    query_campaign = request.query.get("campaign")
+    campaign = body.get("campaign") or query_campaign or DEFAULT_CAMPAIGN
+    if query_campaign is not None and campaign != query_campaign:
+        return _error_response(
+            f"body campaign {campaign!r} does not match ?campaign={query_campaign}")
+    try:
+        validate_campaign(campaign)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    existing = await get_experiment(db, experiment_id)
+    if existing is not None and existing.campaign != campaign:
+        return _wrong_campaign(experiment_id, existing.campaign, campaign, status=409)
 
     try:
         exp = await state.db_writer.create_experiment(
             experiment_id=experiment_id,
             name=name,
+            campaign=campaign,
             controller_id=controller_id,
             note=note,
             status=status,
@@ -596,11 +719,13 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
 
     Query params:
       - experiment_id: filter by experiment
+      - campaign: only jobs of experiments in this campaign
       - status: filter by status (default: 'pending')
       - limit: max number of results
     """
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     experiment_id = request.query.get("experiment_id")
+    campaign = request.query.get("campaign")
     status = request.query.get("status", "pending")
     limit_str = request.query.get("limit")
 
@@ -611,9 +736,9 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
         if limit is not None:
             jobs = jobs[:limit]
     elif status == "pending":
-        jobs = await list_pending_jobs(db, limit=limit)
+        jobs = await list_pending_jobs(db, limit=limit, campaign=campaign)
     else:
-        jobs = await list_jobs_by_status(db, status, limit=limit)  # type: ignore[arg-type]
+        jobs = await list_jobs_by_status(db, status, limit=limit, campaign=campaign)  # type: ignore[arg-type]
 
     return _json_response(jobs)
 
@@ -624,7 +749,7 @@ async def handle_insert_job(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
 
     try:
-        body = await request.json()
+        body = await _request_json(request)
     except Exception:
         return _error_response("invalid JSON body")
 
@@ -666,7 +791,7 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
 
     try:
-        body = await request.json()
+        body = await _request_json(request)
     except Exception:
         return _error_response("invalid JSON body")
 
@@ -687,12 +812,14 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
 
 @routes.get("/api/jobs/pending")
 async def handle_list_pending_jobs(request: web.Request) -> web.Response:
-    """List pending jobs, optionally filtered by experiment."""
+    """List pending jobs, optionally filtered by experiment and campaign."""
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     experiment_id = request.query.get("experiment_id")
     limit_str = request.query.get("limit")
     limit = int(limit_str) if limit_str else None
-    jobs = await list_pending_jobs(db, experiment_id=experiment_id, limit=limit)
+    jobs = await list_pending_jobs(
+        db, experiment_id=experiment_id, limit=limit, campaign=request.query.get("campaign"),
+    )
     return _json_response(jobs)
 
 
@@ -714,7 +841,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     try:
-        body = await request.json()
+        body = await _request_json(request)
     except Exception:
         return _error_response("invalid JSON body")
 
@@ -760,7 +887,7 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     try:
-        body = await request.json()
+        body = await _request_json(request)
     except Exception:
         return _error_response("invalid JSON body")
 
@@ -794,7 +921,7 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict["mlsweep_state"]
     run_id = request.match_info["run_id"]
     try:
-        body = await request.json()
+        body = await _request_json(request)
     except Exception:
         return _error_response("invalid JSON body")
     experiment_id = body.get("experiment_id", "")
@@ -1674,7 +1801,9 @@ def create_app(
         Root directory of mlsweep data.  Static web UI is served from
         ``<mlsweep_dir>/webui/`` if it exists.
     """
-    app = web.Application(middlewares=[auth_middleware], client_max_size=512 * 1024 * 1024)
+    app = web.Application(
+        middlewares=[auth_middleware, campaign_middleware], client_max_size=512 * 1024 * 1024,
+    )
 
     # Store shared objects in app config so handlers can access them
     app["mlsweep_db"] = db

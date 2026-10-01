@@ -1,6 +1,6 @@
 # mlsweep skill
 
-Use this skill when a user needs help using the `mlsweep` package — writing sweep files, instrumenting training scripts, running sweeps, or understanding configuration options.
+Use this skill when a user needs help using the `mlsweep` package. That covers writing sweep files, instrumenting training scripts, running sweeps, and understanding configuration options.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ mlsweep has three components:
 
 **`mlsweep_run`** is a thin HTTP client. Loads a sweep file, generates the run combinations, and POSTs them to the manager. It does not launch anything itself.
 
-All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, and the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`.
+All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, `campaign`, and the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`.
 
 The manager bootstraps mlsweep on remote workers automatically over SSH (builds wheels locally, SCPs them, installs into `/tmp/mlsweep_venv/`). No manual install is needed on workers.
 
@@ -20,10 +20,10 @@ Token auth: the manager generates a token on first startup and saves it to `~/.m
 
 ## What was removed in v1.1 (don't suggest these)
 
-- `mlsweep_viz` — gone. Use the manager web dashboard.
-- `-g`/`-j` on `mlsweep_run` — gone from the submitter. They were always per-machine settings, so they now live on the **worker**: `mlsweep_worker -g <device-ids> -j <jobs-per-gpu>`, or `devices`/`jobs` in `workers.toml`. The manager passes the `workers.toml` values down to each worker.
-- `--workers` flag on `mlsweep_run` — gone. Workers are configured at manager startup (`mlsweep_manager --workers workers.toml`).
-- `WorkerPool` / `mlsweep.pool` — gone. The manager HTTP API is the replacement.
+- `mlsweep_viz` is gone. Use the manager web dashboard.
+- `-g`/`-j` on `mlsweep_run` are gone from the submitter. They were always per-machine settings, so they now live on the worker, as `mlsweep_worker -g <device-ids> -j <jobs-per-gpu>`, or `devices`/`jobs` in `workers.toml`. The manager passes the `workers.toml` values down to each worker.
+- The `--workers` flag on `mlsweep_run` is gone. Workers are configured at manager startup (`mlsweep_manager --workers workers.toml`).
+- `WorkerPool` / `mlsweep.pool` is gone. The manager HTTP API is the replacement.
 
 ## Workflow
 
@@ -58,7 +58,29 @@ mlsweep stop EXP_ID --yes                  # abort a sweep
 
 # 5. View results in the browser
 # URL is printed at manager startup: http://localhost:7891/?token=...
+
+# 6. Group experiments into campaigns
+export MLSWEEP_CAMPAIGN=my_campaign        # or pass --campaign my_campaign to any command
+mlsweep campaign                           # list campaigns
+mlsweep campaign move EXP_ID other         # re-file an experiment
+mlsweep ls --all-campaigns                 # look across every campaign
 ```
+
+## Campaigns
+
+A campaign groups experiments the way an experiment groups runs. Every command
+works in one campaign, taken from `--campaign NAME`, else `MLSWEEP_CAMPAIGN`,
+else `default`. `--all-campaigns` (or `--all_campaigns`) covers every campaign.
+
+- `mlsweep run` submits the new experiment under the current campaign. It
+  refuses `--all-campaigns`, because a new experiment needs one campaign.
+- `ls` and `status` list only the current campaign's experiments.
+- Commands given an experiment ID from a different campaign exit 1 and print
+  the campaign it is in, so the fix is to add `--campaign <that one>`.
+- The dashboard has a campaign selector at the top of the Experiments page and
+  above the experiment selector on the Results, Logs and Artifacts pages.
+
+Campaigns change neither scheduling nor where results are written.
 
 ## Sweep file format
 
@@ -69,7 +91,7 @@ Every sweep file defines `COMMAND` and `OPTIONS`. Everything else is optional.
 
 COMMAND = ["python", "train.py"]       # str or list[str]
 
-OPTIONS = { ... }                      # required — see below
+OPTIONS = { ... }                      # required, see below
 
 # Optional top-level vars:
 GPUS_PER_RUN = 1                       # GPUs per run per node (default: 1)
@@ -90,7 +112,7 @@ Every key in `OPTIONS` starts with `.` (marks it as a dimension). Keys without `
 
 ### Dimension types
 
-A **value dim** has a `"values"` list and sweeps over it:
+A value dim has a `"values"` list and sweeps over it:
 ```python
 ".lr": {
     "values": [1e-4, 3e-4, 1e-3],
@@ -99,12 +121,12 @@ A **value dim** has a `"values"` list and sweeps over it:
 }
 ```
 
-A **fixed dim** has no `"values"` and no subdim keys. Its flags are always appended and it contributes nothing to the run name:
+A fixed dim has no `"values"` and no subdim keys. Its flags are always appended and it contributes nothing to the run name:
 ```python
 ".precision": {"flags": ["--dtype", "bfloat16"]}
 ```
 
-A **subdim** has no `"values"` but has dot-prefixed child keys. Each child is a mutually exclusive branch with its own flags and optional further dims:
+A subdim has no `"values"` but has dot-prefixed child keys. Each child is a mutually exclusive branch with its own flags and optional further dims:
 ```python
 ".optimizer": {
     "name": "opt",
@@ -130,11 +152,11 @@ Use subdims instead of EXCLUDE when a dimension only applies within certain valu
 For value dims, `flags` can be a string shorthand or a per-value dict:
 
 ```python
-# str shorthand — "flags": "--lr" generates ["--lr", str(v)] for each value
-# Python True/False become "True"/"False" (capital — works with hydra; use dict form for lowercase)
+# str shorthand: "flags": "--lr" generates ["--lr", str(v)] for each value
+# Python True/False become "True"/"False" (capitalized, which works with hydra; use the dict form for lowercase)
 ".lr": {"values": [1e-3, 3e-4], "flags": "--lr"}
 
-# dict — explicit token list per value; "values" is optional (inferred from dict key order)
+# dict: explicit token list per value; "values" is optional (inferred from dict key order)
 ".ac": {
     "flags": {
         "none": ["--ac.mode", "none"],
@@ -161,7 +183,7 @@ For subdim branches and fixed dims, `flags` is a string (single token) or list o
 | `"flags"` | see above | CLI flags to emit. |
 | `"name"` | `str` or `None` | Prefix in run name. Defaults to dim key without `.`. `None` omits the dim from the name. |
 | `"singular"` | `bool` | Commit to the first value that succeeds; skip the rest. Default `False`. |
-| `"monotonic"` | `str` | `"increasing"` or `"decreasing"` — stop trying values after the first failure. |
+| `"monotonic"` | `str` | `"increasing"` or `"decreasing"`. Stop trying values after the first failure. |
 | `"distribution"` | `str` | Bayes mode only: `"log_uniform"`, `"uniform"`, `"int_uniform"`. |
 | `"min"` / `"max"` | `float` | Bayes continuous range. |
 | `"samples"` | `int` | Grid mode only: pre-sample N values from a continuous distribution. |
@@ -176,7 +198,7 @@ Subdim segments are dotted onto their parent: `sweep_optmuon.lrs0.1_bs32`. `"nam
 
 Both work only in sequential mode (one job at a time per slot). In parallel mode results are recorded but skipping is not applied dynamically.
 
-**`singular: True`** — good for hardware dims (batch size, activation checkpointing) where you just need one value that fits. The first success locks in the value; all other values for that dim are skipped. Singular dims vary slowest in the cartesian product so other dims are explored first.
+`singular: True` suits hardware dims (batch size, activation checkpointing) where you just need one value that fits. The first success locks in the value; all other values for that dim are skipped. Singular dims vary slowest in the cartesian product so other dims are explored first.
 
 ```python
 ".bs": {
@@ -187,7 +209,7 @@ Both work only in sequential mode (one job at a time per slot). In parallel mode
 }
 ```
 
-**`monotonic`** — good for finding a boundary before committing to any value. A failure at position `i` stops all further trials from that point onward. `"increasing"` tries values in listed order; `"decreasing"` reverses the list first.
+`monotonic` suits finding a boundary before committing to any value. A failure at position `i` stops all further trials from that point onward. `"increasing"` tries values in listed order; `"decreasing"` reverses the list first.
 
 ```python
 ".bs": {
@@ -196,7 +218,7 @@ Both work only in sequential mode (one job at a time per slot). In parallel mode
 }
 ```
 
-Don't combine them — `singular` stops on the first success, `monotonic` stops on the first failure; whichever comes first ends the search.
+Don't combine them. `singular` stops on the first success, `monotonic` stops on the first failure; whichever comes first ends the search.
 
 ## Multi-GPU and multi-node
 
@@ -209,18 +231,18 @@ SET_DIST_ENV = True  # auto-set RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PO
 With `GPUS_PER_RUN = 4` and 8 available GPUs: 2 concurrent runs, each on 4 GPUs. Groups are chosen to maximise NVLink connectivity.
 
 mlsweep spawns one process per GPU per node. Each process receives:
-- `CUDA_VISIBLE_DEVICES` — the assigned GPU IDs for this run
-- `MLSWEEP_GPU_RANK` — 0-based local GPU rank within the run's group
-- `MLSWEEP_NODE_RANK`, `MLSWEEP_NNODES`, `MLSWEEP_MASTER_ADDR`, `MLSWEEP_MASTER_PORT` — multi-node only
+- `CUDA_VISIBLE_DEVICES`, the assigned GPU IDs for this run
+- `MLSWEEP_GPU_RANK`, the 0-based local GPU rank within the run's group
+- `MLSWEEP_NODE_RANK`, `MLSWEEP_NNODES`, `MLSWEEP_MASTER_ADDR`, `MLSWEEP_MASTER_PORT`, multi-node only
 
 `SET_DIST_ENV = True` derives standard PyTorch distributed vars from the above automatically. Use this for frameworks that expect `RANK`/`LOCAL_RANK`/`WORLD_SIZE`/`MASTER_ADDR`/`MASTER_PORT` (TorchTitan, torchrun-launched scripts).
 
 ```python
-# In train.py — without SET_DIST_ENV
+# In train.py, without SET_DIST_ENV
 local_rank = int(os.environ["MLSWEEP_GPU_RANK"])
 device = torch.device(f"cuda:{local_rank}")
 
-# With SET_DIST_ENV = True — standard vars are set, no wrapper needed
+# With SET_DIST_ENV = True the standard vars are set, so no wrapper is needed
 dist.init_process_group(backend="nccl")  # reads RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
 ```
 
@@ -310,8 +332,9 @@ The manager bootstraps mlsweep on remote machines automatically; no manual insta
 | `COMMAND is required` | Add `COMMAND = ["python", "train.py"]` to the sweep file |
 | `Dimension key must start with '.'` | All `OPTIONS` keys (and subdim keys) need a `.` prefix |
 | `has both 'values' and subdimensions` | A dim can have a value list or subdim branches; it cannot have both |
-| `--manager URL is required` | Pass `--manager http://host:7891` — `mlsweep_run` is a submission client and needs a running manager |
+| `--manager URL is required` | Pass `--manager http://host:7891`. `mlsweep_run` is a submission client and needs a running manager |
 | Token errors | Check `~/.mlsweep/manager.token` or pass `--token` / set `MLSWEEP_TOKEN` |
+| `experiment X is in campaign 'Y', not 'Z'` | Pass `--campaign Y` (or `--all-campaigns`), or set `MLSWEEP_CAMPAIGN=Y` |
 | Singular/monotonic not skipping | Only jobs still pending when a result arrives are skipped; lower `--max-concurrent` so fewer run at once |
 | Remote not connecting | Test SSH: `ssh -o BatchMode=yes user@host nvidia-smi` |
 | `need at least GPUS_PER_RUN GPUs` | Worker has fewer GPUs than `GPUS_PER_RUN`; adjust worker config or reduce `GPUS_PER_RUN` |
@@ -319,6 +342,6 @@ The manager bootstraps mlsweep on remote machines automatically; no manual insta
 
 ## Reference
 
-- `docs/sweep_configuration.md` — complete reference: all dim types, flags behavior, CLI options, output layout
-- `docs/examples.md` — DDP, multi-node, TorchTitan, Prime-RL patterns
-- `docs/SKILL.md` — the agent-facing quick reference (readable via `mlsweep --help skill`)
+- `docs/sweep_configuration.md` is the complete reference for dim types, flag behavior, CLI options and the output layout
+- `docs/examples.md` has worked examples for DDP, multi-node runs, TorchTitan and Prime-RL
+- `docs/SKILL.md` is the agent-facing quick reference (readable via `mlsweep --help skill`)

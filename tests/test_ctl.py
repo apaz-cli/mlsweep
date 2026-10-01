@@ -549,11 +549,16 @@ def test_health_includes_version(manager_server):
 def test_apply_returns_failure_count():
     jobs = [{"run_id": "a"}, {"run_id": "b"}]
 
-    def fn(m, t, r, e):
+    campaigns = []
+
+    def fn(m, t, r, e, campaign=None):
+        campaigns.append(campaign)
         return {"ok": True} if r == "a" else None
 
     assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False) == 1
     assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=True) == 0
+    assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False, campaign="c") == 1
+    assert campaigns == [None, None, "c", "c"]
 
 
 def test_retry_nonterminal_exits_nonzero(manager_server, capsys):

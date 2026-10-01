@@ -1,6 +1,6 @@
 ---
 name: mlsweep
-description: Run, monitor, and control mlsweep hyperparameter sweeps (manager → run → watch/fetch → best/cancel/retry). Use when the user mentions mlsweep, sweeps, or running experiments on a GPU cluster.
+description: Operate mlsweep hyperparameter sweeps from submission through results (manager → run → watch/fetch → best/cancel/retry). Use when the user mentions mlsweep, sweeps, or running experiments on a GPU cluster.
 ---
 
 # mlsweep skill
@@ -20,8 +20,7 @@ mlsweep watch <experiment_id>                   # live terminal status
 mlsweep fetch --experiment <id> --wait          # block until done, then leaderboard (exits 1 on failure)
 mlsweep best  --experiment <id>                 # top runs by metric (--json for machines)
 mlsweep wait  <id> --until done                 # exit 0 clean, 1 failure, 2 timeout, 3 stalled
-mlsweep wait  <id> --until any-failure          # return as soon as any run fails
-mlsweep wait  <id> --until stalled --stalled-after 900
+                                                # (also --until any-failure, --until stalled --stalled-after 900)
 mlsweep watch <id> --events                     # one JSON event per line (alias: --json)
 mlsweep ls                                      # list experiments (`mlsweep ls <id>` lists runs)
 mlsweep logs <run_id> --experiment <id>         # tail a run's training.log
@@ -29,6 +28,9 @@ mlsweep metrics --experiment <id> [runs] --keys REGEX [--pivot] [--json|--csv]  
 mlsweep cancel <id> --failed                    # cancel jobs (also --running / --all --yes)
 mlsweep retry  <id> --failed                    # re-queue failed jobs
 mlsweep stop   <id> --yes                       # abort a sweep
+mlsweep campaign                                # list campaigns (* = current)
+mlsweep campaign move <id> <name>               # move an experiment to another campaign
+mlsweep ls --all-campaigns                      # experiments from every campaign
 ```
 
 ## Facts agents need
@@ -36,6 +38,7 @@ mlsweep stop   <id> --yes                       # abort a sweep
 - Manager: start once with `mlsweep manager`. Dashboard at http://localhost:7891.
 - Token: auto-read from `~/.mlsweep/manager.token` (or `MLSWEEP_TOKEN`, or `--token`).
 - Results: `~/.mlsweep/experiments/<experiment_id>/<run>/{metrics.jsonl, training.log, artifacts/}`.
+- Campaigns group experiments. Every command works in the campaign from `--campaign NAME`, else `$MLSWEEP_CAMPAIGN`, else `default`. `--all-campaigns` covers all of them. A command given an experiment from another campaign exits 1 and names that campaign, so rerun it with `--campaign <that one>`. `mlsweep run` refuses `--all-campaigns`.
 - `watch`/`fetch`/`best`/`status`/`ls`/`logs` default `--manager` to `http://localhost:7891` (or `$MLSWEEP_MANAGER`). `run` requires `--manager`.
 - Sweep files are `COMMAND` + `OPTIONS` dicts. CLI flags use dashes.
 - `METRIC = "val_loss"` / `GOAL = "minimize"` at the top of a sweep file record the ranking metric. `fetch`/`best` default `--metric`/`--goal` to the experiment's stored values (OPTIMIZE wins if both are present), then `loss`/`minimize`.

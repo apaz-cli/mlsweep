@@ -690,12 +690,88 @@ mlsweep wait EXP --until stalled --stalled-after 900
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
 with failures.
 
+## Campaigns
+
+A campaign is a named group of experiments, the way an experiment is a group of
+runs. Every experiment belongs to exactly one campaign. If you never name one,
+everything goes into the campaign called `default`.
+
+Each `mlsweep` command works inside one campaign, chosen in this order:
+
+1. `--campaign NAME`
+2. the `MLSWEEP_CAMPAIGN` environment variable
+3. `default`
+
+`--all-campaigns` (also spelled `--all_campaigns`) lifts the restriction.
+
+```bash
+export MLSWEEP_CAMPAIGN=tokenizer_ablation
+mlsweep run sweeps/vocab.py --manager http://localhost:7891   # submitted under tokenizer_ablation
+mlsweep ls                                                    # tokenizer_ablation's experiments only
+mlsweep ls --all-campaigns                                    # every experiment, tagged with its campaign
+mlsweep best --experiment EXP_ID --campaign default           # reach into the default campaign
+```
+
+| Command | What the campaign does |
+|---------|------------------------|
+| `run` | Creates the experiment in the campaign. A new sweep can't use `--all-campaigns`. `--resume` needs the experiment to be in the campaign. |
+| `ls`, `status` | List only the campaign's experiments. `ls --all-campaigns` tags each experiment with its campaign. |
+| `watch`, `fetch`, `best`, `wait`, `logs`, `metrics`, `cancel`, `retry`, `resume`, `stop`, `pause`, `unpause`, `campaign move` | Refuse an experiment filed elsewhere. They exit 1, change nothing, and name the experiment's campaign. |
+
+A refusal looks like this:
+
+```
+Error: experiment vocab_20260930_1412_3f2a is in campaign 'tokenizer_ablation', not 'default'.
+Pass --campaign tokenizer_ablation or --all-campaigns.
+```
+
+Campaign names follow the experiment ID rules: 1 to 128 letters, digits, `_`
+or `-`. A campaign exists while it holds an experiment, so there is nothing to
+create first.
+
+```bash
+mlsweep campaign                       # campaigns with experiment and job counts; * marks the current one
+mlsweep campaign move EXP_ID NEW_NAME  # move an experiment, with all its runs, to another campaign
+```
+
+Campaigns don't change scheduling or storage. Runs from every campaign share one
+queue and the same GPUs, and results stay under
+`~/.mlsweep/experiments/<experiment_id>/`.
+
+### Campaigns in the dashboard
+
+The Experiments page has a campaign selector at the top. The Results, Logs and
+Artifacts pages have one in the sidebar, above the experiment selector. Each
+page lists only the selected campaign's experiments, or every experiment under
+"All campaigns". The choice is kept in the page URL (`?campaign=NAME`), carried
+by the navigation links, and remembered by the browser. A first visit shows
+`default`. A link to one experiment (`?experiment=ID`) switches to that
+experiment's campaign. Each row on the Experiments page has a Move button.
+
+### Campaigns in the HTTP API
+
+Every endpoint accepts `?campaign=NAME`:
+
+- `GET /api/experiments`, `GET /api/jobs` and `GET /api/jobs/pending` return
+  only that campaign's experiments and jobs.
+- `POST /api/experiments` creates the experiment in that campaign, as does a
+  `campaign` field in the body. Re-creating an existing experiment under another
+  campaign returns 409.
+- A request that names an experiment from another campaign, in the path, in
+  `?experiment_id=`, or in a job body, gets 404 with
+  `{"error": ..., "campaign": "<its campaign>"}` and changes nothing. The
+  WebSocket stream follows the same rule.
+
+Without the parameter nothing is restricted. `GET /api/campaigns` lists
+campaigns with their counts, and `PUT /api/experiments/{id}/campaign` with
+`{"campaign": NAME}` moves an experiment.
+
 ## Command-Line Options
 
 ### `mlsweep`
 
 The unified entry point (`mlsweep --help` prints the workflow, grouped into Run /
-Monitor / Control / Docs). Individual binaries remain as aliases.
+Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 
 | Subcommand | Description |
 |-----------|-------------|
@@ -717,6 +793,8 @@ Monitor / Control / Docs). Individual binaries remain as aliases.
 | `stop <exp_id>` | Abort a sweep (requires `--yes`). |
 | `pause <exp_id>` | Stop dispatching new jobs. |
 | `unpause <exp_id>` | Resume dispatching. |
+| `campaign [ls]` | List campaigns with experiment and job counts (`--json`). |
+| `campaign move <exp_id> <name>` | Move an experiment to another campaign. |
 | `docs [topic]` | Print the bundled runbook. |
 | `version` | Print the mlsweep version. |
 
@@ -730,6 +808,9 @@ to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`) and finally
 
 `cancel`, `retry`, and `resume` exit non-zero if any targeted run fails, so
 scripts can detect partial failures.
+
+Every subcommand that talks to the manager takes `--campaign NAME` and
+`--all-campaigns` (see [Campaigns](#campaigns)).
 
 ### `mlsweep_manager`
 
@@ -751,6 +832,8 @@ scripts can detect partial failures.
 | `--output-dir <dir>` | Directory for local submit-side artifacts (submit log + manifest). Default: `~/.mlsweep/submissions`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. |
 | `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
+| `--campaign <name>` | Campaign to submit under (env: `MLSWEEP_CAMPAIGN`, default: `default`). |
+| `--all-campaigns` | With `--resume`, find the experiment in any campaign. Refused for a new sweep. |
 | `--priority N` | Job priority — higher values run sooner (default: 0). |
 | `--stream` | Subscribe to the manager's WebSocket event stream for live terminal status. |
 | `--fetch` | Fetch and display results after submission (when `--stream` is not used). |

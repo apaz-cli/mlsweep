@@ -153,6 +153,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 #lightbox img { max-width: 95vw; max-height: 95vh; object-fit: contain; border-radius: 4px; }
 </style>
 <script src="dialog.js"></script>
+<script src="campaign.js"></script>
 </head>
 <body>
 
@@ -176,6 +177,12 @@ select:focus { outline: none; border-color: #4c9be8; }
   <!-- ── Sidebar ──────────────────────────────────────────────────────────────── -->
   <div id="sidebar">
     <div id="sidebar-top">
+      <div class="sb-section">
+        <div class="sb-title">Campaign</div>
+        <div class="sb-row">
+          <select id="campaign-sel"></select>
+        </div>
+      </div>
       <div class="sb-section">
         <div class="sb-title">Experiment</div>
         <div class="sb-row">
@@ -628,8 +635,11 @@ function showBrowsePreview(runId, file) {
 }
 
 // ── Experiment loading ─────────────────────────────────────────────────────────
+let loadedExp = null;  // experiment currently shown
+
 async function loadExperiment(eid) {
   if (!eid) return;
+  loadedExp = eid;
   jobs = []; fileCache = {}; checkedRuns.clear();
   browseRun = null; browseFile = null; compareFile = null;
 
@@ -643,6 +653,7 @@ async function loadExperiment(eid) {
 
   // Keep Results nav link in sync
   document.getElementById("nav-results").href = pageHref("results.html", { experiment: eid });
+  MLCampaign.linkNav();
 
   const expDl = document.getElementById("exp-dl-all");
   expDl.href = expZipURL(eid);
@@ -690,28 +701,46 @@ async function loadExperiment(eid) {
   });
 }
 
-// ── Experiment selector ────────────────────────────────────────────────────────
+// ── Campaign and experiment selectors ──────────────────────────────────────────
+const campaignSel = document.getElementById("campaign-sel");
+let allExps = [];      // every experiment, for the campaign list
+
+function clearExperiment() {
+  loadedExp = null;
+  jobs = []; fileCache = {}; checkedRuns.clear();
+  browseRun = null; browseFile = null; compareFile = null;
+  document.getElementById("exp-dl-all").style.display = "none";
+  document.getElementById("file-path-sel").innerHTML = `<option value="">— select file path —</option>`;
+  document.getElementById("compare-info").textContent = "";
+  document.getElementById("compare-grid").innerHTML = `<div class="placeholder">No experiments in this campaign.</div>`;
+  document.getElementById("browse-toolbar").style.display = "none";
+  document.getElementById("file-tree").innerHTML = "";
+  document.getElementById("preview-pane").innerHTML = `<div class="placeholder">No experiments in this campaign.</div>`;
+  document.getElementById("run-list").innerHTML = `<div style="color:var(--text-muted);font-size:12px;padding:4px">No experiments in this campaign</div>`;
+}
+
+// Fill the experiment select from the selected campaign, keeping the shown
+// experiment when it is still listed, and load the selection if it changed.
+function showCampaign() {
+  MLCampaign.fill(campaignSel, allExps);
+  const id = MLCampaign.fillExperiments(document.getElementById("exp-sel"),
+                                        MLCampaign.filter(allExps), loadedExp || INIT_EXP);
+  if (!id) clearExperiment();
+  else if (id !== loadedExp) loadExperiment(id);
+}
+
 async function fetchExperiments() {
   try {
     const r = await apiFetch("/api/experiments");
     if (!r.ok) { setConnStatus("disconnected"); return; }
-    const exps = await r.json();
+    allExps = await r.json();
     setConnStatus("connected");
-    const sel = document.getElementById("exp-sel");
-    const prev = sel.value || INIT_EXP;
-    sel.innerHTML = "";
-    for (const e of exps) {
-      const opt = document.createElement("option");
-      opt.value = e.experiment_id; opt.textContent = e.name || e.experiment_id;
-      if (e.experiment_id === prev) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    if (!sel.dataset.loaded) {
-      sel.dataset.loaded = "1";
-      if (sel.value) loadExperiment(sel.value);
-    }
+    MLCampaign.follow(allExps, INIT_EXP);
+    showCampaign();
   } catch { setConnStatus("disconnected"); }
 }
+
+MLCampaign.bind(campaignSel, showCampaign);
 
 document.getElementById("exp-sel").addEventListener("change", e => loadExperiment(e.target.value));
 document.getElementById("refresh-btn").addEventListener("click", fetchExperiments);

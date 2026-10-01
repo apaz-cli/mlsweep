@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from mlsweep._sweep import (
@@ -46,8 +46,8 @@ from mlsweep._writers import (
     WriterFactory,
 )
 from mlsweep._shared import (
-    DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE, _RESET,
-    _git_root, _mlsweep_dir, set_color, strip_color_flag,
+    DEFAULT_CAMPAIGN, DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE,
+    _RESET, _git_root, _mlsweep_dir, set_color, strip_color_flag, validate_campaign,
 )
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -92,11 +92,71 @@ def _manager_token(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def _add_manager_args(parser: argparse.ArgumentParser) -> None:
-    """Add the shared --manager / --token flags."""
+    """Add the shared --manager / --token / --campaign / --all-campaigns flags."""
     parser.add_argument("--manager", default=os.environ.get("MLSWEEP_MANAGER", DEFAULT_MANAGER_URL),
                         help=f"Manager URL (env: MLSWEEP_MANAGER, default: {DEFAULT_MANAGER_URL})")
     parser.add_argument("--token", default=None,
                         help="Manager auth token (or set MLSWEEP_TOKEN env)")
+    _add_campaign_args(parser)
+
+
+def _add_campaign_args(parser: argparse.ArgumentParser) -> None:
+    """Add --campaign NAME and --all-campaigns (also spelled --all_campaigns)."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--campaign", default=None, metavar="NAME",
+                       help=f"Campaign to work in (env: MLSWEEP_CAMPAIGN, default: {DEFAULT_CAMPAIGN})")
+    group.add_argument("--all-campaigns", "--all_campaigns", dest="all_campaigns",
+                       action="store_true", help="Work across every campaign")
+
+
+def _resolve_campaign(args: argparse.Namespace) -> str | None:
+    """The campaign a command works in, or None for --all-campaigns.
+
+    Order: --all-campaigns, --campaign, $MLSWEEP_CAMPAIGN, then the default.
+    Exits with an error on an invalid name.
+    """
+    if getattr(args, "all_campaigns", False):
+        return None
+    name = getattr(args, "campaign", None) or os.environ.get("MLSWEEP_CAMPAIGN") or DEFAULT_CAMPAIGN
+    try:
+        return validate_campaign(name)
+    except ValueError as e:
+        sweep_print(f"{_RED}Error: {e}{_RESET}")
+        sys.exit(1)
+
+
+def _campaign_argv(campaign: str | None) -> list[str]:
+    """Flags that select *campaign* (None = every campaign) on another command."""
+    return ["--all-campaigns"] if campaign is None else ["--campaign", campaign]
+
+
+def _with_campaign(path: str, campaign: str | None) -> str:
+    """Append ``campaign=`` to an API *path* (unchanged for None = every campaign)."""
+    if campaign is None:
+        return path
+    return f"{path}{'&' if '?' in path else '?'}campaign={quote(campaign)}"
+
+
+def require_campaign(manager: str, token: str, experiment_id: str, campaign: str | None) -> None:
+    """Exit with a hint when *experiment_id* is in a campaign other than *campaign*.
+
+    An unknown experiment or an unreachable manager passes silently, so each
+    command reports that its own way.  Every request the command makes
+    afterwards also carries ``?campaign=``, so the manager refuses it if the
+    experiment moves.
+    """
+    if campaign is None:
+        return
+    status, resp = _http_request(
+        "GET", _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}", campaign)),
+        token, quiet=True,
+    )
+    if status == 404 and isinstance(resp, dict) and resp.get("campaign"):
+        actual = resp["campaign"]
+        sweep_print(f"{_RED}Error: experiment {experiment_id} is in campaign '{actual}', "
+                    f"not '{campaign}'.{_RESET}")
+        sweep_print(f"Pass --campaign {actual} or --all-campaigns.")
+        sys.exit(1)
 
 
 # ===============================================================================
@@ -113,11 +173,12 @@ def _http_request(
     data: Any = None,
     headers: dict[str, str] | None = None,
     timeout: int = 30,
+    quiet: bool = False,
 ) -> tuple[int, Any]:
     """Make an HTTP request to the manager. Returns (status_code, parsed_response).
 
     Accepts JSON response and returns the parsed object or raw body for non-JSON.
-    On error, prints a message and returns (status, None).
+    On error, prints a message (unless *quiet*) and returns (status, None).
     """
     req_headers = {"Authorization": f"Bearer {token}"}
     if json_data is not None:
@@ -139,10 +200,12 @@ def _http_request(
         raw = e.read()
         content_type = e.headers.get_content_type()
     except URLError as e:
-        sweep_print(f"{_RED}Error: cannot reach manager at {url}: {e.reason}{_RESET}")
+        if not quiet:
+            sweep_print(f"{_RED}Error: cannot reach manager at {url}: {e.reason}{_RESET}")
         return (0, None)
     except Exception as e:
-        sweep_print(f"{_RED}Error: HTTP request failed: {e}{_RESET}")
+        if not quiet:
+            sweep_print(f"{_RED}Error: HTTP request failed: {e}{_RESET}")
         return (0, None)
 
     # Decode by declared type. Guessing breaks on text bodies that happen to
@@ -401,8 +464,9 @@ def manager_create_experiment(
     skip_rules: dict[str, Any] | None = None,
     metric: str | None = None,
     goal: str | None = None,
+    campaign: str = DEFAULT_CAMPAIGN,
 ) -> dict[str, Any] | None:
-    """Create an experiment on the manager. Returns the experiment dict or None."""
+    """Create an experiment in *campaign* on the manager. Returns the experiment dict or None."""
     status, resp = _http_request(
         "POST",
         _manager_url(manager, "/api/experiments"),
@@ -410,6 +474,7 @@ def manager_create_experiment(
         json_data={
             "experiment_id": experiment_id,
             "name": name,
+            "campaign": campaign,
             "controller_id": controller_id,
             "note": note,
             "status": "running",
@@ -422,7 +487,7 @@ def manager_create_experiment(
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
-        sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id}")
+        sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} (campaign {campaign})")
         return resp
     sweep_print(f"  {_RED}FAIL{_RESET}  Create experiment: {resp}")
     return None
@@ -493,11 +558,12 @@ def manager_submit_jobs_bulk(
     manager: str,
     token: str,
     jobs: list[dict[str, Any]],
+    campaign: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Submit multiple jobs in bulk. Returns list of created job records."""
     status, resp = _http_request(
         "POST",
-        _manager_url(manager, "/api/jobs/bulk"),
+        _manager_url(manager, _with_campaign("/api/jobs/bulk", campaign)),
         token,
         json_data=jobs,
     )
@@ -513,11 +579,13 @@ def manager_get_job_metrics(
     token: str,
     experiment_id: str,
     run_id: str,
+    campaign: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Fetch metrics.jsonl for a completed job."""
     status, resp = _http_request(
         "GET",
-        _manager_url(manager, f"/api/experiments/{experiment_id}/jobs/{run_id}/metrics"),
+        _manager_url(manager, _with_campaign(
+            f"/api/experiments/{experiment_id}/jobs/{run_id}/metrics", campaign)),
         token,
     )
     if status == 200 and isinstance(resp, str):
@@ -538,11 +606,12 @@ def manager_get_experiment_summary(
     experiment_id: str,
     *,
     quiet: bool = False,
+    campaign: str | None = None,
 ) -> dict[str, Any] | None:
     """Get experiment summary from manager."""
     status, resp = _http_request(
         "GET",
-        _manager_url(manager, f"/api/experiments/{experiment_id}/summary"),
+        _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}/summary", campaign)),
         token,
     )
     if status == 200 and isinstance(resp, dict):
@@ -556,14 +625,44 @@ def manager_list_experiments(
     manager: str,
     token: str,
     status_filter: str | None = None,
+    campaign: str | None = None,
 ) -> list[dict[str, Any]] | None:
-    """List experiments on the manager."""
+    """List experiments on the manager, only *campaign*'s unless it is None."""
     path = "/api/experiments"
     if status_filter:
         path += f"?status={status_filter}"
+    path = _with_campaign(path, campaign)
     status, resp = _http_request("GET", _manager_url(manager, path), token, timeout=10)
     if status == 200 and isinstance(resp, list):
         return resp
+    return None
+
+
+def manager_list_campaigns(manager: str, token: str) -> list[dict[str, Any]] | None:
+    """List campaigns with their experiment and job counts."""
+    status, resp = _http_request("GET", _manager_url(manager, "/api/campaigns"), token, timeout=10)
+    if status == 200 and isinstance(resp, list):
+        return resp
+    return None
+
+
+def manager_move_experiment(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    target: str,
+    campaign: str | None = None,
+) -> dict[str, Any] | None:
+    """Move an experiment (it must be in *campaign*, unless None) to campaign *target*."""
+    status, resp = _http_request(
+        "PUT",
+        _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}/campaign", campaign)),
+        token,
+        json_data={"campaign": target},
+    )
+    if status == 200 and isinstance(resp, dict):
+        return resp
+    sweep_print(f"  {_RED}FAIL{_RESET}  Move experiment: {resp}")
     return None
 
 
@@ -572,11 +671,13 @@ def manager_list_experiment_jobs(
     token: str,
     experiment_id: str,
     status_filter: str | None = None,
+    campaign: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """List jobs for an experiment."""
     path = f"/api/experiments/{experiment_id}/jobs"
     if status_filter:
         path += f"?status={status_filter}"
+    path = _with_campaign(path, campaign)
     status, resp = _http_request("GET", _manager_url(manager, path), token)
     if status == 200 and isinstance(resp, list):
         return resp
@@ -589,11 +690,13 @@ def manager_cancel_job(
     token: str,
     run_id: str,
     experiment_id: str,
+    campaign: str | None = None,
 ) -> dict[str, Any] | None:
     """Cancel a pending job."""
     status, resp = _http_request(
         "POST",
-        _manager_url(manager, f"/api/jobs/{run_id}/cancel?experiment_id={experiment_id}"),
+        _manager_url(manager, _with_campaign(
+            f"/api/jobs/{run_id}/cancel?experiment_id={experiment_id}", campaign)),
         token,
     )
     if status == 200 and isinstance(resp, dict):
@@ -606,11 +709,13 @@ def manager_retry_job(
     token: str,
     run_id: str,
     experiment_id: str,
+    campaign: str | None = None,
 ) -> dict[str, Any] | None:
     """Retry a failed job."""
     status, resp = _http_request(
         "POST",
-        _manager_url(manager, f"/api/jobs/{run_id}/retry?experiment_id={experiment_id}"),
+        _manager_url(manager, _with_campaign(
+            f"/api/jobs/{run_id}/retry?experiment_id={experiment_id}", campaign)),
         token,
     )
     if status == 200 and isinstance(resp, dict):
@@ -623,11 +728,12 @@ def manager_set_experiment_status(
     token: str,
     experiment_id: str,
     status: str,
+    campaign: str | None = None,
 ) -> dict[str, Any] | None:
     """Update an experiment's status (running | paused | completed | aborted)."""
     s, resp = _http_request(
         "PUT",
-        _manager_url(manager, f"/api/experiments/{experiment_id}/status"),
+        _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}/status", campaign)),
         token,
         json_data={"status": status},
     )
@@ -642,11 +748,13 @@ def manager_get_job_logs(
     token: str,
     experiment_id: str,
     run_id: str,
+    campaign: str | None = None,
 ) -> str | None:
     """Return a run's training log as text."""
     status, resp = _http_request(
         "GET",
-        _manager_url(manager, f"/api/experiments/{experiment_id}/jobs/{run_id}/logs"),
+        _manager_url(manager, _with_campaign(
+            f"/api/experiments/{experiment_id}/jobs/{run_id}/logs", campaign)),
         token,
     )
     if status == 200 and isinstance(resp, str):
@@ -700,19 +808,21 @@ def build_leaderboard(
     metric: str = "loss",
     goal: str = "minimize",
     jobs: list[dict[str, Any]] | None = None,
+    campaign: str | None = None,
 ) -> list[dict[str, Any]]:
     """Compute a ranked list of run results, best-first by *metric*.
 
     Each row: {run_id, status, combo, value, final, elapsed, exit_code}.
     """
     if jobs is None:
-        jobs = manager_list_experiment_jobs(manager, token, experiment_id) or []
+        jobs = manager_list_experiment_jobs(manager, token, experiment_id, campaign=campaign) or []
 
     # Metrics are per-run requests; fetch them concurrently.
     done_ids = [j.get("run_id") or "" for j in jobs if j.get("status") == "done"]
     with ThreadPoolExecutor(max_workers=8) as pool:
         all_metrics = dict(zip(done_ids, pool.map(
-            lambda rid: manager_get_job_metrics(manager, token, experiment_id, rid), done_ids)))
+            lambda rid: manager_get_job_metrics(manager, token, experiment_id, rid, campaign=campaign),
+            done_ids)))
     return rank_leaderboard(jobs, all_metrics, metric, goal)
 
 
@@ -780,6 +890,7 @@ def _wait_until_settled(
     token: str,
     experiment_id: str,
     interval: int = 10,
+    campaign: str | None = None,
 ) -> bool:
     """Block until an experiment has no pending/dispatched/running jobs.
 
@@ -789,7 +900,8 @@ def _wait_until_settled(
     """
     print(f"Waiting for {experiment_id} to settle (Ctrl+C to stop)...", file=sys.stderr, flush=True)
     while True:
-        resp = manager_get_experiment_summary(manager, token, experiment_id, quiet=True)
+        resp = manager_get_experiment_summary(manager, token, experiment_id, quiet=True,
+                                              campaign=campaign)
         if resp:
             counts = resp.get("job_counts") or {}
             active = sum(int(counts.get(s, 0)) for s in _ACTIVE_JOB_STATUSES)
@@ -809,6 +921,7 @@ def resolve_ranking(
     experiment_id: str,
     metric: str | None = None,
     goal: str | None = None,
+    campaign: str | None = None,
 ) -> tuple[str, str]:
     """Resolve the ``(metric, goal)`` used to rank an experiment's runs.
 
@@ -817,7 +930,8 @@ def resolve_ranking(
     ``OPTIMIZE``) and finally to ``loss``/``minimize``.
     """
     if metric is None or goal is None:
-        summary = manager_get_experiment_summary(manager, token, experiment_id, quiet=True) or {}
+        summary = manager_get_experiment_summary(manager, token, experiment_id, quiet=True,
+                                                 campaign=campaign) or {}
         if metric is None:
             stored_metric = summary.get("metric")
             metric = stored_metric if isinstance(stored_metric, str) and stored_metric else "loss"
@@ -860,6 +974,7 @@ def manager_download_experiment(
     token: str,
     experiment_id: str,
     output_dir: str | Path,
+    campaign: str | None = None,
 ) -> bool:
     """Download experiment results from the manager and extract to output_dir.
 
@@ -867,7 +982,7 @@ def manager_download_experiment(
     and streams the tar.gz response, extracting it to output_dir.
     Returns True on success.
     """
-    url = _manager_url(manager, f"/api/experiments/{experiment_id}/download")
+    url = _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}/download", campaign))
     req = Request(url, method="GET")
     req.add_header("Authorization", f"Bearer {token}")
 
@@ -1012,7 +1127,7 @@ def _pack_project(
 # ===============================================================================
 
 
-def _ws_stream_url(manager: str, experiment_id: str, token: str) -> str:
+def _ws_stream_url(manager: str, experiment_id: str, token: str, campaign: str | None = None) -> str:
     """Build WebSocket URL for experiment event stream."""
     http_url = manager.rstrip("/")
     if http_url.startswith("https://"):
@@ -1021,7 +1136,7 @@ def _ws_stream_url(manager: str, experiment_id: str, token: str) -> str:
         ws_url = "ws://" + http_url[7:]
     else:
         ws_url = "ws://" + http_url
-    return f"{ws_url}/ws/experiments/{experiment_id}?token={token}"
+    return _with_campaign(f"{ws_url}/ws/experiments/{experiment_id}?token={token}", campaign)
 
 
 def _stream_status_live(
@@ -1034,6 +1149,7 @@ def _stream_status_live(
     writer_factory: Any = None,
     variations: list[dict[str, Any]] | None = None,
     output_dir: str = "",
+    campaign: str | None = None,
 ) -> None:
     """Connect to manager WebSocket and display live job status until idle timeout.
 
@@ -1045,7 +1161,7 @@ def _stream_status_live(
     created lazily for each run and fed metric / finish events.
     *variations* is used to look up combos when creating writers.
     """
-    ws_url = _ws_stream_url(manager, experiment_id, token)
+    ws_url = _ws_stream_url(manager, experiment_id, token, campaign)
 
     ws = _WebSocket(ws_url, token, timeout=10.0)
     try:
@@ -1392,9 +1508,11 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
     emit_json = bool(parsed.events or parsed.json)
 
     manager, token = _manager_token(parsed)
+    campaign = _resolve_campaign(parsed)
+    require_campaign(manager, token, parsed.experiment_id, campaign)
 
     # Connect WebSocket with since=now to only get new events
-    ws_url = _ws_stream_url(manager, parsed.experiment_id, token)
+    ws_url = _ws_stream_url(manager, parsed.experiment_id, token, campaign)
     # Append since parameter for new events only
     since = time.time()
     if "?" in ws_url:
@@ -1499,23 +1617,31 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
         set_color(True)
 
     manager, token = _manager_token(parsed)
+    campaign = _resolve_campaign(parsed)
+    require_campaign(manager, token, parsed.experiment, campaign)
 
     had_failure = False
     if parsed.wait:
-        had_failure = _wait_until_settled(manager, token, parsed.experiment, parsed.wait_interval)
+        had_failure = _wait_until_settled(manager, token, parsed.experiment, parsed.wait_interval,
+                                          campaign=campaign)
 
-    metric, goal = resolve_ranking(manager, token, parsed.experiment, parsed.metric, parsed.goal)
+    metric, goal = resolve_ranking(manager, token, parsed.experiment, parsed.metric, parsed.goal,
+                                   campaign=campaign)
 
-    summary = manager_get_experiment_summary(manager, token, parsed.experiment) or {}
-    jobs = manager_list_experiment_jobs(manager, token, parsed.experiment, status_filter=parsed.status)
+    summary = manager_get_experiment_summary(manager, token, parsed.experiment,
+                                             campaign=campaign) or {}
+    jobs = manager_list_experiment_jobs(manager, token, parsed.experiment,
+                                        status_filter=parsed.status, campaign=campaign)
     if jobs is None:
         sys.exit(1)
 
-    rows = build_leaderboard(manager, token, parsed.experiment, metric, goal, jobs=jobs)
+    rows = build_leaderboard(manager, token, parsed.experiment, metric, goal, jobs=jobs,
+                             campaign=campaign)
 
     if parsed.json:
         out = {
             "experiment_id": parsed.experiment,
+            "campaign": summary.get("campaign"),
             "name": summary.get("name"),
             "status": summary.get("status"),
             "job_counts": summary.get("job_counts"),
@@ -1530,6 +1656,7 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
 
     if summary:
         sweep_print(f"Experiment: {summary['name']}")
+        sweep_print(f"Campaign:   {summary.get('campaign')}")
         sweep_print(f"Status:     {summary['status']}")
         counts = summary["job_counts"]
         if counts:
@@ -1541,7 +1668,7 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
 
     # Download experiment artifacts
     output_dir = parsed.output_dir or str(_mlsweep_dir() / "downloads" / parsed.experiment)
-    manager_download_experiment(manager, token, parsed.experiment, output_dir)
+    manager_download_experiment(manager, token, parsed.experiment, output_dir, campaign=campaign)
 
     if had_failure:
         sys.exit(1)
@@ -1579,6 +1706,7 @@ def main() -> None:
             "Environment variables:\n"
             "  MLSWEEP_MANAGER  Manager URL for fetch/watch (default: http://localhost:7891)\n"
             "  MLSWEEP_TOKEN    Authentication token for manager\n"
+            "  MLSWEEP_CAMPAIGN Campaign to submit under (default: default)\n"
             "  MLSWEEP_DIR      Local state dir holding manager.token (default: ~/.mlsweep)\n"
         ),
     )
@@ -1587,6 +1715,7 @@ def main() -> None:
                         help="Manager URL (http://host:port)")
     parser.add_argument("--token", default=None,
                         help="Manager auth token (or set MLSWEEP_TOKEN env)")
+    _add_campaign_args(parser)
     parser.add_argument("--output-dir", default=str(_mlsweep_dir() / "submissions"),
                         help="Directory for local submit-side artifacts (submit log + manifest). "
                              "Results themselves live on the manager under ~/.mlsweep/experiments/.")
@@ -1629,6 +1758,11 @@ def main() -> None:
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
         extra = extra[1:]
+    campaign = _resolve_campaign(args)
+    if campaign is None and args.resume is None and not args.validate:
+        sweep_print(f"{_RED}Error: a new sweep needs one campaign. Pick it with --campaign NAME "
+                    f"instead of --all-campaigns.{_RESET}")
+        sys.exit(1)
 
     # ── Writer factories ────────────────────────────────────────────────────
     writer_factory = None
@@ -1745,6 +1879,7 @@ def main() -> None:
         else:
             sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET} ({n_probes} runs)")
     sweep_print(f"{_BOLD}Experiment:{_RESET} {_CYAN}{experiment_id}{_RESET}")
+    sweep_print(f"{_BOLD}Campaign:{_RESET} {_CYAN}{campaign or 'any (--all-campaigns)'}{_RESET}")
     if extra:
         sweep_print(f"{_BOLD}Extra overrides:{_RESET} {' '.join(extra)}")
 
@@ -1782,14 +1917,16 @@ def main() -> None:
     # ── Resume: fetch completed jobs and rebuild optimizer ─────────────────
     if resume:
         sweep_print("Resuming experiment...")
-        summary = manager_get_experiment_summary(manager, token, experiment_id)
+        require_campaign(manager, token, experiment_id, campaign)
+        summary = manager_get_experiment_summary(manager, token, experiment_id, campaign=campaign)
         if summary is None:
             sweep_print(f"  {_RED}FAIL{_RESET}  Cannot fetch experiment summary — is manager reachable?")
             sys.exit(1)
         sweep_print(f"  Experiment: {summary['name']}")
         sweep_print(f"  Status:     {summary['status']}")
 
-        done_jobs = manager_list_experiment_jobs(manager, token, experiment_id, status_filter="done")  # type: ignore[assignment]
+        done_jobs = manager_list_experiment_jobs(manager, token, experiment_id, status_filter="done",  # type: ignore[assignment]
+                                                 campaign=campaign)
         if done_jobs is None:
             done_jobs = []
         sweep_print(f"  Completed jobs: {len(done_jobs)}")
@@ -1804,7 +1941,8 @@ def main() -> None:
             if combo is None:
                 continue
             run_id = job["run_id"]
-            metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id)
+            metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id,
+                                                   campaign=campaign)
             if metrics_list is None:
                 continue
             best = _best_metric(metrics_list, metric_name, goal)
@@ -1912,6 +2050,7 @@ def main() -> None:
             skip_rules=_skip_rules(options) if method == "grid" else None,
             metric=info.get("metric"),
             goal=info.get("goal"),
+            campaign=campaign or DEFAULT_CAMPAIGN,
         ):
             sys.exit(1)
 
@@ -1933,7 +2072,7 @@ def main() -> None:
         sweep_print("Submitting jobs...")
         job_payloads = build_payloads(variations=variations, experiment_id=experiment_id)
 
-        records = manager_submit_jobs_bulk(manager, token, job_payloads)
+        records = manager_submit_jobs_bulk(manager, token, job_payloads, campaign=campaign)
         if records is None:
             sys.exit(1)
     else:
@@ -1980,7 +2119,7 @@ def main() -> None:
                     return
                 new_job = build_payloads(variations=new_vars, experiment_id=eid)
                 if new_job:
-                    submitted = manager_submit_jobs_bulk(manager, token, new_job)
+                    submitted = manager_submit_jobs_bulk(manager, token, new_job, campaign=campaign)
                     if submitted:
                         variations.extend(new_vars)
                         _register_vars(new_vars)
@@ -2015,7 +2154,7 @@ def main() -> None:
                     # Fetch job from manager to get combo
                     status_code, job_resp = _http_request(
                         "GET",
-                        _manager_url(mgr, f"/api/jobs/{run_id}?experiment_id={eid}"),
+                        _manager_url(mgr, _with_campaign(f"/api/jobs/{run_id}?experiment_id={eid}", campaign)),
                         tok,
                     )
                     if status_code == 200 and isinstance(job_resp, dict):
@@ -2037,7 +2176,7 @@ def main() -> None:
                 if success:
                     # First success for this lex combo: tell optimizer and
                     # immediately submit a replacement.
-                    metrics_list = manager_get_job_metrics(mgr, tok, eid, run_id)
+                    metrics_list = manager_get_job_metrics(mgr, tok, eid, run_id, campaign=campaign)
                     optimizer.tell(combo, _best_metric(metrics_list, metric_name, goal))
                     _lex_done.add(lk)
                     _submit_new(eid)
@@ -2053,29 +2192,33 @@ def main() -> None:
                                 on_event=_bayes_on_event,
                                 writer_factory=writer_factory,
                                 variations=variations,
-                                output_dir=exp_dir)
+                                output_dir=exp_dir,
+                                campaign=campaign)
         else:
             _stream_status_live(manager, token, experiment_id,
                                 writer_factory=writer_factory,
                                 variations=variations,
-                                output_dir=exp_dir)
+                                output_dir=exp_dir,
+                                campaign=campaign)
     elif args.fetch:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"Fetching results...")
         sweep_print(f"{'=' * 80}")
         metric = info.get("metric") or optimize_cfg.get("metric", "loss")
         goal = info.get("goal") or optimize_cfg.get("goal", "minimize")
-        jobs = manager_list_experiment_jobs(manager, token, experiment_id)
+        jobs = manager_list_experiment_jobs(manager, token, experiment_id, campaign=campaign)
         if jobs is not None:
             print_jobs_summary(jobs)
-            print_leaderboard(build_leaderboard(manager, token, experiment_id, metric, goal, jobs=jobs), metric, goal)
+            print_leaderboard(build_leaderboard(manager, token, experiment_id, metric, goal, jobs=jobs,
+                                                campaign=campaign), metric, goal)
         # Download experiment artifacts
-        manager_download_experiment(manager, token, experiment_id, exp_dir)
+        manager_download_experiment(manager, token, experiment_id, exp_dir, campaign=campaign)
     else:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"{n} jobs submitted.")
-        sweep_print(f"Watch:   mlsweep watch {experiment_id} --manager {manager}")
-        sweep_print(f"Fetch:   mlsweep fetch --experiment {experiment_id} --manager {manager} --wait")
+        scope = " ".join(_campaign_argv(campaign))
+        sweep_print(f"Watch:   mlsweep watch {experiment_id} --manager {manager} {scope}")
+        sweep_print(f"Fetch:   mlsweep fetch --experiment {experiment_id} --manager {manager} {scope} --wait")
         sweep_print(f"Results: ~/.mlsweep/experiments/{experiment_id}/")
         sweep_print(f"{'=' * 80}")
 

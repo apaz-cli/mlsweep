@@ -116,7 +116,9 @@ select:focus { outline: none; border-color: #4c9be8; }
 
 /* No selection */
 #no-sel { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
+#campaign-section { margin-bottom: 10px; }
 </style>
+<script src="campaign.js"></script>
 </head>
 <body>
 <nav>
@@ -137,6 +139,12 @@ select:focus { outline: none; border-color: #4c9be8; }
 <div id="layout">
   <div id="sidebar">
     <div id="sidebar-top">
+      <div class="sb-section" id="campaign-section">
+        <span class="sb-title">Campaign</span>
+        <div class="sb-row">
+          <select id="campaign-select"></select>
+        </div>
+      </div>
       <div class="sb-section">
         <span class="sb-title">Experiment</span>
         <div class="sb-row">
@@ -443,7 +451,8 @@ function connectWS(expId) {
   wsExpId = expId;
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url   = `${proto}//${location.host}/ws/experiments/${encodeURIComponent(expId)}?token=${encodeURIComponent(TOKEN)}`;
-  ws = new WebSocket(url);
+  const sock = new WebSocket(url);
+  ws = sock;
 
   ws.addEventListener("open", () => setConnStatus("connected"));
 
@@ -452,6 +461,7 @@ function connectWS(expId) {
   });
 
   ws.addEventListener("close", () => {
+    if (ws !== sock) return;  // replaced or closed on purpose, not dropped
     setConnStatus("reconnecting");
     if (wsExpId === expId)
       wsReconnTimer = setTimeout(() => connectWS(expId), 3000);
@@ -473,30 +483,60 @@ function handleWsEvent(evt) {
 }
 
 // ── Experiment list ───────────────────────────────────────────────────────────
+const campaignSelect = document.getElementById("campaign-select");
+let allExps = [];
+let firstLoad = true;
+
+function clearExperiment() {
+  if (wsReconnTimer) { clearTimeout(wsReconnTimer); wsReconnTimer = null; }
+  wsExpId = null;
+  if (ws) { ws.close(); ws = null; }
+  currentExpId = null;
+  currentRunId = null;
+  jobsData = [];
+  logOutput.innerHTML       = "";
+  logHeader.style.display   = "none";
+  logWrap.style.display     = "none";
+  noSel.style.display       = "";
+  expDlAllBtn.style.display = "none";
+  jobListEl.innerHTML       = `<div class="job-list-msg">No experiments in this campaign</div>`;
+}
+
+// Fill the experiment select from the selected campaign and load *prefer*,
+// else the experiment already shown, else the newest one.  Returns true when
+// it switched experiments (which loads that experiment's jobs).
+async function showCampaign(prefer) {
+  MLCampaign.fill(campaignSelect, allExps);
+  const targetId = MLCampaign.fillExperiments(expSelect, MLCampaign.filter(allExps), prefer, currentExpId);
+  if (!targetId) { clearExperiment(); return false; }
+  if (targetId === currentExpId) return false;
+  await selectExperiment(targetId);
+  return true;
+}
+
+// Returns true when the shown experiment changed (see showCampaign).
 async function loadExperiments() {
   try {
     const r = await apiFetch("/api/experiments");
-    if (!r.ok) { setConnStatus("disconnected"); return; }
-    const exps = await r.json();
+    if (!r.ok) { setConnStatus("disconnected"); return false; }
+    allExps = await r.json();
     setConnStatus("connected");
 
-    const urlExp   = params.get("experiment");
-    const targetId = urlExp || (exps.length ? exps[0].experiment_id : null);
-
-    expSelect.innerHTML = exps.length
-      ? exps.map(e =>
-          `<option value="${escHtml(e.experiment_id)}"${e.experiment_id === targetId ? " selected" : ""}>${escHtml(e.name || e.experiment_id)}</option>`
-        ).join("")
-      : `<option disabled>No experiments</option>`;
-
-    if (targetId) await selectExperiment(targetId);
+    const urlExp = firstLoad ? params.get("experiment") : null;
+    firstLoad = false;
+    MLCampaign.follow(allExps, urlExp);
+    return await showCampaign(urlExp);
   } catch {
     setConnStatus("disconnected");
+    return false;
   }
 }
 
+MLCampaign.bind(campaignSelect, () => showCampaign(null));
 expSelect.addEventListener("change", () => selectExperiment(expSelect.value));
-refreshBtn.addEventListener("click", loadExperiments);
+refreshBtn.addEventListener("click", async () => {
+  if (!(await loadExperiments()) && currentExpId) loadJobs(currentExpId);
+});
 
 ["all", "done", "failed"].forEach(f => {
   document.getElementById(`filter-${f}`).addEventListener("click", () => {

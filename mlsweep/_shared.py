@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -36,6 +37,17 @@ from mlsweep._colors import (  # noqa: F401
 )
 
 DEFAULT_MANAGER_URL = "http://localhost:7891"
+
+# Every experiment belongs to one campaign; this one when none is given.
+DEFAULT_CAMPAIGN = "default"
+_CAMPAIGN_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
+
+
+def validate_campaign(name: str) -> str:
+    """Return *name* if it is a valid campaign name; raise ValueError otherwise."""
+    if not isinstance(name, str) or not _CAMPAIGN_RE.match(name):
+        raise ValueError(f"campaign must be 1-128 chars of [a-zA-Z0-9_-], got {name!r}")
+    return name
 
 
 def _mlsweep_dir() -> Path:

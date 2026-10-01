@@ -151,6 +151,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 #chart-optimization { display: flex; flex-direction: column; overflow-y: auto; background: transparent; border: none; gap: 8px; padding: 0; }
 #opt-minimize-label { font-size: 11px; color: var(--text-label); cursor: pointer; display: none; align-items: center; gap: 4px; }
 </style>
+<script src="campaign.js"></script>
 </head>
 <body>
 
@@ -177,6 +178,11 @@ select:focus { outline: none; border-color: #4c9be8; }
     <h1>Sweep Visualizer</h1>
     <div class="exp-name loading" id="exp-name">Fetching data…</div>
     <div id="sweep-note" style="display:none"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Campaign</div>
+    <select id="campaign-sel"></select>
   </div>
 
   <div class="section">
@@ -1007,16 +1013,45 @@ function _applyEmaIncremental(newValues, lastS) {
 
 // ── Experiment selector list update (from visualize.py verbatim) ──────────────
 
-function _updateExperimentList(experiments) {
+let ALL_EXPS   = [];    // every experiment, for the campaign list
+let LOADED_EXP = null;  // experiment whose data is shown
+
+// Refill the campaign and experiment selects; keeps the selected experiment
+// when it is still listed, else selects *prefer* or the first one.
+function _updateExperimentList(experiments, prefer) {
+  ALL_EXPS = experiments;
+  MLCampaign.fill(document.getElementById("campaign-sel"), ALL_EXPS);
+  const exps = MLCampaign.filter(ALL_EXPS);
   const sel = document.getElementById("experiment-sel");
-  const current = sel.value;
-  sel.innerHTML = "";
-  for (const exp of experiments) {
-    const opt = document.createElement("option");
-    opt.value = exp.experiment_id; opt.textContent = exp.name || exp.experiment_id;
-    if (exp.experiment_id === current) opt.selected = true;
-    sel.appendChild(opt);
+  MLCampaign.fillExperiments(sel, exps, prefer || sel.value);
+}
+
+// The selected campaign has no experiments, so show nothing.
+function clearExperiment() {
+  LOADED_EXP = null;
+  if (_ws) { _ws.onclose = null; _ws.close(); _ws = null; }
+  clearTimeout(_jobRefreshTimer);
+  DATA = null; METRIC_CACHE = {}; LIVE_RUNS = new Set();
+  if (typeof Plotly !== "undefined") {
+    Plotly.purge("chart-curves");
+    Plotly.purge("chart-sensitivity");
+    Plotly.purge("opt-bestsofar");
+    document.querySelectorAll(".opt-scatter-panel").forEach(el => Plotly.purge(el));
   }
+  document.getElementById("opt-scatter-grid").innerHTML = "";
+  ["metric-sel", "color-by", "filters"].forEach(id => { document.getElementById(id).innerHTML = ""; });
+  document.getElementById("exp-dl-metrics").style.display = "none";
+  const el = document.getElementById("exp-name");
+  el.classList.remove("loading");
+  el.textContent = "No experiments in this campaign";
+  document.getElementById("status").textContent = "";
+}
+
+// Load the selected experiment if it is not the one shown.
+function showSelected() {
+  const target = document.getElementById("experiment-sel").value;
+  if (!target) clearExperiment();
+  else if (target !== LOADED_EXP) loadExperiment(target);
 }
 
 // ── JSONL parsing (new — not in visualize.py) ─────────────────────────────────
@@ -1281,10 +1316,12 @@ async function _loadMetrics(expId, jobs) {
 // ── Load experiment (replaces loadExperiment from visualize.py) ───────────────
 
 async function loadExperiment(expId) {
+  LOADED_EXP = expId;
   // Keep Artifacts nav link in sync with the viewed experiment
   const _fq = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
   _fq.set("experiment", expId);
   document.getElementById("nav-files").href = "files.html?" + _fq.toString();
+  MLCampaign.linkNav();
 
   const metricsZipUrl = `/api/experiments/${encodeURIComponent(expId)}/metrics.zip`;
   const dlBtn = document.getElementById("exp-dl-metrics");
@@ -1372,6 +1409,7 @@ async function refreshExperiments() {
     const r = await apiFetch("/api/experiments");
     const experiments = await r.json();
     _updateExperimentList(experiments);
+    showSelected();
   } catch (err) {
     document.getElementById("status").textContent = "Error refreshing: " + err;
   }
@@ -1382,20 +1420,22 @@ async function refreshExperiments() {
 apiFetch("/api/experiments")
   .then(r => r.json())
   .then(experiments => {
-    _updateExperimentList(experiments);
+    MLCampaign.follow(experiments, INIT_EXP);
+    _updateExperimentList(experiments, INIT_EXP);
 
     const sel = document.getElementById("experiment-sel");
-    const target = INIT_EXP || (experiments[0]?.experiment_id || "");
-    if (target) sel.value = target;
-
     sel.onchange = () => loadExperiment(sel.value);
     document.getElementById("refresh-experiments").onclick = refreshExperiments;
+    MLCampaign.bind(document.getElementById("campaign-sel"), () => {
+      _updateExperimentList(ALL_EXPS);
+      showSelected();
+    });
 
-    if (target) loadExperiment(target);
+    if (sel.value) loadExperiment(sel.value);
     else {
       const el = document.getElementById("exp-name");
       el.classList.remove("loading");
-      el.textContent = "No experiments";
+      el.textContent = experiments.length ? "No experiments in this campaign" : "No experiments";
     }
   })
   .catch(err => {

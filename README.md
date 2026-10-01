@@ -174,6 +174,26 @@ Control a running sweep with `mlsweep cancel EXP --failed`, `mlsweep retry EXP -
 
 For a project-local interface, run `mlsweep gen_makefile` in your repo to add `make sweep-run` / `sweep-watch` / `sweep-fetch` / `sweep-status` targets.
 
+### 4. Group experiments into campaigns
+
+A campaign is a named group of experiments. Pick one with `--campaign NAME` or
+`MLSWEEP_CAMPAIGN`, and every command works inside it. `run` submits under it,
+`ls` and `status` list only its experiments, and commands that take an
+experiment ID refuse one filed in another campaign. Without either you are in
+the campaign called `default`. `--all-campaigns` covers all of them.
+
+```sh
+export MLSWEEP_CAMPAIGN=tokenizer_ablation
+mlsweep run sweeps/vocab.py --manager http://localhost:7891 --stream
+mlsweep ls                                   # tokenizer_ablation only
+mlsweep ls --all-campaigns                   # everything, tagged with its campaign
+mlsweep campaign                             # campaigns with experiment and job counts
+mlsweep campaign move EXP_ID other_campaign  # re-file an experiment
+```
+
+The dashboard has a campaign selector on every page that lists experiments. See
+[Campaigns](docs/sweep_configuration.md#campaigns) for the details.
+
 ### Remote workers
 
 The manager installs mlsweep on remote machines automatically over SSH, with no manual setup needed. It builds wheels from the local source at startup, SCPs them to the remote, and installs them into `/tmp/mlsweep_venv/`.
@@ -221,6 +241,7 @@ All flags below assume `--manager http://localhost:7891`:
 | `--validate` | Check config, list all combos, exit |
 | `--stream` | Live status in terminal |
 | `--experiment NAME` | Custom experiment name |
+| `--campaign NAME` | Campaign to submit under (default: `$MLSWEEP_CAMPAIGN`, else `default`) |
 | `--priority N` | Higher values run sooner (default: 0) |
 | `--wandb-project P` | Stream metrics to W&B |
 | `--tensorboard-dir D` | Write TensorBoard logs |
@@ -246,6 +267,9 @@ mlsweep logs RUN_ID --experiment EXP_ID    mlsweep status
 mlsweep cancel EXP --failed          mlsweep retry EXP --failed
 mlsweep resume EXP                   mlsweep pause EXP
 mlsweep unpause EXP                  mlsweep stop EXP --yes
+
+# campaigns (every command also takes --campaign NAME / --all-campaigns)
+mlsweep campaign [ls]                mlsweep campaign move EXP NAME
 
 # docs
 mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, skill

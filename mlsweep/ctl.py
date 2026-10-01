@@ -1,8 +1,13 @@
 """Control-plane subcommands for ``mlsweep``: inspect and manage runs.
 
 These are the lifecycle verbs (ls, logs, cancel, retry, resume, stop, pause,
-unpause) plus the result-ranking command (best). They are thin HTTP clients over
-the manager API and share helpers with ``mlsweep.run_sweep``.
+unpause), the result-ranking command (best), and campaign management
+(campaign). They are thin HTTP clients over the manager API and share helpers
+with ``mlsweep.run_sweep``.
+
+Every command works in one campaign (``--campaign``, ``$MLSWEEP_CAMPAIGN``, or
+the default) unless given ``--all-campaigns``.  A command naming an experiment
+from another campaign exits 1 with a hint.
 """
 
 from __future__ import annotations
@@ -18,21 +23,27 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from mlsweep._shared import _BOLD, _CYAN, _GREEN, _RED, _RESET, _YELLOW
+from mlsweep._shared import validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
+    _campaign_argv,
     _combo_str,
     _manager_token,
     _parse_combo,
+    _resolve_campaign,
     _wait_until_settled,
     build_leaderboard,
     manager_cancel_job,
     manager_get_job_logs,
     manager_get_job_metrics,
+    manager_list_campaigns,
     manager_list_experiment_jobs,
     manager_list_experiments,
+    manager_move_experiment,
     manager_retry_job,
     manager_set_experiment_status,
     print_leaderboard,
+    require_campaign,
     resolve_ranking,
     sweep_print,
 )
@@ -71,14 +82,22 @@ def _color_status(text: str, status: str) -> str:
     return f"{color}{text}{_RESET}" if color else text
 
 
+def _counts_str(job_counts: dict[str, int] | None) -> str:
+    """One-line job tally, e.g. ``3 done / 0 fail / 1 run / 2 pend``."""
+    c = job_counts or {}
+    return (f"{c.get('done', 0)} done / {c.get('failed', 0)} fail / "
+            f"{c.get('running', 0)} run / {c.get('pending', 0)} pend")
+
+
 def _apply(
     targets: list[dict[str, Any]],
-    fn: Callable[[str, str, str, str], object],
+    fn: Callable[..., object],
     verb: str,
     manager: str,
     token: str,
     experiment: str,
     dry_run: bool,
+    campaign: str | None = None,
 ) -> int:
     """Run a per-job action (cancel/retry) over *targets*. Returns # of failures."""
     failures = 0
@@ -87,7 +106,7 @@ def _apply(
         if dry_run:
             sweep_print(f"  would {verb} {run_id}")
         else:
-            ok = fn(manager, token, run_id, experiment)
+            ok = fn(manager, token, run_id, experiment, campaign=campaign)
             _report(ok, f"{verb} {run_id}")
             if not ok:
                 failures += 1
@@ -100,6 +119,18 @@ def _common_parser(prog: str, description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def _connect(args: argparse.Namespace, experiment: str | None = None) -> tuple[str, str, str | None]:
+    """``(manager, token, campaign)`` for parsed *args*.
+
+    With *experiment*, first exit with a hint if it is in another campaign.
+    """
+    manager, token = _manager_token(args)
+    campaign = _resolve_campaign(args)
+    if experiment:
+        require_campaign(manager, token, experiment, campaign)
+    return manager, token, campaign
+
+
 # ── ls ─────────────────────────────────────────────────────────────────────────
 
 
@@ -109,10 +140,11 @@ def ls_cmd(argv: list[str]) -> None:
     parser.add_argument("--status", default=None, help="Filter by status")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
     if args.experiment:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status) or []
+        jobs = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status,
+                                            campaign=campaign) or []
         if args.json:
             print(json.dumps(jobs, indent=2))
             return
@@ -127,22 +159,23 @@ def ls_cmd(argv: list[str]) -> None:
                         f"{_GREEN}{j.get('run_id')}{_RESET}  {combo_s}")
         return
 
-    exps = manager_list_experiments(manager, token, status_filter=args.status)
+    exps = manager_list_experiments(manager, token, status_filter=args.status, campaign=campaign)
     if exps is None:
         sweep_print(f"{_RED}FAIL{_RESET}  list experiments")
         sys.exit(1)
     if args.json:
         print(json.dumps(exps, indent=2))
         return
-    sweep_print(f"{_BOLD}{_CYAN}{len(exps)}{_RESET} experiments:")
+    where = f"in campaign {campaign}" if campaign else "in all campaigns"
+    sweep_print(f"{_BOLD}{_CYAN}{len(exps)}{_RESET} experiments {where}:")
     for e in exps:
-        c = e.get("job_counts") or {}
-        counts = f"{c.get('done',0)} done / {c.get('failed',0)} fail / {c.get('running',0)} run / {c.get('pending',0)} pend"
+        counts = _counts_str(e.get("job_counts"))
         name = e.get("name") or ""
         note = f"  # {e.get('note')}" if e.get("note") else ""
         status = e.get("status", "?")
+        tag = "" if campaign else f"[{e.get('campaign')}]  "
         sweep_print(f"  {_color_status(f'{status:>10}', status)}  "
-                    f"{_GREEN}{e.get('experiment_id')}{_RESET}  {name}{note}")
+                    f"{tag}{_GREEN}{e.get('experiment_id')}{_RESET}  {name}{note}")
         sweep_print(f"             {counts}")
 
 
@@ -156,9 +189,9 @@ def logs_cmd(argv: list[str]) -> None:
     parser.add_argument("--tail", type=int, default=None, help="Show only the last N lines")
     parser.add_argument("--follow", action="store_true", help="Follow new output")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
-    text = manager_get_job_logs(manager, token, args.experiment, args.run)
+    text = manager_get_job_logs(manager, token, args.experiment, args.run, campaign=campaign)
     if text is None:
         sweep_print(f"{_RED}No log found{_RESET} for {args.run} in {args.experiment}")
         sys.exit(1)
@@ -173,7 +206,7 @@ def logs_cmd(argv: list[str]) -> None:
         try:
             while True:
                 time.sleep(2)
-                newer = manager_get_job_logs(manager, token, args.experiment, args.run)
+                newer = manager_get_job_logs(manager, token, args.experiment, args.run, campaign=campaign)
                 if newer and len(newer) > seen:
                     print(newer[seen:], end="")
                     seen = len(newer)
@@ -261,7 +294,7 @@ def metrics_cmd(argv: list[str]) -> None:
     fmt.add_argument("--json", action="store_true", help="Emit the selected metrics as JSON")
     fmt.add_argument("--csv", action="store_true", help="Emit long-format CSV: run,step,key,value")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
     try:
         pattern = re.compile(args.keys) if args.keys else None
@@ -271,10 +304,11 @@ def metrics_cmd(argv: list[str]) -> None:
 
     run_ids = list(args.runs)
     if not run_ids:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment) or []
+        jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
         run_ids = [j["run_id"] for j in jobs]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        fetched = pool.map(lambda rid: manager_get_job_metrics(manager, token, args.experiment, rid),
+        fetched = pool.map(lambda rid: manager_get_job_metrics(manager, token, args.experiment, rid,
+                                                               campaign=campaign),
                            run_ids)
         per_run = {rid: select_metrics(rows or [], pattern) for rid, rows in zip(run_ids, fetched)}
     per_run = {rid: rows for rid, rows in per_run.items() if rows}
@@ -339,9 +373,9 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation for --all")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
-    jobs = manager_list_experiment_jobs(manager, token, args.experiment) or []
+    jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
     statuses = [s for s in _SELECTABLE_STATUSES if getattr(args, s)]
     targets = jobs if args.all else _select_jobs(jobs, args.runs, statuses)
 
@@ -354,7 +388,7 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
         sys.exit(1)
 
     fn = manager_retry_job if retry else manager_cancel_job
-    failures = _apply(targets, fn, verb, manager, token, args.experiment, args.dry_run)
+    failures = _apply(targets, fn, verb, manager, token, args.experiment, args.dry_run, campaign)
     if failures:
         sys.exit(1)
 
@@ -380,8 +414,8 @@ def _set_status_cmd(argv: list[str], name: str, description: str, status: str, d
     if confirm and not args.yes:
         sweep_print(f"{_RED}Aborting a sweep is destructive. Pass --yes to confirm.{_RESET}")
         sys.exit(1)
-    manager, token = _manager_token(args)
-    r = manager_set_experiment_status(manager, token, args.experiment, status)
+    manager, token, campaign = _connect(args, args.experiment)
+    r = manager_set_experiment_status(manager, token, args.experiment, status, campaign=campaign)
     _report(r, f"{done} {args.experiment}")
 
 
@@ -477,11 +511,11 @@ def wait_cmd(argv: list[str]) -> None:
              "for --until stalled (default: 900)",
     )
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
     start = time.monotonic()
     while True:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment)
+        jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign)
         if jobs is None:
             sweep_print(f"{_RED}FAIL{_RESET}  Cannot list jobs for {args.experiment}")
             sys.exit(WAIT_EXIT_FAILURE)
@@ -529,7 +563,7 @@ def resume_cmd(argv: list[str]) -> None:
     parser.add_argument("--sweep", default=None, help="Sweep file (required to continue a Bayesian sweep)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
     if args.sweep:
         from mlsweep._sweep import load_sweep_file
@@ -538,19 +572,21 @@ def resume_cmd(argv: list[str]) -> None:
             # Reuse the submitter's bayes resume path.
             from mlsweep.cli import _forward
             from mlsweep.run_sweep import main as _run_main
-            fwd = [args.sweep, "--resume", args.experiment, "--manager", manager]
+            fwd = [args.sweep, "--resume", args.experiment, "--manager", manager,
+                   *_campaign_argv(campaign)]
             if args.token:
                 fwd += ["--token", args.token]
             _forward("mlsweep run", _run_main, fwd)
             return
 
     # Grid (or no sweep file): re-queue failed / cancelled runs.
-    jobs = manager_list_experiment_jobs(manager, token, args.experiment) or []
+    jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
     targets = [j for j in jobs if j.get("status") in ("failed", "cancelled")]
     if not targets:
         sweep_print("  Nothing to resume, no failed or cancelled jobs.")
         return
-    failures = _apply(targets, manager_retry_job, "retry", manager, token, args.experiment, args.dry_run)
+    failures = _apply(targets, manager_retry_job, "retry", manager, token, args.experiment,
+                      args.dry_run, campaign)
     if failures:
         sys.exit(1)
 
@@ -570,17 +606,71 @@ def best_cmd(argv: list[str]) -> None:
     parser.add_argument("--wait", action="store_true", help="Block until the experiment settles")
     parser.add_argument("--wait-interval", type=int, default=10, help="Seconds between --wait polls")
     args = parser.parse_args(argv)
-    manager, token = _manager_token(args)
+    manager, token, campaign = _connect(args, args.experiment)
 
     had_failure = False
     if args.wait:
-        had_failure = _wait_until_settled(manager, token, args.experiment, args.wait_interval)
+        had_failure = _wait_until_settled(manager, token, args.experiment, args.wait_interval,
+                                          campaign=campaign)
 
-    metric, goal = resolve_ranking(manager, token, args.experiment, args.metric, args.goal)
-    rows = build_leaderboard(manager, token, args.experiment, metric, goal)
+    metric, goal = resolve_ranking(manager, token, args.experiment, args.metric, args.goal,
+                                   campaign=campaign)
+    rows = build_leaderboard(manager, token, args.experiment, metric, goal, campaign=campaign)
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
         print_leaderboard(rows, metric, goal, args.top)
     if had_failure:
         sys.exit(1)
+
+
+# ── campaign ───────────────────────────────────────────────────────────────────
+
+
+def campaign_cmd(argv: list[str]) -> None:
+    """``mlsweep campaign [ls]`` lists campaigns; ``campaign move EXP NAME`` re-files one."""
+    parser = argparse.ArgumentParser(
+        prog="mlsweep campaign",
+        description="List campaigns, or move an experiment to another campaign.",
+    )
+    sub = parser.add_subparsers(dest="action")
+    ls = sub.add_parser("ls", help="List campaigns with experiment and job counts (the default action)")
+    _add_manager_args(ls)
+    ls.add_argument("--json", action="store_true", help="Emit JSON")
+    move = sub.add_parser("move", help="Move an experiment, with all its runs, to another campaign")
+    _add_manager_args(move)
+    move.add_argument("experiment", help="Experiment ID")
+    move.add_argument("target", help="Campaign to move it to (created if new)")
+    args = parser.parse_args(argv if argv and argv[0] in ("ls", "move", "-h", "--help") else ["ls", *argv])
+
+    if args.action == "move":
+        try:
+            validate_campaign(args.target)
+        except ValueError as e:
+            sweep_print(f"{_RED}Error: {e}{_RESET}")
+            sys.exit(1)
+        manager, token, campaign = _connect(args, args.experiment)
+        r = manager_move_experiment(manager, token, args.experiment, args.target, campaign=campaign)
+        _report(r, f"moved {args.experiment} to campaign {args.target}")
+        if not r:
+            sys.exit(1)
+        return
+
+    manager, token = _manager_token(args)
+    current = _resolve_campaign(args)
+    camps = manager_list_campaigns(manager, token)
+    if camps is None:
+        sweep_print(f"{_RED}FAIL{_RESET}  list campaigns")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(camps, indent=2))
+        return
+    sweep_print(f"{_BOLD}{_CYAN}{len(camps)}{_RESET} campaigns:")
+    for c in camps:
+        name = c.get("campaign", "?")
+        mark = "*" if name == current else " "
+        n = c.get("experiments", 0)
+        sweep_print(f"  {mark} {_GREEN}{name}{_RESET}  {n} experiment{'' if n == 1 else 's'}, "
+                    f"{_counts_str(c.get('job_counts'))}")
+    if current is not None:
+        sweep_print("  (* = current campaign, from --campaign, $MLSWEEP_CAMPAIGN, or the default)")

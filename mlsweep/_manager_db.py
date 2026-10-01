@@ -28,6 +28,7 @@ from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, Type
 
 import aiosqlite
 
+from mlsweep._shared import DEFAULT_CAMPAIGN
 from mlsweep._sweep import SkipIndex
 
 _T = TypeVar("_T")
@@ -49,6 +50,9 @@ def _sql_in(statuses: Sequence[str]) -> str:
     return "status IN (" + ", ".join(f"'{s}'" for s in statuses) + ")"
 
 
+# Restricts a jobs query to the experiments of one campaign (one bound parameter).
+_IN_CAMPAIGN = "experiment_id IN (SELECT experiment_id FROM experiments WHERE campaign = ?)"
+
 _ACTIVE_IN = _sql_in(ACTIVE_JOB_STATUSES)
 _UNFINISHED_IN = _sql_in(("pending", *ACTIVE_JOB_STATUSES))
 _FINISHED_IN = _sql_in(FINISHED_JOB_STATUSES)
@@ -67,6 +71,7 @@ class ExperimentRecord:
     experiment_id: str
     name: str
     submit_time: datetime
+    campaign: str = DEFAULT_CAMPAIGN
     controller_id: str | None = None
     note: str | None = None
     status: ExperimentStatus = "running"
@@ -208,6 +213,7 @@ def _row_to_experiment(row: sqlite3.Row) -> ExperimentRecord:
         experiment_id=row["experiment_id"],
         name=row["name"],
         submit_time=_utc(row["submit_time"]),
+        campaign=row["campaign"],
         controller_id=row["controller_id"],
         note=row["note"],
         status=row["status"],
@@ -476,6 +482,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS experiments (
             experiment_id  TEXT PRIMARY KEY,
             name           TEXT NOT NULL,
+            campaign       TEXT NOT NULL DEFAULT 'default',
             submit_time    REAL NOT NULL,
             controller_id  TEXT,
             note           TEXT,
@@ -488,8 +495,11 @@ async def init_db(db: aiosqlite.Connection) -> None:
             goal           TEXT
         );
     """)
-    # Idempotent migration for databases created before metric/goal existed.
-    await _add_missing_columns(db, "experiments", {"metric": "TEXT", "goal": "TEXT"})
+    # Idempotent migration for databases created before metric/goal/campaign
+    # existed.  Experiments from before campaigns land in the default one.
+    await _add_missing_columns(db, "experiments", {
+        "metric": "TEXT", "goal": "TEXT", "campaign": "TEXT NOT NULL DEFAULT 'default'",
+    })
 
     # ── workers ─────────────────────────────────────────────────────
     await db.execute("""
@@ -545,6 +555,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
 
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_experiments_campaign
+            ON experiments(campaign);
         CREATE INDEX IF NOT EXISTS idx_jobs_dispatch
             ON jobs(status, priority DESC, submit_time ASC);
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
@@ -563,6 +575,7 @@ async def create_experiment(
     *,
     experiment_id: str,
     name: str,
+    campaign: str = DEFAULT_CAMPAIGN,
     controller_id: str | None = None,
     note: str | None = None,
     status: ExperimentStatus = "running",
@@ -573,16 +586,20 @@ async def create_experiment(
     metric: str | None = None,
     goal: str | None = None,
 ) -> ExperimentRecord:
-    """Insert a new experiment and return the row."""
+    """Insert a new experiment and return the row.
+
+    Re-creating an existing experiment updates it in place but keeps its
+    campaign; ``update_experiment_campaign`` is the only way to move it.
+    """
     now = _now_epoch()
     singular_dims_json = json.dumps(singular_dims or [])
     row = await _exec_one(
         db,
         """
-        INSERT INTO experiments (experiment_id, name, submit_time, controller_id, note, status,
-                                 expected_jobs, singular_dims, max_concurrent, skip_rules,
-                                 metric, goal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO experiments (experiment_id, name, campaign, submit_time, controller_id, note,
+                                 status, expected_jobs, singular_dims, max_concurrent,
+                                 skip_rules, metric, goal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (experiment_id) DO UPDATE SET
             name = EXCLUDED.name,
             controller_id = EXCLUDED.controller_id,
@@ -596,8 +613,8 @@ async def create_experiment(
             goal = COALESCE(EXCLUDED.goal, experiments.goal)
         RETURNING *;
         """,
-        (experiment_id, name, now, controller_id, note, status, expected_jobs, singular_dims_json,
-         max_concurrent, json.dumps(skip_rules or {}), metric, goal),
+        (experiment_id, name, campaign, now, controller_id, note, status, expected_jobs,
+         singular_dims_json, max_concurrent, json.dumps(skip_rules or {}), metric, goal),
     )
     await db.commit()
     assert row is not None
@@ -644,6 +661,68 @@ async def update_experiment_name(
     )
     await db.commit()
     return _row_to_experiment(row) if row else None
+
+
+async def update_experiment_campaign(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    campaign: str,
+) -> ExperimentRecord | None:
+    """Move an experiment, with all its runs, to *campaign*. Returns updated row or None."""
+    row = await _exec_one(
+        db,
+        "UPDATE experiments SET campaign = ? WHERE experiment_id = ? RETURNING *",
+        (campaign, experiment_id),
+    )
+    await db.commit()
+    return _row_to_experiment(row) if row else None
+
+
+# Statuses broken out in ``job_counts``, plus "total".
+_JOB_COUNT_STATUSES = ("done", "failed", "xfailed", "running", "pending", "dispatched")
+_JOB_COUNT_COLUMNS = ",\n               ".join(
+    ["COUNT(j.run_id) AS total_jobs"]
+    + [f"SUM(CASE WHEN j.status = '{st}' THEN 1 ELSE 0 END) AS {st}_jobs" for st in _JOB_COUNT_STATUSES]
+)
+
+
+def _job_counts(row: Any) -> dict[str, int]:
+    """``job_counts`` from a row selected with ``_JOB_COUNT_COLUMNS`` (None = all zero)."""
+    keys = ("total", *_JOB_COUNT_STATUSES)
+    return {k: (row[f"{k}_jobs"] or 0) if row is not None else 0 for k in keys}
+
+
+async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Every campaign with its experiment and per-status job counts, by name.
+
+    A campaign exists while some experiment is in it.  The default campaign
+    is always listed so clients have somewhere to start.
+    """
+    rows = await _exec_all(
+        db,
+        f"""
+        SELECT e.campaign AS campaign,
+               COUNT(DISTINCT e.experiment_id) AS experiments,
+               {_JOB_COUNT_COLUMNS},
+               MAX(e.submit_time) AS last_submit
+        FROM experiments e
+        LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
+        GROUP BY e.campaign
+        ORDER BY e.campaign
+        """,
+    )
+    by_name: dict[str, dict[str, Any]] = {DEFAULT_CAMPAIGN: {
+        "campaign": DEFAULT_CAMPAIGN, "experiments": 0, "last_submit": None,
+        "job_counts": _job_counts(None),
+    }}
+    for r in rows:
+        by_name[r["campaign"]] = {
+            "campaign": r["campaign"],
+            "experiments": r["experiments"],
+            "job_counts": _job_counts(r),
+            "last_submit": _utc(r["last_submit"]).isoformat(),
+        }
+    return sorted(by_name.values(), key=lambda c: c["campaign"])
 
 
 # ===============================================================================
@@ -893,53 +972,26 @@ async def list_pending_jobs(
     db: aiosqlite.Connection,
     experiment_id: str | None = None,
     limit: int | None = None,
+    campaign: str | None = None,
 ) -> list[JobRecord]:
     """Return pending jobs ordered by priority DESC, submit_time ASC.
 
     This matches the composite index ``idx_jobs_dispatch`` for efficient
-    index-only scans.
+    index-only scans.  *campaign* keeps only jobs of experiments in it.
     """
+    where = ["status = 'pending'"]
+    params: list[Any] = []
     if experiment_id is not None:
-        if limit is not None:
-            cursor = await db.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'pending' AND experiment_id = ?
-                ORDER BY priority DESC, submit_time ASC
-                LIMIT ?
-                """,
-                (experiment_id, limit),
-            )
-        else:
-            cursor = await db.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'pending' AND experiment_id = ?
-                ORDER BY priority DESC, submit_time ASC
-                """,
-                (experiment_id,),
-            )
-    else:
-        if limit is not None:
-            cursor = await db.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'pending'
-                ORDER BY priority DESC, submit_time ASC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-        else:
-            cursor = await db.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'pending'
-                ORDER BY priority DESC, submit_time ASC
-                """
-            )
-    rows = await cursor.fetchall()
-    return [_row_to_job(r) for r in rows]
+        where.append("experiment_id = ?")
+        params.append(experiment_id)
+    if campaign is not None:
+        where.append(_IN_CAMPAIGN)
+        params.append(campaign)
+    sql = f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY priority DESC, submit_time ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [_row_to_job(r) for r in await _exec_all(db, sql, tuple(params))]
 
 
 class SchedulableJob(NamedTuple):
@@ -1533,23 +1585,22 @@ async def list_jobs_by_status(
     db: aiosqlite.Connection,
     status: JobStatus,
     limit: int | None = None,
+    campaign: str | None = None,
 ) -> list[JobRecord]:
-    """Return jobs with the given *status* across all experiments,
-    newest first.  If *limit* is provided, only the first N rows are
-    returned.
+    """Return jobs with the given *status* across all experiments (or only
+    those in *campaign*), newest first.  If *limit* is provided, only the
+    first N rows are returned.
     """
+    sql = "SELECT * FROM jobs WHERE status = ?"
+    params: list[Any] = [status]
+    if campaign is not None:
+        sql += f" AND {_IN_CAMPAIGN}"
+        params.append(campaign)
+    sql += " ORDER BY submit_time DESC"
     if limit is not None:
-        cursor = await db.execute(
-            "SELECT * FROM jobs WHERE status = ? ORDER BY submit_time DESC LIMIT ?",
-            (status, limit),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT * FROM jobs WHERE status = ? ORDER BY submit_time DESC",
-            (status,),
-        )
-    rows = await cursor.fetchall()
-    return [_row_to_job(r) for r in rows]
+        sql += " LIMIT ?"
+        params.append(limit)
+    return [_row_to_job(r) for r in await _exec_all(db, sql, tuple(params))]
 
 
 # Whitelist of column names that can be used with list_jobs_since.
@@ -1684,6 +1735,7 @@ async def experiment_summary(
     return {
         "experiment_id": experiment_id,
         "name": exp.name if exp else None,
+        "campaign": exp.campaign if exp else None,
         "status": exp.status if exp else None,
         "note": exp.note if exp else None,
         "submit_time": exp.submit_time.isoformat() if exp else None,
@@ -1696,20 +1748,25 @@ async def experiment_summary(
 async def list_experiments_with_counts(
     db: aiosqlite.Connection,
     status: "ExperimentStatus | None" = None,
+    campaign: str | None = None,
 ) -> list[dict[str, Any]]:
-    """List experiments with per-status job counts in a single query."""
-    where = "WHERE e.status = ?" if status is not None else ""
-    params = (status,) if status is not None else ()
+    """List experiments with per-status job counts in a single query.
+
+    *status* and *campaign* each narrow the list when given.
+    """
+    conds: list[str] = []
+    params: tuple[str, ...] = ()
+    if status is not None:
+        conds.append("e.status = ?")
+        params += (status,)
+    if campaign is not None:
+        conds.append("e.campaign = ?")
+        params += (campaign,)
+    where = f"WHERE {' AND '.join(conds)}" if conds else ""
     cursor = await db.execute(
         f"""
         SELECT e.*,
-               COUNT(j.run_id) AS total_jobs,
-               SUM(CASE WHEN j.status = 'done'       THEN 1 ELSE 0 END) AS done_jobs,
-               SUM(CASE WHEN j.status = 'failed'     THEN 1 ELSE 0 END) AS failed_jobs,
-               SUM(CASE WHEN j.status = 'xfailed'    THEN 1 ELSE 0 END) AS xfailed_jobs,
-               SUM(CASE WHEN j.status = 'running'    THEN 1 ELSE 0 END) AS running_jobs,
-               SUM(CASE WHEN j.status = 'pending'    THEN 1 ELSE 0 END) AS pending_jobs,
-               SUM(CASE WHEN j.status = 'dispatched' THEN 1 ELSE 0 END) AS dispatched_jobs
+               {_JOB_COUNT_COLUMNS}
         FROM experiments e
         LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
         {where}
@@ -1724,15 +1781,7 @@ async def list_experiments_with_counts(
         exp = _row_to_experiment(r)
         d = dataclasses.asdict(exp)
         d["submit_time"] = exp.submit_time.isoformat()
-        d["job_counts"] = {
-            "total":      r["total_jobs"]      or 0,
-            "done":       r["done_jobs"]       or 0,
-            "failed":     r["failed_jobs"]     or 0,
-            "xfailed":    r["xfailed_jobs"]    or 0,
-            "running":    r["running_jobs"]    or 0,
-            "pending":    r["pending_jobs"]    or 0,
-            "dispatched": r["dispatched_jobs"] or 0,
-        }
+        d["job_counts"] = _job_counts(r)
         result.append(d)
     return result
 
@@ -1902,6 +1951,7 @@ class DbWriter:
         *,
         experiment_id: str,
         name: str,
+        campaign: str = DEFAULT_CAMPAIGN,
         controller_id: str | None = None,
         note: str | None = None,
         status: ExperimentStatus = "running",
@@ -1914,7 +1964,7 @@ class DbWriter:
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
-            db, experiment_id=experiment_id, name=name,
+            db, experiment_id=experiment_id, name=name, campaign=campaign,
             controller_id=controller_id, note=note,
             status=status, expected_jobs=expected_jobs,
             singular_dims=singular_dims, max_concurrent=max_concurrent,
@@ -1938,6 +1988,12 @@ class DbWriter:
     ) -> ExperimentRecord | None:
         db = self._db
         return await self._enqueue(lambda: update_experiment_name(db, experiment_id, name))
+
+    async def update_experiment_campaign(
+        self, experiment_id: str, campaign: str
+    ) -> ExperimentRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_experiment_campaign(db, experiment_id, campaign))
 
     async def delete_experiment(self, experiment_id: str) -> bool:
         db = self._db

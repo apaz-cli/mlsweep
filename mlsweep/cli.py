@@ -123,6 +123,10 @@ def _build_help(include_banner: bool = False) -> str:
             ("pause EXP", "stop dispatching new jobs"),
             ("unpause EXP", "resume dispatching"),
         ]),
+        ("Campaigns", [
+            ("campaign [ls]", "list campaigns with experiment and job counts"),
+            ("campaign move EXP NAME", "move an experiment to another campaign"),
+        ]),
         ("Docs", [
             ("docs [topic]", "read the bundled runbook (README by default)"),
             ("version", "print the version"),
@@ -143,6 +147,8 @@ def _build_help(include_banner: bool = False) -> str:
     lines += [
         "watch/fetch/best/status/ls/logs default --manager to $MLSWEEP_MANAGER or http://localhost:7891.",
         "`run` requires --manager explicitly.",
+        "Each command works in the campaign named by --campaign, else $MLSWEEP_CAMPAIGN, else",
+        "`default`. --all-campaigns covers every campaign (not allowed when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
         f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
         f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, skill)",
@@ -258,6 +264,7 @@ def _status_cmd(argv: list[str]) -> None:
         _add_manager_args,
         _http_request,
         _manager_url,
+        _resolve_campaign,
         _resolve_token,
         manager_list_experiments,
     )
@@ -273,6 +280,7 @@ def _status_cmd(argv: list[str]) -> None:
 
     manager = args.manager.rstrip("/")
     token = _resolve_token(args.token)
+    campaign = _resolve_campaign(args)
     mlsweep_dir = _mlsweep_dir()
     token_file = mlsweep_dir / "manager.token"
     local_version = _pkg_version("mlsweep")
@@ -285,12 +293,13 @@ def _status_cmd(argv: list[str]) -> None:
     gpus = _query_gpu_stats()
     disk = shutil.disk_usage(mlsweep_dir)
 
-    exps = (manager_list_experiments(manager, token) or []) if manager_up else []
+    exps = (manager_list_experiments(manager, token, campaign=campaign) or []) if manager_up else []
     experiments = [e["experiment_id"] for e in exps if isinstance(e, dict) and e.get("experiment_id")]
 
     if args.json:
         print(json.dumps({
             "manager": manager,
+            "campaign": campaign,
             "results_dir": str(mlsweep_dir / "experiments"),
             "dashboard": f"{manager}/?token=<token>",
             "mlsweep_dir": str(mlsweep_dir),
@@ -311,6 +320,7 @@ def _status_cmd(argv: list[str]) -> None:
 
     print(f"{_BOLD}{_CYAN}mlsweep status{_RESET}")
     print(f"  {_label('manager:')}{manager}")
+    print(f"  {_label('campaign:')}{campaign or 'all (--all-campaigns)'}")
     print(f"  {_label('results:')}{mlsweep_dir / 'experiments'}")
     print(f"  {_label('dashboard:')}{manager}/?token=<token>")
     print()
@@ -436,7 +446,10 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
-_CTL_CMDS = frozenset({"ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best", "wait"})
+_CTL_CMDS = frozenset({
+    "ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best", "wait",
+    "campaign",
+})
 
 
 def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:

@@ -21,12 +21,13 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import aiosqlite
 
@@ -1616,6 +1617,32 @@ def _rsync_sync(
     return ok
 
 
+def _load_prctl() -> Callable[..., int] | None:
+    """libc's ``prctl``, resolved once in the parent (None where unavailable)."""
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except Exception:
+        return None
+
+
+_PRCTL = _load_prctl()
+
+
+def _die_with_parent() -> None:
+    """Arrange for a child process to get SIGTERM when its parent (the manager) dies.
+
+    ``prctl(PR_SET_PDEATHSIG, ...)`` asks the kernel to deliver SIGTERM to this
+    process the moment its parent exits — covering SIGKILL and crashes, which a
+    shutdown hook can't.  This runs as ``preexec_fn`` in the child, so libc is
+    resolved beforehand and the child only makes the syscall.  Errors are
+    ignored so tunnel setup never fails because of it.
+    """
+    if _PRCTL is not None:
+        _PRCTL(1, signal.SIGTERM)  # PR_SET_PDEATHSIG == 1
+
+
 async def _launch_tunnel(
     host: str,
     manager_port: int,
@@ -1639,6 +1666,7 @@ async def _launch_tunnel(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=sshpass_env,
+            preexec_fn=_die_with_parent,
         )
     except OSError as e:
         print(f"  {_YELLOW}WARN{_RESET}  Could not start tunnel to {host}: {e}", file=sys.stderr)
