@@ -71,6 +71,7 @@ from mlsweep._shared import (
     set_color,
 )
 from mlsweep._topology import _gpu_topology, visible_devices
+from mlsweep import _env
 
 # ── Run state ──────────────────────────────────────────────────────────────────
 
@@ -232,6 +233,15 @@ def _flush_log_locked(rs: RunState) -> None:
         _send_run_msg(_log_msg(rs, rs.sent_seq, b"".join(rs.pending_log)))
         rs.pending_log.clear()
         rs.sent_seq = rs.log_seq
+
+
+def _close_log(rs: RunState) -> None:
+    """Send what is left of the run's log and close training.log."""
+    with rs.log_lock:
+        _flush_log_locked(rs)
+        if rs.log_fh is not None:
+            rs.log_fh.close()
+            rs.log_fh = None
 
 
 def _log_flush_thread() -> None:
@@ -396,18 +406,81 @@ def _handle_run(msg: MsgRun, rs: RunState) -> None:
     try:
         _setup_and_spawn(msg, rs)
     except _Cancelled:
-        _finish_unstarted(msg, exit_code=-int(signal.SIGTERM))
+        _finish_unstarted(msg, rs, exit_code=-int(signal.SIGTERM))
     except Exception as exc:
         print(f"[worker] ERROR in run {msg.run_id}: {exc}", file=sys.stderr, flush=True)
-        _finish_unstarted(msg, exit_code=-1)
+        _append_log(rs, f"[mlsweep] run setup failed: {exc}\n".encode())
+        _finish_unstarted(msg, rs, exit_code=-1)
 
 
 class _Cancelled(Exception):
     """The run was cancelled before its training processes started."""
 
 
-def _finish_unstarted(msg: MsgRun, exit_code: int) -> None:
+def _run_setup_proc(rs: RunState, cmd: "list[str] | str", cwd: str) -> None:
+    """Run a setup step, streaming its output to training.log. Cancellable: a cancel
+    signals its process group. Raises CalledProcessError on a nonzero exit."""
+    with _lock:
+        _check_cancelled_locked(rs)
+        proc = rs.setup_proc = subprocess.Popen(
+            cmd,
+            shell=isinstance(cmd, str),
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # so a cancel can signal the whole group
+        )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        _append_log(rs, line)
+    proc.wait()
+    with _lock:
+        rs.setup_proc = None
+    _check_cancelled(rs)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
+def _find_venv(cwd: str) -> str | None:
+    """A ``.venv`` in the run's cwd, else in remote_dir."""
+    for base in (cwd, _remote_dir):
+        if base and os.path.isdir(os.path.join(base, ".venv", "bin")):
+            return os.path.join(base, ".venv")
+    return None
+
+
+def _auto_env_enabled() -> bool:
+    """Whether the worker should build a default env.
+
+    Off with MLSWEEP_AUTO_ENV=0. Also off when the worker was started inside a
+    venv or conda env other than mlsweep's own: runs inherit that environment."""
+    if os.environ.get("MLSWEEP_AUTO_ENV", "1").lower() in ("0", "false", "no", "off"):
+        return False
+    return not any(
+        prefix and os.path.realpath(prefix) != os.path.realpath(sys.prefix)
+        for prefix in (os.environ.get("VIRTUAL_ENV"), os.environ.get("CONDA_PREFIX"))
+    )
+
+
+def _default_env(rs: RunState, project_dir: str) -> str | None:
+    """Build or reuse a venv from the project's dependency files (see mlsweep._env)."""
+    if not _auto_env_enabled():
+        return None
+    spec = _env.detect(project_dir)
+    if spec is None:
+        _append_log(rs, b"[mlsweep] no .venv, pyproject.toml, requirements.txt or setup.py "
+                        b"found; running with the worker's PATH\n")
+        return None
+    return _env.ensure(
+        spec, project_dir, rs.scratch_path,
+        run=lambda cmd, cwd: _run_setup_proc(rs, cmd, cwd),
+        log=lambda text: _append_log(rs, text.encode()),
+    )
+
+
+def _finish_unstarted(msg: MsgRun, rs: RunState, exit_code: int) -> None:
     """Report a failed result for a run that never spawned its training processes."""
+    _close_log(rs)
     result = MsgResult(run_id=msg.run_id, experiment=msg.experiment,
                        success=False, elapsed=0.0, exit_code=exit_code)
     with _lock:
@@ -481,29 +554,7 @@ def _setup_and_spawn(msg: MsgRun, rs: RunState) -> None:
             workspace = os.path.join(scratch_path, "workspace")
             os.makedirs(workspace, exist_ok=True)
             cwd = workspace
-        cmd = msg.setup_command
-        use_shell = isinstance(cmd, str)
-        with _lock:
-            _check_cancelled_locked(rs)
-            setup_proc = rs.setup_proc = subprocess.Popen(
-                cmd,
-                shell=use_shell,
-                cwd=workspace,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,  # so a cancel can signal the whole group
-            )
-        setup_output, _ = setup_proc.communicate()
-        with _lock:
-            rs.setup_proc = None
-        _check_cancelled(rs)
-        setup_output = setup_output or b""
-        if setup_proc.returncode != 0:
-            setup_output += f"[mlsweep] setup_command exited {setup_proc.returncode}\n".encode()
-        if setup_output:
-            _append_log(rs, setup_output)
-        if setup_proc.returncode != 0:
-            raise subprocess.CalledProcessError(setup_proc.returncode, cmd)
+        _run_setup_proc(rs, msg.setup_command, workspace)
 
     # ── RUN_FROM: working directory for the run ────────────────────────────
     # Resolve against the run's base cwd (the extracted workspace when a file
@@ -530,14 +581,13 @@ def _setup_and_spawn(msg: MsgRun, rs: RunState) -> None:
         base_env["PYTHONPATH"] = workspace + (os.pathsep + existing if existing else "")
     base_env.pop("EXP_SERVER", None)
 
-    # Activate .venv if present: workspace first, then remote_dir fallback
-    _venv_bin = os.path.join(cwd, ".venv", "bin")
-    if not os.path.isdir(_venv_bin) and _remote_dir:
-        _venv_bin = os.path.join(_remote_dir, ".venv", "bin")
-    if os.path.isdir(_venv_bin):
+    # Activate a venv: .venv in the cwd, then in remote_dir, else a default env
+    # built from the project's dependency files.
+    venv_dir = _find_venv(cwd) or _default_env(rs, workspace or cwd)
+    if venv_dir is not None:
         _old_path = base_env.get("PATH", os.environ.get("PATH", ""))
-        base_env["PATH"] = _venv_bin + os.pathsep + _old_path
-        base_env["VIRTUAL_ENV"] = os.path.dirname(_venv_bin)
+        base_env["PATH"] = os.path.join(venv_dir, "bin") + os.pathsep + _old_path
+        base_env["VIRTUAL_ENV"] = venv_dir
         base_env.pop("PYTHONHOME", None)
 
     # Pre-compute dist env values if SET_DIST_ENV is requested
@@ -582,14 +632,13 @@ def _setup_and_spawn(msg: MsgRun, rs: RunState) -> None:
             )
             procs.append(proc)
             pids.append(proc.pid)
-    except OSError:
+    except OSError as exc:
         for p in procs:
             try:
                 p.kill()
             except OSError:
                 pass
-        _finish_unstarted(msg, exit_code=-1)
-        return
+        raise RuntimeError(f"could not start {msg.command[0]!r}: {exc}") from exc
 
     # A cancel that raced with the spawn found no pids to signal; honour it now.
     with _lock:
@@ -623,11 +672,7 @@ def _run_thread(
     assert procs[0].stdout is not None
     for raw_line in procs[0].stdout:
         _append_log(state, raw_line)
-    with state.log_lock:
-        _flush_log_locked(state)
-        if state.log_fh is not None:
-            state.log_fh.close()
-            state.log_fh = None
+    _close_log(state)
 
     # Wait for all ranks to finish
     rcs = [procs[0].wait()] + [p.wait() for p in procs[1:]]

@@ -906,6 +906,20 @@ venv = "/home/user/myproject/.venv"
 
 The manager starts a worker process on each machine via SSH (`python -m mlsweep.worker`). The worker ignores SIGHUP so SSH disconnects do not kill it. If the manager exits cleanly it sends a shutdown signal; if the manager crashes, the worker keeps any in-flight runs running to completion and then exits. Run logs and metrics are streamed back to the manager over a persistent TCP connection and written to disk immediately. Artifacts are rsynced at the end of each run.
 
+### Run environment
+
+Your project's code is uploaded with each sweep, but its Python environment is not: venvs and compiled packages don't carry across machines. Each run gets an environment from the first of:
+
+1. `.venv/` in the run's working directory, then in the worker's `remote_dir`.
+2. A default env the worker builds from the project's dependency files, the same ones `pip install .` reads:
+   - `pyproject.toml` with a `[project]` table
+   - `requirements.txt`
+   - `setup.py` / `setup.cfg`
+
+When the dependencies are a plain list (static `[project].dependencies`, or a `requirements.txt` without `-e`, `-r` or local paths), the env holds only those dependencies and is cached per machine at `~/.cache/mlsweep/envs/<hash>/` (or `$MLSWEEP_ENV_CACHE`), keyed on the list, the Python version and the platform. The first run on a machine builds it; concurrent runs wait for that one build, and later runs reuse it until the dependencies change. Your project's own code always comes from the uploaded workspace, which is on `PYTHONPATH`. Anything else (`setup.py`, dynamic dependencies) is `pip install`ed per run into the run's scratch directory.
+
+The build output goes to the run's `training.log`. The env uses the worker's Python (`/tmp/mlsweep_venv`'s interpreter on bootstrapped workers). To turn this off, set `MLSWEEP_AUTO_ENV=0` in the worker's environment; it is also off when the worker itself was started inside another venv or conda env, whose interpreter runs then inherit.
+
 ## Metrics API
 
 Training scripts log metrics via the `MLSweepLogger` class:

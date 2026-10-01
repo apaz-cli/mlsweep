@@ -198,6 +198,8 @@ The dashboard has a campaign selector on every page that lists experiments. See
 
 The manager installs mlsweep on remote machines automatically over SSH, with no manual setup needed. It builds wheels from the local source at startup, SCPs them to the remote, and installs them into `/tmp/mlsweep_venv/`.
 
+Your code is uploaded with each sweep. Its dependencies are installed on the remote from `pyproject.toml` / `requirements.txt` and cached per machine, unless the run directory or `remote_dir` already has a `.venv` (see Run environment in `mlsweep --help sweep_configuration`).
+
 #### 1. Create a workers.toml
 
 ```toml
