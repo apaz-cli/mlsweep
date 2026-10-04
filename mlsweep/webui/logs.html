@@ -118,6 +118,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 #no-sel { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
 #campaign-section { margin-bottom: 10px; }
 </style>
+<script src="dialog.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
@@ -176,6 +177,7 @@ select:focus { outline: none; border-color: #4c9be8; }
       </a>
       <span class="log-run-id" id="log-run-id"></span>
       <span id="log-badge"></span>
+      <button class="quick-btn" id="rename-btn" title="Give this run a display name">Rename</button>
       <span class="hdr-spacer"></span>
       <label class="autoscroll-label">
         <input type="checkbox" id="auto-scroll" checked> Auto-scroll
@@ -206,15 +208,6 @@ function apiFetch(path, opts = {}) {
 }
 function pageHref(page) {
   return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
-}
-function escHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-function jobName(j) {
-  if (!j.label) return escHtml(j.run_id);
-  return `${escHtml(j.label)} <span style="color:var(--text-muted);font-size:9px">${escHtml(j.run_id)}</span>`;
 }
 function parseJSON(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
@@ -265,6 +258,7 @@ const logBadgeEl   = document.getElementById("log-badge");
 const logDlBtn     = document.getElementById("log-dl-btn");
 const expDlAllBtn  = document.getElementById("exp-dl-all");
 const refreshBtn   = document.getElementById("refresh-btn");
+const renameBtn    = document.getElementById("rename-btn");
 
 // ── Auto-scroll ───────────────────────────────────────────────────────────────
 logOutput.addEventListener("scroll", () => {
@@ -303,7 +297,7 @@ async function selectJob(job) {
 
   currentRunId = job.run_id;
 
-  logRunIdEl.innerHTML = jobName(job);
+  logRunIdEl.innerHTML = runNameHtml(job);
   setBadge(job.status);
   logHeader.style.display = "";
   logWrap.style.display   = "flex";
@@ -374,7 +368,7 @@ function renderJobList() {
     const sel      = j.run_id === currentRunId;
     return `<div class="job-item${sel ? " selected" : ""}" data-run-id="${escHtml(j.run_id)}" data-exp-id="${escHtml(j.experiment_id)}">
       <div class="job-item-top">
-        <span class="job-run-id" title="${escHtml(j.run_id)}">${jobName(j)}</span>
+        <span class="job-run-id" title="${escHtml(j.run_id)}">${runNameHtml(j)}</span>
         <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
       </div>
       ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}
@@ -388,6 +382,25 @@ function renderJobList() {
     });
   });
 }
+
+// Show a run's new display name in the list and, if selected, the header.
+function setJobLabel(runId, label) {
+  const job = jobsData.find(j => j.run_id === runId);
+  if (!job) return;
+  job.label = label;
+  const el = Array.from(jobListEl.querySelectorAll(".job-item"))
+    .find(el => el.dataset.runId === runId);
+  if (el) el.querySelector(".job-run-id").innerHTML = runNameHtml(job);
+  if (runId === currentRunId) logRunIdEl.innerHTML = runNameHtml(job);
+}
+
+async function renameCurrentJob() {
+  const job = jobsData.find(j => j.run_id === currentRunId);
+  if (!job) return;
+  const label = await mlRenameRun(apiFetch, job.experiment_id, job.run_id, job.label);
+  if (label !== undefined) setJobLabel(job.run_id, label);
+}
+renameBtn.addEventListener("click", renameCurrentJob);
 
 function setJobStatus(runId, status) {
   const job = jobsData.find(j => j.run_id === runId);
@@ -479,6 +492,8 @@ function handleWsEvent(evt) {
     setJobStatus(evt.run_id, "dispatched");
   } else if (evt.type === "job_done") {
     setJobStatus(evt.run_id, evt.status || (evt.success ? "done" : "failed"));
+  } else if (evt.type === "job_updated" && "label" in evt) {
+    setJobLabel(evt.run_id, evt.label);
   }
 }
 

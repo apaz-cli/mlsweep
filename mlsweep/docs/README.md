@@ -158,8 +158,8 @@ mlsweep status                                       # manager / token / GPUs / 
 mlsweep watch EXP_ID                                 # live terminal status
 mlsweep ls                                           # list experiments (`mlsweep ls EXP_ID` lists runs)
 mlsweep logs RUN_ID --experiment EXP_ID              # tail a run's training.log
-mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics as tables (--pivot, --json, --csv)
-mlsweep best --experiment EXP_ID                     # top runs by metric (leaderboard)
+mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics (--last, --with-dims, --pivot, --json, --csv)
+mlsweep best --experiment EXP_ID                     # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
 
@@ -171,6 +171,10 @@ machine-readable output.
 Control a running sweep with `mlsweep cancel EXP --failed`, `mlsweep retry EXP --failed`,
 `mlsweep resume EXP`, `mlsweep pause EXP`, `mlsweep unpause EXP`, or `mlsweep stop EXP --yes`.
 `cancel`, `retry`, and `resume` exit non-zero if any targeted run fails.
+
+Generated run IDs get long. `mlsweep rename EXP RUN_ID "warmup ablation"` gives a run a
+display name, and `--clear` removes it. The name appears next to the run ID in `ls`, `best`,
+and the dashboard. The run ID itself never changes, and every other command keeps taking it.
 
 For a project-local interface, run `mlsweep gen_makefile` in your repo to add `make sweep-run` / `sweep-watch` / `sweep-fetch` / `sweep-status` targets.
 
@@ -231,7 +235,7 @@ mlsweep_manager --workers workers.toml
 
 ## Dashboard
 
-The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, and system status. Open it in a browser while your sweep runs.
+The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, and system status. Open it in a browser while your sweep runs. The Rename buttons on the Experiments and Logs pages set a run's display name, the same one `mlsweep rename` sets.
 
 ## Useful CLI flags
 
@@ -269,6 +273,7 @@ mlsweep logs RUN_ID --experiment EXP_ID    mlsweep status
 mlsweep cancel EXP --failed          mlsweep retry EXP --failed
 mlsweep resume EXP                   mlsweep pause EXP
 mlsweep unpause EXP                  mlsweep stop EXP --yes
+mlsweep rename EXP RUN_ID NAME       # display name for a run; --clear removes it
 
 # campaigns (every command also takes --campaign NAME / --all-campaigns)
 mlsweep campaign [ls]                mlsweep campaign move EXP NAME

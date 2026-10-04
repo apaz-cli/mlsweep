@@ -298,6 +298,43 @@ def test_insert_jobs_bulk(manager_server):
     assert {j["run_id"] for j in data} == {"ra", "rb"}
 
 
+def test_create_experiment_with_jobs_atomic(manager_server):
+    _, url = manager_server
+    body = {
+        "name": "sweep",
+        "jobs": [
+            {"run_id": "r1", "command": ["echo", "a"]},
+            {"run_id": "r2", "command": ["echo", "b"]},
+        ],
+    }
+    data = _api_post(url, _TOKEN, "/api/experiments/e_atomic/jobs/bulk", body)
+    assert data["experiment"]["experiment_id"] == "e_atomic"
+    assert {j["run_id"] for j in data["jobs"]} == {"r1", "r2"}
+    assert len(_api_get(url, _TOKEN, "/api/experiments/e_atomic/jobs")) == 2
+
+
+def test_create_experiment_with_jobs_rejects_duplicate_run_id(manager_server):
+    _, url = manager_server
+    body = {
+        "name": "sweep",
+        "jobs": [
+            {"run_id": "dup", "command": ["echo", "a"]},
+            {"run_id": "dup", "command": ["echo", "b"]},
+        ],
+    }
+    try:
+        _api_post(url, _TOKEN, "/api/experiments/e_dup/jobs/bulk", body)
+        pytest.fail("expected 409")
+    except urllib.error.HTTPError as e:
+        assert e.code == 409
+    # The failed submission must not leave a half-created experiment behind.
+    try:
+        _api_get(url, _TOKEN, "/api/experiments/e_dup")
+        pytest.fail("expected 404")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
 def test_get_job_not_found(manager_server):
     _, url = manager_server
     try:
@@ -332,6 +369,41 @@ def test_update_job_priority(manager_server):
         "experiment_id": "e_pri", "priority": 99,
     })
     assert job["priority"] == 99
+
+
+def test_update_job_label(manager_server):
+    _, url = manager_server
+    for eid in ("e_lab", "e_lab2"):
+        _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": eid})
+        _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": eid, "command": ["echo"]})
+
+    def label(eid):
+        return _api_get(url, _TOKEN, f"/api/jobs/r1?experiment_id={eid}")["label"]
+
+    job = _api_put(url, _TOKEN, "/api/jobs/r1/label", {"experiment_id": "e_lab", "label": "  base  "})
+    assert job["label"] == "base"
+    # Run IDs repeat across experiments, so the rename touches only the one named.
+    assert label("e_lab2") is None
+
+    _api_put(url, _TOKEN, "/api/jobs/r1/label", {"experiment_id": "e_lab", "label": " "})
+    assert label("e_lab") is None
+    _api_put(url, _TOKEN, "/api/jobs/r1/label", {"experiment_id": "e_lab", "label": "again"})
+    _api_put(url, _TOKEN, "/api/jobs/r1/label", {"experiment_id": "e_lab", "label": None})
+    assert label("e_lab") is None
+
+
+@pytest.mark.parametrize("path, body, expected_status", [
+    ("/api/jobs/r1/label", {"experiment_id": "e_lab_err", "label": 5}, 400),
+    ("/api/jobs/r1/label", {"label": "x"}, 400),
+    ("/api/jobs/nope/label", {"experiment_id": "e_lab_err", "label": "x"}, 404),
+])
+def test_update_job_label_errors(manager_server, path, body, expected_status):
+    _, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_lab_err"})
+    _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": "e_lab_err", "command": ["echo"]})
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _api_put(url, _TOKEN, path, body)
+    assert exc.value.code == expected_status
 
 
 def test_cancel_job(manager_server):

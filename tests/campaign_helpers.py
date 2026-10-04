@@ -10,6 +10,12 @@ from conftest import _start_manager, _teardown_manager
 TOKEN = "test-token"
 
 
+def static_url(server, name, **params):
+    """A web UI page URL on *server*, authenticated, with extra query *params*."""
+    query = "&".join(f"{k}={v}" for k, v in {"token": TOKEN, **params}.items())
+    return f"{server.url}/static/{name}?{query}"
+
+
 def uid(prefix):
     """A fresh id, so tests sharing one manager never collide."""
     return f"{prefix}_{uuid.uuid4().hex[:8]}"

@@ -406,8 +406,9 @@ def _unpack_log(data: str | bytes) -> str:
 def _merge_metric_rows(rows: Sequence[tuple[int, str | bytes]]) -> dict[int, str]:
     """``{step: json}`` from per-step and packed metric rows.
 
-    A packed row holds the values stored first, so it wins over a per-step row
-    for the same step (a later duplicate that INSERT OR IGNORE let through).
+    Per-step rows are already merged by ``insert_metric``, so the first row for
+    a step is the whole dict.  A packed row (zlib BLOB) overwrites per-step rows
+    for the same step.
     """
     by_step: dict[int, str] = {}
     for step, data in rows:
@@ -419,6 +420,47 @@ def _merge_metric_rows(rows: Sequence[tuple[int, str | bytes]]) -> dict[int, str
                 s, _, d = line.partition("\t")
                 by_step[int(s)] = d
     return by_step
+
+
+def _merge_metric_json(datas: Sequence[str]) -> str | None:
+    """One step's JSON dicts merged into one (later dicts win per key).
+
+    ``None`` if none of them parses as a dict.
+    """
+    merged: dict[str, Any] | None = None
+    for data in datas:
+        try:
+            d = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(d, dict):
+            merged = merged or {}
+            merged.update(d)
+    return None if merged is None else json.dumps(merged, separators=(",", ":"))
+
+
+def _pack_metric_rows(
+    rows: Sequence[tuple[int, str | bytes]],
+    extra: Sequence[tuple[int, str]],
+) -> tuple[int, bytes]:
+    """``(first_step, zlib blob)`` for ``pack_metrics``; CPU-bound, run off the loop.
+
+    Folds same-step dicts from the synced metrics.jsonl (which may have several
+    ``log()`` calls at one step), then overlays the stored rows (which include
+    any already-packed BLOB).  Live rows win on conflicting keys, and extra-only
+    keys and steps are preserved.  Only steps with more than one source are
+    parsed; the rest pass through as stored.
+    """
+    sources: dict[int, list[str]] = {}
+    for step, data in [*extra, *_merge_metric_rows(rows).items()]:
+        sources.setdefault(step, []).append(data)
+    by_step: dict[int, str] = {}
+    for step, datas in sources.items():
+        merged = datas[0] if len(datas) == 1 else _merge_metric_json(datas)
+        if merged is not None:
+            by_step[step] = merged
+    text = "\n".join(f"{s}\t{by_step[s]}" for s in sorted(by_step)).encode("utf-8")
+    return min(by_step), zlib.compress(text, 6)
 
 
 async def pack_metrics(
@@ -437,14 +479,11 @@ async def pack_metrics(
     )]
     if len(rows) + len(extra) < 2:
         return  # nothing to merge
-    by_step = dict(extra)
-    by_step.update(_merge_metric_rows(rows))  # what was stored first wins
-    text = "\n".join(f"{s}\t{by_step[s]}" for s in sorted(by_step)).encode("utf-8")
-    packed = await asyncio.to_thread(zlib.compress, text, 6)
+    first_step, packed = await asyncio.to_thread(_pack_metric_rows, rows, extra)
     await db.execute("DELETE FROM metrics WHERE job_key = ? AND attempt = ?", (job_key, attempt))
     await db.execute(
         "INSERT INTO metrics (job_key, attempt, step, data) VALUES (?, ?, ?, ?)",
-        (job_key, attempt, min(by_step), packed),
+        (job_key, attempt, first_step, packed),
     )
     await db.commit()
 
@@ -585,11 +624,13 @@ async def create_experiment(
     skip_rules: dict[str, Any] | None = None,
     metric: str | None = None,
     goal: str | None = None,
+    commit: bool = True,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row.
 
     Re-creating an existing experiment updates it in place but keeps its
     campaign; ``update_experiment_campaign`` is the only way to move it.
+    With ``commit=False`` the caller owns the transaction.
     """
     now = _now_epoch()
     singular_dims_json = json.dumps(singular_dims or [])
@@ -616,7 +657,8 @@ async def create_experiment(
         (experiment_id, name, campaign, now, controller_id, note, status, expected_jobs,
          singular_dims_json, max_concurrent, json.dumps(skip_rules or {}), metric, goal),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     assert row is not None
     return _row_to_experiment(row)
 
@@ -899,6 +941,51 @@ async def insert_job(
     return job
 
 
+async def _insert_jobs_and_reopen(
+    db: aiosqlite.Connection,
+    jobs: list[dict[str, Any]],
+) -> list[JobRecord]:
+    """Insert job rows and reopen experiments that gained pending jobs.
+
+    Does not commit (the caller owns the transaction).
+    """
+    now = _now_epoch()
+    records: list[JobRecord] = []
+    for j in jobs:
+        command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
+            j["command"], j.get("combo"), j.get("env"), j.get("return_files"), j.get("files")
+        )
+
+        row = await _exec_one(
+            db,
+            """
+            INSERT INTO jobs (
+                run_id, experiment_id, priority, status, submit_time,
+                command, combo, env, gpus_per_run, nodes_per_run,
+                set_dist_env, run_from, return_files, files, max_retries,
+                artifact_id, setup_command
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?
+            )
+            RETURNING *;
+            """,
+            (j["run_id"], j["experiment_id"], j.get("priority", 0),
+             j.get("status", "pending"), now,
+             command_json, combo_json, env_json,
+             j.get("gpus_per_run", 1), j.get("nodes_per_run", 1),
+             int(j.get("set_dist_env", False)), j.get("run_from"),
+             return_files_json, files_json, j.get("max_retries", 2),
+             j.get("artifact_id"), j.get("setup_command")),
+        )
+        assert row is not None
+        records.append(_row_to_job(row))
+    await _reopen_experiments(db, {r.experiment_id for r in records if r.status == "pending"})
+    return records
+
+
 async def insert_jobs_bulk(
     db: aiosqlite.Connection,
     jobs: list[dict[str, Any]],
@@ -910,43 +997,32 @@ async def insert_jobs_bulk(
 
     Returns the inserted JobRecord list.
     """
-    now = _now_epoch()
     try:
-        records: list[JobRecord] = []
-        for j in jobs:
-            command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
-                j["command"], j.get("combo"), j.get("env"), j.get("return_files"), j.get("files")
-            )
-
-            row = await _exec_one(
-                db,
-                """
-                INSERT INTO jobs (
-                    run_id, experiment_id, priority, status, submit_time,
-                    command, combo, env, gpus_per_run, nodes_per_run,
-                    set_dist_env, run_from, return_files, files, max_retries,
-                    artifact_id, setup_command
-                ) VALUES (
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?
-                )
-                RETURNING *;
-                """,
-                (j["run_id"], j["experiment_id"], j.get("priority", 0),
-                 j.get("status", "pending"), now,
-                 command_json, combo_json, env_json,
-                 j.get("gpus_per_run", 1), j.get("nodes_per_run", 1),
-                 int(j.get("set_dist_env", False)), j.get("run_from"),
-                 return_files_json, files_json, j.get("max_retries", 2),
-                 j.get("artifact_id"), j.get("setup_command")),
-            )
-            assert row is not None
-            records.append(_row_to_job(row))
-        await _reopen_experiments(db, {r.experiment_id for r in records if r.status == "pending"})
+        records = await _insert_jobs_and_reopen(db, jobs)
         await db.commit()
         return records
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def create_experiment_with_jobs(
+    db: aiosqlite.Connection,
+    *,
+    jobs: list[dict[str, Any]],
+    **fields: Any,
+) -> tuple[ExperimentRecord, list[JobRecord]]:
+    """Create (or update) an experiment and insert its jobs atomically.
+
+    *fields* are ``create_experiment``'s keyword arguments.  Either both the
+    experiment row and every job land, or nothing does, so a job-insert
+    failure never leaves a half-created experiment behind.
+    """
+    try:
+        exp = await create_experiment(db, commit=False, **fields)
+        records = await _insert_jobs_and_reopen(db, jobs)
+        await db.commit()
+        return exp, records
     except Exception:
         await db.rollback()
         raise
@@ -1817,9 +1893,21 @@ async def insert_metric(
     step: int,
     data: dict[str, Any],
 ) -> None:
-    """Persist one metric row.  A duplicate (job_key, attempt, step) is ignored."""
+    """Persist one metric row, merging into any row already at this step.
+
+    A second ``log()`` at the same step is merged (not dropped): keys already
+    stored are preserved, and keys in *data* are added or overwrite them.
+    """
     await db.execute(
-        "INSERT OR IGNORE INTO metrics (job_key, attempt, step, data) VALUES (?, ?, ?, ?)",
+        """
+        INSERT INTO metrics (job_key, attempt, step, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (job_key, attempt, step) DO UPDATE SET
+            data = CASE WHEN typeof(data) = 'text'
+                        THEN json_patch(data, excluded.data)
+                        ELSE excluded.data
+                   END
+        """,
         (job_key, attempt, step, json.dumps(data, separators=(",", ":"))),
     )
     await db.commit()
@@ -1970,6 +2058,12 @@ class DbWriter:
             singular_dims=singular_dims, max_concurrent=max_concurrent,
             skip_rules=skip_rules, metric=metric, goal=goal,
         ))
+
+    async def create_experiment_with_jobs(
+        self, *, jobs: list[dict[str, Any]], **fields: Any,
+    ) -> tuple[ExperimentRecord, list[JobRecord]]:
+        db = self._db
+        return await self._enqueue(lambda: create_experiment_with_jobs(db, jobs=jobs, **fields))
 
     async def update_experiment_status(
         self, experiment_id: str, status: ExperimentStatus

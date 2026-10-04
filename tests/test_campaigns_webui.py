@@ -12,7 +12,7 @@ import json
 import pytest
 
 from browser import Browser, find_chromium
-from campaign_helpers import TOKEN, ok, seed, shared_manager
+from campaign_helpers import TOKEN, ok, seed, shared_manager, static_url
 
 CHROME = find_chromium()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chromium-family browser installed")
@@ -61,11 +61,7 @@ def page(mgr, seeded, _browser):
     _browser.goto(f"{mgr.url}/static/experiments.html")
     _browser.eval("localStorage.clear()")
 
-    def url(name, **params):
-        query = "&".join(f"{k}={v}" for k, v in {"token": TOKEN, **params}.items())
-        return f"{mgr.url}/static/{name}?{query}"
-
-    _browser.url = url
+    _browser.url = lambda name, **params: static_url(mgr, name, **params)
     return _browser
 
 

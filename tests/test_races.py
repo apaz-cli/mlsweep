@@ -195,7 +195,9 @@ def test_log_is_complete_and_unduplicated_across_a_dropped_connection(proxied):
     time.sleep(2)
     proxy.sever()
     _wait(lambda: _job(url, "rc", "chatty")["status"] == "done", 60, "chatty to finish")
-    lines = _log_text(url, "rc", "chatty").splitlines()
+    # The worker may add its own "[mlsweep] ..." notices; only the job's lines count.
+    lines = [ln for ln in _log_text(url, "rc", "chatty").splitlines()
+             if not ln.startswith("[mlsweep] ")]
     assert lines == [f"line {i}" for i in range(n)]
 
 

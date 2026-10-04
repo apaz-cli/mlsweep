@@ -118,6 +118,7 @@ def _build_help(include_banner: bool = False) -> str:
         ("Control", [
             ("cancel EXP", "cancel runs (--failed/--running/--all)"),
             ("retry EXP", "re-queue failed runs"),
+            ("rename EXP RUN NAME", "give a run a display name (--clear removes it)"),
             ("resume EXP", "continue an experiment"),
             ("stop EXP", "abort a sweep"),
             ("pause EXP", "stop dispatching new jobs"),
@@ -447,8 +448,8 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
 _CTL_CMDS = frozenset({
-    "ls", "logs", "metrics", "cancel", "retry", "resume", "stop", "pause", "unpause", "best", "wait",
-    "campaign",
+    "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "stop", "pause", "unpause", "best",
+    "wait", "campaign",
 })
 
 

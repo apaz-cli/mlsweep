@@ -1,5 +1,5 @@
-"""Tests for the mlsweep lifecycle commands (ls/logs/cancel/retry/resume/stop/
-pause/unpause) and the result-ranking logic (best/fetch leaderboard).
+"""Tests for the mlsweep lifecycle commands (ls/logs/cancel/retry/rename/resume/
+stop/pause/unpause) and the result-ranking logic (best/fetch leaderboard).
 
 Pure functions are unit-tested; the HTTP-facing commands are exercised against a
 real manager subprocess via the ``manager_server`` fixture.
@@ -174,9 +174,9 @@ def test_wait_until_settled_reports_failure(manager_server):
 
 def test_print_leaderboard(capsys):
     rows = [
-        {"run_id": "best", "status": "done", "combo": {"lr": 0.001},
+        {"run_id": "best", "label": None, "status": "done", "combo": {"lr": 0.001},
          "value": 1.0, "final": 1.0, "elapsed": 1.0, "exit_code": 0},
-        {"run_id": "worst", "status": "done", "combo": None,
+        {"run_id": "worst", "label": None, "status": "done", "combo": None,
          "value": 2.0, "final": 2.0, "elapsed": 1.0, "exit_code": 0},
     ]
     run_sweep.print_leaderboard(rows, "loss", "minimize", top=10)
@@ -184,6 +184,48 @@ def test_print_leaderboard(capsys):
     assert "LEADERBOARD" in out
     assert "best" in out
     assert "lr=0.001" in out
+
+    rows[0]["label"] = "baseline"
+    run_sweep.print_leaderboard(rows, "loss", "minimize", top=10)
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "best" in ln and "lr=" in ln)
+    assert "(baseline)" in line
+
+
+def test_rank_leaderboard_carries_label():
+    jobs = [{**_job("a", "done", {}), "label": "baseline"}, _job("b", "done", {})]
+    rows = run_sweep.rank_leaderboard(jobs, {"a": [{"loss": 1.0}], "b": [{"loss": 2.0}]})
+    assert [(r["run_id"], r["label"]) for r in rows] == [("a", "baseline"), ("b", None)]
+
+
+def _ranked(run_id, combo, value):
+    return {"run_id": run_id, "label": None, "status": "done", "combo": combo,
+            "value": value, "final": value, "elapsed": 1.0, "exit_code": 0}
+
+
+def test_grouped_leaderboard_picks_best_per_group(capsys):
+    # rows are already best-first (minimize): n1 → c (0.05), then a (0.10)
+    rows = [
+        _ranked("c", {"est": "n1", "lr": 0.003}, 0.05),
+        _ranked("a", {"est": "n1", "lr": 0.001}, 0.10),
+        _ranked("b", {"est": "n2", "lr": 0.003}, 0.20),
+    ]
+    ctl._print_grouped_leaderboard(rows, "est", "loss", "minimize", top=10)
+    out = capsys.readouterr().out
+    assert "best per est" in out
+    assert "est=n1" in out and "est=n2" in out
+    assert out.index("0.050000") < out.index("0.200000")
+
+
+def test_metric_table_grid(capsys):
+    rows = [
+        _ranked("c", {"est": "n1", "lr": 0.003}, 0.05),
+        _ranked("a", {"est": "n1", "lr": 0.001}, 0.10),
+        _ranked("b", {"est": "n2", "lr": 0.003}, 0.20),
+    ]
+    ctl._print_metric_table(rows, "est,lr", "loss", "minimize")
+    out = capsys.readouterr().out
+    assert "loss by est × lr" in out
+    assert "0.05" in out and "0.1" in out and "0.2" in out
 
 
 # ── Integration (real manager, no worker) ──────────────────────────────────────
@@ -569,3 +611,58 @@ def test_retry_nonterminal_exits_nonzero(manager_server, capsys):
         ctl.retry_cmd(_base(url, server) + ["e", "r1"])
     assert exc.value.code == 1
     assert "FAIL" in capsys.readouterr().out
+
+
+# ── rename ─────────────────────────────────────────────────────────────────────
+
+
+def test_rename_sets_and_clears_name(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1", combo={"lr": 0.001})
+    _mk_job(url, "e", "r2")
+
+    ctl.rename_cmd(_base(url, server) + ["e", "r1", "warmup ablation"])
+    assert "renamed r1 to 'warmup ablation'" in capsys.readouterr().out
+    labels = {j["run_id"]: j["label"] for j in _api_get(url, _TOKEN, "/api/experiments/e/jobs")}
+    assert labels == {"r1": "warmup ablation", "r2": None}
+
+    # ls shows the name beside the run ID; best --json carries it.
+    ctl.ls_cmd(_base(url, server) + ["e"])
+    assert "(warmup ablation)" in capsys.readouterr().out
+    _set_status(url, "e", "r1", "done")
+    ctl.best_cmd(_base(url, server) + ["--experiment", "e", "--json"])
+    rows = {r["run_id"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows["r1"]["label"] == "warmup ablation"
+
+    ctl.rename_cmd(_base(url, server) + ["e", "r1", "--clear"])
+    assert "cleared the name of r1" in capsys.readouterr().out
+    assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["label"] is None
+
+
+@pytest.mark.parametrize("args", [["r1"], ["r1", "  "], ["r1", "x", "--clear"]])
+def test_rename_needs_exactly_one_of_name_or_clear(manager_server, capsys, args):
+    server, url = manager_server
+    with pytest.raises(SystemExit) as exc:
+        ctl.rename_cmd(_base(url, server) + ["e", *args])
+    assert exc.value.code == 2
+    assert "NAME or --clear" in capsys.readouterr().err
+
+
+def test_rename_unknown_run_exits_nonzero(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    with pytest.raises(SystemExit) as exc:
+        ctl.rename_cmd(_base(url, server) + ["e", "missing", "x"])
+    assert exc.value.code == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_rename_refuses_run_in_another_campaign(manager_server, capsys):
+    server, url = manager_server
+    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e", "campaign": "other"})
+    _mk_job(url, "e", "r1")
+    with pytest.raises(SystemExit) as exc:
+        ctl.rename_cmd(_base(url, server) + ["e", "r1", "x", "--campaign", "default"])
+    assert exc.value.code == 1
+    assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["label"] is None

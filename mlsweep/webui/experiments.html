@@ -69,21 +69,28 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .exp-name-cell { display: flex; align-items: center; }
 .exp-name { font-weight: 600; color: var(--text-strong); }
 .exp-note { font-size: 11px; color: var(--text-muted); font-style: italic; margin-left: 8px; }
-.exp-actions { display: flex; gap: 6px; align-items: center; }
+/* Action cells stay table cells (the buttons flex inside a div), so they
+   stretch to the row and its bottom border stays one line. */
+.actions-cell { white-space: nowrap; }
+.actions { display: flex; gap: 6px; align-items: center; }
 .btn-link { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; text-decoration: none; white-space: nowrap; }
 .btn-link:hover { background: var(--btn-hover); }
 .btn-delete { color: #c0392b; border-color: #c0392b44; }
 .btn-delete:hover { background: #c0392b18; }
 
-/* Jobs sub-table */
-.jobs-row td { padding: 0; }
-.jobs-container { padding: 6px 20px 12px 40px; background: var(--bg); border-bottom: 1px solid var(--border); }
-.jobs-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-.jobs-table th { text-align: left; padding: 4px 8px; color: var(--text-dim); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); }
-.jobs-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.jobs-table tr:last-child td { border-bottom: none; }
+/* Runs: rows of the experiments table, right after their experiment's row,
+   so they share its columns.  Worker, Elapsed and Combo span the count columns. */
+.runs-head td { padding: 6px 10px 4px; color: var(--text-dim); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); background: var(--bg); }
+.run-row td, .runs-empty td { padding: 5px 10px; font-size: 11px; border-bottom: 1px solid var(--border); vertical-align: middle; background: var(--bg); }
+.runs-head td:first-child, .run-row td:first-child, .runs-empty td { padding-left: 30px; }
+/* Long run IDs wrap when space runs out rather than widening the Name column. */
+.run-row td:first-child { overflow-wrap: anywhere; }
+.run-row:hover td { background: var(--btn-hover); }
+.runs-empty td { color: var(--text-muted); }
 .mono { font-family: monospace; font-size: 10px; }
-.combo-cell { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.combo-cell { color: var(--text-dim); }
+/* Zero width so a long combo ends in an ellipsis instead of widening the columns it spans. */
+.combo-clip { width: 0; min-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Job detail expand */
 .job-toggle { cursor: pointer; font-size: 10px; color: var(--text-dim); user-select: none; margin-right: 5px; }
@@ -236,7 +243,7 @@ async function deleteExperiment(expId) {
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
   if (r.ok) {
     document.getElementById(`exp-row-${expId}`)?.remove();
-    document.getElementById(`jobs-row-${expId}`)?.remove();
+    runRowsOf(expId).forEach(r => r.remove());
     experiments = experiments.filter(e => e.experiment_id !== expId);
     allExperiments = allExperiments.filter(e => e.experiment_id !== expId);
   } else {
@@ -282,25 +289,13 @@ async function renameExperiment(expId) {
 }
 
 async function renameJob(expId, runId) {
-  const jobs = jobsCache[expId] || [];
-  const job = jobs.find(j => j.run_id === runId);
-  const current = job?.label || "";
-  const newLabel = await mlPrompt("Label for this run:", current, { okLabel: "Save", placeholder: runId });
-  if (newLabel === null) return;
-  const label = newLabel.trim() || null;
-  if (label === (current || null)) return;
-  const r = await apiFetch(`/api/jobs/${encodeURIComponent(runId)}/label`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ experiment_id: expId, label }),
-  });
-  if (r.ok) {
-    if (job) job.label = label;
-    const jobsRow = document.getElementById(`jobs-row-${expId}`);
-    if (jobsRow) jobsRow.querySelector("td").innerHTML = renderJobs(expId);
-  } else {
-    await mlAlert(`Rename failed: ${r.status}`);
-  }
+  const job = (jobsCache[expId] || []).find(j => j.run_id === runId);
+  const label = await mlRenameRun(apiFetch, expId, runId, job?.label);
+  if (label === undefined) return;
+  if (job) job.label = label;
+  renderRuns(expId);
+  // Then redraw from the manager, which also brings in anything else that changed.
+  await refreshAll();
 }
 
 // ── Job detail panel ──────────────────────────────────────────────────────────
@@ -358,52 +353,64 @@ function toggleJobDetail(expId, runId) {
   }
 }
 
-// ── Render jobs sub-table ─────────────────────────────────────────────────────
-function renderJobs(expId) {
+// ── Render runs ───────────────────────────────────────────────────────────────
+// An experiment's runs are rows of the experiments table, tagged with
+// data-runs-of so they can be replaced together.
+function runsHtml(expId) {
   const jobs = jobsCache[expId] || [];
   const rows = jobs.map(j => {
     const comboObj = j.combo ? (typeof j.combo === "string" ? (() => { try { return JSON.parse(j.combo); } catch { return {}; } })() : j.combo) : {};
-    const comboStr = Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" ");
+    const comboStr = escHtml(Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" "));
     const filesHref = `files.html?${TOKEN?"token="+encodeURIComponent(TOKEN)+"&":""}experiment=${encodeURIComponent(expId)}&run=${encodeURIComponent(j.run_id)}`;
     const key = `${expId}/${j.run_id}`;
     const isOpen = expandedJobs.has(key);
     const safeExpId = JSON.stringify(expId).replace(/"/g, '&quot;');
     const safeRunId = JSON.stringify(j.run_id).replace(/"/g, '&quot;');
-    const displayName = j.label
-      ? `${j.label} <span style="color:var(--text-muted);font-size:9px">${j.run_id}</span>`
-      : j.run_id;
-    return `<tr style="cursor:pointer" onclick="toggleJobDetail(${safeExpId}, ${safeRunId})">
-      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${displayName}</td>
+    return `<tr class="run-row" style="cursor:pointer" onclick="toggleJobDetail(${safeExpId}, ${safeRunId})">
+      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${runNameHtml(j)}</td>
       <td>${badge(j.status)}</td>
-      <td>${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
+      <td colspan="2">${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
-      <td class="combo-cell mono" title="${comboStr}">${comboStr}</td>
-      <td onclick="event.stopPropagation()">
+      <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
+      <td class="actions-cell" onclick="event.stopPropagation()"><div class="actions">
         <a class="btn-link" href="${filesHref}">Artifacts</a>
         <button class="btn-link" onclick="event.stopPropagation();renameJob(${safeExpId},${safeRunId})">Rename</button>
-      </td>
+      </div></td>
     </tr>
     <tr id="job-detail-${expId}-${j.run_id}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
-      <td colspan="6">${isOpen ? renderJobDetail(j) : ""}</td>
+      <td colspan="9">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
-  return `<div class="jobs-container">
-    <table class="jobs-table">
-      <thead><tr><th>Run ID</th><th>Status</th><th>Worker</th><th>Elapsed</th><th>Combo</th><th></th></tr></thead>
-      <tbody>${rows || "<tr><td colspan=6 style='color:var(--text-muted)'>No jobs</td></tr>"}</tbody>
-    </table>
-  </div>`;
+  const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
+      <td>Elapsed</td><td colspan="3">Combo</td><td></td></tr>`;
+  return rows ? head + rows : `<tr class="runs-empty"><td colspan="9">No jobs</td></tr>`;
+}
+
+function runRowsOf(expId) {
+  return [...document.querySelectorAll(`#exp-tbody tr[data-runs-of="${CSS.escape(expId)}"]`)];
+}
+
+// Replace an experiment's run rows: drawn under its row when it is expanded,
+// removed when it is not.
+function renderRuns(expId) {
+  runRowsOf(expId).forEach(r => r.remove());
+  const expRow = document.getElementById(`exp-row-${expId}`);
+  if (!expRow || !expandedExps.has(expId) || !jobsCache[expId]) return;
+  const tmp = document.createElement("tbody");
+  tmp.innerHTML = runsHtml(expId);
+  const rows = [...tmp.rows];
+  rows.forEach(r => { r.dataset.runsOf = expId; });
+  expRow.after(...rows);
 }
 
 // ── Toggle expand ──────────────────────────────────────────────────────────────
 async function toggleExpand(expId) {
-  const jobsRow = document.getElementById(`jobs-row-${expId}`);
   const expRow  = document.getElementById(`exp-row-${expId}`);
   const toggle  = expRow ? expRow.querySelector(".exp-toggle") : null;
 
   if (expandedExps.has(expId)) {
     expandedExps.delete(expId);
-    if (jobsRow) jobsRow.style.display = "none";
+    renderRuns(expId);
     if (toggle) toggle.textContent = "▶";
     expRow && expRow.classList.remove("expanded");
     return;
@@ -422,10 +429,7 @@ async function toggleExpand(expId) {
     }
   }
 
-  if (jobsRow) {
-    jobsRow.style.display = "";
-    jobsRow.querySelector("td").innerHTML = renderJobs(expId);
-  }
+  renderRuns(expId);
 }
 
 // ── Refresh jobs for expanded experiments ─────────────────────────────────────
@@ -434,10 +438,7 @@ async function refreshExpandedJobs() {
     try {
       const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
       jobsCache[expId] = await r.json();
-      const jobsRow = document.getElementById(`jobs-row-${expId}`);
-      if (jobsRow && jobsRow.style.display !== "none") {
-        jobsRow.querySelector("td").innerHTML = renderJobs(expId);
-      }
+      renderRuns(expId);
     } catch {}
   }
 }
@@ -514,7 +515,7 @@ function renderExperiments(exps) {
   for (const id of existingIds) {
     if (!newIds.has(id)) {
       document.getElementById(`exp-row-${id}`)?.remove();
-      document.getElementById(`jobs-row-${id}`)?.remove();
+      runRowsOf(id).forEach(r => r.remove());
     }
   }
 
@@ -543,13 +544,13 @@ function renderExperiments(exps) {
       <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
-      <td class="exp-actions">
+      <td class="actions-cell"><div class="actions">
         <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
         <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Artifacts</a>
         <button class="btn-link" onclick="event.stopPropagation();renameExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Rename</button>
         <button class="btn-link" onclick="event.stopPropagation();moveExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Move</button>
         <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
-      </td>`;
+      </div></td>`;
 
     if (existingRow) {
       existingRow.innerHTML = html;
@@ -562,30 +563,12 @@ function renderExperiments(exps) {
       tr.dataset.expId = expId;
       tr.innerHTML = html;
 
-      const jobsTr = document.createElement("tr");
-      jobsTr.className = "jobs-row";
-      jobsTr.id = `jobs-row-${expId}`;
-      jobsTr.style.display = isExpanded ? "" : "none";
-      jobsTr.innerHTML = `<td colspan="9"></td>`;
-
-      // Insert at idx*2 position (each exp takes 2 rows).
+      // Before the idx-th experiment row; the previous experiment's runs stay above it.
       const allRows = tbody.querySelectorAll(".exp-row");
-      if (idx < allRows.length) {
-        tbody.insertBefore(jobsTr, allRows[idx]);
-        tbody.insertBefore(tr, jobsTr);
-      } else {
-        tbody.appendChild(tr);
-        tbody.appendChild(jobsTr);
-      }
+      tbody.insertBefore(tr, idx < allRows.length ? allRows[idx] : null);
     }
 
-    // Update jobs row content if expanded.
-    if (isExpanded) {
-      const jobsRow = document.getElementById(`jobs-row-${expId}`);
-      if (jobsRow && jobsCache[expId]) {
-        jobsRow.querySelector("td").innerHTML = renderJobs(expId);
-      }
-    }
+    if (isExpanded) renderRuns(expId);
   });
 }
 
@@ -625,9 +608,16 @@ function showCampaign() {
 
 MLCampaign.bind(campaignSelect, showCampaign);
 
+async function refreshAll() {
+  await fetchExperiments();
+  await refreshExpandedJobs();
+}
+
 fetchExperiments();
 setInterval(fetchExperiments, 5000);
 setInterval(refreshExpandedJobs, 10000);
+// A rename made in another tab or from the CLI shows as soon as you come back.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAll(); });
 </script>
 </body>
 </html>

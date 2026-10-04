@@ -12,7 +12,7 @@ mlsweep has three components:
 
 **`mlsweep_run`** is a thin HTTP client. Loads a sweep file, generates the run combinations, and POSTs them to the manager. It does not launch anything itself.
 
-All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, `campaign`, and the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`.
+All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, `campaign`, the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`, and `rename` for run display names.
 
 The manager bootstraps mlsweep on remote workers automatically over SSH (builds wheels locally, SCPs them, installs into `/tmp/mlsweep_venv/`). No manual install is needed on workers.
 
@@ -44,8 +44,8 @@ mlsweep status                             # manager / token / GPUs / result pat
 mlsweep watch EXP_ID                       # live terminal status
 mlsweep ls                                 # list experiments (`mlsweep ls EXP_ID` lists runs)
 mlsweep logs RUN_ID --experiment EXP_ID    # tail a run's training.log
-mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # flat keys as a curve, one column per run
-mlsweep best --experiment EXP_ID           # top runs by metric (leaderboard)
+mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape keys (--last, --with-dims, 2-group --pivot, --json, --csv)
+mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
 
 # 4. Control a running sweep
@@ -55,6 +55,7 @@ mlsweep resume EXP_ID                      # continue an experiment
 mlsweep pause EXP_ID                       # stop dispatching new jobs
 mlsweep unpause EXP_ID                     # resume dispatching
 mlsweep stop EXP_ID --yes                  # abort a sweep
+mlsweep rename EXP_ID RUN_ID NAME          # display name for a run (--clear removes it)
 
 # 5. View results in the browser
 # URL is printed at manager startup: http://localhost:7891/?token=...
@@ -193,6 +194,8 @@ For subdim branches and fixed dims, `flags` is a string (single token) or list o
 `{sweep_name}_{dim1_name}{val1}_{dim2_name}{val2}…`
 
 Subdim segments are dotted onto their parent: `sweep_optmuon.lrs0.1_bs32`. `"name": None` omits a dim. Boolean values abbreviate to `T`/`F`.
+
+A run can also carry a display name. Set it with `mlsweep rename` or the Rename button on the dashboard's Experiments and Logs pages, and remove it with `--clear` or by saving an empty name. The name shows next to the run ID in `ls`, `best`, and every dashboard page. It never replaces the run ID. Directories, `logs`, `cancel` and the API keep using the ID. Run IDs repeat across experiments of the same sweep, so a rename applies to one experiment only. Over HTTP it is `PUT /api/jobs/RUN_ID/label` with `{"experiment_id": ..., "label": NAME}`, where a null or blank label clears it.
 
 ## Skipping: singular and monotonic
 

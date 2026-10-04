@@ -125,6 +125,7 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .jobs-table th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
 .jobs-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .mono { font-family: monospace; font-size: 11px; }
+.jobs-table td.id-cell { overflow-wrap: anywhere; }
 .no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
 
 /* Connection indicator */
@@ -266,10 +267,6 @@ document.getElementById("nav-logs").href       = pageHref("logs.html");
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function badge(cls, label) {
   return `<span class="badge badge-${cls}">${label}</span>`;
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
 
 function relTime(iso) {
@@ -595,8 +592,8 @@ function renderInFlight(jobs) {
     return;
   }
   tbody.innerHTML = jobs.map(j => `<tr>
-    <td class="mono">${j.run_id.slice(0,20)}</td>
-    <td class="mono">${j.experiment_id || "—"}</td>
+    <td class="mono id-cell">${runNameHtml(j)}</td>
+    <td class="mono id-cell">${escHtml(j.experiment_id || "—")}</td>
     <td>${badge(j.status, j.status)}</td>
     <td class="mono">${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
     <td class="mono">${j.dispatched_gpu_ids ? JSON.parse(j.dispatched_gpu_ids || "[]").join(",") : "—"}</td>

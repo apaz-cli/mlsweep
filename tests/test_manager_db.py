@@ -91,16 +91,19 @@ def test_insert_and_get_metrics():
     asyncio.run(run())
 
 
-def test_insert_metric_duplicate():
+def test_insert_metric_merges_same_step():
     async def run():
         db = await _init_db()
         try:
             job = await _dispatched(db)
-            await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 0.5})
-            await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 999.0})
+            await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 0.5, "acc": 0.9})
+            await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 999.0, "final": 0.8})
             rows = await get_metrics_for_run(db, "run1", "exp1")
             assert len(rows) == 1
-            assert rows[0]["loss"] == 0.5
+            # Same-key values are overwritten; other keys are preserved.
+            assert rows[0]["loss"] == 999.0
+            assert rows[0]["acc"] == 0.9
+            assert rows[0]["final"] == 0.8
         finally:
             await db.close()
 

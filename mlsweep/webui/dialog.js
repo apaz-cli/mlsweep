@@ -140,3 +140,38 @@
     });
   };
 })();
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// A run's display name: its label, or its run ID if it has none.
+function runDisplayName(j) {
+  return j.label || j.run_id;
+}
+
+// A run's display name as HTML: its label with the run ID muted beside it.
+function runNameHtml(j) {
+  if (!j.label) return escHtml(j.run_id);
+  return `${escHtml(j.label)} <span style="color:var(--text-muted);font-size:9px">${escHtml(j.run_id)}</span>`;
+}
+
+// Ask for a run's new display name and save it.  Resolves to the new label
+// (null = cleared), or undefined if cancelled, unchanged, or the save failed.
+// *apiFetch* is the page's authenticated fetch.
+async function mlRenameRun(apiFetch, expId, runId, current) {
+  const input = await mlPrompt(`Rename run ${runId}:`, current || "", { okLabel: "Rename", placeholder: runId });
+  if (input === null) return undefined;
+  const label = input.trim() || null;
+  if (label === (current || null)) return undefined;
+  const r = await apiFetch(`/api/jobs/${encodeURIComponent(runId)}/label`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ experiment_id: expId, label }),
+  });
+  if (r.ok) return label;
+  await mlAlert(`Rename failed: ${r.status}`);
+  return undefined;
+}

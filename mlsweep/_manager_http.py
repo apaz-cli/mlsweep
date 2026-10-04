@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import zipfile
@@ -228,11 +229,15 @@ async def auth_middleware(
     """Middleware that enforces token authentication on all routes.
 
     Skips static file routes (prefix ``/static/``) so the web UI can load
-    without a token in every asset request.
+    without a token in every asset request.  Static files are marked
+    ``no-cache`` so a browser revalidates them (a cheap 304) on every load
+    instead of pairing fresh HTML with a stale cached ``dialog.js``.
     """
     # Allow static files without auth
     if request.path.startswith("/static/"):
-        return await handler(request)
+        response = await handler(request)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
     # Allow OPTIONS (CORS preflight) without auth
     if request.method == "OPTIONS":
@@ -406,6 +411,49 @@ async def handle_list_experiments(request: web.Request) -> web.Response:
     return _json_response(experiments)
 
 
+async def _experiment_fields(
+    request: web.Request,
+    db: aiosqlite.Connection,
+    body: dict[str, Any],
+    experiment_id: str,
+) -> dict[str, Any] | web.Response:
+    """Experiment-create kwargs from a request body, or an error response.
+
+    The campaign comes from the body's ``campaign``, else ``?campaign=``, else
+    the default campaign.  An experiment that already exists in another
+    campaign is refused with 409.
+    """
+    goal = body.get("goal")
+    if goal is not None and goal not in ("minimize", "maximize"):
+        return _error_response("'goal' must be 'minimize' or 'maximize'")
+    query_campaign = request.query.get("campaign")
+    campaign = body.get("campaign") or query_campaign or DEFAULT_CAMPAIGN
+    if query_campaign is not None and campaign != query_campaign:
+        return _error_response(
+            f"body campaign {campaign!r} does not match ?campaign={query_campaign}")
+    try:
+        validate_campaign(campaign)
+    except ValueError as exc:
+        return _error_response(str(exc))
+    existing = await get_experiment(db, experiment_id)
+    if existing is not None and existing.campaign != campaign:
+        return _wrong_campaign(experiment_id, existing.campaign, campaign, status=409)
+    return {
+        "experiment_id": experiment_id,
+        "name": body.get("name") or experiment_id,
+        "campaign": campaign,
+        "controller_id": body.get("controller_id"),
+        "note": body.get("note"),
+        "status": body.get("status", "running"),
+        "expected_jobs": body.get("expected_jobs", 0),
+        "singular_dims": body.get("singular_dims") or [],
+        "max_concurrent": body.get("max_concurrent", 0),
+        "skip_rules": body.get("skip_rules") or {},
+        "metric": body.get("metric"),
+        "goal": goal,
+    }
+
+
 @routes.post("/api/experiments")
 async def handle_create_experiment(request: web.Request) -> web.Response:
     """Create a new experiment.
@@ -431,46 +479,11 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     except ValueError as exc:
         return _error_response(str(exc), status=400)
 
-    name = body.get("name") or experiment_id
-    controller_id = body.get("controller_id")
-    note = body.get("note")
-    status = body.get("status", "running")
-    expected_jobs = body.get("expected_jobs", 0)
-    singular_dims = body.get("singular_dims") or []
-    max_concurrent = body.get("max_concurrent", 0)
-    skip_rules = body.get("skip_rules") or {}
-    metric = body.get("metric")
-    goal = body.get("goal")
-    if goal is not None and goal not in ("minimize", "maximize"):
-        return _error_response("'goal' must be 'minimize' or 'maximize'")
-    query_campaign = request.query.get("campaign")
-    campaign = body.get("campaign") or query_campaign or DEFAULT_CAMPAIGN
-    if query_campaign is not None and campaign != query_campaign:
-        return _error_response(
-            f"body campaign {campaign!r} does not match ?campaign={query_campaign}")
+    fields = await _experiment_fields(request, db, body, experiment_id)
+    if isinstance(fields, web.Response):
+        return fields
     try:
-        validate_campaign(campaign)
-    except ValueError as exc:
-        return _error_response(str(exc))
-    existing = await get_experiment(db, experiment_id)
-    if existing is not None and existing.campaign != campaign:
-        return _wrong_campaign(experiment_id, existing.campaign, campaign, status=409)
-
-    try:
-        exp = await state.db_writer.create_experiment(
-            experiment_id=experiment_id,
-            name=name,
-            campaign=campaign,
-            controller_id=controller_id,
-            note=note,
-            status=status,
-            expected_jobs=expected_jobs,
-            singular_dims=singular_dims,
-            max_concurrent=max_concurrent,
-            skip_rules=skip_rules,
-            metric=metric,
-            goal=goal,
-        )
+        exp = await state.db_writer.create_experiment(**fields)
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
@@ -810,6 +823,48 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
     return _json_response(records, status=201)
 
 
+@routes.post("/api/experiments/{experiment_id}/jobs/bulk")
+async def handle_create_experiment_with_jobs(request: web.Request) -> web.Response:
+    """Create (or update) an experiment and insert its jobs atomically.
+
+    Either the experiment row and every job land, or nothing does.  A duplicate
+    run_id inside the experiment aborts the whole submission with 409.
+    """
+    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    experiment_id = request.match_info["experiment_id"]
+    try:
+        experiment_id = _sanitize_experiment_id(experiment_id)
+    except ValueError as exc:
+        return _error_response(str(exc), status=400)
+
+    try:
+        body = await _request_json(request)
+    except Exception:
+        return _error_response("invalid JSON body")
+
+    jobs = body.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        return _error_response("'jobs' must be a non-empty array")
+    for job in jobs:
+        job["experiment_id"] = experiment_id
+
+    fields = await _experiment_fields(request, db, body, experiment_id)
+    if isinstance(fields, web.Response):
+        return fields
+    try:
+        exp, records = await state.db_writer.create_experiment_with_jobs(jobs=jobs, **fields)
+    except sqlite3.IntegrityError:
+        return _error_response(
+            "duplicate run_id in this experiment (run names must be unique per "
+            "experiment); nothing was created — fix the sweep's names and resubmit",
+            status=409,
+        )
+
+    state.request_schedule()
+    return _json_response({"experiment": exp, "jobs": records}, status=201)
+
+
 @routes.get("/api/jobs/pending")
 async def handle_list_pending_jobs(request: web.Request) -> web.Response:
     """List pending jobs, optionally filtered by experiment and campaign."""
@@ -929,6 +984,8 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
         return _error_response("'experiment_id' is required")
     label = body.get("label")
     if label is not None:
+        if not isinstance(label, str):
+            return _error_response("'label' must be a string or null")
         label = label.strip() or None
     job = await state.db_writer.update_job_label(run_id, experiment_id, label)
     if job is None:

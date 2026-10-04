@@ -108,6 +108,11 @@ def _stored_bytes(c: Cluster, table: str, job_key: int) -> tuple[int, int]:
                           "WHERE job_key = ?", (job_key,)).fetchone()
 
 
+def _run_lines(text: str) -> list[str]:
+    """A run log's lines from the job itself, without the worker's ``[mlsweep]`` notices."""
+    return [ln for ln in text.splitlines() if not ln.startswith("[mlsweep] ")]
+
+
 def _metrics(c: Cluster, eid: str, rid: str) -> list[dict]:
     """A run's metric rows (the endpoint serves JSONL, and 404 before the first one)."""
     try:
@@ -137,7 +142,7 @@ def test_a_very_chatty_run_is_stored_whole_compact_and_fast_to_read(cluster):
         time.sleep(1)  # keep probing while the tail is stored
 
     text, read_s = _timed(lambda: c.get_text(f"/api/experiments/{eid}/jobs/r/logs"))
-    lines = text.splitlines()
+    lines = _run_lines(text)
     assert len(lines) == n
     assert lines == [f"line {i} {PAD}" for i in range(n)]
     raw = len(text.encode())
@@ -158,7 +163,7 @@ def test_many_chatty_runs_at_once_keep_their_logs_separate_and_whole(cluster):
             _submit(c, eid, f"r{i}", _printer(n, tag=f"r{i} "))
         c.wait_statuses(eid, {"done": runs}, timeout=90)
     for i in range(runs):
-        lines = c.get_text(f"/api/experiments/{eid}/jobs/r{i}/logs").splitlines()
+        lines = _run_lines(c.get_text(f"/api/experiments/{eid}/jobs/r{i}/logs"))
         assert lines == [f"r{i} line {k} {PAD}" for k in range(n)], f"r{i}"
     print(f"\ncrowd: api p95 {lat.p95*1e3:.0f} ms, worst {lat.worst*1e3:.0f} ms")
     assert lat.p95 < 0.25 and lat.worst < 2
@@ -182,7 +187,7 @@ def test_a_chatty_run_survives_a_dropped_connection_with_its_log_whole(proxied, 
                90, "big to finish")
     c = Cluster.__new__(Cluster)
     c.url = url
-    lines = c.get_text("/api/experiments/rc/jobs/big/logs").splitlines()  # complete once done
+    lines = _run_lines(c.get_text("/api/experiments/rc/jobs/big/logs"))  # complete once done
     assert len(lines) == n
     assert lines == [f"line {i} {PAD}" for i in range(n)]
 

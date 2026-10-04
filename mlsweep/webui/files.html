@@ -300,11 +300,6 @@ let browseFile  = null;         // file path highlighted in Browse tree
 let compareFile = null;         // file path shown in Compare grid
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-function runName(j) {
-  if (!j.label) return esc(j.run_id);
-  return `${esc(j.label)} <span style="color:var(--text-muted);font-size:9px">${esc(j.run_id)}</span>`;
-}
 function fmtSize(b) {
   if (b == null) return "";
   if (b < 1024) return b + " B";
@@ -392,9 +387,9 @@ function renderRunList() {
     info.className = "run-info";
     const combo = comboStr(j);
     const elapsed = fmtElapsed(j.elapsed);
-    info.innerHTML = `<div class="run-id-text">${runName(j)}</div>` +
-      (combo ? `<div class="run-combo-text">${esc(combo)}</div>` : "") +
-      (elapsed ? `<div class="run-elapsed-text">${esc(elapsed)}</div>` : "");
+    info.innerHTML = `<div class="run-id-text">${runNameHtml(j)}</div>` +
+      (combo ? `<div class="run-combo-text">${escHtml(combo)}</div>` : "") +
+      (elapsed ? `<div class="run-elapsed-text">${escHtml(elapsed)}</div>` : "");
 
     const bdg = document.createElement("span");
     bdg.className = `badge badge-${j.status}`;
@@ -509,18 +504,18 @@ async function renderCompareGrid() {
     const card  = document.createElement("div");
     card.className = "run-card";
 
-    const dlHref = found ? esc(authURL(artifactURL(expId(), j.run_id, compareFile))) : "";
+    const dlHref = found ? escHtml(authURL(artifactURL(expId(), j.run_id, compareFile))) : "";
     const fname  = compareFile.split("/").pop();
 
     card.innerHTML = `
       <div class="card-header">
-        <span class="card-run-id" title="${esc(j.run_id)}">${runName(j)}</span>
+        <span class="card-run-id" title="${escHtml(j.run_id)}">${runNameHtml(j)}</span>
         <span class="badge badge-${j.status}">${j.status}</span>
       </div>
-      ${combo ? `<div class="card-combo" title="${esc(combo)}">${esc(combo)}</div>` : ""}
+      ${combo ? `<div class="card-combo" title="${escHtml(combo)}">${escHtml(combo)}</div>` : ""}
       <div class="card-body"></div>
       <div class="card-footer">
-        ${found ? `<a class="btn-sm" href="${dlHref}" download="${esc(fname)}">Download</a>` : ""}
+        ${found ? `<a class="btn-sm" href="${dlHref}" download="${escHtml(fname)}">Download</a>` : ""}
       </div>`;
 
     const body = card.querySelector(".card-body");
@@ -577,7 +572,7 @@ async function loadBrowse(runId) {
   toolbar.style.display = "flex";
   document.getElementById("run-dl-zip").href = runZipURL(expId(), runId);
   const _browseJob = jobs.find(j => j.run_id === runId);
-  document.getElementById("browse-run-label").innerHTML = _browseJob ? runName(_browseJob) : esc(runId);
+  document.getElementById("browse-run-label").innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
   tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">Loading…</div>`;
   pane.innerHTML = `<div class="placeholder">Loading files…</div>`;
 
@@ -597,7 +592,7 @@ async function loadBrowse(runId) {
     const row = document.createElement("div");
     row.className = "file-row" + (f.path === browseFile ? " selected" : "");
     row.dataset.path = f.path;
-    row.innerHTML = `<span class="file-icon">${fileIcon(f.path)}</span><span class="file-name" title="${esc(f.path)}">${esc(f.path)}</span><span class="file-size">${fmtSize(f.size)}</span><span class="file-modified">${fmtModified(f.modified)}</span>`;
+    row.innerHTML = `<span class="file-icon">${fileIcon(f.path)}</span><span class="file-name" title="${escHtml(f.path)}">${escHtml(f.path)}</span><span class="file-size">${fmtSize(f.size)}</span><span class="file-modified">${fmtModified(f.modified)}</span>`;
     row.addEventListener("click", () => {
       browseFile = f.path;
       tree.querySelectorAll(".file-row").forEach(r => r.classList.remove("selected"));
@@ -625,9 +620,9 @@ function showBrowsePreview(runId, file) {
 
   pane.innerHTML = `
     <div class="preview-header">
-      <span class="preview-filename">${esc(file.path)}</span>
+      <span class="preview-filename">${escHtml(file.path)}</span>
       <span class="preview-meta">${fmtSize(file.size)}${file.modified ? ` · ${fmtModified(file.modified)}` : ""}</span>
-      <a class="btn-sm" href="${esc(authURL(url))}" download="${esc(fname)}">Download</a>
+      <a class="btn-sm" href="${escHtml(authURL(url))}" download="${escHtml(fname)}">Download</a>
     </div>
     <div id="preview-content"></div>`;
 

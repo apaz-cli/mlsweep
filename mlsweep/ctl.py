@@ -1,8 +1,8 @@
 """Control-plane subcommands for ``mlsweep``: inspect and manage runs.
 
 These are the lifecycle verbs (ls, logs, cancel, retry, resume, stop, pause,
-unpause), the result-ranking command (best), and campaign management
-(campaign). They are thin HTTP clients over the manager API and share helpers
+unpause), run naming (rename), the result-ranking command (best), and campaign
+management (campaign). They are thin HTTP clients over the manager API and share helpers
 with ``mlsweep.run_sweep``.
 
 Every command works in one campaign (``--campaign``, ``$MLSWEEP_CAMPAIGN``, or
@@ -26,11 +26,14 @@ from mlsweep._shared import _BOLD, _CYAN, _GREEN, _RED, _RESET, _YELLOW
 from mlsweep._shared import validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
+    _leaderboard_header,
+    _leaderboard_row,
     _campaign_argv,
     _combo_str,
     _manager_token,
     _parse_combo,
     _resolve_campaign,
+    _run_str,
     _wait_until_settled,
     build_leaderboard,
     manager_cancel_job,
@@ -42,6 +45,7 @@ from mlsweep.run_sweep import (
     manager_move_experiment,
     manager_retry_job,
     manager_set_experiment_status,
+    manager_set_job_label,
     print_leaderboard,
     require_campaign,
     resolve_ranking,
@@ -139,6 +143,8 @@ def ls_cmd(argv: list[str]) -> None:
     parser.add_argument("experiment", nargs="?", help="Experiment ID (omit to list experiments)")
     parser.add_argument("--status", default=None, help="Filter by status")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
+    parser.add_argument("--with-dims", action="store_true",
+                        help="With --json: add a parsed 'dims' object for each run")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
@@ -146,6 +152,8 @@ def ls_cmd(argv: list[str]) -> None:
         jobs = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status,
                                             campaign=campaign) or []
         if args.json:
+            if args.with_dims:
+                jobs = [dict(j, dims=_parse_combo(j["combo"]) or {}) for j in jobs]
             print(json.dumps(jobs, indent=2))
             return
         if not jobs:
@@ -156,7 +164,7 @@ def ls_cmd(argv: list[str]) -> None:
             combo_s = _combo_str(_parse_combo(j.get("combo")))
             status = j.get("status", "?")
             sweep_print(f"  {_color_status(f'{status:>11}', status)}  "
-                        f"{_GREEN}{j.get('run_id')}{_RESET}  {combo_s}")
+                        f"{_run_str(j['run_id'], j['label'])}  {combo_s}")
         return
 
     exps = manager_list_experiments(manager, token, status_filter=args.status, campaign=campaign)
@@ -253,25 +261,69 @@ def select_metrics(rows: list[dict[str, Any]], pattern: re.Pattern[str] | None) 
     return out
 
 
-def pivot_metrics(rows: list[dict[str, Any]], pattern: re.Pattern[str],
+def _pivot_run(
+    rows: list[dict[str, Any]],
+    pattern: re.Pattern[str] | None,
+    step: int | None,
+) -> tuple[dict[tuple[str, ...], Any], Any]:
+    """``({(captures…): value}, max_step)`` for one run.
+
+    Each key contributes its own latest value, not the value at the latest step
+    that happened to have any matching key.  A key contributes only when every
+    capture group matched, so a 2-group pattern never mixes 1- and 2-tuples.
+    A None *pattern* takes every key whole, as a 1-tuple.
+    *step* caps the steps considered (latest at or before it; the latest
+    overall if None).  ``max_step`` is the largest step among the chosen keys,
+    or None when nothing matched.
+    """
+    out: dict[tuple[str, ...], Any] = {}
+    last_step: dict[tuple[str, ...], Any] = {}
+    for row in rows:
+        s = row["step"]
+        if not isinstance(s, (int, float)):
+            continue
+        if step is not None and s > step:
+            continue
+        for k, v in row.items():
+            if k == "step":
+                continue
+            if pattern is None:
+                key: tuple[str, ...] = (k,)
+            else:
+                m = pattern.search(k)
+                if not m or any(g is None for g in m.groups()):
+                    continue
+                key = tuple(m.groups())
+            if key not in last_step or s >= last_step[key]:
+                last_step[key] = s
+                out[key] = v
+    return out, (max(last_step.values()) if last_step else None)
+
+
+def pivot_metrics(rows: list[dict[str, Any]], pattern: re.Pattern[str] | None,
                   step: int | None) -> tuple[int | None, dict[str, Any]]:
-    """For a pattern with one capture group, return ``(step, {capture: value})`` from the
-    latest logged step at or before *step* (the latest overall if None) that has any
-    matching key.  Turns flat keys like ``val/nll@r16`` into a curve over the capture."""
-    chosen = None
-    for row in sorted(rows, key=lambda r: r.get("step") or 0):
-        if step is not None and (row.get("step") or 0) > step:
-            break
-        if any(k != "step" and pattern.search(k) for k in row):
-            chosen = row
-    if chosen is None:
-        return None, {}
-    vals = {}
-    for k, v in chosen.items():
-        m = pattern.search(k) if k != "step" else None
-        if m:
-            vals[m.group(1)] = v
-    return chosen.get("step"), vals
+    """Backward-compatible single-group pivot: ``(step, {capture: value})``."""
+    vals, max_step = _pivot_run(rows, pattern, step)
+    return max_step, {g[0]: v for g, v in vals.items()}
+
+
+def _dim_columns(jobs: list[dict[str, Any]]) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Ordered dim names and ``run_id → combo`` parsed from a jobs list."""
+    dims: list[str] = []
+    combos: dict[str, dict[str, Any]] = {}
+    for j in jobs:
+        rid = j["run_id"]
+        combo = _parse_combo(j["combo"]) or {}
+        combos[rid] = combo
+        for k in combo:
+            if k not in dims:
+                dims.append(k)
+    return dims, combos
+
+
+def _csv_cell(v: Any) -> str:
+    """CSV cell for a dim or metric value (None → empty, not ``-``)."""
+    return "" if v is None else str(v)
 
 
 def metrics_cmd(argv: list[str]) -> None:
@@ -282,17 +334,21 @@ def metrics_cmd(argv: list[str]) -> None:
     parser.add_argument("--experiment", required=True, help="Experiment ID")
     parser.add_argument("runs", nargs="*", help="Run IDs (default: every run in the experiment)")
     parser.add_argument("--keys", default=None, help="Regex selecting metric keys")
-    parser.add_argument("--pivot", action="store_true",
-                        help="Turn keys into rows using --keys' first capture group, e.g. "
-                             "--keys 'val/nll@r(\\d+)' --pivot prints value vs. r, one column "
-                             "per run (a curve from flat keys)")
+    shape = parser.add_mutually_exclusive_group()
+    shape.add_argument("--pivot", action="store_true",
+                       help="Reshape keys via --keys' capture groups: one group makes one "
+                            "column per run; two groups make a row×column grid per run")
+    shape.add_argument("--last", action="store_true",
+                       help="One row per run: each selected key's own latest value")
     parser.add_argument("--step", type=int, default=None,
-                        help="With --pivot: use this step (latest at or before it; default: latest)")
+                        help="With --pivot: use steps at or before this (default: latest)")
     parser.add_argument("--tail", type=int, default=10,
                         help="Steps per run in the table view (default 10; 0 = all)")
+    parser.add_argument("--with-dims", action="store_true",
+                        help="Add each sweep dimension as a column, from the submitted combo")
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="Emit the selected metrics as JSON")
-    fmt.add_argument("--csv", action="store_true", help="Emit long-format CSV: run,step,key,value")
+    fmt.add_argument("--csv", action="store_true", help="Emit CSV (long, or wide with --last)")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
@@ -302,10 +358,24 @@ def metrics_cmd(argv: list[str]) -> None:
         sweep_print(f"{_RED}Bad --keys regex{_RESET}: {e}")
         sys.exit(2)
 
-    run_ids = list(args.runs)
-    if not run_ids:
+    jobs: list[dict[str, Any]] = []
+    if not args.runs or args.with_dims:
         jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
-        run_ids = [j["run_id"] for j in jobs]
+    dims, combo_by_run = _dim_columns(jobs)
+    if not args.with_dims:
+        dims = []  # so every dim column below comes out empty
+    run_ids = list(args.runs) or [j["run_id"] for j in jobs]
+
+    # combo_by_run covers every run when --with-dims is on (it fetched all jobs).
+    def dim_cells(rid: str, fmt: Callable[[Any], str]) -> list[str]:
+        return [fmt(combo_by_run[rid].get(d)) for d in dims]
+
+    def with_dims(rid: str, data: Any) -> Any:
+        return {"dims": combo_by_run[rid], "metrics": data} if args.with_dims else data
+
+    def run_label(rid: str) -> str:
+        return f"{rid} ({_combo_str(combo_by_run[rid])})" if args.with_dims else rid
+
     with ThreadPoolExecutor(max_workers=8) as pool:
         fetched = pool.map(lambda rid: manager_get_job_metrics(manager, token, args.experiment, rid,
                                                                campaign=campaign),
@@ -317,38 +387,81 @@ def metrics_cmd(argv: list[str]) -> None:
                     + (f" matching {args.keys!r}" if args.keys else ""))
         sys.exit(1)
 
-    if args.json:
-        print(json.dumps(per_run, indent=2))
-        return
-    if args.csv:
-        w = csv.writer(sys.stdout)
-        w.writerow(["run", "step", "key", "value"])
-        for rid, rows in per_run.items():
-            for row in rows:
-                for k, v in row.items():
-                    if k != "step":
-                        w.writerow([rid, row["step"], k, v])
+    # ── --last: wide, one row per run ────────────────────────────────────────
+    if args.last:
+        wide = {rid: pivot_metrics(rows, None, None)[1] for rid, rows in per_run.items()}
+        keys = sorted({k for vals in wide.values() for k in vals})
+        if args.json:
+            print(json.dumps({rid: with_dims(rid, vals) for rid, vals in wide.items()}, indent=2))
+            return
+        if args.csv:
+            w = csv.writer(sys.stdout)
+            w.writerow(["run"] + dims + keys)
+            for rid, vals in wide.items():
+                w.writerow([rid] + dim_cells(rid, _csv_cell) + [_csv_cell(vals.get(k)) for k in keys])
+            return
+        _print_table(["run"] + dims + keys,
+                     [[rid] + dim_cells(rid, _fmt) + [_fmt(vals.get(k)) for k in keys]
+                      for rid, vals in wide.items()])
         return
 
+    # ── --pivot: reshape key captures ────────────────────────────────────────
     if args.pivot:
         if pattern is None or pattern.groups < 1:
             sweep_print(f"{_RED}--pivot needs --keys with a capture group{_RESET}, "
                         "e.g. --keys 'val/nll@r(\\d+)'")
             sys.exit(2)
-        cols = []
+        if pattern.groups > 2:
+            sweep_print(f"{_RED}--pivot supports at most two capture groups{_RESET}")
+            sys.exit(2)
+
+        if pattern.groups == 1:
+            cols = []
+            for rid, rows in per_run.items():
+                pstep, vals = pivot_metrics(rows, pattern, args.step)
+                if vals:
+                    cols.append((f"{run_label(rid)} @{pstep}", vals))
+            if not cols:
+                sweep_print(f"{_YELLOW}No pivot values{_RESET} in {args.experiment}")
+                return
+            xs = sorted({x for _, vals in cols for x in vals}, key=_sort_key)
+            _print_table(["x"] + [c for c, _ in cols],
+                         [[x] + [_fmt(vals.get(x)) for _, vals in cols] for x in xs])
+            return
+
+        # two capture groups: one row×column grid per run
         for rid, rows in per_run.items():
-            step, vals = pivot_metrics(rows, pattern, args.step)
-            if vals:
-                cols.append((f"{rid} @{step}", vals))
-        xs = sorted({x for _, vals in cols for x in vals}, key=_sort_key)
-        _print_table(["x"] + [c for c, _ in cols],
-                     [[x] + [_fmt(vals.get(x)) for _, vals in cols] for x in xs])
+            grid, _ = _pivot_run(rows, pattern, args.step)
+            if not grid:
+                continue
+            xs = sorted({g[0] for g in grid}, key=_sort_key)
+            ys = sorted({g[1] for g in grid}, key=_sort_key)
+            print(f"{_BOLD}{_CYAN}== {run_label(rid)}{_RESET}")
+            _print_table(["x\\y"] + ys,
+                         [[x] + [_fmt(grid.get((x, y))) for y in ys] for x in xs])
+            print()
         return
 
+    # ── long JSON / CSV ──────────────────────────────────────────────────────
+    if args.json:
+        print(json.dumps({rid: with_dims(rid, rows) for rid, rows in per_run.items()}, indent=2))
+        return
+    if args.csv:
+        w = csv.writer(sys.stdout)
+        w.writerow(["run"] + dims + ["step", "key", "value"])
+        for rid, rows in per_run.items():
+            cells = dim_cells(rid, _csv_cell)
+            for row in rows:
+                for k, v in row.items():
+                    if k != "step":
+                        w.writerow([rid] + cells + [row["step"], k, _csv_cell(v)])
+        return
+
+    # ── table view ───────────────────────────────────────────────────────────
     for rid, rows in per_run.items():
         keys = sorted({k for r in rows for k in r if k != "step"})
         shown = rows[-args.tail:] if args.tail else rows
-        print(f"{_BOLD}{_CYAN}== {rid}{_RESET}  ({len(rows)} steps)")
+        print(f"{_BOLD}{_CYAN}== {run_label(rid)}{_RESET}  ({len(rows)} steps)")
         _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(k)) for k in keys] for r in shown])
         print()
 
@@ -399,6 +512,32 @@ def cancel_cmd(argv: list[str]) -> None:
 
 def retry_cmd(argv: list[str]) -> None:
     _cancel_retry(argv, retry=True)
+
+
+# ── rename ─────────────────────────────────────────────────────────────────────
+
+
+def rename_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep rename",
+        "Give a run a display name, shown next to its run ID in ls, best, and the "
+        "dashboard. The run ID itself never changes.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("run", help="Run ID")
+    parser.add_argument("name", nargs="?", default=None, help="New display name")
+    parser.add_argument("--clear", action="store_true", help="Remove the display name")
+    args = parser.parse_args(argv)
+    name = (args.name or "").strip()
+    if args.clear == bool(name):
+        parser.error("give a non-empty NAME or --clear, not both")
+    manager, token, campaign = _connect(args, args.experiment)
+
+    r = manager_set_job_label(manager, token, args.run, args.experiment, name or None,
+                              campaign=campaign)
+    _report(r, f"cleared the name of {args.run}" if args.clear else f"renamed {args.run} to {name!r}")
+    if not r:
+        sys.exit(1)
 
 
 # ── stop / pause / unpause ─────────────────────────────────────────────────────
@@ -594,6 +733,57 @@ def resume_cmd(argv: list[str]) -> None:
 # ── best ───────────────────────────────────────────────────────────────────────
 
 
+def _best_by(rows: list[dict[str, Any]], dims: list[str]) -> dict[tuple[str, ...], dict[str, Any]]:
+    """The best ranked row for each combination of *dims*' values.
+
+    *rows* are already best-first.  Runs with no value, or missing a dim, are skipped.
+    """
+    best: dict[tuple[str, ...], dict[str, Any]] = {}
+    for r in rows:
+        combo = r["combo"] or {}
+        if r["value"] is None or not all(d in combo for d in dims):
+            continue
+        best.setdefault(tuple(_fmt(combo[d]) for d in dims), r)
+    return best
+
+
+def _print_grouped_leaderboard(
+    rows: list[dict[str, Any]], group_by: str, metric: str, goal: str, top: int,
+) -> None:
+    """Print the best run for each value of *group_by* (rows are already best-first)."""
+    groups = {k[0]: r for k, r in _best_by(rows, [group_by]).items()}
+    if not groups:
+        sweep_print(f"  {_YELLOW}(no completed runs with a value for dim {group_by!r}){_RESET}")
+        return
+    shown = list(groups.items())
+    if top:
+        shown = shown[:top]
+    _leaderboard_header(metric, goal, f"best per {_GREEN}{group_by}{_RESET} ({len(groups)} groups)")
+    for i, (key, r) in enumerate(shown, 1):
+        _leaderboard_row(i, r, f"{_GREEN}{group_by}={key}{_RESET}  ")
+
+
+def _print_metric_table(
+    rows: list[dict[str, Any]], spec: str, metric: str, goal: str,
+) -> None:
+    """Print a 2-D grid of *metric* over two dims, best value per cell."""
+    parts = [d.strip() for d in spec.split(",")]
+    if len(parts) != 2 or not all(parts):
+        sweep_print(f"{_RED}--table needs exactly two dims, e.g. --table est,lr{_RESET}")
+        sys.exit(2)
+    d1, d2 = parts
+    best = _best_by(rows, parts)
+    if not best:
+        sweep_print(f"  {_YELLOW}(no completed runs with values for {d1!r}/{d2!r}){_RESET}")
+        return
+    xs = sorted({k[0] for k in best}, key=_sort_key)
+    ys = sorted({k[1] for k in best}, key=_sort_key)
+    sweep_print(f"\n{_BOLD}{_CYAN}{metric} by {d1} × {d2}{_RESET} ({goal})")
+    _print_table([f"{d1}\\{d2}"] + ys,
+                 [[x] + [_fmt(best[x, y]["value"] if (x, y) in best else None) for y in ys]
+                  for x in xs])
+
+
 def best_cmd(argv: list[str]) -> None:
     parser = _common_parser("mlsweep best", "Show the best runs of an experiment by metric.")
     parser.add_argument("--experiment", required=True, help="Experiment ID")
@@ -602,6 +792,12 @@ def best_cmd(argv: list[str]) -> None:
     parser.add_argument("--goal", default=None, choices=["minimize", "maximize"],
                         help="Rank direction (default: experiment's goal, else minimize)")
     parser.add_argument("--top", type=int, default=10, help="Show top N runs (0 = all)")
+    parser.add_argument("--group-by", default=None, metavar="DIM",
+                        help="Show the best run for each value of this dimension")
+    parser.add_argument("--table", default=None, metavar="D1,D2",
+                        help="2-D grid of the metric over two dimensions")
+    parser.add_argument("--with-dims", action="store_true",
+                        help="With --json: add each sweep dimension as a top-level key")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     parser.add_argument("--wait", action="store_true", help="Block until the experiment settles")
     parser.add_argument("--wait-interval", type=int, default=10, help="Seconds between --wait polls")
@@ -616,8 +812,15 @@ def best_cmd(argv: list[str]) -> None:
     metric, goal = resolve_ranking(manager, token, args.experiment, args.metric, args.goal,
                                    campaign=campaign)
     rows = build_leaderboard(manager, token, args.experiment, metric, goal, campaign=campaign)
+
     if args.json:
+        if args.with_dims:
+            rows = [{**r, **(r["combo"] or {})} for r in rows]
         print(json.dumps(rows, indent=2))
+    elif args.group_by:
+        _print_grouped_leaderboard(rows, args.group_by, metric, goal, args.top)
+    elif args.table:
+        _print_metric_table(rows, args.table, metric, goal)
     else:
         print_leaderboard(rows, metric, goal, args.top)
     if had_failure:

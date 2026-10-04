@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import base64
+import collections
 import functools
 import hashlib
 import importlib.metadata
@@ -465,11 +466,17 @@ def manager_create_experiment(
     metric: str | None = None,
     goal: str | None = None,
     campaign: str = DEFAULT_CAMPAIGN,
+    jobs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Create an experiment in *campaign* on the manager. Returns the experiment dict or None."""
+    """Create an experiment in *campaign* on the manager. Returns the response dict or None.
+
+    With *jobs*, the experiment and its jobs are created in one atomic request:
+    either all of it lands or none of it does.
+    """
+    path = f"/api/experiments/{experiment_id}/jobs/bulk" if jobs else "/api/experiments"
     status, resp = _http_request(
         "POST",
-        _manager_url(manager, "/api/experiments"),
+        _manager_url(manager, _with_campaign(path, campaign)),
         token,
         json_data={
             "experiment_id": experiment_id,
@@ -484,10 +491,13 @@ def manager_create_experiment(
             "skip_rules": skip_rules or {},
             "metric": metric,
             "goal": goal,
+            **({"jobs": jobs} if jobs else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
-        sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} (campaign {campaign})")
+        with_jobs = f" with {len(jobs)} job(s)" if jobs else ""
+        sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} "
+                    f"(campaign {campaign}){with_jobs}")
         return resp
     sweep_print(f"  {_RED}FAIL{_RESET}  Create experiment: {resp}")
     return None
@@ -723,6 +733,26 @@ def manager_retry_job(
     return None
 
 
+def manager_set_job_label(
+    manager: str,
+    token: str,
+    run_id: str,
+    experiment_id: str,
+    label: str | None,
+    campaign: str | None = None,
+) -> dict[str, Any] | None:
+    """Set a run's display name, or clear it with *label* None."""
+    status, resp = _http_request(
+        "PUT",
+        _manager_url(manager, _with_campaign(f"/api/jobs/{run_id}/label", campaign)),
+        token,
+        json_data={"experiment_id": experiment_id, "label": label},
+    )
+    if status == 200 and isinstance(resp, dict):
+        return resp
+    return None
+
+
 def manager_set_experiment_status(
     manager: str,
     token: str,
@@ -783,6 +813,11 @@ def _combo_str(combo: Any) -> str:
     return "  ".join(f"{k}={v}" for k, v in combo.items())
 
 
+def _run_str(run_id: Any, label: Any) -> str:
+    """A run ID in green, followed by its display name if it has one."""
+    return f"{_GREEN}{run_id}{_RESET}" + (f"  ({label})" if label else "")
+
+
 def _metric_values(metrics: list[dict[str, Any]] | None, metric: str) -> list[float]:
     """Finite values of *metric* across metric rows, in step order."""
     return [
@@ -812,7 +847,7 @@ def build_leaderboard(
 ) -> list[dict[str, Any]]:
     """Compute a ranked list of run results, best-first by *metric*.
 
-    Each row: {run_id, status, combo, value, final, elapsed, exit_code}.
+    Each row: {run_id, label, status, combo, value, final, elapsed, exit_code}.
     """
     if jobs is None:
         jobs = manager_list_experiment_jobs(manager, token, experiment_id, campaign=campaign) or []
@@ -845,6 +880,7 @@ def rank_leaderboard(
                 final = vals[-1]
         rows.append({
             "run_id": run_id,
+            "label": j.get("label"),
             "status": st,
             "combo": _parse_combo(j.get("combo")),
             "value": value,
@@ -862,6 +898,21 @@ def rank_leaderboard(
     return rows
 
 
+def _leaderboard_header(metric: str, goal: str, summary: str) -> None:
+    """Print the ruled ``LEADERBOARD:`` banner shared by the ranking printers."""
+    rule = f"{_CYAN}{'=' * 80}{_RESET}"
+    sweep_print(f"\n{rule}")
+    sweep_print(f"{_BOLD}LEADERBOARD:{_RESET} {_MAGENTA}{metric}{_RESET} ({goal}), {summary}")
+    sweep_print(rule)
+
+
+def _leaderboard_row(i: int, r: dict[str, Any], prefix: str = "") -> None:
+    """Print one ranked run; *prefix* goes just before the run name."""
+    final = f"  final={r['final']:.6f}" if isinstance(r["final"], (int, float)) else ""
+    sweep_print(f"  {i:>3}. {_MAGENTA}{r['value']:>12.6f}{_RESET}{final}  {prefix}"
+                f"{_run_str(r['run_id'], r['label'])}  {_combo_str(r['combo'])}")
+
+
 def print_leaderboard(
     rows: list[dict[str, Any]],
     metric: str = "loss",
@@ -870,19 +921,12 @@ def print_leaderboard(
 ) -> None:
     """Print the ranked runs."""
     done = [r for r in rows if r["value"] is not None]
-    rule = f"{_CYAN}{'=' * 80}{_RESET}"
-    sweep_print(f"\n{rule}")
-    sweep_print(f"{_BOLD}LEADERBOARD:{_RESET} {_MAGENTA}{metric}{_RESET} ({goal}), "
-                f"{_GREEN}{len(done)}{_RESET} completed runs")
-    sweep_print(rule)
+    _leaderboard_header(metric, goal, f"{_GREEN}{len(done)}{_RESET} completed runs")
     if not done:
         sweep_print(f"  {_YELLOW}(no completed runs with a metric value){_RESET}")
         return
-    shown = done[:top] if top else done
-    for i, r in enumerate(shown, 1):
-        final = f"  final={r['final']:.6f}" if isinstance(r["final"], (int, float)) else ""
-        sweep_print(f"  {i:>3}. {_MAGENTA}{r['value']:>12.6f}{_RESET}{final}  "
-                    f"{_GREEN}{r['run_id']}{_RESET}  {_combo_str(r['combo'])}")
+    for i, r in enumerate(done[:top] if top else done, 1):
+        _leaderboard_row(i, r)
 
 
 def _wait_until_settled(
@@ -1434,6 +1478,21 @@ def _skip_rules(options: dict[str, Any]) -> dict[str, Any]:
     return rules
 
 
+def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
+    """Exit if two runs would share a name (jobs require unique names per experiment)."""
+    counts = collections.Counter(v["name"] for v in variations)
+    dups = sorted(name for name, n in counts.items() if n > 1)
+    if not dups:
+        return
+    for name in dups:
+        sweep_print(f"  duplicate run name: {name}")
+    sweep_print(
+        f"{_RED}Error:{_RESET} {len(dups)} run name(s) collide. "
+        "Give each dimension a 'name' (or distinct values) so every run name is unique."
+    )
+    sys.exit(1)
+
+
 def _build_job_payloads(
     variations: list[dict[str, Any]],
     experiment_id: str,
@@ -1815,6 +1874,7 @@ def main() -> None:
             sys.exit(0)
 
         all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
+        _check_duplicate_run_names(all_variations)
         expected = count_expected(options)
         excluded = expected - len(all_variations)
         dim_names = [k[1:] for k in options]
@@ -1973,6 +2033,7 @@ def main() -> None:
             variations = optimizer.suggest(n=budget)
 
     n = len(variations)
+    _check_duplicate_run_names(variations)
 
     # ── List variations ────────────────────────────────────────────────────
     for var in variations:
@@ -2034,27 +2095,7 @@ def main() -> None:
             except OSError:
                 pass
 
-    # ── 2. Create experiment ───────────────────────────────────────────────
-    if resume:
-        sweep_print("Resuming — experiment already exists")
-    else:
-        singular_dim_names = [k[1:] for k, v in options.items() if v.get("singular")]
-        if not manager_create_experiment(
-            manager, token, experiment_id,
-            name=sweep_name,
-            note=args.note,
-            expected_jobs=expected if method == "bayes" else 0,
-            singular_dims=singular_dim_names,
-            max_concurrent=args.max_concurrent,
-            # The Bayes controller handles singular probes itself.
-            skip_rules=_skip_rules(options) if method == "grid" else None,
-            metric=info.get("metric"),
-            goal=info.get("goal"),
-            campaign=campaign or DEFAULT_CAMPAIGN,
-        ):
-            sys.exit(1)
-
-    # ── 3. Build and submit jobs ───────────────────────────────────────────
+    # ── 2. Build job payloads ───────────────────────────────────────────────
     build_payloads = functools.partial(
         _build_job_payloads,
         artifact_id=artifact_id or "",
@@ -2068,15 +2109,32 @@ def main() -> None:
         max_retries=args.max_retries,
         setup_command=args.setup_command,
     )
-    if n > 0:
-        sweep_print("Submitting jobs...")
-        job_payloads = build_payloads(variations=variations, experiment_id=experiment_id)
+    job_payloads = build_payloads(variations=variations, experiment_id=experiment_id)
 
-        records = manager_submit_jobs_bulk(manager, token, job_payloads, campaign=campaign)
-        if records is None:
+    # ── 3. Create experiment and submit jobs atomically ────────────────────
+    if resume:
+        sweep_print("Resuming — experiment already exists")
+    if job_payloads:
+        sweep_print("Submitting jobs...")
+    if resume:
+        if job_payloads and manager_submit_jobs_bulk(
+                manager, token, job_payloads, campaign=campaign) is None:
             sys.exit(1)
-    else:
-        sweep_print("No new jobs to submit.")
+    elif not manager_create_experiment(
+        manager, token, experiment_id,
+        name=sweep_name,
+        note=args.note,
+        expected_jobs=expected if method == "bayes" else 0,
+        singular_dims=[k[1:] for k, v in options.items() if v.get("singular")],
+        max_concurrent=args.max_concurrent,
+        # The Bayes controller handles singular probes itself.
+        skip_rules=_skip_rules(options) if method == "grid" else None,
+        metric=info.get("metric"),
+        goal=info.get("goal"),
+        campaign=campaign or DEFAULT_CAMPAIGN,
+        jobs=job_payloads,
+    ):
+        sys.exit(1)
 
     # ── 4. Write local manifest ────────────────────────────────────────────
     _write_manifest(exp_dir, experiment_id, variations, note=args.note)
