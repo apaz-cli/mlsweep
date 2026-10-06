@@ -648,6 +648,14 @@ def manager_list_experiments(
     return None
 
 
+def manager_list_workers(manager: str, token: str) -> list[dict[str, Any]] | None:
+    """List workers on the manager, enriched with live GPU occupancy and health."""
+    status, resp = _http_request("GET", _manager_url(manager, "/api/workers"), token, timeout=10)
+    if status == 200 and isinstance(resp, list):
+        return resp
+    return None
+
+
 def manager_list_campaigns(manager: str, token: str) -> list[dict[str, Any]] | None:
     """List campaigns with their experiment and job counts."""
     status, resp = _http_request("GET", _manager_url(manager, "/api/campaigns"), token, timeout=10)

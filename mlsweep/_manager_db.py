@@ -97,6 +97,7 @@ class WorkerRecord:
     ssh_key: str | None = None
     venv: str | None = None
     devices: str | None = None  # JSON list of ints
+    unhealthy_devices: str | None = None  # JSON list of ints excluded by the CUDA probe
     last_error: str | None = None  # human-readable reason for the last failure
 
 
@@ -239,6 +240,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         ssh_key=row["ssh_key"],
         venv=row["venv"],
         devices=row["devices"],
+        unhealthy_devices=row["unhealthy_devices"],
         last_error=row["last_error"],
     )
 
@@ -553,9 +555,14 @@ async def init_db(db: aiosqlite.Connection) -> None:
             ssh_key       TEXT,
             venv          TEXT,
             devices       TEXT,
+            unhealthy_devices TEXT,
             last_error    TEXT
         );
     """)
+    # Idempotent migration for databases created before the device-health probe.
+    await _add_missing_columns(db, "workers", {
+        "unhealthy_devices": "TEXT",
+    })
 
     # ── artifacts ───────────────────────────────────────────────────
     await db.execute("""
@@ -783,6 +790,7 @@ async def upsert_worker(
     ssh_key: str | None = None,
     venv: str | None = None,
     devices: str | None = None,
+    unhealthy_devices: str | None = None,
     status: WorkerStatus = "connected",
     last_error: str | None = None,
 ) -> WorkerRecord:
@@ -792,8 +800,9 @@ async def upsert_worker(
         db,
         """
         INSERT INTO workers (worker_id, host, remote_dir, status, last_seen,
-                             scratch_dir, port, ssh_key, venv, devices, last_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             scratch_dir, port, ssh_key, venv, devices,
+                             unhealthy_devices, last_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (worker_id) DO UPDATE SET
             host = EXCLUDED.host,
             remote_dir = EXCLUDED.remote_dir,
@@ -804,11 +813,12 @@ async def upsert_worker(
             ssh_key = EXCLUDED.ssh_key,
             venv = EXCLUDED.venv,
             devices = EXCLUDED.devices,
+            unhealthy_devices = EXCLUDED.unhealthy_devices,
             last_error = EXCLUDED.last_error
         RETURNING *;
         """,
         (worker_id, host, remote_dir, status, now,
-         scratch_dir, port, ssh_key, venv, devices, last_error),
+         scratch_dir, port, ssh_key, venv, devices, unhealthy_devices, last_error),
     )
     await db.commit()
     assert row is not None
@@ -2106,6 +2116,7 @@ class DbWriter:
         ssh_key: str | None = None,
         venv: str | None = None,
         devices: str | None = None,
+        unhealthy_devices: str | None = None,
         status: WorkerStatus = "connected",
         last_error: str | None = None,
     ) -> WorkerRecord:
@@ -2113,7 +2124,8 @@ class DbWriter:
         return await self._enqueue(lambda: upsert_worker(
             db, worker_id=worker_id, host=host, remote_dir=remote_dir,
             scratch_dir=scratch_dir, port=port, ssh_key=ssh_key,
-            venv=venv, devices=devices, status=status, last_error=last_error,
+            venv=venv, devices=devices, unhealthy_devices=unhealthy_devices,
+            status=status, last_error=last_error,
         ))
 
     async def update_worker_status(

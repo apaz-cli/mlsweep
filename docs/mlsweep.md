@@ -328,6 +328,15 @@ mlsweep_manager --workers workers.toml
 
 The manager bootstraps mlsweep on remote machines automatically; no manual install is needed. Requires passwordless SSH. Test with `ssh -o BatchMode=yes user@host1 nvidia-smi`.
 
+At registration a worker probes each candidate GPU by actually creating a CUDA
+context on it. A device can enumerate in `nvidia-smi` (`0%` util, compute mode
+`Default`) while being unusable for compute — typically after a fault that leaves
+`GPU Recovery Action: Reset`. Such devices are excluded before the worker reports
+its GPUs, so the scheduler never dispatches to them; `mlsweep status` lists them
+as `unhealthy=[...]` on the worker's line and `/api/workers` exposes the same as
+`unhealthy_gpus`. Pass `--no-device-probe` to a worker to skip the probe (e.g. on
+a host where creating a context is itself restricted).
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -341,6 +350,8 @@ The manager bootstraps mlsweep on remote machines automatically; no manual insta
 | Singular/monotonic not skipping | Only jobs still pending when a result arrives are skipped; lower `--max-concurrent` so fewer run at once |
 | Remote not connecting | Test SSH: `ssh -o BatchMode=yes user@host nvidia-smi` |
 | `need at least GPUS_PER_RUN GPUs` | Worker has fewer GPUs than `GPUS_PER_RUN`; adjust worker config or reduce `GPUS_PER_RUN` |
+| `mlsweep status` shows a worker with fewer GPUs than expected, or `unhealthy=[N]` | GPU `N` failed the CUDA-context probe (often `GPU Recovery Action: Reset`). Reset it (`sudo nvidia-smi --gpu-reset -i N`) or drop it from the worker's `devices` list |
+| Jobs die with `CUDA error: CUDA-capable device(s) is/are busy or unavailable` | The device could not create a primary context. Reset it and confirm the worker excludes it (`mlsweep status`) |
 | No metrics plots | Script must use `MLSweepLogger`; stdout/stderr are still captured without it |
 
 ## Reference

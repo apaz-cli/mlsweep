@@ -10,6 +10,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 
 
 def visible_devices() -> list[int]:
@@ -39,6 +41,74 @@ def visible_devices() -> list[int]:
     except (FileNotFoundError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError):
         pass
     return []
+
+
+# Try to create and release a CUDA primary context on the single device exposed via
+# CUDA_VISIBLE_DEVICES.  This is the exact operation that fails when a GPU is in a
+# bad state (e.g. "GPU Recovery Action: Reset" after a fault) even though
+# `nvidia-smi` lists it as idle with no processes.  Any non-zero exit (1 = context
+# creation failed, 3 = cuInit failed) marks the device unhealthy.  If libcuda is absent (CPU-only / AMD host) it exits 0 so
+# the device is treated as usable and nothing is excluded by accident.
+_CUDA_PROBE = """\
+import ctypes, ctypes.util, sys
+name = ctypes.util.find_library("cuda") or "libcuda.so.1"
+try:
+    lib = ctypes.CDLL(name)
+except OSError:
+    sys.exit(0)
+try:
+    retain = lib.cuDevicePrimaryCtxRetain
+    release = lib.cuDevicePrimaryCtxRelease
+except AttributeError:
+    sys.exit(0)
+if lib.cuInit(0) != 0:
+    sys.exit(3)
+ctx = ctypes.c_void_p()
+if retain(ctypes.byref(ctx), 0) != 0:
+    sys.exit(1)
+release(0)
+sys.exit(0)
+"""
+
+
+def probe_usable_devices(
+    devices: list[int], timeout: float = 10.0,
+) -> tuple[list[int], list[int]]:
+    """Split *devices* into ``(usable, unhealthy)`` by creating a real CUDA context.
+
+    Enumerating a device (``nvidia-smi --query-gpu=index``) is not enough: a device
+    that has faulted still enumerates and shows 0% utilization, but every CUDA
+    context creation on it fails.  A worker that advertises such a device gets jobs
+    that die in their first ``.cuda()`` call, spending retries.  Each probe runs in an
+    isolated subprocess so the worker process itself never holds a context, and
+    all probes run concurrently so the hello waits for the slowest one only.
+    """
+    procs: dict[int, subprocess.Popen[bytes] | None] = {}
+    for d in devices:
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = str(d)
+        env.pop("HIP_VISIBLE_DEVICES", None)
+        try:
+            procs[d] = subprocess.Popen(
+                [sys.executable, "-c", _CUDA_PROBE], env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            procs[d] = None
+    # The probes are independent, so run them concurrently against one deadline.
+    deadline = time.monotonic() + timeout
+    usable: list[int] = []
+    unhealthy: list[int] = []
+    for d, proc in procs.items():
+        ok = False
+        if proc is not None:
+            try:
+                ok = proc.wait(max(0.0, deadline - time.monotonic())) == 0
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        (usable if ok else unhealthy).append(d)
+    return usable, unhealthy
 
 
 def _topo_score(conn_type: str) -> int:

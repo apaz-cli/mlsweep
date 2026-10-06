@@ -83,6 +83,7 @@ class WorkerConn:
     port: int
     writer: asyncio.StreamWriter | None = None  # the current connection's stream
     gpus: list[int] = field(default_factory=list)
+    unhealthy_gpus: list[int] = field(default_factory=list)  # enumerated but failed the CUDA probe
     topo: dict[str, int] = field(default_factory=dict)
     gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
     max_jobs_per_gpu: int = 1

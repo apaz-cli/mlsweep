@@ -1277,6 +1277,14 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
 # ── Workers ────────────────────────────────────────────────────────────────────
 
 
+def _json_list(s: str | None) -> list[Any]:
+    """Decode a JSON-list DB column, treating NULL or garbage as empty."""
+    try:
+        return json.loads(s) if s else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
     """Merge a DB WorkerRecord with live WorkerConn data.
 
@@ -1289,18 +1297,16 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
     wc = state.workers.get(wr.worker_id)
     if wc is not None:
         d["gpus"] = wc.gpus
+        d["unhealthy_gpus"] = wc.unhealthy_gpus
         d["gpu_occupancy"] = state.occupancy(wc)
         d["gpu_stats"] = wc.gpu_stats
         d["max_jobs_per_gpu"] = wc.max_jobs_per_gpu
     else:
-        devices_str = d["devices"]
-        if isinstance(devices_str, str) and devices_str:
-            try:
-                d["gpus"] = json.loads(devices_str)
-            except (json.JSONDecodeError, TypeError):
-                d["gpus"] = []
-        else:
-            d["gpus"] = []
+        # devices holds every GPU the worker considered; the probe-excluded
+        # ones are reported separately, as for a live worker.
+        unhealthy = _json_list(d["unhealthy_devices"])
+        d["gpus"] = [g for g in _json_list(d["devices"]) if g not in unhealthy]
+        d["unhealthy_gpus"] = unhealthy
         d["gpu_occupancy"] = {}
         d["gpu_stats"] = {}
         d["max_jobs_per_gpu"] = 1

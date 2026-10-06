@@ -207,6 +207,10 @@ class MsgWorkerHello:
     # [{run_id, success, elapsed, exit_code, experiment}].  Re-sent on every hello so a
     # result produced while the manager was disconnected (or restarting) is not lost.
     completed: list[dict[str, Any]] = field(default_factory=list)
+    # GPUs the worker enumerated but excluded because CUDA context creation failed
+    # (e.g. a faulted device pending reset).  Informational; the scheduler only sees
+    # ``gpus``.  Defaulted, so an older peer that omits it stays compatible.
+    unhealthy_gpus: list[int] = field(default_factory=list)
     protocol: int = 0             # PROTOCOL_VERSION of the worker
     t: str = "whello"
 

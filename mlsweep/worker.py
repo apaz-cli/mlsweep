@@ -70,7 +70,7 @@ from mlsweep._shared import (
     read_msg,
     set_color,
 )
-from mlsweep._topology import _gpu_topology, visible_devices
+from mlsweep._topology import _gpu_topology, probe_usable_devices, visible_devices
 from mlsweep import _env
 
 # ── Run state ──────────────────────────────────────────────────────────────────
@@ -109,6 +109,9 @@ class ConnState:
     sock: socket.socket
     send_queue: "queue.Queue[bytes | None]"
     closed: bool = False
+    # Set once MsgWorkerHello is queued.  The manager drops a connection whose first
+    # message is anything else, so stats and run traffic wait for this.
+    ready: bool = False
 
 
 # ── Global worker state (protected by _lock) ───────────────────────────────────
@@ -135,6 +138,8 @@ _scratch_dir: str = "/tmp/mlsweep"
 _remote_dir: str = ""
 _token: str = ""
 _device_override: list[int] | None = None  # None = use all visible
+_device_probe: bool = True  # probe each visible GPU with a real CUDA context at hello
+_probed_ok: set[int] = set()  # GPUs that passed the probe once; not re-probed on reconnect
 _max_jobs_per_gpu: int = 1  # per-GPU packing cap reported to the manager (0 = unlimited)
 _ipc_sock_path: str = "/tmp/mlsweep/.worker.sock"  # set to port-specific path at startup
 
@@ -179,11 +184,17 @@ def _current_connection() -> "ConnState | None":
     Run messages (started / log / result) go here rather than to the connection that
     dispatched the run: after a reconnect, the dispatching connection is one the
     manager no longer reads, and anything sent on it is silently lost."""
+    live = _live_connections()
+    return live[-1] if live else None
+
+
+def _live_connections() -> "list[ConnState]":
+    """Open connections whose MsgWorkerHello has been queued, oldest first.
+
+    Anything sent to the manager goes through here: the manager drops a connection
+    whose first message is not the hello."""
     with _lock:
-        for conn in reversed(_connections):
-            if not conn.closed:
-                return conn
-    return None
+        return [c for c in _connections if c.ready and not c.closed]
 
 
 def _send_run_msg(data: bytes) -> None:
@@ -305,6 +316,20 @@ def _read_thread(conn: ConnState) -> None:
     gpus = visible_devices()
     if _device_override is not None:
         gpus = [g for g in _device_override if g in gpus]
+    # Drop GPUs that enumerate but cannot create a CUDA context (e.g. faulted devices
+    # pending reset).  Without this the scheduler keeps dispatching to them and every
+    # job dies in its first .cuda() call, burning retries.
+    # GPUs that already passed are skipped: on reconnect they may be running jobs,
+    # and a failed GPU is re-probed each hello so a reset brings it back.
+    unhealthy: list[int] = []
+    to_probe = [g for g in gpus if g not in _probed_ok]
+    if _device_probe and to_probe:
+        _, unhealthy = probe_usable_devices(to_probe)
+        _probed_ok.update(g for g in to_probe if g not in unhealthy)
+        gpus = [g for g in gpus if g not in unhealthy]
+        for d in unhealthy:
+            print(f"  WARNING  GPU {d} is visible but cannot create a CUDA context; "
+                  f"excluding it from scheduling", file=sys.stderr)
     topo_internal = _gpu_topology()
     topo_wire: dict[str, int] = {
         f"{a},{b}": score for (a, b), score in topo_internal.items()
@@ -327,9 +352,12 @@ def _read_thread(conn: ConnState) -> None:
         scratch_dir=_scratch_dir,
         max_jobs_per_gpu=_max_jobs_per_gpu,
         completed=completed,
+        unhealthy_gpus=unhealthy,
         protocol=PROTOCOL_VERSION,
     )
-    conn.send_queue.put(encode(hello_resp))
+    with _lock:
+        conn.send_queue.put(encode(hello_resp))
+        conn.ready = True
 
     # Main message loop
     while not _shutdown_event.is_set():
@@ -1039,9 +1067,7 @@ def _gpu_stats_thread() -> None:
         if not stats:
             continue
         wire = encode(MsgGpuStats(stats=stats))
-        with _lock:
-            conns = list(_connections)
-        for conn in conns:
+        for conn in _live_connections():
             if not conn.closed:
                 try:
                     conn.send_queue.put_nowait(wire)
@@ -1080,7 +1106,7 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 def main() -> None:
     try:
-        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu
+        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu, _device_probe
 
         parser = argparse.ArgumentParser(description="mlsweep worker daemon")
         parser.add_argument("--token", default="", help="Authentication token")
@@ -1091,6 +1117,9 @@ def main() -> None:
         parser.add_argument("-g", "--devices", default=None,
                             help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7 "
                                  "(default: all visible)")
+        parser.add_argument("--no-device-probe", action="store_true",
+                            help="Skip the per-GPU CUDA-context health probe at worker "
+                                 "registration (by default faulted GPUs are excluded)")
         parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
                             help="Max concurrent jobs per GPU on this worker "
                                  "(0 = unlimited, default: 1)")
@@ -1109,6 +1138,7 @@ def main() -> None:
         _remote_dir = args.remote_dir or os.getcwd()
         _token = args.token
         _max_jobs_per_gpu = args.jobs
+        _device_probe = not args.no_device_probe
         if args.devices:
             _device_override = [int(x) for x in args.devices.split(",")]
 

@@ -180,7 +180,7 @@ def _worker_shell_cmd(candidates: list[str], worker_args: list[str]) -> str:
 
 
 def _ensure_worker_wheels() -> None:
-    """Build the local mlsweep wheel into ``_wheels/`` at manager startup.
+    """Build or fetch the local mlsweep wheel into ``_wheels/`` at startup.
 
     Runs synchronously at manager startup (before the event loop).  Remote
     workers are bootstrapped by SCPing this wheel and pip-installing it there;
@@ -218,15 +218,23 @@ def _ensure_worker_wheels() -> None:
     for w in wheels_dir.glob("mlsweep-*.whl"):
         w.unlink(missing_ok=True)
 
+    # From a source checkout (plain or editable), build the wheel from the
+    # tree so local changes ship to workers.  From a regular install the
+    # package's parent is site-packages, which pip cannot build, so fetch the
+    # published wheel for the exact installed version instead.
     repo_root = Path(__file__).resolve().parent.parent
-    r = subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", "--no-deps",
-         "--wheel-dir", str(wheels_dir), str(repo_root)],
-        capture_output=True,
-    )
+    if (repo_root / "pyproject.toml").exists():
+        action = "wheel"
+        args = ["--wheel-dir", str(wheels_dir), str(repo_root)]
+    else:
+        action = "download"
+        args = ["--only-binary=:all:", "--dest", str(wheels_dir),
+                f"mlsweep=={local_version}"]
+    r = subprocess.run([sys.executable, "-m", "pip", action, "--no-deps", *args],
+                       capture_output=True)
     if r.returncode != 0:
         print(
-            f"[wheels] pip wheel failed:\n{r.stderr.decode(errors='replace')}",
+            f"[wheels] pip {action} failed:\n{r.stderr.decode(errors='replace')}",
             file=sys.stderr,
         )
         return
@@ -647,6 +655,8 @@ async def _worker_read_task(
         if isinstance(hello, MsgWorkerHello):
             await _handle_worker_hello(db, state, wc, gen, hello)
         else:
+            print(f"  {_YELLOW}WARN{_RESET}  Worker {wc.host} sent {type(hello).__name__} "
+                  "before its hello; dropping the connection")
             hello = None
     except Exception as e:
         if not isinstance(e, (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError, ValueError)):
@@ -723,7 +733,7 @@ async def _reconnect_worker(
         try:
             reader, writer, _ = await launch_worker(
                 host=wc.host, remote_dir=wc.remote_dir, token=state.token,
-                scratch_dir=wc.scratch_dir, devices=wc.gpus, max_jobs_per_gpu=wc.max_jobs_per_gpu,
+                scratch_dir=wc.scratch_dir, devices=sorted(wc.gpus + wc.unhealthy_gpus), max_jobs_per_gpu=wc.max_jobs_per_gpu,
                 password=wc.password, ssh_key=wc.ssh_key, venv=wc.venv, port=wc.port,
             )
         except Exception:
@@ -807,6 +817,7 @@ async def _handle_worker_hello(
             wc.gpus = msg.gpus
             wc.max_jobs_per_gpu = msg.max_jobs_per_gpu
             wc.hello_seen = True
+        wc.unhealthy_gpus = msg.unhealthy_gpus
         wc.topo = msg.topo
         wc.scratch_dir = msg.scratch_dir
 
@@ -841,11 +852,17 @@ async def _handle_worker_hello(
             port=wc.port,
             ssh_key=wc.ssh_key,
             venv=wc.venv,
-            devices=json.dumps(wc.gpus),
+            # Persist probe-excluded GPUs too: a manager restart relaunches the
+            # worker with --devices from this column, and a GPU that is reset
+            # later must still be a candidate for the next probe.
+            devices=json.dumps(sorted(wc.gpus + wc.unhealthy_gpus)),
+            unhealthy_devices=json.dumps(wc.unhealthy_gpus),
             status="connected",
         )
         n_gpus = len(wc.gpus)
-        print(f"  {_GREEN}OK{_RESET}    {wc.host}: {n_gpus} GPU{'s' if n_gpus != 1 else ''} available")
+        extra = (f"  {_YELLOW}{len(wc.unhealthy_gpus)} unhealthy GPU(s) "
+                 f"excluded: {wc.unhealthy_gpus}{_RESET}") if wc.unhealthy_gpus else ""
+        print(f"  {_GREEN}OK{_RESET}    {wc.host}: {n_gpus} GPU{'s' if n_gpus != 1 else ''} available{extra}")
         n_resumed = len(resuming.keys() & expected.keys())
         if n_resumed:
             print(f"  {_GREEN}RESUME{_RESET} {wc.host}: {n_resumed} run(s) still active")

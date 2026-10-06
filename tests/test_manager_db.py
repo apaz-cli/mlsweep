@@ -39,6 +39,7 @@ from mlsweep._manager_db import (
     dispatch_job,
     list_active_jobs,
     upsert_worker,
+    get_worker,
     pack_metrics,
     apply_result_rules,
     count_active_jobs,
@@ -69,6 +70,27 @@ async def _dispatched(db, run_id="run1", experiment_id="exp1"):
 
 
 # ── Metrics and logs ────────────────────────────────────────────────────────────
+
+
+def test_worker_unhealthy_devices_roundtrip():
+    async def run():
+        db = await _init_db()
+        try:
+            await upsert_worker(db, worker_id="w1", host="h", remote_dir="/",
+                                devices="[0, 1, 3]", unhealthy_devices="[2]")
+            w = await get_worker(db, "w1")
+            assert w.devices == "[0, 1, 3]"
+            assert w.unhealthy_devices == "[2]"
+            # A later upsert without health clears it.
+            await upsert_worker(db, worker_id="w1", host="h", remote_dir="/",
+                                devices="[0, 1]")
+            w = await get_worker(db, "w1")
+            assert w.devices == "[0, 1]"
+            assert w.unhealthy_devices is None
+        finally:
+            await db.close()
+
+    asyncio.run(run())
 
 
 def test_insert_and_get_metrics():

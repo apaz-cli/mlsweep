@@ -220,6 +220,7 @@ def test_reconnect_known_workers_schedules_remote_only():
             "worker_id TEXT PRIMARY KEY, host TEXT NOT NULL, remote_dir TEXT NOT NULL, "
             "status TEXT NOT NULL DEFAULT 'offline', last_seen REAL, scratch_dir TEXT, "
             "port INTEGER NOT NULL DEFAULT 7890, ssh_key TEXT, venv TEXT, devices TEXT, "
+            "unhealthy_devices TEXT, "
             "last_error TEXT)"
         )
         await db.commit()

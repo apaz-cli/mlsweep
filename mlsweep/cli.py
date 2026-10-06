@@ -268,6 +268,7 @@ def _status_cmd(argv: list[str]) -> None:
         _resolve_campaign,
         _resolve_token,
         manager_list_experiments,
+        manager_list_workers,
     )
     from mlsweep.worker import _query_gpu_stats
 
@@ -296,6 +297,7 @@ def _status_cmd(argv: list[str]) -> None:
 
     exps = (manager_list_experiments(manager, token, campaign=campaign) or []) if manager_up else []
     experiments = [e["experiment_id"] for e in exps if isinstance(e, dict) and e.get("experiment_id")]
+    workers = (manager_list_workers(manager, token) or []) if manager_up else []
 
     if args.json:
         print(json.dumps({
@@ -313,6 +315,7 @@ def _status_cmd(argv: list[str]) -> None:
             "jobs_in_flight": health.get("jobs_in_flight"),
             "token_present": bool(token),
             "gpus": gpus,
+            "workers": workers,
             "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
             "recent_experiments": experiments[-5:],
             "n_experiments": len(experiments),
@@ -357,6 +360,18 @@ def _status_cmd(argv: list[str]) -> None:
             print(f"{_CONT}gpu{g['gpu']}  util={g['util_pct']}%  mem={g['mem_used_mb']}/{g['mem_total_mb']} MiB")
     else:
         print(f"  {_label('gpus:')}{_YELLOW}none visible{_RESET} (no nvidia-smi / rocm-smi output)")
+
+    if manager_up and workers:
+        print(f"  {_label('workers:')}{len(workers)}")
+        for w in workers:
+            host = w.get("host") or w.get("worker_id", "?")
+            wstatus = w.get("status", "?")
+            wgpus = w.get("gpus") or []
+            bad = w.get("unhealthy_gpus") or []
+            line = f"{_CONT}{host}  {wstatus}  gpus={wgpus}  jobs/GPU={w.get('max_jobs_per_gpu', '?')}"
+            if bad:
+                line += f"  {_YELLOW}unhealthy={bad}{_RESET}"
+            print(line)
 
     if manager_up and experiments:
         print(f"  {_label('recent:')}{len(experiments)} experiments; latest:")
