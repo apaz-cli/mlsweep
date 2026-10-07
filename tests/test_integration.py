@@ -391,6 +391,45 @@ def test_artifact_sweep_end_to_end(manager_with_worker, tmp_path):
         assert (run_dir / "training.csv").exists(), f"Missing training.csv for {job['run_id']}"
 
 
+def test_pack_project_skips_caches_venvs_and_build_metadata(tmp_path):
+    """Excludes match each path component as a pattern (``*.egg-info``,
+    ``*.pyc``), and excluded directories are not shipped."""
+    import tarfile
+    from mlsweep.run_sweep import _pack_project
+    for rel in ("train.py", "pkg/mod.py", "pkg/__pycache__/mod.cpython-313.pyc", "stray.pyc",
+                "proj.egg-info/PKG-INFO", ".venv/lib/site.py", ".git/HEAD", "data/empty/.keep"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("x")
+    (tmp_path / "link.py").symlink_to(tmp_path / "train.py")
+    tarball, _ = _pack_project(tmp_path)
+    try:
+        names = set(tarfile.open(tarball).getnames())
+    finally:
+        os.unlink(tarball)
+    assert names == {"train.py", "pkg", "pkg/mod.py", "data", "data/empty", "data/empty/.keep"}
+
+
+@pytest.mark.parametrize("venv", [True, False], ids=["with-venv", "without-venv"])
+def test_pack_project_skips_top_level_build_only_next_to_a_venv(tmp_path, venv):
+    """With a venv in the project root, a top-level build/ is setuptools output;
+    without one it may be source.  A nested build/ is always shipped."""
+    import tarfile
+    from mlsweep.run_sweep import _pack_project
+    for rel in ("train.py", "build/lib/train.py", "pkg/build/gen.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("x")
+    if venv:
+        (tmp_path / ".venv").mkdir()
+        (tmp_path / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    tarball, _ = _pack_project(tmp_path)
+    try:
+        names = set(tarfile.open(tarball).getnames())
+    finally:
+        os.unlink(tarball)
+    assert "pkg/build/gen.py" in names
+    assert ("build/lib/train.py" in names) is not venv
+
+
 # ── Tests: logs sweep ─────────────────────────────────────────────────────────
 
 
@@ -427,5 +466,7 @@ def test_logs_sweep_end_to_end(manager_with_worker, tmp_path):
             )
             text = urllib.request.urlopen(req, timeout=10).read().decode()
             assert text.strip(), f"No logs for {job['run_id']}"
+            # The `--` overrides reach the job (log_train prints its settings).
+            assert "epochs=1 " in text and "bs=512 " in text, text[:600]
         except urllib.error.HTTPError as e:
             pytest.fail(f"Log endpoint returned {e.code} for {job['run_id']}")

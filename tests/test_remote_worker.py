@@ -6,6 +6,8 @@ the manager to have a public IP:
   - _tunnel_monitor_task: restarts the tunnel when it dies
   - _reconnect_worker: hostname stripping (user@host → host for TCP connect)
   - connect_single_worker: no tunnel launched for localhost workers
+  - workers files: per-worker scratch_dir
+  - launched workers' output is drained, so their pipes never fill
 """
 
 import asyncio
@@ -271,3 +273,60 @@ def test_reconnect_known_workers_schedules_remote_only():
         await db.close()
 
     asyncio.run(_run())
+
+
+# ── Launch configuration and output ────────────────────────────────────────────
+
+
+def test_workers_file_scratch_dir_is_optional_per_worker(tmp_path):
+    from mlsweep._manager_workers import _parse_workers_file
+    wf = tmp_path / "workers.toml"
+    wf.write_text('[[workers]]\nhost = "a"\nremote_dir = "/p"\nscratch_dir = "/big/scratch"\n'
+                  '[[workers]]\nhost = "b"\nremote_dir = "/p"\n')
+    assert [w["scratch_dir"] for w in _parse_workers_file(str(wf))] == ["/big/scratch", None]
+
+
+def test_relay_copies_every_line_including_overlong_ones(capsys):
+    """Output is relayed in chunks, so a line longer than the reader's limit
+    (which would make readline() raise and stop the draining) still passes."""
+    from mlsweep._manager_workers import _relay_stream
+
+    async def relay(data: bytes) -> None:
+        stream = asyncio.StreamReader()
+        stream.feed_data(data)
+        stream.feed_eof()
+        await _relay_stream(stream, "h:1")
+
+    asyncio.run(relay(b"first\n" + b"x" * 200_000 + b"\nlast"))
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == "[worker h:1] first"
+    assert lines[-1] == "[worker h:1] last"
+    assert "".join(ln.removeprefix("[worker h:1] ") for ln in lines[1:-1]) == "x" * 200_000
+
+
+def test_remote_workers_are_given_their_scratch_dir(monkeypatch):
+    """The scratch dir reaches a remote worker's command line, as it does a
+    local worker's; remote workers used to keep the default regardless."""
+    from mlsweep import _manager_workers as mw
+
+    async def bootstrapped(*args, **kwargs):
+        return True
+
+    launched: list[tuple[str, ...]] = []
+
+    class Launched(Exception):
+        pass
+
+    async def capture(*cmd, **kwargs):
+        launched.append(cmd)
+        raise Launched
+
+    monkeypatch.setattr(mw, "_bootstrap_worker_venv", bootstrapped)
+    monkeypatch.setattr(mw.asyncio, "create_subprocess_exec", capture)
+    try:
+        asyncio.run(mw.launch_worker("user@gpu.invalid", "/proj", "tok", scratch_dir="/big/scratch"))
+    except Launched:
+        pass
+    [cmd] = launched
+    assert cmd[cmd.index("user@gpu.invalid") + 1].count("--scratch-dir /big/scratch") == 1
+

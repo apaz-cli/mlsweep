@@ -40,6 +40,13 @@ DEFAULT_MANAGER_URL = "http://localhost:7891"
 
 # Every experiment belongs to one campaign; this one when none is given.
 DEFAULT_CAMPAIGN = "default"
+DEFAULT_SCRATCH_DIR = "/tmp/mlsweep"
+
+# Experiment statuses whose pending jobs the scheduler must NOT dispatch.
+# 'paused' is a temporary hold (resumable); 'aborted' is a permanent stop.
+# 'running' and 'completed' remain schedulable so that retrying a job in a
+# finished experiment works without a separate status flip.
+NON_SCHEDULABLE_EXPERIMENT_STATUSES: tuple[str, ...] = ("paused", "aborted")
 _CAMPAIGN_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 
 
@@ -86,6 +93,12 @@ def _val_sort_key(v: Any) -> tuple[int, Any]:
     return (2, str(v))
 
 
+def same_attempt(a: int, b: int) -> bool:
+    """Whether two attempt numbers name the same attempt.  0 is unknown (from a
+    peer predating attempt numbers) and matches any attempt."""
+    return not a or not b or a == b
+
+
 def dist_master_port(experiment: str, run_id: str) -> int:
     """Deterministic torch.distributed master port for a run, in [20000, 30000)."""
     return 20000 + int(hashlib.md5(f"{experiment}/{run_id}".encode()).hexdigest()[:4], 16) % 10000
@@ -117,6 +130,10 @@ def line_chunks(data: bytes) -> list[bytes]:
 PROTOCOL_VERSION = 2
 # A run is identified by (experiment, run_id).  Run names are derived from the
 # sweep, so two experiments of the same sweep use the same run_ids.
+# Each dispatch of a run is a new attempt, numbered from 1.  MsgRun carries it
+# and the worker's messages about the run echo it, so a late message from an
+# attempt the manager has taken back (an evicted run's result) is not mistaken
+# for the current attempt's.  0 means unknown, from a peer predating the field.
 # Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","shutdown","ping"}.
 # Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong","gpu_stats"}.
 
@@ -157,6 +174,7 @@ class MsgRun:
     setup_command: list[str] = field(default_factory=list)
     # Command list executed in the workspace after artifact extraction
     # and before training. Run without shell for safety.
+    attempt: int = 0
     t: str = "run"
 
 
@@ -172,6 +190,7 @@ class MsgCleanup:
     run_id: str
     experiment: str
     final: bool = False     # True = run finished and artifacts synced; safe to delete scratch
+    attempt: int = 0
     t: str = "cleanup"
 
 
@@ -200,11 +219,11 @@ class MsgPing:
 class MsgWorkerHello:
     gpus: list[int]
     topo: dict[str, int]          # "{gpu_a},{gpu_b}" → score (JSON requires string keys)
-    resuming: list[dict[str, Any]]  # [{run_id, experiment, pid, gpu_ids}]
+    resuming: list[dict[str, Any]]  # [{run_id, experiment, attempt, pid, gpu_ids}]
     scratch_dir: str
     max_jobs_per_gpu: int = 1     # worker's per-GPU packing cap (0 = unlimited)
     # Results of runs that ended but that no manager has acknowledged yet:
-    # [{run_id, success, elapsed, exit_code, experiment}].  Re-sent on every hello so a
+    # [{run_id, success, elapsed, exit_code, experiment, attempt}].  Re-sent on every hello so a
     # result produced while the manager was disconnected (or restarting) is not lost.
     completed: list[dict[str, Any]] = field(default_factory=list)
     # GPUs the worker enumerated but excluded because CUDA context creation failed
@@ -220,6 +239,7 @@ class MsgStarted:
     run_id: str
     pid: int
     experiment: str
+    attempt: int = 0
     t: str = "started"
 
 
@@ -230,6 +250,7 @@ class MsgLog:
     data: str               # whole lines
     start: int              # byte offset in training.log where this chunk begins
     experiment: str
+    attempt: int = 0
     t: str = "log"
 
 
@@ -239,6 +260,7 @@ class MsgMetric:
     step: int
     data: dict[str, Any]
     experiment: str
+    attempt: int = 0
     t: str = "metric"
 
 
@@ -246,6 +268,7 @@ class MsgMetric:
 class MsgSyncReq:
     run_id: str
     experiment: str
+    attempt: int = 0
     t: str = "syncreq"
 
 
@@ -256,6 +279,7 @@ class MsgResult:
     elapsed: float
     exit_code: int
     experiment: str
+    attempt: int = 0
     t: str = "result"
 
 

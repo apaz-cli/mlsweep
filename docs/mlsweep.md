@@ -42,7 +42,7 @@ mlsweep run sweeps/my_sweep.py --validate   # or: print all combos without submi
 # 3. Monitor / rank / fetch
 mlsweep status                             # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                       # live terminal status
-mlsweep ls                                 # list experiments (`mlsweep ls EXP_ID` lists runs)
+mlsweep ls                                 # experiments grouped by status (`mlsweep ls EXP_ID` lists runs, --all lifts the cap of 20 settled)
 mlsweep logs RUN_ID --experiment EXP_ID    # tail a run's training.log
 mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape keys (--last, --with-dims, 2-group --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
@@ -316,10 +316,10 @@ Per-run hyperparameter flags are appended as CLI arguments to the training comma
 host = "user@host1"              # SSH target (required)
 remote_dir = "/path/to/project"  # project root on the remote (required)
 ssh_key = "~/.ssh/id_ed25519"
-gpus = 4                         # total GPUs to use (default: all visible)
 jobs = 2                         # worker-level cap: max concurrent jobs per GPU (0 = unlimited)
-devices = [0, 1, 2, 3]           # specific GPU IDs (alternative to gpus)
+devices = [0, 1, 2, 3]           # GPU IDs to use (default: all visible)
 venv = "/path/to/venv"           # prefer this venv over the auto-bootstrapped one
+scratch_dir = "/scratch/mlsweep" # run working files (default: /tmp/mlsweep)
 ```
 
 ```bash

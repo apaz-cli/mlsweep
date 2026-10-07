@@ -156,7 +156,7 @@ Every client command resolves the token the same way, in order: `--token`, then 
 ```sh
 mlsweep status                                       # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                                 # live terminal status
-mlsweep ls                                           # list experiments (`mlsweep ls EXP_ID` lists runs)
+mlsweep ls                                           # experiments grouped by status (`mlsweep ls EXP_ID` lists runs, --all lifts the cap of 20 settled)
 mlsweep logs RUN_ID --experiment EXP_ID              # tail a run's training.log
 mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics (--last, --with-dims, --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID                     # top runs by metric (--group-by DIM, --table D1,D2)
@@ -223,9 +223,9 @@ jobs = 2
 | `pass`       | no       | SSH password (needs `sshpass`); or set `MLSWEEP_SSH_PASS` env var |
 | `venv`       | no       | Existing venv to prefer over the auto-bootstrapped one. Accepts a project root, venv root, `bin/` dir, activate script, or python binary. |
 | `devices`    | no       | Specific GPU IDs to use (worker CLI: `-g`). Default: all visible. |
-| `gpus`       | no       | Total GPU count (default: all visible) |
 | `jobs`       | no       | Max concurrent jobs per GPU on this worker (worker CLI: `-j`). Default 1; set to 0 for unlimited. |
 | `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). |
+| `scratch_dir` | no      | Where the worker keeps each run's working files while it runs (default: the manager's `--scratch-dir`, `/tmp/mlsweep`). A second worker given a directory that a live worker already uses takes a `.worker-<port>` subdirectory of it. |
 
 #### 2. Start the manager with the workers file
 
@@ -253,7 +253,7 @@ All flags below assume `--manager http://localhost:7891`:
 | `--tensorboard-dir D` | Write TensorBoard logs |
 | `--color` | Enable ANSI color in human-readable output (default: off) |
 
-Colored output is **off by default** so piping and logging stay clean. Pass
+Colored output is off by default so piping and logging stay clean. Pass
 `--color` to any entry point (`mlsweep`, `mlsweep run`, `mlsweep manager`,
 `mlsweep worker`) to turn it on. Machine-readable output (`--json`, `--csv`) and
 raw `logs`/`metrics` text are never colorized.

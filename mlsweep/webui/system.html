@@ -74,6 +74,17 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .btn-connect { font-size: 12px; padding: 4px 12px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
 .btn-connect:hover { opacity: 0.85; }
 
+.section-actions { display: flex; align-items: center; gap: 12px; }
+
+/* Placement toggle */
+.placement { display: flex; align-items: center; gap: 6px; }
+.placement-label { font-size: 11px; font-weight: 600; color: var(--text-label); }
+.placement-toggle { display: flex; border: 1px solid var(--border-input); border-radius: 4px; overflow: hidden; }
+.placement-toggle button { font-size: 12px; padding: 3px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.placement-toggle button + button { border-left: 1px solid var(--border-input); }
+.placement-toggle button:hover { background: var(--btn-hover); }
+.placement-toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); font-weight: 600; }
+
 /* Modal */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal-backdrop.hidden { display: none; }
@@ -159,7 +170,16 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
     <h2>System Status</h2>
     <div class="section-header">
       <h3>Workers</h3>
-      <button class="btn-connect" id="btn-connect-worker">+ Connect Worker</button>
+      <div class="section-actions">
+        <div class="placement">
+          <span class="placement-label">Placement</span>
+          <div class="placement-toggle" id="placement-toggle">
+            <button data-placement="pack" title="Fill the busiest GPUs and workers that still have room. Keeps idle GPUs and whole machines free for multi-GPU and multi-node jobs.">Pack</button>
+            <button data-placement="spread" title="Put each job on the least busy GPU, so every GPU gets one job before any gets a second.">Spread</button>
+          </div>
+        </div>
+        <button class="btn-connect" id="btn-connect-worker">+ Connect Worker</button>
+      </div>
     </div>
     <div id="workers-grid" class="workers-grid">
       <div class="no-data">Loading…</div>
@@ -498,6 +518,35 @@ async function setWorkerGpus(el, workerId, currentGpus) {
   }
 }
 
+// ── Scheduler placement ────────────────────────────────────────────────────────
+function renderPlacement(placement) {
+  for (const btn of document.querySelectorAll("#placement-toggle button")) {
+    btn.classList.toggle("active", btn.dataset.placement === placement);
+  }
+}
+
+async function setPlacement(placement) {
+  try {
+    const res = await apiFetch("/api/scheduler", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ placement }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      await mlAlert("Failed: " + (data.error || res.status));
+      return;
+    }
+    renderPlacement((await res.json()).placement);
+  } catch (e) {
+    await mlAlert("Network error: " + e.message);
+  }
+}
+
+for (const btn of document.querySelectorAll("#placement-toggle button")) {
+  btn.addEventListener("click", () => setPlacement(btn.dataset.placement));
+}
+
 // ── GPU stat list ──────────────────────────────────────────────────────────────
 function renderGpuList(gpus, occ, gpuStats) {
   if (!gpus.length) return "";
@@ -604,18 +653,20 @@ function renderInFlight(jobs) {
 // ── Poll ──────────────────────────────────────────────────────────────────────
 async function refresh() {
   try {
-    const [wRes, jRes, dRes] = await Promise.all([
+    const [wRes, jRes, dRes, sRes] = await Promise.all([
       apiFetch("/api/workers"),
       apiFetch("/api/jobs?status=running"),
       apiFetch("/api/jobs?status=dispatched"),
+      apiFetch("/api/scheduler"),
     ]);
-    if (!wRes.ok || !jRes.ok || !dRes.ok) {
+    if (!wRes.ok || !jRes.ok || !dRes.ok || !sRes.ok) {
       setConnStatus("disconnected");
       return;
     }
     const workers = await wRes.json();
     const jobs    = [...(await jRes.json()), ...(await dRes.json())];
     setConnStatus("connected");
+    renderPlacement((await sRes.json()).placement);
     renderWorkers(workers);
     renderInFlight(jobs);
   } catch (e) {

@@ -27,9 +27,10 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from mlsweep._manager_db import DbWriter, JobRecord
+from mlsweep._shared import DEFAULT_SCRATCH_DIR
 
 # A run is identified by (experiment_id, run_id); run names repeat across experiments.
 RunKey = tuple[str, str]
@@ -67,6 +68,15 @@ class InFlightRun:
         return (self.experiment_id, self.run_id)
 
 
+# How the scheduler places jobs on GPUs.  "pack" fills the busiest GPUs and
+# workers that still have room, keeping idle GPUs and whole machines free for
+# multi-GPU and multi-node jobs.  "spread" puts each job on the least busy
+# GPU, so every GPU gets one job before any gets a second.
+Placement = Literal["pack", "spread"]
+PLACEMENTS: tuple[Placement, ...] = ("pack", "spread")
+DEFAULT_PLACEMENT: Placement = "pack"
+
+
 # ── Worker connection ─────────────────────────────────────────────────────────
 
 
@@ -92,7 +102,7 @@ class WorkerConn:
     conn_gen: int = 0  # bumped per TCP connection; tasks of older connections stand down
     reconnect_attempts: int = 0
     hello_seen: bool = False  # later hellos keep GPU/concurrency settings changed via the API
-    scratch_dir: str = "/tmp/mlsweep"
+    scratch_dir: str = DEFAULT_SCRATCH_DIR
     remote_dir: str = ""
     password: str | None = None
     ssh_key: str | None = None
@@ -116,10 +126,12 @@ class ManagerState:
         self.artifact_base_url: str = artifact_base_url
         self.token: str = token
         self.manager_port: int = 0
+        self.scratch_dir: str = DEFAULT_SCRATCH_DIR  # for workers that do not set their own
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
         self.launching: set[str] = set()  # worker ids with a launch in progress
         self.runs: dict[RunKey, InFlightRun] = {}
+        self.placement: Placement = DEFAULT_PLACEMENT
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self.lock: asyncio.Lock = asyncio.Lock()
         self.schedule_event: asyncio.Event = asyncio.Event()

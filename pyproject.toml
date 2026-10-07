@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlsweep"
-version = "3.1.2"
+version = "3.2.0"
 description = "A flexible hyperparameter sweep scheduler for distributed ML training"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ dependencies = [
 wandb = ["wandb"]
 tensorboard = ["tensorboard"]
 all = ["wandb", "tensorboard"]
-test = ["torch", "pytest", "paramiko"]
+test = ["torch", "pytest", "pytest-xdist", "paramiko"]
 
 [project.scripts]
 mlsweep = "mlsweep.cli:main"
@@ -50,9 +50,13 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-v", "--tb=short", "--strict-markers"]
+# Run in parallel with `pytest -n 16` (about one worker per CPU core).
+# loadgroup keeps each xdist_group on one worker, so the load-sensitive timing
+# tests never run against each other.
+addopts = ["-v", "--tb=short", "--strict-markers", "--dist", "loadgroup"]
 markers = [
     "gpu: tests that require GPU hardware",
+    "xdist_group(name): run on the same xdist worker as the rest of the group",
 ]
 
 [tool.pyright]

@@ -21,6 +21,8 @@ import asyncio
 import json
 import sqlite3
 import dataclasses
+import itertools
+import shlex
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,7 +30,7 @@ from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, Type
 
 import aiosqlite
 
-from mlsweep._shared import DEFAULT_CAMPAIGN
+from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES
 from mlsweep._sweep import SkipIndex
 
 _T = TypeVar("_T")
@@ -38,11 +40,6 @@ ExperimentStatus = Literal["running", "paused", "completed", "aborted"]
 
 ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
 FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled")
-# Experiment statuses whose pending jobs the scheduler must NOT dispatch.
-# 'paused' is a temporary hold (resumable); 'aborted' is a permanent stop.
-# 'running' and 'completed' remain schedulable so that retrying a job in a
-# finished experiment works without a separate status flip.
-NON_SCHEDULABLE_EXPERIMENT_STATUSES: tuple[str, ...] = ("paused", "aborted")
 
 
 def _sql_in(statuses: Sequence[str]) -> str:
@@ -376,24 +373,27 @@ _METRICS_TABLE = """
     ) WITHOUT ROWID
 """
 
-# A log row is a chunk of whole lines; seq is the byte offset in the run's
-# training.log just past the chunk.  data is TEXT, or zlib-compressed UTF-8
-# as a BLOB when that is smaller.
+# A log row is a span of the run's training.log; seq is the byte offset just
+# past it.  data is TEXT, or zlib-compressed UTF-8 as a BLOB when that is
+# smaller.  Live rows are chunks of whole lines.  Once an attempt is finished,
+# compact_log_attempt replaces its rows with one row of the same form.
+# A rowid table, because WITHOUT ROWID wastes about a third of each page on
+# rows this large.
 _LOGS_TABLE = """
     CREATE TABLE IF NOT EXISTS logs (
         job_key  INTEGER NOT NULL,
         attempt  INTEGER NOT NULL,
         seq      INTEGER NOT NULL,
         data     NOT NULL,
-        PRIMARY KEY (job_key, attempt, seq)
-    ) WITHOUT ROWID
+        UNIQUE (job_key, attempt, seq)
+    )
 """
 
-def _pack_log(text: str) -> str | bytes:
+def _pack_log(text: str, level: int = 6) -> str | bytes:
     """Compress a log chunk if that saves at least 10%."""
     raw = text.encode("utf-8")
     if len(raw) >= 256:
-        packed = zlib.compress(raw, 6)
+        packed = zlib.compress(raw, level)
         if len(packed) < len(raw) * 0.9:
             return packed
     return text
@@ -506,14 +506,44 @@ async def _add_missing_columns(
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
+async def _migrate_logs_to_rowid(db: aiosqlite.Connection) -> bool:
+    """Rebuild a WITHOUT ROWID ``logs`` table as a rowid table, in one transaction.
+
+    Returns True if the table was rebuilt.  An interrupted rebuild rolls back
+    and leaves the old table as it was.
+    """
+    row = await _exec_one(db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'logs'")
+    if row is None or "WITHOUT ROWID" not in row[0].upper():
+        return False
+    await db.execute("BEGIN")
+    try:
+        await db.execute("ALTER TABLE logs RENAME TO logs_old")
+        await db.execute(_LOGS_TABLE)
+        await db.execute(
+            "INSERT INTO logs (job_key, attempt, seq, data) "
+            "SELECT job_key, attempt, seq, data FROM logs_old ORDER BY job_key, attempt, seq"
+        )
+        await db.execute("DROP TABLE logs_old")
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+    return True
+
+
 async def init_db(db: aiosqlite.Connection) -> None:
     """Create tables and indexes if they do not exist (idempotent).
 
     Enables WAL mode and foreign key enforcement on the connection.
     synchronous=NORMAL is safe under WAL and avoids an fsync on every
     commit, which matters because every log line and metric is a commit.
+
+    Incremental auto-vacuum lets the log compactor give freed pages back to
+    the filesystem.  It applies to a new database, and to an existing one at
+    its next VACUUM.
     """
     db.row_factory = sqlite3.Row
+    await db.execute("PRAGMA auto_vacuum=INCREMENTAL")
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA synchronous=NORMAL")
     await db.execute("PRAGMA foreign_keys=ON")
@@ -577,6 +607,10 @@ async def init_db(db: aiosqlite.Connection) -> None:
 
     await db.execute(_JOBS_TABLE)
     await db.execute(_METRICS_TABLE)
+    await db.commit()
+    # The rebuild leaves the old table's pages free; VACUUM returns them.
+    if await _migrate_logs_to_rowid(db):
+        await db.execute("VACUUM")
     await db.execute(_LOGS_TABLE)
 
     # ── job_nodes ────────────────────────────────────────────────────
@@ -599,6 +633,16 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
+    # ── settings ────────────────────────────────────────────────────
+    # Manager-wide knobs changed from the web UI, such as the GPU placement
+    # policy.  One row per key; a missing row means the default.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """)
+
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
         CREATE INDEX IF NOT EXISTS idx_experiments_campaign
@@ -608,6 +652,27 @@ async def init_db(db: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
             ON jobs(worker_id);
     """)
+    await db.commit()
+
+
+# ===============================================================================
+# Settings
+# ===============================================================================
+
+
+async def get_setting(db: aiosqlite.Connection, key: str) -> str | None:
+    """Return the stored value of manager setting *key*, or ``None`` if unset."""
+    row = await _exec_one(db, "SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else None
+
+
+async def set_setting(db: aiosqlite.Connection, key: str, value: str) -> None:
+    """Store manager setting *key*."""
+    await db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
     await db.commit()
 
 
@@ -728,7 +793,7 @@ async def update_experiment_campaign(
 
 
 # Statuses broken out in ``job_counts``, plus "total".
-_JOB_COUNT_STATUSES = ("done", "failed", "xfailed", "running", "pending", "dispatched")
+_JOB_COUNT_STATUSES = ("done", "failed", "xfailed", "cancelled", "running", "pending", "dispatched")
 _JOB_COUNT_COLUMNS = ",\n               ".join(
     ["COUNT(j.run_id) AS total_jobs"]
     + [f"SUM(CASE WHEN j.status = '{st}' THEN 1 ELSE 0 END) AS {st}_jobs" for st in _JOB_COUNT_STATUSES]
@@ -919,6 +984,16 @@ def _serialize_job_fields(
     return command_json, combo_json, env_json, return_files_json, files_json
 
 
+def _setup_command_text(value: Any) -> str | None:
+    """A job's setup command as stored: one shell-style string.  An argument
+    list is joined so that dispatch's ``shlex.split`` gives it back."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(a, str) for a in value):
+        return shlex.join(value) if value else None
+    raise ValueError("'setup_command' must be a string or a list of strings")
+
+
 async def insert_job(
     db: aiosqlite.Connection,
     *,
@@ -937,7 +1012,7 @@ async def insert_job(
     files: dict[str, str] | None = None,
     max_retries: int = 2,
     artifact_id: str | None = None,
-    setup_command: str | None = None,
+    setup_command: str | list[str] | None = None,
 ) -> JobRecord:
     """Insert a new job row. Returns the created JobRecord."""
     [job] = await insert_jobs_bulk(db, [dict(
@@ -988,7 +1063,7 @@ async def _insert_jobs_and_reopen(
              j.get("gpus_per_run", 1), j.get("nodes_per_run", 1),
              int(j.get("set_dist_env", False)), j.get("run_from"),
              return_files_json, files_json, j.get("max_retries", 2),
-             j.get("artifact_id"), j.get("setup_command")),
+             j.get("artifact_id"), _setup_command_text(j.get("setup_command"))),
         )
         assert row is not None
         records.append(_row_to_job(row))
@@ -1523,17 +1598,21 @@ async def retry_job(
     run_id: str,
     experiment_id: str,
 ) -> JobRecord | None:
-    """Re-queue a finished job, using one retry.
+    """Re-queue a finished job on request, with a fresh automatic-retry budget.
 
-    Returns None if the job is not finished or has no retries left.
+    ``max_retries`` caps the retries the manager makes on its own when a run is
+    lost.  A retry someone asks for is not one of those.  It resets
+    ``retry_count``, so the new attempt gets the full budget.  Earlier attempts
+    keep their logs and metrics, which are keyed by ``attempt``.
+
+    Returns None if the job is not finished.
     """
     row = await _exec_one(
         db,
         f"""
-        UPDATE jobs SET status = 'pending', retry_count = retry_count + 1, {_CLEAR_DISPATCH}
+        UPDATE jobs SET status = 'pending', retry_count = 0, {_CLEAR_DISPATCH}
         WHERE run_id = ? AND experiment_id = ?
           AND {_FINISHED_IN}
-          AND retry_count < max_retries
         RETURNING *
         """,
         (run_id, experiment_id),
@@ -1999,6 +2078,139 @@ async def get_logs_for_run(
     return "".join(parts)
 
 
+# A compacted log is one row, so this compression is a level above the live one.
+_COMPACT_LOG_LEVEL = 9
+
+
+async def uncompacted_log_attempts(
+    db: aiosqlite.Connection, limit: int = 64, after: tuple[int, int] = (-1, -1),
+) -> list[tuple[int, int]]:
+    """``(job_key, attempt)`` of finished attempts whose log is still in several rows.
+
+    An attempt is finished once a later one has been dispatched, or once its
+    job is in a finished status.  Only attempts past *after* are returned, in
+    order, so a caller can page through them.
+    """
+    rows = await _exec_all(
+        db,
+        f"""
+        SELECT l.job_key, l.attempt FROM logs l JOIN jobs j ON j.job_key = l.job_key
+        WHERE (l.job_key, l.attempt) > (?, ?)
+          AND (l.attempt < j.attempt OR (l.attempt = j.attempt AND j.{_FINISHED_IN}))
+        GROUP BY l.job_key, l.attempt HAVING COUNT(*) > 1
+        ORDER BY l.job_key, l.attempt
+        LIMIT ?
+        """,
+        (*after, limit),
+    )
+    return [(r[0], r[1]) for r in rows]
+
+
+def _join_log_rows(datas: Sequence[str | bytes]) -> str | bytes:
+    """One row's data holding the text of *datas*, in the form ``insert_log`` stores."""
+    return _pack_log("".join(_unpack_log(d) for d in datas), _COMPACT_LOG_LEVEL)
+
+
+async def replace_log_rows(
+    db: aiosqlite.Connection,
+    job_key: int,
+    attempt: int,
+    count: int,
+    last_seq: int,
+    data: str | bytes,
+) -> bool:
+    """Replace an attempt's rows up to *last_seq* with one row, in one transaction.
+
+    *count* is how many rows the caller read up to *last_seq*.  If that no
+    longer matches (the job was deleted, or the rows changed), nothing is
+    written and this returns False.  Rows after *last_seq* are kept.
+    """
+    row = await _exec_one(
+        db,
+        "SELECT COUNT(*), MAX(seq) FROM logs WHERE job_key = ? AND attempt = ? AND seq <= ?",
+        (job_key, attempt, last_seq),
+    )
+    if row is None or (row[0], row[1]) != (count, last_seq):
+        return False
+    await db.execute(
+        "DELETE FROM logs WHERE job_key = ? AND attempt = ? AND seq <= ?",
+        (job_key, attempt, last_seq),
+    )
+    await db.execute(
+        "INSERT INTO logs (job_key, attempt, seq, data) VALUES (?, ?, ?, ?)",
+        (job_key, attempt, last_seq, data),
+    )
+    await db.commit()
+    return True
+
+
+async def compact_log_attempt(
+    db: aiosqlite.Connection, writer: DbWriter, job_key: int, attempt: int,
+) -> bool:
+    """Compress one attempt's log rows into a single row.
+
+    The rows are read on *db* and compressed off the event loop.  Only the
+    swap goes through *writer*, as one transaction checked against what was
+    read.  Interrupting this at any point leaves the log as it was.  Returns
+    True if the rows were replaced.
+    """
+    rows = await _exec_all(
+        db,
+        "SELECT seq, data FROM logs WHERE job_key = ? AND attempt = ? ORDER BY seq",
+        (job_key, attempt),
+    )
+    if len(rows) < 2:
+        return False
+    data = await asyncio.to_thread(_join_log_rows, [r[1] for r in rows])
+    return await writer.replace_log_rows(job_key, attempt, len(rows), rows[-1][0], data)
+
+
+# Free pages released per write, so other writes are not held up for long.
+_VACUUM_PAGES = 2000
+
+
+async def release_free_pages(db: aiosqlite.Connection) -> bool:
+    """Shrink the file by up to ``_VACUUM_PAGES`` free pages (a no-op without
+    incremental auto-vacuum).  Returns whether free pages remain."""
+    mode = await _exec_all(db, "PRAGMA auto_vacuum")
+    if not mode or mode[0][0] != 2:  # 2 is INCREMENTAL
+        return False
+    await _exec_all(db, f"PRAGMA incremental_vacuum({_VACUUM_PAGES})")
+    await db.commit()
+    rows = await _exec_all(db, "PRAGMA freelist_count")
+    return bool(rows and rows[0][0])
+
+
+# Seconds between sweeps for finished logs.
+_COMPACT_INTERVAL = 30.0
+
+
+async def log_compactor(db: aiosqlite.Connection, writer: DbWriter) -> None:
+    """Compact finished attempts' logs, one at a time, behind other writes.
+
+    Runs for the life of the manager.  Whatever it has not reached yet is
+    still readable as it is, and it picks up again after a restart.  Each
+    sweep pages through the backlog once, then waits before the next.
+    """
+    while True:
+        after = (-1, -1)
+        try:
+            compacted = False
+            while batch := await uncompacted_log_attempts(db, after=after):
+                for job_key, attempt in batch:
+                    # One attempt that cannot be compacted must not hold up the rest.
+                    try:
+                        compacted |= await compact_log_attempt(db, writer, job_key, attempt)
+                    except Exception as e:
+                        print(f"log compaction of job {job_key} attempt {attempt} failed: {e!r}")
+                after = batch[-1]
+            if compacted:
+                await writer.release_free_pages()
+        except Exception as e:
+            print(f"log compaction failed: {e!r}")
+        await asyncio.sleep(_COMPACT_INTERVAL)
+
+
 # ===============================================================================
 # DB Writer Actor
 # ===============================================================================
@@ -2021,12 +2233,18 @@ class DbWriter:
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
-        self._q: asyncio.Queue[tuple[Callable[[], Coroutine[Any, Any, Any]], asyncio.Future[Any]]] = asyncio.Queue()
+        # (priority, seq, fn, fut): background writes (priority 1) run only
+        # when no normal write (priority 0) is waiting.  seq keeps each
+        # priority FIFO and ensures fn/fut are never compared.
+        self._q: asyncio.PriorityQueue[
+            tuple[int, int, Callable[[], Coroutine[Any, Any, Any]], asyncio.Future[Any]]
+        ] = asyncio.PriorityQueue()
+        self._seq = itertools.count()
 
     async def run(self) -> None:
         """Actor loop — run as a long-lived asyncio task."""
         while True:
-            fn, fut = await self._q.get()
+            _, _, fn, fut = await self._q.get()
             try:
                 fut.set_result(await fn())
             except Exception as exc:
@@ -2036,10 +2254,12 @@ class DbWriter:
                     pass
                 fut.set_exception(exc)
 
-    async def _enqueue(self, fn: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+    async def _enqueue(
+        self, fn: Callable[[], Coroutine[Any, Any, _T]], *, background: bool = False,
+    ) -> _T:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[_T] = loop.create_future()
-        await self._q.put((fn, fut))
+        await self._q.put((int(background), next(self._seq), fn, fut))
         return await fut
 
     # ── Experiments ───────────────────────────────────────────────────────────
@@ -2144,6 +2364,12 @@ class DbWriter:
         db = self._db
         await self._enqueue(lambda: update_worker_devices(db, worker_id, devices))
 
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    async def set_setting(self, key: str, value: str) -> None:
+        db = self._db
+        await self._enqueue(lambda: set_setting(db, key, value))
+
     # ── Jobs ──────────────────────────────────────────────────────────────────
 
     async def insert_job(
@@ -2164,7 +2390,7 @@ class DbWriter:
         files: dict[str, str] | None = None,
         max_retries: int = 2,
         artifact_id: str | None = None,
-        setup_command: str | None = None,
+        setup_command: str | list[str] | None = None,
     ) -> JobRecord:
         db = self._db
         return await self._enqueue(lambda: insert_job(
@@ -2313,3 +2539,19 @@ class DbWriter:
     async def insert_log(self, job_key: int, attempt: int, seq: int, data: str) -> None:
         db = self._db
         await self._enqueue(lambda: insert_log(db, job_key, attempt, seq, data))
+
+    async def release_free_pages(self) -> None:
+        """Background writes, one batch at a time: each runs only when no other
+        write is waiting."""
+        db = self._db
+        while await self._enqueue(lambda: release_free_pages(db), background=True):
+            pass
+
+    async def replace_log_rows(
+        self, job_key: int, attempt: int, count: int, last_seq: int, data: str | bytes,
+    ) -> bool:
+        """Background write: it runs only when no other write is waiting."""
+        db = self._db
+        return await self._enqueue(
+            lambda: replace_log_rows(db, job_key, attempt, count, last_seq, data),
+            background=True)

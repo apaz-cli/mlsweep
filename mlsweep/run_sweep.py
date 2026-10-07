@@ -11,6 +11,7 @@ Usage:
 import argparse
 import base64
 import collections
+import fnmatch
 import functools
 import hashlib
 import importlib.metadata
@@ -217,6 +218,18 @@ def _http_request(
         except json.JSONDecodeError:
             pass
     return (status, raw.decode("utf-8", errors="replace") if raw else None)
+
+
+def _report_failure(label: str, status: int, resp: Any) -> None:
+    """Print a FAIL line with the manager's ``error`` message, else its body.
+
+    Status 0 means the manager was unreachable, which ``_http_request``
+    already reported, so nothing is printed.
+    """
+    if not status:
+        return
+    text = resp["error"] if isinstance(resp, dict) and "error" in resp else resp
+    sweep_print(f"  {_RED}FAIL{_RESET}  {label}: {text}")
 
 
 def _manager_url(manager: str, path: str) -> str:
@@ -499,7 +512,7 @@ def manager_create_experiment(
         sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} "
                     f"(campaign {campaign}){with_jobs}")
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Create experiment: {resp}")
+    _report_failure("Create experiment", status, resp)
     return None
 
 
@@ -524,7 +537,7 @@ def manager_register_artifact(
     if status in (200, 201) and isinstance(resp, dict):
         sweep_print(f"  {_GREEN}OK{_RESET}    Artifact registered: {artifact_id[:16]}...")
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Register artifact: {resp}")
+    _report_failure("Register artifact", status, resp)
     return None
 
 
@@ -560,7 +573,7 @@ def manager_upload_artifact_data(
     if status in (200, 201, 204):
         sweep_print(f"  {_GREEN}OK{_RESET}    Artifact uploaded ({file_size} bytes)")
         return True
-    sweep_print(f"  {_RED}FAIL{_RESET}  Upload artifact: {resp}")
+    _report_failure("Upload artifact", status, resp)
     return False
 
 
@@ -580,7 +593,7 @@ def manager_submit_jobs_bulk(
     if status in (200, 201) and isinstance(resp, list):
         sweep_print(f"  {_GREEN}OK{_RESET}    {len(resp)} jobs submitted")
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Submit jobs: {resp}")
+    _report_failure("Submit jobs", status, resp)
     return None
 
 
@@ -627,7 +640,7 @@ def manager_get_experiment_summary(
     if status == 200 and isinstance(resp, dict):
         return resp
     if not quiet:
-        sweep_print(f"  {_RED}FAIL{_RESET}  Get summary: {resp}")
+        _report_failure("Get summary", status, resp)
     return None
 
 
@@ -680,7 +693,7 @@ def manager_move_experiment(
     )
     if status == 200 and isinstance(resp, dict):
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  Move experiment: {resp}")
+    _report_failure("Move experiment", status, resp)
     return None
 
 
@@ -699,7 +712,7 @@ def manager_list_experiment_jobs(
     status, resp = _http_request("GET", _manager_url(manager, path), token)
     if status == 200 and isinstance(resp, list):
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  List jobs: {resp}")
+    _report_failure("List jobs", status, resp)
     return None
 
 
@@ -719,6 +732,7 @@ def manager_cancel_job(
     )
     if status == 200 and isinstance(resp, dict):
         return resp
+    _report_failure(f"cancel {run_id}", status, resp)
     return None
 
 
@@ -738,6 +752,7 @@ def manager_retry_job(
     )
     if status == 200 and isinstance(resp, dict):
         return resp
+    _report_failure(f"retry {run_id}", status, resp)
     return None
 
 
@@ -777,7 +792,7 @@ def manager_set_experiment_status(
     )
     if s == 200 and isinstance(resp, dict):
         return resp
-    sweep_print(f"  {_RED}FAIL{_RESET}  set status {status}: {resp}")
+    _report_failure(f"set status {status}", s, resp)
     return None
 
 
@@ -1107,6 +1122,40 @@ class _HashWriter:
         self.f.close()
 
 
+def _project_files(root: Path, excludes: set[str], top_level_excludes: frozenset[str] = frozenset()) -> list[Path]:
+    """Directories and regular files under *root*, sorted, without
+    anything whose name matches an exclude pattern or is a symlink, socket or fifo.
+    *top_level_excludes* are directory names skipped directly under *root* only."""
+    def skipped(name: str) -> bool:
+        return any(fnmatch.fnmatchcase(name, pat) for pat in excludes)
+
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not skipped(d) and not (here / d).is_symlink()
+                       and not (here == root and d in top_level_excludes)]
+        out.extend(here / d for d in dirnames)
+        for name in filenames:
+            path = here / name
+            if not skipped(name) and path.is_file() and not path.is_symlink():
+                out.append(path)
+    return sorted(out)
+
+
+def _build_output_dirs(root: Path) -> frozenset[str]:
+    """Top-level directories of *root* that are build output rather than source.
+
+    A project with a virtualenv in its root installs into it, so a top-level
+    ``build/`` there is setuptools' leftover, not code the runs need.  Without
+    a venv, ``build/`` may be the project's own source and is shipped.
+    """
+    try:
+        has_venv = any((d / "pyvenv.cfg").is_file() for d in root.iterdir() if d.is_dir())
+    except OSError:
+        has_venv = False
+    return frozenset({"build"}) if has_venv else frozenset()
+
+
 def _pack_project(
     project_root: str | Path,
     *,
@@ -1115,7 +1164,9 @@ def _pack_project(
     """Create a tar.gz of the project directory.
 
     Returns (tarball_path, sha256_hex).
-    Skips common VCS and cache directories.
+    Skips common VCS and cache directories, matching each path component
+    against shell-style patterns.  Skipped directories are not walked, so a
+    large ``.venv`` costs nothing.
     """
     root = Path(project_root).resolve()
     if exclude_patterns is None:
@@ -1123,7 +1174,7 @@ def _pack_project(
 
     excludes: set[str] = {
         ".git", ".svn", ".hg",
-        "__pycache__", ".pyc", ".pyo",
+        "__pycache__", "*.pyc", "*.pyo",
         ".mypy_cache", ".pytest_cache", ".ruff_cache",
         "node_modules",
         "outputs",
@@ -1145,23 +1196,9 @@ def _pack_project(
         with open(tmp_path, "wb") as raw_f:
             hw = _HashWriter(raw_f, sha)
             with tarfile.open(fileobj=hw, mode="w:gz") as tar:  # type: ignore[call-overload]
-                for entry in sorted(root.rglob("*")):
-                    rel = entry.relative_to(root)
-                    parts = rel.parts
-
-                    skip = False
-                    for part in parts:
-                        if part in excludes:
-                            skip = True
-                            break
-
-                    if skip:
-                        continue
-                    if entry.is_symlink() or entry.is_socket() or entry.is_fifo():
-                        continue
-
+                for entry in _project_files(root, excludes, _build_output_dirs(root)):
                     try:
-                        tar.add(str(entry), arcname=str(rel), recursive=False)
+                        tar.add(str(entry), arcname=str(entry.relative_to(root)), recursive=False)
                     except (PermissionError, OSError):
                         continue
 
@@ -1506,7 +1543,7 @@ def _build_job_payloads(
     experiment_id: str,
     artifact_id: str,
     command: list[str],
-    extra_flags: list[str],
+    cli_overrides: list[str],
     gpus_per_run: int,
     nodes_per_run: int,
     set_dist_env: bool,
@@ -1518,11 +1555,13 @@ def _build_job_payloads(
     """Convert sweep variations into job payloads for the manager API.
 
     Each payload is a dict with keys matching the JobRecord fields expected
-    by POST /api/jobs/bulk.
+    by POST /api/jobs/bulk.  A run's command is ``COMMAND + EXTRA_FLAGS +
+    OPTIONS flags + -- overrides``; each variation's ``overrides`` already
+    starts with EXTRA_FLAGS.
     """
     jobs = []
     for var in variations:
-        full_command = list(command) + var["overrides"] + list(extra_flags)
+        full_command = list(command) + var["overrides"] + list(cli_overrides)
         env_dict: dict[str, str] = {}
         tag_parts = [f"{k}={v}" for k, v in var["combo"].items() if v is not None]
         if tag_parts:
@@ -1803,7 +1842,7 @@ def main() -> None:
     parser.add_argument("--validate", action="store_true",
                         help="Validate sweep config, print all combinations, and exit")
     parser.add_argument("--max-retries", type=int, default=2,
-                        help="Max retries for failed jobs (default: 2)")
+                        help="Max automatic retries of a run lost with its worker (default: 2)")
     parser.add_argument("--setup-command", default=None,
                         help="Shell command executed before training in the worker workspace")
     parser.add_argument("--wandb-project", default=None,
@@ -2108,7 +2147,7 @@ def main() -> None:
         _build_job_payloads,
         artifact_id=artifact_id or "",
         command=command,
-        extra_flags=extra_flags,
+        cli_overrides=extra,
         gpus_per_run=gpus_per_run,
         nodes_per_run=nodes_per_run,
         set_dist_env=set_dist_env,

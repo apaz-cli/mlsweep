@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from conftest import _api_post, _wait_for_job
-from mlsweep.ctl import pivot_metrics, select_metrics
+from mlsweep.ctl import metrics_cmd, pivot_metrics, select_metrics
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -43,6 +43,14 @@ with MLSweepLogger() as lg:
     for step in (1, 2):
         lg.log({"loss": 3.0 - step, "val@1": 4.0 - step, "val@4": OFFSET - step}, step=step)
 """
+
+
+@pytest.mark.parametrize("shape", ["--csv", "--json", "--last"])
+def test_tail_outside_table_view_points_at_last(shape, capsys):
+    with pytest.raises(SystemExit) as exc:
+        metrics_cmd(["--experiment", "e", "--tail", "1", shape])
+    assert exc.value.code == 2
+    assert "--last" in capsys.readouterr().err
 
 
 def test_metrics_command_end_to_end(manager_with_worker):

@@ -27,7 +27,17 @@ import time
 import pytest
 
 from conftest import _api_get, _api_post, _experiment_jobs, _find_free_port
-from mlsweep._shared import MsgWorkerHello, decode, encode
+from test_worker_cleanup import _recv
+from mlsweep._shared import (
+    PROTOCOL_VERSION,
+    MsgCancel,
+    MsgHello,
+    MsgRun,
+    MsgWorkerHello,
+    decode,
+    encode,
+    read_msg,
+)
 
 TOKEN = "reconnect-test-token"
 
@@ -68,7 +78,7 @@ def _start_manager(tmp_path, port: int, workers_file: str, gpus: str = "0") -> s
     return subprocess.Popen(
         [sys.executable, "-m", "mlsweep.manager", "--port", str(port),
          "--db", str(tmp_path / "m.db"), "--mlsweep-dir", str(tmp_path / "out"),
-         "--token", TOKEN, "--workers", workers_file],
+         "--token", TOKEN, "--workers", workers_file, "--scratch-dir", str(tmp_path / "scratch")],
         stdout=open(tmp_path / f"manager_{port}.log", "w"), stderr=subprocess.STDOUT, env=env,
     )
 
@@ -78,20 +88,44 @@ def _connected_worker(url: str):
     return ws[0] if ws else None
 
 
-def _process_gpu(run_id: str) -> str | None:
-    """CUDA_VISIBLE_DEVICES of the live process running *run_id*."""
+def _process_gpu(run_id: str, proj) -> str | None:
+    """CUDA_VISIBLE_DEVICES of the live process running *run_id* in *proj*.
+
+    Matching on the working directory as well keeps out runs of the same name
+    from other tests or real sweeps on the machine.
+    """
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
         try:
             env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+            cwd = os.readlink(f"/proc/{pid}/cwd")
         except OSError:
             continue
-        if f"MLSWEEP_RUN_NAME={run_id}".encode() in env:
+        if f"MLSWEEP_RUN_NAME={run_id}".encode() in env and cwd == os.path.realpath(proj):
             for kv in env:
                 if kv.startswith(b"CUDA_VISIBLE_DEVICES="):
                     return kv.split(b"=", 1)[1].decode()
     return None
+
+
+def _kill_worker(proj, port: int) -> None:
+    """SIGKILL the worker for *proj* on *port*, matching whole arguments so that
+    no other worker on the machine (``--port 45678`` for port 4567) is hit."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        args = dict(zip(argv, argv[1:]))
+        if (b"mlsweep.worker" in argv and args.get(b"--port") == str(port).encode()
+                and args.get(b"--remote-dir") == str(proj).encode()):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
 
 
 class _Proxy:
@@ -263,25 +297,25 @@ def restartable(tmp_path):
         return url
 
     try:
-        yield start, managers
+        yield start, managers, proj
     finally:
         for m in managers:
             if m.poll() is None:
                 m.terminate()
                 m.wait()
-        subprocess.run(["pkill", "-f", f"mlsweep.worker .*--port {Q}"], check=False)
+        _kill_worker(proj, Q)
 
 
 def test_manager_restart_keeps_the_gpu_a_run_is_actually_on(restartable):
-    start, managers = restartable
+    start, managers, proj = restartable
     url = start()
     _api(url, "/api/experiments", {"experiment_id": "rc"})
     _api(url, "/api/jobs", {"run_id": "A", "experiment_id": "rc", "command": _sleeper(3)})
     time.sleep(1)
     _api(url, "/api/jobs", {"run_id": "B", "experiment_id": "rc", "command": _sleeper(60)})
-    _wait(lambda: _process_gpu("B") is not None, 20, "B to start")
+    _wait(lambda: _process_gpu("B", proj) is not None, 20, "B to start")
     _wait(lambda: _jobs(url)["A"]["status"] == "done", 30, "A to finish")
-    b_gpu = _process_gpu("B")
+    b_gpu = _process_gpu("B", proj)
 
     managers[-1].send_signal(signal.SIGKILL)   # crash; the worker keeps B running
     managers[-1].wait()
@@ -290,12 +324,12 @@ def test_manager_restart_keeps_the_gpu_a_run_is_actually_on(restartable):
     booked = _wait(lambda: _jobs(url)["B"].get("dispatched_gpu_ids"), 20, "B to be restored")
     assert json.loads(booked) == [int(b_gpu)]
     _api(url, "/api/jobs", {"run_id": "C", "experiment_id": "rc", "command": _sleeper(10)})
-    c_gpu = _wait(lambda: _process_gpu("C"), 20, "C to start")
+    c_gpu = _wait(lambda: _process_gpu("C", proj), 20, "C to start")
     assert c_gpu != b_gpu                      # C must not be stacked onto B's GPU
 
 
 def test_run_that_ends_while_manager_is_down_is_not_rerun(restartable, tmp_path):
-    start, managers = restartable
+    start, managers, _ = restartable
     url = start()
     _api(url, "/api/experiments", {"experiment_id": "rc"})
     starts = tmp_path / "d_starts.txt"          # one line per time D is launched
@@ -315,3 +349,55 @@ def test_run_that_ends_while_manager_is_down_is_not_rerun(restartable, tmp_path)
     d = _jobs(url)["D"]
     assert (d["status"], d["exit_code"]) == ("done", 0)
     assert starts.read_text().count("start") == 1   # D ran exactly once
+
+
+# ── attempts ───────────────────────────────────────────────────────────────────
+
+
+def _fake_worker_connection(server, resuming, timeout=30.0):
+    """Accept the manager's next connection on *server* and answer its hello as a
+    worker running *resuming*.  Returns the socket."""
+    server.settimeout(timeout)
+    sock, _ = server.accept()
+    sock.settimeout(timeout)
+    assert isinstance(decode(read_msg(sock)), MsgHello)
+    sock.sendall(encode(MsgWorkerHello(gpus=[0], topo={}, resuming=resuming, scratch_dir="/s",
+                                       protocol=PROTOCOL_VERSION)))
+    return sock
+
+
+def test_hello_reporting_another_attempt_is_a_ghost(tmp_path):
+    """After a reconnect, a worker reports a run under an attempt other than the
+    one the database has on it.  The manager cancels that run on the worker and
+    dispatches the job again, as a new attempt, without spending a retry."""
+    import socket as socket_mod
+    P, M = _find_free_port(), _find_free_port()
+    server = socket_mod.socket()
+    server.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", P))
+    server.listen(4)
+    wf = tmp_path / "workers.toml"
+    wf.write_text(f'[[workers]]\nhost = "localhost"\nremote_dir = "{tmp_path}"\nport = {P}\n')
+    mgr = _start_manager(tmp_path, M, str(wf))
+    url = f"http://127.0.0.1:{M}"
+    try:
+        first = _fake_worker_connection(server, resuming=[])
+        _api(url, "/api/experiments", {"experiment_id": "rc"})
+        _api(url, "/api/jobs", {"run_id": "r", "experiment_id": "rc", "command": ["true"]})
+        run = _recv(first, MsgRun)
+        assert (run.run_id, run.attempt) == ("r", 1)
+        first.close()  # the connection drops before the worker says anything more
+
+        second = _fake_worker_connection(server, resuming=[
+            {"run_id": "r", "experiment": "rc", "attempt": 7, "pid": 123, "gpu_ids": [0]}])
+        cancel = _recv(second, MsgCancel)
+        assert (cancel.run_id, cancel.experiment) == ("r", "rc")
+        rerun = _recv(second, MsgRun)
+        assert (rerun.run_id, rerun.attempt) == ("r", 2)
+        assert _jobs(url)["r"]["retry_count"] == 0
+        second.close()
+    finally:
+        mgr.terminate()
+        mgr.wait()
+        server.close()
+

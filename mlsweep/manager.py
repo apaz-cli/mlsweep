@@ -24,7 +24,8 @@ from secrets import token_hex
 import aiosqlite
 from aiohttp import web
 
-from mlsweep._manager_state import ManagerState
+from mlsweep._manager_state import PLACEMENTS, ManagerState
+from mlsweep._shared import DEFAULT_SCRATCH_DIR
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,6 +62,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers",
         default=None,
         help="Path to workers config file (default: local worker with visible GPUs)",
+    )
+    parser.add_argument(
+        "--scratch-dir",
+        default=os.environ.get("MLSWEEP_SCRATCH_DIR", DEFAULT_SCRATCH_DIR),
+        help="Workers' scratch directory, unless a workers file entry sets scratch_dir "
+             f"(env: MLSWEEP_SCRATCH_DIR, default: {DEFAULT_SCRATCH_DIR})",
     )
     parser.add_argument(
         "--color",
@@ -179,7 +186,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     # write_db is owned exclusively by the DbWriter actor (serial writes).
     # read_db is used by all other coroutines for SELECT queries; WAL mode
     # allows concurrent reads alongside the writer without blocking.
-    from mlsweep._manager_db import DbWriter, init_db
+    from mlsweep._manager_db import DbWriter, init_db, log_compactor
     import sqlite3 as _sqlite3
 
     write_db = await aiosqlite.connect(db_path)
@@ -187,23 +194,35 @@ async def _async_main(args: argparse.Namespace) -> None:
     print(f"Connected to database: {db_path}")
     print("Database schema initialized")
 
-    read_db = await aiosqlite.connect(db_path)
-    read_db.row_factory = _sqlite3.Row
-    await read_db.execute("PRAGMA journal_mode=WAL")
-    await read_db.execute("PRAGMA foreign_keys=ON")
+    async def _open_reader() -> aiosqlite.Connection:
+        conn = await aiosqlite.connect(db_path)
+        conn.row_factory = _sqlite3.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    read_db = await _open_reader()
+    # The compactor reads whole logs; its own connection keeps those reads
+    # from queueing ahead of the scheduler's and the HTTP handlers'.
+    compact_db = await _open_reader()
 
     # ── DB writer actor ──────────────────────────────────────────────────
     writer = DbWriter(write_db)
     writer_task = asyncio.create_task(writer.run(), name="db-writer")
+    compactor_task = asyncio.create_task(log_compactor(compact_db, writer), name="log-compactor")
 
     # ── State ────────────────────────────────────────────────────────────
     # Jobs a previous manager left dispatched/running stay that way.  Each
     # worker's hello reports what it is still running, and the jobs of
     # workers that do not come back are requeued (see _handle_worker_hello).
-    from mlsweep._manager_db import count_pending_jobs
+    from mlsweep._manager_db import count_pending_jobs, get_setting
 
     state = ManagerState()
     state.db_writer = writer
+    placement = await get_setting(read_db, "placement")
+    for p in PLACEMENTS:
+        if p == placement:
+            state.placement = p
     print(f"{await count_pending_jobs(read_db)} pending job(s) in database")
 
     # ── Shutdown coordination ────────────────────────────────────────────
@@ -233,6 +252,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     state.artifact_base_url = f"http://{args.host}:{args.port}"
     state.token = token
     state.manager_port = args.port
+    state.scratch_dir = args.scratch_dir
     scheduler_task = asyncio.create_task(scheduler_loop(read_db, state), name="scheduler")
 
     app = create_app(read_db, state, token, mlsweep_dir=mlsweep_dir)
@@ -277,11 +297,13 @@ async def _async_main(args: argparse.Namespace) -> None:
     # ── Cleanup ──────────────────────────────────────────────────────────
     print("Shutting down HTTP server...")
     scheduler_task.cancel()
+    compactor_task.cancel()
     dashboard_task.cancel()
     await runner.cleanup()
     writer_task.cancel()
     print("Closing database...")
     await read_db.close()
+    await compact_db.close()
     await write_db.close()
     pid_file = mlsweep_dir / "manager.pid"
     pid_file.unlink(missing_ok=True)

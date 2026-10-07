@@ -182,18 +182,15 @@ def _parse_amd_topo_output(text: str) -> dict[tuple[int, int], int]:
 
 
 @functools.lru_cache(maxsize=None)
-def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
-    """Query GPU interconnect topology via nvidia-smi or amd-smi.
+def _gpu_topology() -> dict[tuple[int, int], int]:
+    """Query this host's GPU interconnect topology via nvidia-smi or amd-smi.
 
     Returns {(gpu_a, gpu_b): score} where higher score means better connectivity
     (NVLink/XGMI >> PCIe switch >> PCIe host bridge >> NUMA >> cross-NUMA).
     Falls back to {} if all queries fail.
-    worker: None for local; SSH target string for remote.
     """
-    ssh_prefix = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", worker] if worker else []
-
     # Try nvidia-smi first
-    cmd = ssh_prefix + ["nvidia-smi", "topo", "-m"]
+    cmd = ["nvidia-smi", "topo", "-m"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
@@ -202,7 +199,7 @@ def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
         pass
 
     # Fall back to amd-smi (AMD GPUs)
-    cmd = ssh_prefix + ["amd-smi", "topology", "--json"]
+    cmd = ["amd-smi", "topology", "--json"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
@@ -215,7 +212,7 @@ def _gpu_topology(worker: str | None = None) -> dict[tuple[int, int], int]:
 
 def _parse_topo_wire(wire_topo: dict[str, int]) -> dict[tuple[int, int], int]:
     """Convert wire-format topology (string keys ``"gpu_a,gpu_b"`` → score)
-    to the internal format ``{(gpu_a, gpu_b): score}`` used by ``_best_gpu_groups``.
+    to the internal format ``{(gpu_a, gpu_b): score}`` used by ``closest_gpu_group``.
     """
     result: dict[tuple[int, int], int] = {}
     for k, v in wire_topo.items():
@@ -224,52 +221,26 @@ def _parse_topo_wire(wire_topo: dict[str, int]) -> dict[tuple[int, int], int]:
     return result
 
 
-def _best_gpu_groups(devices: list[int], group_size: int, n_groups: int,
-                     worker: str | None = None,
-                     topo: dict[tuple[int, int], int] | None = None) -> list[list[int]]:
-    """Select n_groups non-overlapping groups of group_size GPUs from devices,
-    preferring groups with the best NVLink/PCIe interconnect.
+def closest_gpu_group(devices: list[int], group_size: int,
+                      topo: dict[tuple[int, int], int]) -> list[int]:
+    """Pick *group_size* GPUs from *devices* with the best NVLink/PCIe interconnect.
 
-    Uses a greedy algorithm: seeds each group with the highest-scoring pair,
-    then expands by adding the GPU that maximises total score to the existing group.
-    Falls back to sequential grouping when topology is unavailable (all scores zero).
-    worker=None means local; SSH target string for remote topology query.
-    topo: pre-supplied topology dict (takes precedence over worker SSH query).
+    Seeds the group with the highest-scoring pair, then greedily adds the GPU
+    that scores best against the group so far.  Ties keep *devices* order, so
+    with no topology (all scores zero) this is ``devices[:group_size]``.
+    The caller guarantees ``len(devices) >= group_size``.
     """
-    if group_size == 1:
-        return [[d] for d in devices[:n_groups]]
-
-    if topo is None:
-        topo = _gpu_topology(worker)
+    if group_size <= 1:
+        return devices[:group_size]
 
     def pair_score(a: int, b: int) -> int:
         return topo.get((a, b), 0) + topo.get((b, a), 0)
 
-    available = list(devices)
-    groups = []
-
-    for _ in range(n_groups):
-        if len(available) < group_size:
-            break
-        # Seed with the highest-scoring pair (O(n^2), fine for ≤64 GPUs)
-        best_pair = (available[0], available[1] if len(available) > 1 else available[0])
-        best_pair_score = -1
-        for a, b in itertools.combinations(available, 2):
-            s = pair_score(a, b)
-            if s > best_pair_score:
-                best_pair_score, best_pair = s, (a, b)
-        # Greedily expand to group_size
-        group = list(best_pair)
-        remaining = [d for d in available if d not in set(group)]
-        while len(group) < group_size and remaining:
-            best_g = max(remaining, key=lambda g: sum(pair_score(g, e) for e in group))
-            group.append(best_g)
-            remaining.remove(best_g)
-
-        if len(group) < group_size:
-            break
-        groups.append(group)
-        used = set(group)
-        available = [g for g in available if g not in used]
-
-    return groups
+    # Highest-scoring pair (O(n^2), fine for <=64 GPUs).
+    group = list(max(itertools.combinations(devices, 2), key=lambda p: pair_score(*p)))
+    remaining = [d for d in devices if d not in group]
+    while len(group) < group_size:
+        best = max(remaining, key=lambda g: sum(pair_score(g, e) for e in group))
+        group.append(best)
+        remaining.remove(best)
+    return group

@@ -56,7 +56,7 @@ from mlsweep._manager_db import (
     list_pending_jobs,
     list_workers,
 )
-from mlsweep._manager_state import InFlightRun, ManagerState
+from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState
 from mlsweep._manager_workers import (
     _check_experiments_complete_locked,
     _detach_locked,
@@ -790,6 +790,8 @@ async def handle_insert_job(request: web.Request) -> web.Response:
             artifact_id=body.get("artifact_id"),
             setup_command=body.get("setup_command"),
         )
+    except ValueError as exc:
+        return _error_response(str(exc))
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
@@ -815,6 +817,8 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
 
     try:
         records = await state.db_writer.insert_jobs_bulk(jobs_data)
+    except ValueError as exc:
+        return _error_response(str(exc))
     except Exception as exc:
         return _error_response(str(exc), status=500)
 
@@ -854,6 +858,8 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
         return fields
     try:
         exp, records = await state.db_writer.create_experiment_with_jobs(jobs=jobs, **fields)
+    except ValueError as exc:
+        return _error_response(str(exc))
     except sqlite3.IntegrityError:
         return _error_response(
             "duplicate run_id in this experiment (run names must be unique per "
@@ -1020,10 +1026,11 @@ async def handle_cancel_job(request: web.Request) -> web.Response:
 
 @routes.post("/api/jobs/{run_id}/retry")
 async def handle_retry_job(request: web.Request) -> web.Response:
-    """Retry a failed job (increment retry count, reset to pending).
+    """Retry a finished job: reset it to pending with a fresh retry budget.
 
     Only jobs in a terminal state (``failed``, ``cancelled``, ``done``)
     can be retried.  Running or pending jobs return 409 Conflict.
+    ``max_retries`` does not apply here.  It only caps automatic retries.
     """
     db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
     state: ManagerState = request.config_dict["mlsweep_state"]
@@ -1035,11 +1042,9 @@ async def handle_retry_job(request: web.Request) -> web.Response:
         current = await get_job(db, run_id, experiment_id)
         if current is None:
             return _not_found("job")
-        if current.status not in FINISHED_JOB_STATUSES:
-            return _error_response(
-                f"job is {current.status}; only finished jobs can be retried", status=409,
-            )
-        return _error_response("max_retries reached", status=400)
+        return _error_response(
+            f"job is {current.status}; only finished jobs can be retried", status=409,
+        )
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -1345,7 +1350,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     """Add a new worker dynamically.
 
     Accepts JSON body: {host (required), remote_dir?, ssh_key?, venv?,
-    port?, devices?}.  Generates a worker_id from the host, upserts into the DB,
+    port?, devices?, scratch_dir?}.  Generates a worker_id from the host, upserts into the DB,
     and spawns a background task to connect to the worker.
 
     ``remote_dir`` is optional: the training code is shipped as an artifact and
@@ -1368,6 +1373,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     venv = body.get("venv")
     port = body.get("port", 0)
     devices = body.get("devices")
+    scratch_dir = body.get("scratch_dir") or state.scratch_dir
 
     # Use explicit worker_id (reconnect) or derive from host/port (new worker),
     # and claim it so a concurrent add of the same worker is refused.
@@ -1403,6 +1409,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
         host=host,
         remote_dir=remote_dir,
         worker_id=worker_id,
+        scratch_dir=scratch_dir,
         ssh_key=ssh_key,
         venv=venv,
         port=port,
@@ -1501,6 +1508,39 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
     to_evict = [r.run_id for r in evict]
     state.request_schedule()
     return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict})
+
+
+# ── Scheduler ──────────────────────────────────────────────────────────────────
+
+
+@routes.get("/api/scheduler")
+async def handle_get_scheduler(request: web.Request) -> web.Response:
+    """Return the scheduler settings: ``{"placement": "pack" | "spread"}``."""
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    return _json_response({"placement": state.placement})
+
+
+@routes.patch("/api/scheduler")
+async def handle_patch_scheduler(request: web.Request) -> web.Response:
+    """Change the GPU placement policy.
+
+    Accepts JSON: {"placement": "pack" | "spread"}.  Persisted across manager
+    restarts.  Applies to jobs dispatched from the next scheduling pass on;
+    running jobs stay where they are.
+    """
+    state: ManagerState = request.config_dict["mlsweep_state"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response("invalid JSON body")
+    placement = body.get("placement")
+    if placement not in PLACEMENTS:
+        return _error_response(f"'placement' must be one of {list(PLACEMENTS)}")
+    await state.db_writer.set_setting("placement", placement)
+    async with state.lock:
+        state.placement = placement
+    state.request_schedule()
+    return _json_response({"placement": placement})
 
 
 # ── Artifacts ──────────────────────────────────────────────────────────────────

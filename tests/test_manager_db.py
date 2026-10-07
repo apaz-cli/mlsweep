@@ -48,9 +48,17 @@ from mlsweep._manager_db import (
     get_metrics_for_run,
     insert_log,
     get_logs_for_run,
+    last_log_seq,
+    uncompacted_log_attempts,
+    compact_log_attempt,
+    replace_log_rows,
+    finish_job,
+    DbWriter,
     register_artifact,
     get_artifact,
     increment_artifact_ref,
+    get_setting,
+    set_setting,
 )
 
 
@@ -70,6 +78,44 @@ async def _dispatched(db, run_id="run1", experiment_id="exp1"):
 
 
 # ── Metrics and logs ────────────────────────────────────────────────────────────
+
+
+def test_settings_roundtrip():
+    async def run():
+        db = await _init_db()
+        try:
+            assert await get_setting(db, "placement") is None
+            await set_setting(db, "placement", "spread")
+            await set_setting(db, "placement", "pack")
+            assert await get_setting(db, "placement") == "pack"
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_setup_command_may_be_a_string_or_an_argument_list():
+    """Dispatch splits the stored command with shlex, so a list is stored joined."""
+    import shlex
+
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="e", name="e")
+            jobs = await insert_jobs_bulk(db, [
+                {"run_id": "s", "experiment_id": "e", "command": ["true"], "setup_command": "make all"},
+                {"run_id": "l", "experiment_id": "e", "command": ["true"],
+                 "setup_command": ["sh", "-c", "echo 'a b'"]},
+            ])
+            assert jobs[0].setup_command == "make all"
+            assert shlex.split(jobs[1].setup_command) == ["sh", "-c", "echo 'a b'"]
+            with pytest.raises(ValueError):
+                await insert_jobs_bulk(db, [{"run_id": "x", "experiment_id": "e",
+                                             "command": ["true"], "setup_command": 3}])
+        finally:
+            await db.close()
+
+    asyncio.run(run())
 
 
 def test_worker_unhealthy_devices_roundtrip():
@@ -212,6 +258,171 @@ def test_logs_of_each_attempt_are_kept_apart():
 
     asyncio.run(run())
 
+
+
+async def _log_rows(db, job_key):
+    async with db.execute(
+        "SELECT attempt, seq, data FROM logs WHERE job_key = ? ORDER BY attempt, seq", (job_key,)
+    ) as cur:
+        return [tuple(r) for r in await cur.fetchall()]
+
+
+async def _write_chunks(db, job, chunks):
+    seq = await last_log_seq(db, job.job_key, job.attempt)
+    for chunk in chunks:
+        seq += len(chunk.encode())
+        await insert_log(db, job.job_key, job.attempt, seq, chunk)
+    return seq
+
+
+_CHUNKS = ["hello\n", "".join(f"step {i} loss 0.5\n" for i in range(500)), "bye\n"]
+
+
+def test_old_without_rowid_logs_table_is_rebuilt(tmp_path):
+    async def run():
+        path = str(tmp_path / "m.db")
+        db = await aiosqlite.connect(path)
+        await db.execute(
+            "CREATE TABLE logs (job_key INTEGER NOT NULL, attempt INTEGER NOT NULL, "
+            "seq INTEGER NOT NULL, data NOT NULL, PRIMARY KEY (job_key, attempt, seq)) WITHOUT ROWID"
+        )
+        await db.executemany("INSERT INTO logs VALUES (?, ?, ?, ?)",
+                             [(1, 1, 4, "one\n"), (1, 1, 8, b"x"), (2, 1, 4, "two\n")])
+        await db.commit()
+        await db.close()
+
+        db = await aiosqlite.connect(path)
+        try:
+            await init_db(db)
+            async with db.execute("SELECT sql FROM sqlite_master WHERE name = 'logs'") as cur:
+                assert "WITHOUT ROWID" not in (await cur.fetchone())[0].upper()
+            async with db.execute("PRAGMA auto_vacuum") as cur:
+                assert (await cur.fetchone())[0] == 2  # incremental, set by the rebuild's VACUUM
+            async with db.execute("SELECT * FROM logs ORDER BY job_key, seq") as cur:
+                assert [tuple(r) for r in await cur.fetchall()] == [
+                    (1, 1, 4, "one\n"), (1, 1, 8, b"x"), (2, 1, 4, "two\n")]
+            await init_db(db)  # idempotent
+            await insert_log(db, 2, 1, 4, "dup\n")  # duplicate seq still ignored
+            assert len(await _log_rows(db, 2)) == 1
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_finished_attempt_logs_compact_to_one_row():
+    async def run():
+        db = await _init_db()
+        writer = DbWriter(db)
+        task = asyncio.create_task(writer.run())
+        try:
+            job = await _dispatched(db)
+            end = await _write_chunks(db, job, _CHUNKS)
+            # Still running, so left alone.
+            assert await uncompacted_log_attempts(db) == []
+
+            await finish_job(db, "run1", "exp1", success=True, exit_code=0, elapsed=1.0)
+            assert await uncompacted_log_attempts(db) == [(job.job_key, job.attempt)]
+            assert await compact_log_attempt(db, writer, job.job_key, job.attempt)
+
+            rows = await _log_rows(db, job.job_key)
+            assert [(a, s) for a, s, _ in rows] == [(job.attempt, end)]
+            assert isinstance(rows[0][2], bytes)
+            assert await get_logs_for_run(db, "run1", "exp1") == "".join(_CHUNKS)
+            assert await last_log_seq(db, job.job_key, job.attempt) == end
+            assert await uncompacted_log_attempts(db) == []
+        finally:
+            task.cancel()
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_earlier_attempt_logs_compact_while_the_retry_runs():
+    async def run():
+        db = await _init_db()
+        writer = DbWriter(db)
+        task = asyncio.create_task(writer.run())
+        try:
+            first = await _dispatched(db)
+            await _write_chunks(db, first, _CHUNKS)
+            await requeue_jobs(db, [("exp1", "run1")], spend_retry=True)
+            second = await dispatch_job(db, "run1", "exp1", "w1", [0])
+            await _write_chunks(db, second, ["a\n", "b\n"])
+
+            assert await uncompacted_log_attempts(db) == [(first.job_key, first.attempt)]
+            before = await get_logs_for_run(db, "run1", "exp1")
+            assert await compact_log_attempt(db, writer, first.job_key, first.attempt)
+            assert await get_logs_for_run(db, "run1", "exp1") == before
+        finally:
+            task.cancel()
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_log_swap_is_refused_when_rows_changed_and_keeps_later_rows():
+    async def run():
+        db = await _init_db()
+        try:
+            job = await _dispatched(db)
+            end = await _write_chunks(db, job, _CHUNKS)
+            rows = await _log_rows(db, job.job_key)
+            # Read 3 rows, but a 4th arrived after them: the 3 are swapped, the 4th kept.
+            await _write_chunks(db, job, ["late\n"])
+            assert await replace_log_rows(db, job.job_key, job.attempt, 3, end, "".join(_CHUNKS))
+            assert await get_logs_for_run(db, "run1", "exp1") == "".join(_CHUNKS) + "late\n"
+            # A count that no longer matches writes nothing.
+            after = await _log_rows(db, job.job_key)
+            assert not await replace_log_rows(db, job.job_key, job.attempt, len(rows), end, "x")
+            assert await _log_rows(db, job.job_key) == after
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_failed_log_swap_rolls_back(tmp_path):
+    async def run():
+        db = await aiosqlite.connect(str(tmp_path / "m.db"))
+        await init_db(db)
+        writer = DbWriter(db)
+        task = asyncio.create_task(writer.run())
+        try:
+            job = await _dispatched(db)
+            end = await _write_chunks(db, job, _CHUNKS)
+            before = await _log_rows(db, job.job_key)
+            # The delete runs, then the insert fails (data NOT NULL).
+            with pytest.raises(Exception):
+                await writer.replace_log_rows(job.job_key, job.attempt, 3, end, None)
+            assert await _log_rows(db, job.job_key) == before
+        finally:
+            task.cancel()
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_interrupted_log_swap_leaves_nothing(tmp_path):
+    async def run():
+        path = str(tmp_path / "m.db")
+        db = await aiosqlite.connect(path)
+        await init_db(db)
+        job = await _dispatched(db)
+        end = await _write_chunks(db, job, _CHUNKS)
+        before = await _log_rows(db, job.job_key)
+        # Die between the delete and the commit.
+        await db.execute("DELETE FROM logs WHERE job_key = ? AND seq <= ?", (job.job_key, end))
+        await db.close()
+
+        db = await aiosqlite.connect(path)
+        try:
+            await init_db(db)
+            assert await _log_rows(db, job.job_key) == before
+        finally:
+            await db.close()
+
+    asyncio.run(run())
 
 def test_create_and_get_experiment():
     async def run():
@@ -624,6 +835,27 @@ def test_requeue_of_a_lost_run_spends_retries_then_fails():
     asyncio.run(run())
 
 
+def test_manual_retry_restores_the_automatic_retry_budget():
+    async def run():
+        db = await _init_db()
+        try:
+            await _dispatched(db, "r1")
+            for _ in range(3):  # two retries spent, then the third loss fails it
+                await requeue_jobs(db, [("exp1", "r1")], spend_retry=True)
+                await dispatch_job(db, "r1", "exp1", "w1", [0])
+            assert (await get_job(db, "r1", "exp1")).status == "failed"
+
+            assert (await retry_job(db, "r1", "exp1")).retry_count == 0
+            job = await dispatch_job(db, "r1", "exp1", "w1", [0])
+            assert job.attempt == 4
+            requeued, failed = await requeue_jobs(db, [("exp1", "r1")], spend_retry=True)
+            assert [j.retry_count for j in requeued] == [1] and failed == []
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
 def test_result_rules_apply_monotonic_and_singular():
     async def run():
         db = await _init_db()
@@ -676,11 +908,10 @@ def test_retry_job():
             assert await retry_job(db, "r1", "exp1") is None  # not finished
             await update_job_status(db, "r1", "exp1", "failed")
             await update_experiment_status(db, "exp1", "completed")
-            for n in (1, 2):
+            for _ in range(4):  # max_retries caps automatic retries only
                 job = await retry_job(db, "r1", "exp1")
-                assert (job.status, job.retry_count) == ("pending", n)
+                assert (job.status, job.retry_count) == ("pending", 0)
                 await update_job_status(db, "r1", "exp1", "failed")
-            assert await retry_job(db, "r1", "exp1") is None  # max_retries reached
             assert (await get_experiment(db, "exp1")).status == "running"
         finally:
             await db.close()

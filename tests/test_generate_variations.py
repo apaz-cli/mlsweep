@@ -274,3 +274,18 @@ def test_str_flags_on_fixed_and_subdim():
         ".debug": {"flags": "--debug", "name": None},
     }
     _snapshot("str_flags_fixed_subdim", OPTIONS)
+
+
+def test_job_command_is_command_extra_flags_options_then_cli_overrides():
+    """The documented order, with EXTRA_FLAGS once and the ``--`` overrides last."""
+    from mlsweep.run_sweep import _build_job_payloads
+    opts = {".lr": {"values": [0.1], "flags": "--lr"}}
+    validate_options(opts)
+    variations = generate_variations("s", opts, extra_flags=["--seed", "42"])
+    [job] = _build_job_payloads(
+        variations, "e", artifact_id="", command=["python", "train.py"],
+        cli_overrides=["--epochs", "1"], gpus_per_run=1, nodes_per_run=1,
+        set_dist_env=False, run_from=None, priority=0, max_retries=0,
+    )
+    assert job["command"] == ["python", "train.py", "--seed", "42", "--lr", "0.1", "--epochs", "1"]
+

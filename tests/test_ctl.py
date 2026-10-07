@@ -6,6 +6,7 @@ real manager subprocess via the ``manager_server`` fixture.
 """
 
 import json
+import re
 import threading
 import time
 
@@ -15,6 +16,7 @@ from conftest import _api_get, _api_post, _api_request
 
 from mlsweep import ctl
 from mlsweep import run_sweep
+from mlsweep._colors import set_color
 from mlsweep.cli import _status_cmd
 
 _TOKEN = "test-token"
@@ -228,6 +230,115 @@ def test_metric_table_grid(capsys):
     assert "0.05" in out and "0.1" in out and "0.2" in out
 
 
+def _exp(eid, status="completed", **counts):
+    c = {k: counts.get(k, 0) for k in ("done", "failed", "xfailed", "cancelled", "running", "pending", "dispatched")}
+    c["total"] = sum(c.values())
+    return {"experiment_id": eid, "status": status, "campaign": "default",
+            "submit_time": "2026-01-01T00:00:00+00:00", "job_counts": c}
+
+
+def _section_of(out):
+    """Map each bullet's ID to the ``## `` heading it sits under."""
+    heading, under = "", {}
+    for line in out.splitlines():
+        if line.startswith("## "):
+            heading = line
+        elif line.startswith("- "):
+            under[line[2:].split(":")[0]] = heading
+    return under
+
+
+def test_ls_experiments_grouped_by_status_most_urgent_first(capsys):
+    ctl._ls_experiments([
+        _exp("e_done", done=3),
+        _exp("e_allfail", failed=2),
+        _exp("e_some", done=1, failed=1),
+        _exp("e_run", "running", done=1, running=1, pending=2),
+        _exp("e_paused", "paused", pending=4),
+    ], "default", show_all=False)
+    out = capsys.readouterr().out
+    assert out.startswith("# Campaign default: 5 experiments\n")
+    headings = [ln for ln in out.splitlines() if ln.startswith("## ")]
+    # The manager's "completed" reads "done", the same word runs use.
+    assert headings == ["## Running (1)", "## Paused (1)", "## Failed (1)", "## Done (2)"]
+    under = _section_of(out)
+    # Every run failed: listed as failed.  Some runs failed: still done.
+    assert under["e_allfail"] == "## Failed (1)"
+    assert under["e_some"] == "## Done (2)"
+    assert "- e_run: 4 runs, 1 done, 1 running, 2 pending." in out
+    assert "- e_some: 2 runs, 1 done, 1 failed." in out
+    assert "0 " not in out  # zero counts are left out
+
+
+def test_ls_running_experiment_with_nothing_active_says_so(capsys):
+    ctl._ls_experiments([_exp("e", "running", done=1, cancelled=2)], "default", show_all=False)
+    assert "- e: 3 runs, 1 done, 2 cancelled. Submitted" in (out := capsys.readouterr().out)
+    assert "No runs are active." in out
+
+
+def test_ls_truncates_only_settled_sections_unless_all(capsys):
+    n = ctl._LS_LIMIT + 5
+    exps = [_exp(f"c{i}", done=1) for i in range(n)] + [_exp(f"f{i}", failed=1) for i in range(n)]
+    ctl._ls_experiments(exps, "default", show_all=False)
+    out = capsys.readouterr().out
+    assert f"## Done ({n}, newest {ctl._LS_LIMIT} shown)" in out
+    assert "- 5 more done experiments not shown. Pass --all to list them." in out
+    assert f"## Failed ({n})" in out and f"- f{n - 1}:" in out
+    assert f"- c{n - 1}:" not in out
+    ctl._ls_experiments(exps, "default", show_all=True)
+    out = capsys.readouterr().out
+    assert f"## Done ({n})" in out and f"- c{n - 1}:" in out and "not shown" not in out
+
+
+def test_ls_runs_layout(capsys):
+    jobs = [
+        {"run_id": "r1", "status": "done", "combo": '{"lr": 0.01, "seed": 1}', "elapsed": 125.0,
+         "attempt": 2},
+        {"run_id": "r2", "status": "failed", "combo": '{"lr": 0.001, "seed": 1}', "elapsed": 13.0,
+         "exit_code": 1, "attempt": 3, "worker_id": "w0", "label": "warmup"},
+        {"run_id": "r3", "status": "pending", "combo": '{"lr": 0.1, "seed": 1}'},
+    ]
+    ctl._ls_runs("e", jobs, {"status": "running"}, "alpha", show_all=False)
+    out = capsys.readouterr().out
+    assert out.startswith("# Experiment e: running, 3 runs, 1 done, 1 failed, 1 pending\n")
+    assert "Dims: lr (0.001, 0.01, 0.1), seed (1)\n" in out
+    headings = [ln for ln in out.splitlines() if ln.startswith("## ")]
+    assert headings == ["## Pending (1)", "## Failed (1)", "## Done (1)"]
+    # Dims that never vary are left off the bullets.
+    assert "- r1: lr=0.01. 2m05s.\n" in out
+    assert "- r3: lr=0.1.\n" in out
+    assert "- r2 (warmup): lr=0.001. Exit 1 after 13s, attempt 3 on w0.\n" in out
+    assert "  Logs: mlsweep logs r2 --experiment e --campaign alpha --tail 50" in out
+
+
+def test_ls_runs_heading_says_done_for_completed(capsys):
+    jobs = [{"run_id": "r1", "status": "done", "combo": "{}", "elapsed": 5.0}]
+    ctl._ls_runs("e", jobs, {"status": "completed"}, "default", show_all=False)
+    assert capsys.readouterr().out.startswith("# Experiment e: done, 1 run, 1 done\n")
+
+
+def test_ls_dims_summarizes_long_value_lists():
+    assert ctl._dim_values([3, 1, 2]) == "1, 2, 3"
+    assert ctl._dim_values([i / 1000 for i in range(1, 51)]) == "50 values from 0.001 to 0.05"
+    assert ctl._dim_values([f"v{i}" for i in range(20)]) == "20 values"
+
+
+def test_ls_color_only_with_flag(capsys):
+    ctl._ls_experiments([_exp("e", failed=1)], "default", show_all=False)
+    assert "\033[" not in capsys.readouterr().out
+    set_color(True)
+    try:
+        ctl._ls_experiments([_exp("e", failed=1)], "default", show_all=False)
+    finally:
+        set_color(False)
+    out = capsys.readouterr().out
+    assert "\033[1m\033[31m## Failed (1)\033[0m" in out
+    assert "\033[94me\033[0m" in out  # the experiment ID
+    assert "\033[31m1 failed\033[0m" in out  # each count in its status color
+    # Stripped of color, the text matches the plain output exactly.
+    assert "- e: 1 run, 1 failed." in re.sub(r"\033\[[0-9;]*m", "", out)
+
+
 # ── Integration (real manager, no worker) ──────────────────────────────────────
 
 
@@ -293,7 +404,45 @@ def test_retry_failed_jobs(manager_server, capsys):
     ctl.retry_cmd(_base(url, server) + ["e", "--failed"])
     capsys.readouterr()
     jobs = _api_get(url, _TOKEN, "/api/experiments/e/jobs")
-    assert all(j["status"] == "pending" and j["retry_count"] == 1 for j in jobs)
+    assert all(j["status"] == "pending" and j["retry_count"] == 0 for j in jobs)
+
+
+def test_retry_is_not_capped_by_max_retries(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    for _ in range(4):  # past the default max_retries of 2
+        _set_status(url, "e", "r1", "failed", exit_code=1)
+        ctl.retry_cmd(_base(url, server) + ["e", "r1", "--dry-run"])
+        assert "would retry r1" in capsys.readouterr().out
+        ctl.retry_cmd(_base(url, server) + ["e", "r1"])
+        capsys.readouterr()
+        job = _api_get(url, _TOKEN, "/api/experiments/e/jobs")[0]
+        assert (job["status"], job["retry_count"]) == ("pending", 0)
+
+
+@pytest.mark.parametrize("held", ["paused", "aborted"])
+def test_retry_on_held_experiment_says_to_unpause(manager_server, capsys, held):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    _api_put(url, _TOKEN, "/api/experiments/e/status", {"status": held})
+    capsys.readouterr()
+
+    ctl.retry_cmd(_base(url, server) + ["e", "--failed"])
+    assert "mlsweep unpause e" in capsys.readouterr().out
+
+
+def test_retry_on_running_experiment_has_no_unpause_note(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "failed", exit_code=1)
+    capsys.readouterr()
+
+    ctl.retry_cmd(_base(url, server) + ["e", "--failed"])
+    assert "unpause" not in capsys.readouterr().out
 
 
 def test_stop_requires_yes_then_aborts(manager_server, capsys):
@@ -629,7 +778,7 @@ def test_rename_sets_and_clears_name(manager_server, capsys):
 
     # ls shows the name beside the run ID; best --json carries it.
     ctl.ls_cmd(_base(url, server) + ["e"])
-    assert "(warmup ablation)" in capsys.readouterr().out
+    assert "- r1 (warmup ablation)" in capsys.readouterr().out
     _set_status(url, "e", "r1", "done")
     ctl.best_cmd(_base(url, server) + ["--experiment", "e", "--json"])
     rows = {r["run_id"]: r for r in json.loads(capsys.readouterr().out)}

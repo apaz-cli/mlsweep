@@ -18,12 +18,14 @@ import json
 import re
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any
 
-from mlsweep._shared import _BOLD, _CYAN, _GREEN, _RED, _RESET, _YELLOW
-from mlsweep._shared import validate_campaign
+from mlsweep._shared import _BLUE, _BOLD, _BRIGHT_BLUE, _CYAN, _DIM, _GREEN, _MAGENTA, _RED, _RESET, _YELLOW
+from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
     _leaderboard_header,
@@ -33,10 +35,10 @@ from mlsweep.run_sweep import (
     _manager_token,
     _parse_combo,
     _resolve_campaign,
-    _run_str,
     _wait_until_settled,
     build_leaderboard,
     manager_cancel_job,
+    manager_get_experiment_summary,
     manager_get_job_logs,
     manager_get_job_metrics,
     manager_list_campaigns,
@@ -80,12 +82,6 @@ _STATUS_COLORS = {
 }
 
 
-def _color_status(text: str, status: str) -> str:
-    """Wrap an already-width-formatted status field in its status color."""
-    color = _STATUS_COLORS.get(status)
-    return f"{color}{text}{_RESET}" if color else text
-
-
 def _counts_str(job_counts: dict[str, int] | None) -> str:
     """One-line job tally, e.g. ``3 done / 0 fail / 1 run / 2 pend``."""
     c = job_counts or {}
@@ -103,18 +99,47 @@ def _apply(
     dry_run: bool,
     campaign: str | None = None,
 ) -> int:
-    """Run a per-job action (cancel/retry) over *targets*. Returns # of failures."""
+    """Run a per-job action (cancel/retry) over *targets*. Returns # of failures.
+
+    *fn* prints its own FAIL line with the manager's reason.
+    """
     failures = 0
     for j in targets:
         run_id = j.get("run_id", "")
         if dry_run:
             sweep_print(f"  would {verb} {run_id}")
         else:
-            ok = fn(manager, token, run_id, experiment, campaign=campaign)
-            _report(ok, f"{verb} {run_id}")
-            if not ok:
+            if fn(manager, token, run_id, experiment, campaign=campaign):
+                sweep_print(f"  OK  {verb} {run_id}")
+            else:
                 failures += 1
     return failures
+
+
+def _retry(
+    targets: list[dict[str, Any]],
+    manager: str,
+    token: str,
+    experiment: str,
+    dry_run: bool,
+    campaign: str | None = None,
+) -> int:
+    """``_apply`` with retry, then warn if the re-queued runs are held. Returns # of failures."""
+    failures = _apply(targets, manager_retry_job, "retry", manager, token, experiment,
+                      dry_run, campaign)
+    if not dry_run and failures < len(targets):
+        _warn_if_held(manager, token, experiment, campaign)
+    return failures
+
+
+def _warn_if_held(manager: str, token: str, experiment: str, campaign: str | None) -> None:
+    """Re-queued runs never dispatch while the experiment is paused or stopped. Say so."""
+    summary = manager_get_experiment_summary(manager, token, experiment, quiet=True,
+                                             campaign=campaign)
+    status = (summary or {}).get("status")
+    if status in NON_SCHEDULABLE_EXPERIMENT_STATUSES:
+        sweep_print(f"  {_YELLOW}Note{_RESET}: {experiment} is {status}, so re-queued runs will "
+                    f"not start. Run `mlsweep unpause {experiment}` to dispatch them.")
 
 
 def _common_parser(prog: str, description: str) -> argparse.ArgumentParser:
@@ -136,12 +161,282 @@ def _connect(args: argparse.Namespace, experiment: str | None = None) -> tuple[s
 
 
 # ── ls ─────────────────────────────────────────────────────────────────────────
+#
+# Markdown-shaped output meant to read well for people and for LLMs: one
+# heading per status, most urgent first, then one bullet per experiment or run
+# whose numbers all carry their labels.  Only the oldest settled entries
+# (done experiments and runs) are cut, and --all lifts that cut.  A finished
+# experiment reads "done" like a finished run, though the manager (and --json)
+# calls it "completed".
+
+_LS_LIMIT = 20
+
+# Section order: what needs attention first.  Unknown statuses go last.
+_EXP_SECTIONS = ("running", "paused", "aborted", "failed", "done")
+_RUN_SECTIONS = ("running", "dispatched", "pending", "failed", "cancelled", "xfailed", "done")
+_COUNT_ORDER = ("done", "failed", "xfailed", "cancelled", "running", "dispatched", "pending")
+
+_SECTION_COLORS = {
+    **_STATUS_COLORS,
+    "aborted": _RED,
+    "paused": _YELLOW,
+    "xfailed": _YELLOW,
+}
+
+
+# One color per role, shared by both views.  Status words, counts and section
+# headings take their status color from _SECTION_COLORS; everything else is one
+# of these.
+_C_ID = _BRIGHT_BLUE   # campaign, experiment and run IDs
+_C_NAME = _MAGENTA     # names you chose: dim names, run labels, notes
+_C_TIME = _BLUE        # ages and durations
+_C_AUX = _DIM          # secondary detail: prose around values, workers, hints
+_C_WARN = _YELLOW      # needs a look: retries, stalls, nothing active
+_C_CMD = _BOLD         # commands to paste
+
+
+def _paint(text: object, *colors: object) -> str:
+    """*text* wrapped in *colors*.  Plain unless --color is on."""
+    return "".join(str(c) for c in colors) + f"{text}{_RESET}"
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        t = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _dur(seconds: float) -> str:
+    """Compact duration: ``45s``, ``3m02s``, ``2h14m``, ``10d``."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600}h" if s < 7 * 86400 else f"{s // 86400}d"
+
+
+def _ago(raw: Any) -> str | None:
+    t = _parse_time(raw)
+    return f"{_dur((datetime.now(timezone.utc) - t).total_seconds())} ago" if t else None
+
+
+def _tally(counts: dict[str, int]) -> str:
+    """``6 runs, 5 done, 1 failed``: every count labeled, zeros left out."""
+    total = counts.get("total", sum(counts.get(k, 0) for k in _COUNT_ORDER))
+    parts = [_paint(f"{total} run" + ("" if total == 1 else "s"), _BOLD)]
+    parts += [_paint(f"{counts[k]} {k}", _SECTION_COLORS.get(k, "")) for k in _COUNT_ORDER if counts.get(k)]
+    return ", ".join(parts)
+
+
+def _exp_counts(e: dict[str, Any]) -> dict[str, int]:
+    return e.get("job_counts") or {}
+
+
+def _exp_status(status: str | None) -> str:
+    """An experiment status as ls shows it: ``completed`` reads ``done``, like a run."""
+    return "done" if status == "completed" else status or "unknown"
+
+
+def _exp_section(e: dict[str, Any]) -> str:
+    """The heading an experiment goes under.  A done one whose every run failed is failed."""
+    status = _exp_status(e.get("status"))
+    c = _exp_counts(e)
+    if status == "done" and c.get("failed") and not c.get("done") and not c.get("xfailed"):
+        return "failed"
+    return status
+
+
+def _heading(level: int, text: str, status: str) -> str:
+    return _paint(f"{'#' * level} {text}", _BOLD, _SECTION_COLORS.get(status, ""))
+
+
+def _sections(
+    items: list[dict[str, Any]],
+    key: Callable[[dict[str, Any]], str],
+    order: tuple[str, ...],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        groups.setdefault(key(it), []).append(it)
+    names = [s for s in order if s in groups] + sorted(s for s in groups if s not in order)
+    return [(s, groups[s]) for s in names]
+
+
+def _print_sections(
+    sections: list[tuple[str, list[dict[str, Any]]]],
+    bullet: Callable[[dict[str, Any]], list[str]],
+    noun: str,
+    which: str,
+    show_all: bool,
+    level: int,
+) -> None:
+    for status, group in sections:
+        shown = group if show_all or status != "done" else group[:_LS_LIMIT]
+        count = f"{len(group)}" if len(shown) == len(group) else f"{len(group)}, {which} {len(shown)} shown"
+        sweep_print("")
+        sweep_print(_heading(level, f"{status.capitalize()} ({count})", status))
+        for it in shown:
+            for line in bullet(it):
+                sweep_print(line)
+        if len(shown) < len(group):
+            sweep_print(_paint(f"- {len(group) - len(shown)} more {status} {noun} not shown. Pass ", _C_AUX)
+                        + _paint("--all", _C_CMD) + _paint(" to list them.", _C_AUX))
+
+
+def _exp_bullet(e: dict[str, Any]) -> list[str]:
+    status = e.get("status") or "unknown"
+    c = _exp_counts(e)
+    text = f"- {_paint(e.get('experiment_id'), _C_ID)}: {_tally(c)}."
+    ago = _ago(e.get("submit_time"))
+    if ago:
+        text += _paint(" Submitted ", _C_AUX) + _paint(ago, _C_TIME) + _paint(".", _C_AUX)
+    if status == "running" and not any(c.get(k) for k in ("running", "dispatched", "pending")):
+        text += _paint(" No runs are active.", _C_WARN)
+    if e.get("note"):
+        text += f" {_paint('Note:', _C_NAME)} {e['note']}"
+    return [text]
+
+
+def _varying_dims(jobs: list[dict[str, Any]]) -> tuple[dict[str, list[Any]], set[str]]:
+    """Every dim with its distinct values in first-seen order, and the dims that vary."""
+    values: dict[str, list[Any]] = {}
+    for j in jobs:
+        for k, v in (_parse_combo(j.get("combo")) or {}).items():
+            seen = values.setdefault(k, [])
+            if v not in seen:
+                seen.append(v)
+    varying = {k for k, vs in values.items() if len(vs) > 1}
+    return values, varying if len(jobs) > 1 else set(values)
+
+
+_DIM_VALUES_SHOWN = 8
+
+
+def _dim_values(values: list[Any]) -> str:
+    """A dim's values, sorted when numeric; a long list becomes a count and range."""
+    numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values)
+    if numeric:
+        values = sorted(values)
+    if len(values) <= _DIM_VALUES_SHOWN:
+        return ", ".join(str(v) for v in values)
+    if numeric:
+        return f"{len(values)} values from {values[0]:.4g} to {values[-1]:.4g}"
+    return f"{len(values)} values"
+
+
+def _logs_hint(run_id: str, experiment: str, campaign: str | None) -> str:
+    scope = " --all-campaigns" if campaign is None else (
+        f" --campaign {campaign}" if campaign != DEFAULT_CAMPAIGN else "")
+    return (f"  {_paint('Logs:', _C_AUX)} "
+            + _paint(f"mlsweep logs {run_id} --experiment {experiment}{scope} --tail 50", _C_CMD))
+
+
+def _run_bullet(
+    j: dict[str, Any],
+    varying: set[str],
+    stalled: set[str],
+    experiment: str,
+    campaign: str | None,
+) -> list[str]:
+    status = j.get("status") or "unknown"
+    run_id = j.get("run_id", "?")
+    head = f"- {_paint(run_id, _C_ID)}" + (
+        f" ({_paint(j['label'], _C_NAME)})" if j.get("label") else "")
+    combo = _parse_combo(j.get("combo")) or {}
+    dims = " ".join(f"{_paint(k, _C_NAME)}={v}" for k, v in combo.items() if k in varying)
+    facts: list[str] = []
+    took = _paint(_dur(j["elapsed"]), _C_TIME) if j.get("elapsed") is not None else None
+    if status == "running":
+        start = _parse_time(j.get("start_time"))
+        if start:
+            since = _dur((datetime.now(timezone.utc) - start).total_seconds())
+            facts.append(f"Running for {_paint(since, _C_TIME)}")
+        if run_id in stalled:
+            facts.append(_paint("stalled", _BOLD, _C_WARN))
+    elif status in ("failed", "cancelled", "xfailed") and j.get("exit_code") is not None:
+        code = _paint(f"Exit {j['exit_code']}", _BOLD, _SECTION_COLORS.get(status, ""))
+        facts.append(code + (f" after {took}" if took else ""))
+    elif took:
+        facts.append(took)
+    if status != "done" and (j.get("attempt") or 0) > 1:
+        facts.append(_paint(f"attempt {j['attempt']}", _C_WARN))
+    on = _paint(f" on {j['worker_id']}", _C_AUX) if (
+        status in ("running", "dispatched", "failed") and j.get("worker_id")) else ""
+    text = head + ":" if dims or facts or on else head
+    if dims:
+        text += f" {dims}."
+    if facts or on:
+        text += " " + (", ".join(facts) or "Placed") + on + "."
+    lines = [text]
+    if status == "failed":
+        lines.append(_logs_hint(run_id, experiment, campaign))
+    return lines
+
+
+def _ls_experiments(exps: list[dict[str, Any]], campaign: str | None, show_all: bool) -> None:
+    if campaign is not None:
+        by_campaign = [(campaign, exps)]
+    else:
+        names = sorted({e.get("campaign") or DEFAULT_CAMPAIGN for e in exps})
+        by_campaign = [(c, [e for e in exps if (e.get("campaign") or DEFAULT_CAMPAIGN) == c])
+                       for c in names]
+        sweep_print(_paint(f"# All campaigns: {len(exps)} experiments in {len(names)} campaigns", _BOLD))
+    for i, (c, group) in enumerate(by_campaign):
+        level = 1 if campaign is not None else 2
+        if i or campaign is None:
+            sweep_print("")
+        n = len(group)
+        sweep_print(_paint(f"{'#' * level} Campaign ", _BOLD) + _paint(c, _BOLD, _C_ID)
+                    + _paint(f": {n} experiment{'' if n == 1 else 's'}", _BOLD))
+        _print_sections(_sections(group, _exp_section, _EXP_SECTIONS), _exp_bullet,
+                        "experiments", "newest", show_all, level + 1)
+    if exps:
+        sweep_print("")
+        sweep_print(_paint("Run ", _C_AUX) + _paint("mlsweep ls <experiment>", _C_CMD)
+                    + _paint(" to list its runs.", _C_AUX))
+
+
+def _ls_runs(
+    experiment: str,
+    jobs: list[dict[str, Any]],
+    summary: dict[str, Any] | None,
+    campaign: str | None,
+    show_all: bool,
+) -> None:
+    counts = dict(Counter(j.get("status", "unknown") for j in jobs), total=len(jobs))
+    summary = summary or {}
+    status = _exp_status(summary["status"]) if summary.get("status") else None
+    sweep_print(_paint("# Experiment ", _BOLD) + _paint(experiment, _BOLD, _C_ID) + ": "
+                + (f"{_paint(status, _BOLD, _SECTION_COLORS.get(status, ''))}, " if status else "")
+                + _tally(counts))
+    values, varying = _varying_dims(jobs)
+    if values:
+        sweep_print(_paint("Dims:", _BOLD) + " " + ", ".join(
+            f"{_paint(k, _C_NAME)} ({_dim_values(vs)})" for k, vs in values.items()))
+    if summary.get("note"):
+        sweep_print(f"{_paint('Note:', _C_NAME)} {summary['note']}")
+    stalled = set(summary.get("stalled_runs") or [])
+    _print_sections(
+        _sections(jobs, lambda j: j.get("status") or "unknown", _RUN_SECTIONS),
+        lambda j: _run_bullet(j, varying, stalled, experiment, campaign),
+        "runs", "first", show_all, 2,
+    )
 
 
 def ls_cmd(argv: list[str]) -> None:
     parser = _common_parser("mlsweep ls", "List experiments, or the runs within one experiment.")
     parser.add_argument("experiment", nargs="?", help="Experiment ID (omit to list experiments)")
     parser.add_argument("--status", default=None, help="Filter by status")
+    parser.add_argument("--all", action="store_true",
+                        help=f"List every done experiment or run "
+                             f"(by default only the newest {_LS_LIMIT} are shown)")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     parser.add_argument("--with-dims", action="store_true",
                         help="With --json: add a parsed 'dims' object for each run")
@@ -156,35 +451,21 @@ def ls_cmd(argv: list[str]) -> None:
                 jobs = [dict(j, dims=_parse_combo(j["combo"]) or {}) for j in jobs]
             print(json.dumps(jobs, indent=2))
             return
-        if not jobs:
-            sweep_print("  No jobs found.")
-            return
-        sweep_print(f"{_BOLD}{_CYAN}{args.experiment}{_RESET} — {len(jobs)} runs:")
-        for j in jobs:
-            combo_s = _combo_str(_parse_combo(j.get("combo")))
-            status = j.get("status", "?")
-            sweep_print(f"  {_color_status(f'{status:>11}', status)}  "
-                        f"{_run_str(j['run_id'], j['label'])}  {combo_s}")
+        summary = manager_get_experiment_summary(manager, token, args.experiment, quiet=True,
+                                                 campaign=campaign)
+        _ls_runs(args.experiment, jobs, summary, campaign, args.all)
         return
 
-    exps = manager_list_experiments(manager, token, status_filter=args.status, campaign=campaign)
+    # Experiments are listed as "done", so accept that for the manager's "completed".
+    status_filter = "completed" if args.status == "done" else args.status
+    exps = manager_list_experiments(manager, token, status_filter=status_filter, campaign=campaign)
     if exps is None:
         sweep_print(f"{_RED}FAIL{_RESET}  list experiments")
         sys.exit(1)
     if args.json:
         print(json.dumps(exps, indent=2))
         return
-    where = f"in campaign {campaign}" if campaign else "in all campaigns"
-    sweep_print(f"{_BOLD}{_CYAN}{len(exps)}{_RESET} experiments {where}:")
-    for e in exps:
-        counts = _counts_str(e.get("job_counts"))
-        name = e.get("name") or ""
-        note = f"  # {e.get('note')}" if e.get("note") else ""
-        status = e.get("status", "?")
-        tag = "" if campaign else f"[{e.get('campaign')}]  "
-        sweep_print(f"  {_color_status(f'{status:>10}', status)}  "
-                    f"{tag}{_GREEN}{e.get('experiment_id')}{_RESET}  {name}{note}")
-        sweep_print(f"             {counts}")
+    _ls_experiments(exps, campaign, args.all)
 
 
 # ── logs ───────────────────────────────────────────────────────────────────────
@@ -342,7 +623,7 @@ def metrics_cmd(argv: list[str]) -> None:
                        help="One row per run: each selected key's own latest value")
     parser.add_argument("--step", type=int, default=None,
                         help="With --pivot: use steps at or before this (default: latest)")
-    parser.add_argument("--tail", type=int, default=10,
+    parser.add_argument("--tail", type=int, default=None,
                         help="Steps per run in the table view (default 10; 0 = all)")
     parser.add_argument("--with-dims", action="store_true",
                         help="Add each sweep dimension as a column, from the submitted combo")
@@ -350,6 +631,10 @@ def metrics_cmd(argv: list[str]) -> None:
     fmt.add_argument("--json", action="store_true", help="Emit the selected metrics as JSON")
     fmt.add_argument("--csv", action="store_true", help="Emit CSV (long, or wide with --last)")
     args = parser.parse_args(argv)
+    if args.tail is not None and (args.json or args.csv or args.last or args.pivot):
+        parser.error("--tail only applies to the table view. For one row per run "
+                     "(each key's latest value), use --last")
+    tail = 10 if args.tail is None else args.tail
     manager, token, campaign = _connect(args, args.experiment)
 
     try:
@@ -460,7 +745,7 @@ def metrics_cmd(argv: list[str]) -> None:
     # ── table view ───────────────────────────────────────────────────────────
     for rid, rows in per_run.items():
         keys = sorted({k for r in rows for k in r if k != "step"})
-        shown = rows[-args.tail:] if args.tail else rows
+        shown = rows[-tail:] if tail else rows
         print(f"{_BOLD}{_CYAN}== {run_label(rid)}{_RESET}  ({len(rows)} steps)")
         _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(k)) for k in keys] for r in shown])
         print()
@@ -500,8 +785,11 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
         sweep_print(f"{_RED}Refusing to {verb} all {len(targets)} runs without --yes.{_RESET}")
         sys.exit(1)
 
-    fn = manager_retry_job if retry else manager_cancel_job
-    failures = _apply(targets, fn, verb, manager, token, args.experiment, args.dry_run, campaign)
+    if retry:
+        failures = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
+    else:
+        failures = _apply(targets, manager_cancel_job, verb, manager, token, args.experiment,
+                          args.dry_run, campaign)
     if failures:
         sys.exit(1)
 
@@ -724,8 +1012,7 @@ def resume_cmd(argv: list[str]) -> None:
     if not targets:
         sweep_print("  Nothing to resume, no failed or cancelled jobs.")
         return
-    failures = _apply(targets, manager_retry_job, "retry", manager, token, args.experiment,
-                      args.dry_run, campaign)
+    failures = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
     if failures:
         sys.exit(1)
 

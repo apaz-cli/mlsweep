@@ -17,6 +17,7 @@ from mlsweep.run_sweep import (
     _WebSocket,
     manager_create_experiment,
     manager_get_experiment_summary,
+    manager_get_job_logs,
     manager_list_experiment_jobs,
     manager_register_artifact,
     manager_submit_jobs_bulk,
@@ -132,20 +133,26 @@ def _job_status(url: str, experiment_id: str, run_id: str) -> str | None:
     return None
 
 
+def _slots(url: str) -> int:
+    """Jobs that can run at once: one per GPU of every connected worker."""
+    workers = _api_get(url, _TOKEN, "/api/workers")
+    return max(sum(len(w.get("gpus") or []) for w in workers if w.get("status") == "connected"), 1)
+
+
 def test_abort_experiment_stops_dispatch(manager_with_worker):
     """Aborting an experiment must immediately stop the scheduler from
     dispatching its remaining pending jobs (regression for D1: abort used to be
     a no-op because the scheduler ignored experiment status).
 
-    With a single-slot worker and many short jobs, the buggy version would churn
-    through and complete all of them; the fixed scheduler reads experiment
-    status from the DB each pass, so once aborted, untouched jobs stay pending.
+    With more short jobs than slots, the buggy version would churn through and
+    complete all of them; the fixed scheduler reads experiment status from the
+    DB each pass, so once aborted, untouched jobs stay pending.
     """
     server, url = manager_with_worker
     exp = "exp_abort"
     manager_create_experiment(url, _TOKEN, exp, "abort_test")
 
-    n = 6
+    n = _slots(url) + 4  # more than can start before the abort lands
     jobs = [
         {
             "run_id": f"run{i}",
@@ -193,10 +200,7 @@ def test_cancel_running_job_frees_slot(manager_with_worker):
     exp = "exp_cancel_slot"
     manager_create_experiment(url, _TOKEN, exp, "cancel_slot_test")
 
-    # Total slots = sum of GPUs across connected workers (one job per GPU).
-    workers = _api_get(url, _TOKEN, "/api/workers")
-    slots = sum(len(w.get("gpus") or []) for w in workers if w.get("status") == "connected")
-    slots = max(slots, 1)
+    slots = _slots(url)
 
     # Fill every slot with a long-running hog.
     hogs = [{
@@ -269,3 +273,31 @@ def test_concurrent_slots(manager_with_worker):
     assert job_b["status"] == "done"
     assert job_a["exit_code"] == 0
     assert job_b["exit_code"] == 0
+
+
+def test_local_worker_uses_the_managers_scratch_dir_and_its_output_is_logged(
+        manager_with_worker, tmp_path):
+    """The fixture's manager runs with ``--scratch-dir`` under tmp_path: its
+    local worker keeps run directories there, and what the worker prints
+    reaches the manager's log instead of filling an unread pipe."""
+    server, url = manager_with_worker
+    exp = "exp_scratch"
+    manager_create_experiment(url, _TOKEN, exp, "scratch_test")
+
+    job = _submit_and_wait(url, exp, "where", ["sh", "-c", 'echo "dir=$MLSWEEP_RUN_DIR"'])
+    assert job["status"] == "done"
+    log = manager_get_job_logs(url, _TOKEN, exp, "where")
+    assert log is not None
+    assert f"dir={tmp_path / 'scratch' / exp / 'where'}" in log
+
+    manager_submit_jobs_bulk(url, _TOKEN, [{
+        "run_id": "bad_setup", "experiment_id": exp, "command": ["true"],
+        "setup_command": "false", "files": {}, "return_files": [],
+    }])
+    job = _wait_for_job(url, _TOKEN, "bad_setup", exp, timeout=60)
+    assert job is not None and job["status"] == "failed"
+    deadline = time.time() + 10
+    while "ERROR in run bad_setup" not in (tmp_path / "manager.log").read_text():
+        assert time.time() < deadline, "the worker's error never reached manager.log"
+        time.sleep(0.1)
+

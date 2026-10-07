@@ -16,6 +16,7 @@ to hold ``state.lock``.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import importlib.metadata
 import json
 import os
@@ -44,9 +45,10 @@ from mlsweep._manager_db import (
     list_workers,
     multinode_progress,
 )
-from mlsweep._manager_state import InFlightRun, ManagerState, RunKey, WorkerConn
+from mlsweep._manager_state import InFlightRun, ManagerState, Placement, RunKey, WorkerConn
 from mlsweep._parsync import parsync_bin
 from mlsweep._shared import (
+    DEFAULT_SCRATCH_DIR,
     MsgCancel,
     MsgCleanup,
     MsgGpuStats,
@@ -75,8 +77,9 @@ from mlsweep._shared import (
     from_obj,
     dist_master_port,
     line_chunks,
+    same_attempt,
 )
-from mlsweep._topology import _best_gpu_groups, _parse_topo_wire
+from mlsweep._topology import _parse_topo_wire, closest_gpu_group
 
 _HELLO_TIMEOUT = 30.0
 _HEARTBEAT_INTERVAL = 10.0
@@ -98,7 +101,7 @@ def _parse_workers_file(
     """Parse a TOML workers file.
 
     Each ``[[workers]]`` entry requires ``host`` and ``remote_dir``.
-    Optional fields: gpus, jobs, devices, pass, ssh_key, venv, port.
+    Optional fields: gpus, jobs, devices, pass, ssh_key, venv, port, scratch_dir.
 
     Returns a list of dicts suitable for ``launch_worker()``.
     """
@@ -130,6 +133,7 @@ def _parse_workers_file(
                 "ssh_key": entry.get("ssh_key"),
                 "venv": entry.get("venv") or remote_dir,
                 "port": entry.get("port", 7890),
+                "scratch_dir": entry.get("scratch_dir"),
             }
         )
     return result
@@ -179,6 +183,10 @@ def _worker_shell_cmd(candidates: list[str], worker_args: list[str]) -> str:
     )
 
 
+# The wheel shipped to remote workers, built or fetched at manager startup.
+_WHEELS_DIR = Path(__file__).resolve().parent / "_wheels"
+
+
 def _ensure_worker_wheels() -> None:
     """Build or fetch the local mlsweep wheel into ``_wheels/`` at startup.
 
@@ -193,29 +201,39 @@ def _ensure_worker_wheels() -> None:
     invalidates the cache.  Without this, a stale wheel would be shipped to
     remote workers and install an ``mlsweep_worker`` that lacks flags the
     manager passes (e.g. ``--jobs``).
+
+    Managers starting at the same time from one install build one at a time,
+    under a lock in the wheels directory; the others then reuse the result.
     """
-    wheels_dir = Path(__file__).resolve().parent / "_wheels"
     local_version = importlib.metadata.version("mlsweep")
-    complete = wheels_dir / ".complete"
+    if _wheel_is_current(local_version):
+        return
+    _WHEELS_DIR.mkdir(exist_ok=True)
+    with open(_WHEELS_DIR / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not _wheel_is_current(local_version):  # not built while we waited
+            _build_worker_wheel(local_version)
 
-    # Reuse the cache only when the sentinel matches the version we are about
-    # to ship *and* a wheel for that version is actually present.
-    if complete.exists():
-        try:
-            cached_version = complete.read_text(encoding="utf-8").strip()
-        except OSError:
-            cached_version = ""
-        if cached_version == local_version and list(
-            wheels_dir.glob(f"mlsweep-{local_version}-*.whl")
-        ):
-            return
 
+def _wheel_is_current(local_version: str) -> bool:
+    """Whether the sentinel matches the version we are about to ship *and* a
+    wheel for that version is actually present."""
+    try:
+        cached_version = (_WHEELS_DIR / ".complete").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return cached_version == local_version and bool(
+        list(_WHEELS_DIR.glob(f"mlsweep-{local_version}-*.whl")))
+
+
+def _build_worker_wheel(local_version: str) -> None:
+    """Replace the cached wheel with one for *local_version*.  Caller holds the lock."""
+    complete = _WHEELS_DIR / ".complete"
     print("[wheels] Building worker wheel...", flush=True)
-    wheels_dir.mkdir(exist_ok=True)
 
     # Drop stale mlsweep wheels from older versions.  We install the wheel
     # file directly on the remote, so leave exactly one candidate behind.
-    for w in wheels_dir.glob("mlsweep-*.whl"):
+    for w in _WHEELS_DIR.glob("mlsweep-*.whl"):
         w.unlink(missing_ok=True)
 
     # From a source checkout (plain or editable), build the wheel from the
@@ -225,10 +243,10 @@ def _ensure_worker_wheels() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     if (repo_root / "pyproject.toml").exists():
         action = "wheel"
-        args = ["--wheel-dir", str(wheels_dir), str(repo_root)]
+        args = ["--wheel-dir", str(_WHEELS_DIR), str(repo_root)]
     else:
         action = "download"
-        args = ["--only-binary=:all:", "--dest", str(wheels_dir),
+        args = ["--only-binary=:all:", "--dest", str(_WHEELS_DIR),
                 f"mlsweep=={local_version}"]
     r = subprocess.run([sys.executable, "-m", "pip", action, "--no-deps", *args],
                        capture_output=True)
@@ -246,7 +264,7 @@ def _ensure_worker_wheels() -> None:
     except OSError:
         pass
 
-    wheels = [p.name for p in wheels_dir.glob("*.whl")]
+    wheels = [p.name for p in _WHEELS_DIR.glob("*.whl")]
     print(f"[wheels] Ready ({len(wheels)} wheel)", flush=True)
 
 
@@ -307,11 +325,10 @@ async def _bootstrap_worker_venv(
         pass  # fall through to bootstrap
 
     # 2. mkdir + SCP bundled wheels to remote.
-    wheels_dir = Path(__file__).resolve().parent / "_wheels"
-    wheel_files = [str(p) for p in wheels_dir.glob("*.whl")]
+    wheel_files = [str(p) for p in _WHEELS_DIR.glob("*.whl")]
     if not wheel_files:
         print(
-            f"[bootstrap] no mlsweep wheel in {wheels_dir} — "
+            f"[bootstrap] no mlsweep wheel in {_WHEELS_DIR} — "
             f"run the manager once to build it",
             file=sys.stderr,
         )
@@ -420,11 +437,42 @@ def _sshpass_args(password: str | None) -> tuple[list[str], dict[str, str] | Non
 # ===============================================================================
 
 
+# Tasks copying launched workers' output; held so they are not garbage collected.
+_output_relays: set["asyncio.Task[None]"] = set()
+
+
+async def _relay_stream(stream: asyncio.StreamReader, label: str) -> None:
+    """Copy *stream* to the manager's stderr, one prefixed line at a time."""
+    buf = b""
+    while chunk := await stream.read(65536):
+        *lines, buf = (buf + chunk).split(b"\n")
+        if len(buf) > 65536:  # no newline in sight; do not buffer without bound
+            lines.append(buf)
+            buf = b""
+        for ln in lines:
+            print(f"[worker {label}] {ln.decode(errors='replace')}", file=sys.stderr, flush=True)
+    if buf:
+        print(f"[worker {label}] {buf.decode(errors='replace')}", file=sys.stderr, flush=True)
+
+
+def _relay_worker_output(proc: asyncio.subprocess.Process, label: str) -> None:
+    """Keep reading a launched worker's stdout and stderr for as long as it runs.
+
+    Left unread, a pipe fills up after about 64 KiB, and the worker then blocks
+    on its next write of a traceback, a warning or a child's error output.
+    """
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            task = asyncio.create_task(_relay_stream(stream, label))
+            _output_relays.add(task)
+            task.add_done_callback(_output_relays.discard)
+
+
 async def launch_worker(
     host: str,
     remote_dir: str,
     token: str,
-    scratch_dir: str = "/tmp/mlsweep",
+    scratch_dir: str = DEFAULT_SCRATCH_DIR,
     devices: list[int] | None = None,
     max_jobs_per_gpu: int = 1,
     password: str | None = None,
@@ -489,6 +537,7 @@ async def launch_worker(
         worker_args = [
             "--token", token,
             "--remote-dir", remote_dir,
+            "--scratch-dir", scratch_dir,
             "--port", str(bind_port),
             *devices_args,
             *jobs_args,
@@ -548,6 +597,7 @@ async def launch_worker(
         raise RuntimeError(f"worker failed to start on {host}: {last_line}{hint}")
 
     worker_port = int(line.split("=")[1])
+    _relay_worker_output(proc, f"{host}:{worker_port}")
 
     # Connect to the worker's TCP port
     reader, writer = await asyncio.wait_for(
@@ -822,8 +872,22 @@ async def _handle_worker_hello(
         wc.scratch_dir = msg.scratch_dir
 
         expected = {j.key: j for j in await list_active_jobs(db, wc.worker_id)}
-        resuming = {(r["experiment"], r["run_id"]): r for r in msg.resuming}
-        completed = {(r["experiment"], r["run_id"]): r for r in msg.completed}
+
+        def current(r: dict[str, Any]) -> bool:
+            """Whether a reported run is the attempt the database has on this worker."""
+            job = expected.get((r["experiment"], r["run_id"]))
+            return job is not None and same_attempt(r.get("attempt", 0), job.attempt)
+
+        # Reports of other attempts (or of runs not expected here) are ghosts.
+        resuming = {(r["experiment"], r["run_id"]): r for r in msg.resuming if current(r)}
+        completed = {(r["experiment"], r["run_id"]): r for r in msg.completed if current(r)}
+        for r in msg.resuming:
+            if not current(r):
+                _send(wc, MsgCancel(run_id=r["run_id"], experiment=r["experiment"]))
+        for r in msg.completed:
+            if not current(r):
+                _send(wc, MsgCleanup(run_id=r["run_id"], experiment=r["experiment"],
+                                     attempt=r.get("attempt", 0), final=False))
 
         lost: list[JobRecord] = []
         for key, job in expected.items():
@@ -834,10 +898,6 @@ async def _handle_worker_hello(
             await _adopt_run_locked(db, state, wc, job, report, running=key in resuming)
             if key in completed:
                 results.append(from_obj(report))
-        for exp_id, run_id in resuming.keys() - expected.keys():
-            _send(wc, MsgCancel(run_id=run_id, experiment=exp_id))
-        for exp_id, run_id in completed.keys() - expected.keys():
-            _send(wc, MsgCleanup(run_id=run_id, experiment=exp_id, final=False))
         # A run that never started has not really been tried; one that started has.
         await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "dispatched"], lost=False)
         await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "running"], lost=True)
@@ -900,17 +960,22 @@ async def _adopt_run_locked(
 # ===============================================================================
 
 
-def _find_run(state: ManagerState, wc: WorkerConn, experiment: str, run_id: str) -> InFlightRun | None:
-    """The in-flight run a message from *wc* refers to, if *wc* holds a node of it."""
+def _find_run(
+    state: ManagerState, wc: WorkerConn, experiment: str, run_id: str, attempt: int,
+) -> InFlightRun | None:
+    """The in-flight run a message from *wc* refers to, if *wc* holds a node of it
+    and the message is about the attempt in flight, not one taken back earlier."""
     run = state.runs.get((experiment, run_id))
-    return run if run is not None and wc.worker_id in run.nodes else None
+    if run is None or wc.worker_id not in run.nodes or not same_attempt(attempt, run.attempt):
+        return None
+    return run
 
 
 async def _handle_started(
     db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgStarted,
 ) -> None:
     async with state.lock:
-        run = _find_run(state, wc, msg.experiment, msg.run_id)
+        run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
         if run is None:
             return
         run.last_progress = time.time()
@@ -929,7 +994,7 @@ async def _handle_log(
     leaves a gap.  The manager then asks once for a replay from where its copy
     ends and drops chunks until the replay arrives, which covers them.
     """
-    run = _find_run(state, wc, msg.experiment, msg.run_id)
+    run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
     if run is None or wc.worker_id != run.primary or msg.seq <= run.log_end:
         return
     if msg.start != run.log_end:
@@ -949,7 +1014,7 @@ async def _handle_log(
 async def _handle_metric(
     db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgMetric,
 ) -> None:
-    run = _find_run(state, wc, msg.experiment, msg.run_id)
+    run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
     if run is None:
         return
     run.last_progress = time.time()
@@ -963,14 +1028,15 @@ async def _handle_sync_req(
     db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgSyncReq,
 ) -> None:
     """Copy a running run's artifacts to the manager, off the read loop."""
-    run = _find_run(state, wc, msg.experiment, msg.run_id)
+    run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
     if run is None:
         return
 
     async def sync() -> None:
         await _run_rsync(state, wc, run.experiment_id, run.run_id)
         # final=False because the run is still executing; the worker keeps its scratch.
-        _send(wc, MsgCleanup(run_id=run.run_id, experiment=run.experiment_id, final=False))
+        _send(wc, MsgCleanup(run_id=run.run_id, experiment=run.experiment_id,
+                             attempt=run.attempt, final=False))
 
     asyncio.create_task(sync())
 
@@ -985,12 +1051,14 @@ async def _handle_result(
     missing metrics.  Its GPUs are freed at once, since its process has exited.
 
     A result for a run not in flight on *wc* (cancelled, requeued or deleted,
-    before or during the sync) is only acknowledged.
+    before or during the sync), or for an earlier attempt of it, is only
+    acknowledged.
     """
     async with state.lock:
-        run = _find_run(state, wc, msg.experiment, msg.run_id)
+        run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
         if run is None:
-            _send(wc, MsgCleanup(run_id=msg.run_id, experiment=msg.experiment, final=False))
+            _send(wc, MsgCleanup(run_id=msg.run_id, experiment=msg.experiment,
+                                 attempt=msg.attempt, final=False))
             return
         eid, rid = run.experiment_id, run.run_id
         run.nodes[wc.worker_id] = []  # frees this node's GPUs
@@ -1014,8 +1082,8 @@ async def _handle_result(
     extra = await asyncio.to_thread(_read_metric_rows, primary_dir / "metrics.jsonl")
 
     async with state.lock:
-        if _find_run(state, wc, eid, rid) is not run:
-            _send(wc, MsgCleanup(run_id=rid, experiment=eid, final=synced))
+        if _find_run(state, wc, eid, rid, msg.attempt) is not run:
+            _send(wc, MsgCleanup(run_id=rid, experiment=eid, attempt=run.attempt, final=synced))
             return
         if nodes:
             await state.db_writer.mark_job_node_result(rid, eid, wc.worker_id, msg.success, msg.elapsed)
@@ -1043,7 +1111,7 @@ async def _handle_result(
     state.request_schedule()
     # The outputs are safe on the manager; the worker may delete its scratch.
     if synced:
-        _send(wc, MsgCleanup(run_id=rid, experiment=eid, final=True))
+        _send(wc, MsgCleanup(run_id=rid, experiment=eid, attempt=run.attempt, final=True))
 
 
 def _run_output_dir(state: ManagerState, experiment_id: str, run_id: str, subdir: str | None = None) -> Path:
@@ -1225,7 +1293,6 @@ async def connect_workers(
     state: ManagerState,
     *,
     workers_file: str | None = None,
-    scratch_dir: str = "/tmp/mlsweep",
     manager_port: int = 0,
 ) -> list[WorkerConn]:
     """Launch and connect every configured worker concurrently.
@@ -1251,7 +1318,7 @@ async def connect_workers(
             host=cfg["host"],
             remote_dir=cfg["remote_dir"],
             worker_id=wid,
-            scratch_dir=scratch_dir,
+            scratch_dir=cfg.get("scratch_dir") or state.scratch_dir,
             password=cfg.get("password"),
             ssh_key=cfg.get("ssh_key"),
             venv=cfg.get("venv"),
@@ -1314,7 +1381,7 @@ async def reconnect_known_workers(
             host=wr.host,
             remote_dir=wr.remote_dir,
             worker_id=wr.worker_id,
-            scratch_dir=wr.scratch_dir or "/tmp/mlsweep",
+            scratch_dir=wr.scratch_dir or state.scratch_dir,
             ssh_key=wr.ssh_key,
             venv=wr.venv,
             port=wr.port,
@@ -1334,7 +1401,7 @@ async def connect_single_worker(
     remote_dir: str,
     *,
     worker_id: str,
-    scratch_dir: str = "/tmp/mlsweep",
+    scratch_dir: str = DEFAULT_SCRATCH_DIR,
     password: str | None = None,
     ssh_key: str | None = None,
     venv: str | None = None,
@@ -1452,8 +1519,12 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
     caps = await experiment_concurrency_caps(db)
     topos = {wc.worker_id: _parse_topo_wire(wc.topo) for wc in connected}
     running: dict[str, int] = {}
+    on_worker = {wc.worker_id: 0 for wc in connected}
     for run in state.runs.values():
         running[run.experiment_id] = running.get(run.experiment_id, 0) + 1
+        for wid in run.nodes:
+            if wid in on_worker:
+                on_worker[wid] += 1
 
     # Occupancy only grows during a pass, so a shape that did not fit never will.
     no_fit: set[tuple[int, int]] = set()
@@ -1464,23 +1535,59 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
         shape = (job.gpus_per_run, job.nodes_per_run)
         if shape in no_fit:
             continue
-        placements: list[tuple[WorkerConn, list[int]]] = []
-        for wc in connected:
-            gpus = _find_gpu_group(wc, job.gpus_per_run, topos[wc.worker_id],
-                                   occupancy=occupancy[wc.worker_id])
-            if gpus is not None:
-                placements.append((wc, gpus))
-                if len(placements) == max(1, job.nodes_per_run):
-                    break
-        if len(placements) < max(1, job.nodes_per_run):
+        placements = _place(job, connected, occupancy, on_worker, topos, state.placement)
+        if placements is None:
             no_fit.add(shape)
             continue
         if not await _dispatch_locked(state, job, placements):
             continue
-        for wc, gpus in placements:
-            for g in gpus:
-                occupancy[wc.worker_id][g] += 1
+        _book(placements, occupancy, on_worker)
         running[job.experiment_id] = running.get(job.experiment_id, 0) + 1
+
+
+def _book(
+    placements: list[tuple[WorkerConn, list[int]]],
+    occupancy: dict[str, dict[int, int]],
+    on_worker: dict[str, int],
+) -> None:
+    """Count a dispatched job's *placements* in the pass's occupancy tallies."""
+    for wc, gpus in placements:
+        on_worker[wc.worker_id] += 1
+        for g in gpus:
+            occupancy[wc.worker_id][g] += 1
+
+
+def _place(
+    job: SchedulableJob,
+    workers: list[WorkerConn],
+    occupancy: dict[str, dict[int, int]],
+    on_worker: dict[str, int],
+    topos: dict[str, dict[tuple[int, int], int]],
+    placement: Placement,
+) -> list[tuple[WorkerConn, list[int]]] | None:
+    """Choose a worker and GPUs for each node of *job*, or ``None`` if it does not fit.
+
+    Each worker offers its best GPU group.  The offers are ranked by how busy
+    their GPUs are, then by how busy the whole worker is.  "spread" takes the
+    least busy and "pack" the busiest.  Ties keep connection order.
+    """
+    spread = placement == "spread"
+    offers: list[tuple[tuple[int, float], WorkerConn, list[int]]] = []
+    for wc in workers:
+        occ = occupancy[wc.worker_id]
+        gpus = _find_gpu_group(wc, job.gpus_per_run, topos[wc.worker_id],
+                               occupancy=occ, spread=spread)
+        if gpus is None:
+            continue
+        gpu_load = max((occ[g] for g in gpus), default=0)
+        worker_load = on_worker[wc.worker_id] / max(1, len(wc.gpus))
+        offers.append(((gpu_load, worker_load), wc, gpus))
+    n_nodes = max(1, job.nodes_per_run)
+    if len(offers) < n_nodes:
+        return None
+    # Sorting is stable, also when reversed, so ties keep connection order.
+    offers.sort(key=lambda o: o[0], reverse=not spread)
+    return [(wc, gpus) for _, wc, gpus in offers[:n_nodes]]
 
 
 async def _dispatch_locked(
@@ -1541,6 +1648,7 @@ async def _dispatch_locked(
             artifact_id=claimed.artifact_id or "",
             artifact_url=artifact_url,
             setup_command=shlex.split(claimed.setup_command) if claimed.setup_command else [],
+            attempt=claimed.attempt,
         ))
         state.broadcast(job.experiment_id, {
             "type": "job_dispatched", "run_id": job.run_id,
@@ -1555,24 +1663,27 @@ def _find_gpu_group(
     topo: dict[tuple[int, int], int],
     *,
     occupancy: dict[int, int],
+    spread: bool,
 ) -> list[int] | None:
     """Find *gpus_needed* GPUs on *wc* with room for another job, or ``None``.
 
     Per-GPU packing is bounded by the worker's ``max_jobs_per_gpu`` (0 =
-    unlimited).  Prefers topologically close GPUs.  CPU-only jobs
-    (``gpus_needed == 0``) get ``[]``.
+    unlimited).  Takes the least busy GPUs when *spread*, otherwise the
+    busiest, and among GPUs equally suitable prefers topologically close ones.
+    CPU-only jobs (``gpus_needed == 0``) get ``[]``.
     """
     if gpus_needed == 0:
         return []
     cap = wc.max_jobs_per_gpu
-    available = [g for g in wc.gpus if cap <= 0 or occupancy[g] < cap]
-    if len(available) < gpus_needed:
+    free = [g for g in wc.gpus if cap <= 0 or occupancy[g] < cap]
+    if len(free) < gpus_needed:
         return None
-    if topo:
-        groups = _best_gpu_groups(available, gpus_needed, 1, topo=topo)
-        if groups:
-            return groups[0]
-    return available[:gpus_needed]
+    # Sorting is stable, so GPUs at the same load stay in device order.
+    free.sort(key=lambda g: occupancy[g], reverse=not spread)
+    # Go only as far past the best load level as the group needs.
+    level = occupancy[free[gpus_needed - 1]]
+    pool = free[:gpus_needed] + [g for g in free[gpus_needed:] if occupancy[g] == level]
+    return closest_gpu_group(pool, gpus_needed, topo)
 
 
 # ===============================================================================

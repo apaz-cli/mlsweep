@@ -4,7 +4,6 @@ import io
 import os
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import sys
@@ -15,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import mlsweep._parsync as _parsync
+from conftest import _find_free_port
 from mlsweep._parsync import fetch_parsync, parsync_bin
 
 
@@ -150,13 +150,6 @@ def ssh_localhost(tmp_path_factory: pytest.TempPathFactory):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-
-
-def _find_free_port() -> int:
-    """Return an available TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 def _wait_for_ssh(port: int, key_path: Path, timeout: int = 15) -> bool:

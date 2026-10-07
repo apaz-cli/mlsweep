@@ -172,6 +172,19 @@ def test_experiment_max_concurrent_create_and_update(manager_server):
         assert e.code == 400
 
 
+def test_scheduler_placement_get_and_set(manager_server):
+    _, url = manager_server
+    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "pack"}
+    assert _api_request(url, _TOKEN, "PATCH", "/api/scheduler",
+                        {"placement": "spread"}) == {"placement": "spread"}
+    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "spread"}
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _api_request(url, _TOKEN, "PATCH", "/api/scheduler", {"placement": "random"})
+    assert exc.value.code == 400
+    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "spread"}
+
+
 def test_delete_experiment(manager_server):
     _, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_to_del"})
@@ -432,7 +445,7 @@ def test_retry_job(manager_server):
     job = _api_post(url, _TOKEN, "/api/jobs/r_retry/retry"
                     "?experiment_id=e_retry")
     assert job["status"] == "pending"
-    assert job["retry_count"] == 1
+    assert job["retry_count"] == 0
 
 
 def test_retry_job_not_terminal_rejected(manager_server):

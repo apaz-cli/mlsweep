@@ -26,6 +26,7 @@ from test_reconnect import (  # noqa: F401  (proxied is a fixture)
     TOKEN,
     _Proxy,
     _api,
+    _kill_worker,
     _start_manager,
     _wait,
     proxied,
@@ -134,7 +135,7 @@ def test_restart_does_not_rerun_jobs_of_a_worker_slow_to_return(tmp_path):
                 m.wait()
         worker_b.terminate()
         worker_b.wait()
-        subprocess.run(["pkill", "-f", f"mlsweep.worker .*--port {PA}"], check=False)
+        _kill_worker(proj, PA)
         proxy.close()
         lock.close()
 

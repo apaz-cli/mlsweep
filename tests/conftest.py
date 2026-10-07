@@ -22,11 +22,33 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Ports for test servers come from a block per xdist worker, below the kernel's
+# ephemeral range and the [20000, 30000) range of hashed dist master ports.
+# Asking the kernel instead (bind to port 0, close, hand out the number) lets
+# two test processes get the same port before either binds it, and a manager
+# then adopts the other test's worker on its "fixed" port.
+_PORT_BASE = 10000
+_PORT_BLOCK = 400  # 25 blocks fit below 20000; more xdist workers wrap around
+_ports_handed_out = 0
+
+
 def _find_free_port():
-    """Return an available TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    """Return a TCP port on localhost that is free and that no other test
+    process will be handed."""
+    global _ports_handed_out
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    n = int(worker[2:]) if worker[2:].isdigit() else 0
+    start = _PORT_BASE + (n % 25) * _PORT_BLOCK
+    for _ in range(_PORT_BLOCK):
+        port = start + _ports_handed_out % _PORT_BLOCK
+        _ports_handed_out += 1
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+            except OSError:
+                continue  # in use by something outside the tests
+        return port
+    raise RuntimeError(f"no free port in [{start}, {start + _PORT_BLOCK})")
 
 
 def _api_get(url, token, path):
@@ -113,6 +135,15 @@ def _wait_for_experiment_complete(url, token, experiment_id,
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
+def _log_tail(tmp_path, lines=40):
+    """The end of a manager's log, for a failure message."""
+    try:
+        text = (tmp_path / "manager.log").read_text(errors="replace")
+    except OSError:
+        return ""
+    return "manager.log:\n" + "\n".join(text.splitlines()[-lines:])
+
+
 def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int = 0):
     """Start a real mlsweep manager process and return (proc, server, url).
 
@@ -127,6 +158,11 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
     worker entries (each pinned to device 0) and waits for all to connect.  Used
     to exercise multi-node scheduling on a single machine — each worker process
     is treated as a separate node.
+
+    Workers keep their scratch under ``tmp_path/scratch`` (the second of two
+    workers in a subdirectory it claims), so tests running at the same time
+    never share run directories.  The manager's output goes to
+    ``tmp_path/manager.log``.
     """
     db_path = str(tmp_path / "manager.db")
     port = _find_free_port()
@@ -140,6 +176,7 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
         "--db", db_path,
         "--mlsweep-dir", str(mlsweep_dir),
         "--token", token,
+        "--scratch-dir", str(tmp_path / "scratch"),
     ]
 
     if n_local_workers > 0:
@@ -163,7 +200,11 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
         workers_file.write_text("")
         cmd += ["--workers", str(workers_file)]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # A file rather than a pipe.  Nothing reads the output, and a full pipe
+    # would block the manager.
+    log = open(tmp_path / "manager.log", "w")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    log.close()
 
     url = f"http://127.0.0.1:{port}"
     deadline = time.time() + 30
@@ -178,12 +219,12 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
                 started = True
                 break
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.1)
 
     if not started:
         proc.terminate()
         proc.wait()
-        pytest.fail(f"Manager did not start within 30 seconds.")
+        pytest.fail(f"Manager did not start within 30 seconds.\n{_log_tail(tmp_path)}")
 
     need_workers = n_local_workers if n_local_workers > 0 else (1 if with_worker else 0)
     if need_workers:
@@ -199,11 +240,12 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
                     break
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.1)
         if not ready:
             proc.terminate()
             proc.wait()
-            pytest.fail(f"Expected {need_workers} worker(s) to connect within 30 seconds.")
+            pytest.fail(f"Expected {need_workers} worker(s) to connect within 30 seconds.\n"
+                        f"{_log_tail(tmp_path)}")
 
     class Server:
         pass

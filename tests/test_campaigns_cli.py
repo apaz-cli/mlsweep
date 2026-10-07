@@ -292,20 +292,27 @@ def test_ls_lists_only_the_current_campaign(mgr, capsys):
     mine, other, dflt = seed(mgr, cx), seed(mgr, uid("cy")), seed(mgr, "default")
     code, out = _run_cli(["ls", "--campaign", cx] + _base(mgr), capsys)
     assert code == 0
-    assert f"1 experiments in campaign {cx}" in out
+    assert f"# Campaign {cx}: 1 experiment\n" in out
     assert mine in out and other not in out and dflt not in out
     code, out = _run_cli(["ls"] + _base(mgr), capsys)
-    assert dflt in out and mine not in out and "in campaign default" in out
+    assert dflt in out and mine not in out and "# Campaign default:" in out
 
 
-def test_ls_all_campaigns_tags_each_experiment(mgr, capsys):
+def test_ls_all_campaigns_heads_each_campaign(mgr, capsys):
     cx = uid("cx")
     mine, dflt = seed(mgr, cx), seed(mgr, "default")
-    code, out = _run_cli(["ls", "--all-campaigns"] + _base(mgr), capsys)
-    assert code == 0 and "in all campaigns" in out
-    line = next(line for line in out.splitlines() if mine in line)
-    assert f"[{cx}]" in line
-    assert f"[default]  {dflt}" in out
+    code, out = _run_cli(["ls", "--all-campaigns", "--all"] + _base(mgr), capsys)
+    assert code == 0 and out.startswith("# All campaigns:")
+    # Each experiment is listed under its own campaign's heading.
+    heading = ""
+    under = {}
+    for line in out.splitlines():
+        if line.startswith("## Campaign "):
+            heading = line
+        elif line.startswith("- "):
+            under[line[2:].split(":")[0]] = heading
+    assert under[mine].startswith(f"## Campaign {cx}:")
+    assert under[dflt].startswith("## Campaign default:")
 
 
 def test_ls_json_is_filtered(mgr, capsys):
@@ -543,4 +550,4 @@ def test_sweep_runs_and_fetches_within_campaign(manager_with_worker, tmp_path, c
     assert code == 1 and "is in campaign 'e2e', not 'default'" in out
 
     code, out = _run_cli(["ls", "--all-campaigns"] + base, capsys)
-    assert "[e2e]" in out and "camp_e2e" in out
+    assert "## Campaign e2e: 1 experiment" in out and "- camp_e2e:" in out

@@ -29,6 +29,7 @@ TOKEN = "reconnect-test-token"  # the token test_reconnect._start_manager passes
 _JOB = r"""
 import os, signal, sys, time
 journal, schedule = sys.argv[1], [float(s) for s in sys.argv[2].split(",")]
+term_delay = float(sys.argv[3])
 exp, run = os.environ["EXP_EXPERIMENT"], os.environ["MLSWEEP_RUN_NAME"]
 worker = os.path.basename(os.environ.get("MLSWEEP_WORKER_SOCKET", "-"))
 gpu = os.environ.get("CUDA_VISIBLE_DEVICES") or "-"
@@ -37,6 +38,7 @@ def write(ev):
     os.write(fd, f"{ev} {exp} {run} {os.getpid()} {worker} {gpu} {time.time()}\n".encode())
     os.close(fd)
 def term(*_):
+    time.sleep(term_delay)
     write("term")
     os._exit(143)
 signal.signal(signal.SIGTERM, term)
@@ -53,10 +55,12 @@ write("end")
 """
 
 
-def journaled(journal: Path, *seconds: float) -> list[str]:
+def journaled(journal: Path, *seconds: float, term_delay: float = 0.0) -> list[str]:
     """Command for a journaled job.  Attempt *n* runs ``seconds[n]`` seconds
-    (the last value repeats)."""
-    return [sys.executable, "-c", _JOB, str(journal), ",".join(str(s) for s in seconds)]
+    (the last value repeats).  On SIGTERM it lingers *term_delay* seconds, then
+    journals ``term`` and exits."""
+    return [sys.executable, "-c", _JOB, str(journal), ",".join(str(s) for s in seconds),
+            str(term_delay)]
 
 
 @dataclass(frozen=True)
@@ -194,8 +198,9 @@ class Cluster:
     def experiment(self, name: str, **fields) -> str:
         """Create an experiment with a name unique to this cluster; return its id.
 
-        Worker scratch lives under /tmp/mlsweep/<experiment>, shared with any
-        other worker on the machine, so ids must not collide.
+        Workers this cluster's manager launches keep their scratch under its
+        tmp_path.  Ids stay unique anyway, so a run directory is never shared
+        with a worker started some other way.
         """
         eid = f"{name}_{self.tag}"
         self.post("/api/experiments", {"experiment_id": eid, **fields})

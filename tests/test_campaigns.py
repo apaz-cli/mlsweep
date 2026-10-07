@@ -197,13 +197,13 @@ def test_db_list_campaigns_counts():
         alpha, beta, default = camps
         assert alpha["experiments"] == 2
         assert alpha["job_counts"] == {"total": 3, "done": 1, "failed": 1, "running": 0, "pending": 1,
-                                      "xfailed": 0, "dispatched": 0}
+                                      "xfailed": 0, "cancelled": 0, "dispatched": 0}
         assert beta["experiments"] == 1
         assert beta["job_counts"]["done"] == 1 and beta["job_counts"]["total"] == 1
         assert default == {
             "campaign": "default", "experiments": 0, "last_submit": None,
             "job_counts": {"total": 0, "done": 0, "failed": 0, "running": 0, "pending": 0,
-                           "xfailed": 0, "dispatched": 0},
+                           "xfailed": 0, "cancelled": 0, "dispatched": 0},
         }
         assert alpha["last_submit"] is not None
     _db_test(body)

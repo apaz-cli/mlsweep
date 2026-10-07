@@ -102,7 +102,7 @@ def test_metrics_endpoint_empty(manager_server):
         assert e.code == 404
 
 
-def test_metrics_websocket_broadcast(manager_with_worker):
+def test_metrics_websocket_broadcast(manager_with_worker, tmp_path):
     """Connect to WebSocket, submit a job that logs, verify metric events arrive."""
     server, url = manager_with_worker
     token = server.token
@@ -115,7 +115,7 @@ def test_metrics_websocket_broadcast(manager_with_worker):
     # Submit a sweep that logs (integration_grid uses fast_train which logs)
     proc = subprocess.run(
         [*MLSWEEP_RUN, "tests/sweeps/integration_grid.py",
-         "--output-dir", str(Path("__pycache__")),  # dummy, not used
+         "--output-dir", str(tmp_path),
          "--experiment", "ws_metrics",
          "--manager", url, "--token", token,
          "--fetch"],

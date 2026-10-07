@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from cluster_harness import Cluster, max_overlap, stays, wait_until
+from cluster_harness import Cluster, journaled, max_overlap, stays, wait_until
 from test_reconnect import _Proxy, proxied  # noqa: F401  (proxied is a fixture)
 
 
@@ -106,6 +106,7 @@ def test_pending_jobs_start_in_priority_order(cluster_factory):
     assert [s.run for s in c.spans(eid)] == ["c", "a", "b", "d", "e"]
 
 
+@pytest.mark.xdist_group("timing")
 def test_new_capacity_is_used_promptly(cluster_factory):
     """Adding a device wakes the scheduler; it does not wait for the periodic pass."""
     c = cluster_factory([{"devices": [0], "jobs": 1}])
@@ -288,7 +289,7 @@ def test_racing_retries_rerun_a_job_exactly_once(cluster_factory):
     wait_until(lambda: c.job(eid, "r")["status"] == "done", 20, "second attempt")
     assert c.starts(eid) == {"r": 2}
     job = c.job(eid, "r")
-    assert job["retry_count"] == 1
+    assert job["retry_count"] == 0
     lines = c.get_text(f"/api/experiments/{eid}/jobs/r/logs").splitlines()
     assert [ln for ln in lines if not ln.startswith("[mlsweep]")] == ["attempt 1", "attempt 2"]
 
@@ -334,6 +335,27 @@ def test_evicted_run_is_requeued_without_a_retry_and_never_overlaps(cluster_fact
     assert first.how == "term" and second.how == "end"
     assert second.start >= first.stop
     assert c.job(eid, "r")["retry_count"] == 0
+
+
+def test_a_late_result_from_an_evicted_attempt_does_not_end_the_next(cluster_factory):
+    """The evicted attempt takes a while to exit, so the run is dispatched again
+    to the same worker before that attempt's result arrives.  The worker starts
+    the new attempt once the old one is gone, and the old attempt's result
+    (exit 143) is not recorded as the new attempt's."""
+    c = cluster_factory([{"devices": [0], "jobs": 1}])
+    eid = c.experiment("late")
+    wid = c.worker_ids[0]
+    c.post("/api/jobs", {**c.job_body(eid, "r", 60, 0.5, gpus=1),
+                         "command": journaled(c.journal, 60, 0.5, term_delay=1.5)})
+    wait_until(lambda: c.job(eid, "r")["status"] == "running", 20, "r to run")
+    c.patch(f"/api/workers/{wid}/devices", {"remove": [0]})
+    c.patch(f"/api/workers/{wid}/devices", {"add": [0]})
+    wait_until(lambda: c.job(eid, "r")["status"] in ("done", "failed"), 30, "r to finish")
+    job = c.job(eid, "r")
+    assert (job["status"], job["exit_code"], job["retry_count"]) == ("done", 0, 0)
+    first, second = c.spans(eid)
+    assert first.how == "term" and second.how == "end"
+    assert second.start >= first.stop
 
 
 def test_removing_a_worker_moves_its_runs_elsewhere(cluster_factory):

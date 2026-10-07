@@ -25,6 +25,10 @@ from cluster_harness import TOKEN, Cluster, wait_until
 from conftest import _api_get, _api_post
 from test_reconnect import _Proxy, proxied  # noqa: F401  (proxied is a fixture)
 
+# The latency and duration bounds assume a machine that is not also running
+# the other heavy tests here; under `pytest -n` the group shares one worker.
+pytestmark = pytest.mark.xdist_group("timing")
+
 PAD = "x" * 40
 
 
