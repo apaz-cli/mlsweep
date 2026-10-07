@@ -531,6 +531,10 @@ async def _migrate_logs_to_rowid(db: aiosqlite.Connection) -> bool:
     return True
 
 
+# Bytes the WAL file is cut back to after a checkpoint.
+_WAL_SIZE_LIMIT = 16 * 1024 * 1024
+
+
 async def init_db(db: aiosqlite.Connection) -> None:
     """Create tables and indexes if they do not exist (idempotent).
 
@@ -546,6 +550,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
     await db.execute("PRAGMA auto_vacuum=INCREMENTAL")
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA synchronous=NORMAL")
+    # SQLite reuses the WAL file without shrinking it, so a burst such as a
+    # VACUUM would otherwise leave it at that size for good.
+    await db.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT}")
     await db.execute("PRAGMA foreign_keys=ON")
 
     # ── experiments ─────────────────────────────────────────────────
