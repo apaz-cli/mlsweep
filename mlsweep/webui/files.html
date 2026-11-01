@@ -163,6 +163,7 @@ select:focus { outline: none; border-color: #4c9be8; }
   <a class="nav-link" id="nav-results" href="#">Results</a>
   <a class="nav-link" id="nav-logs" href="#">Logs</a>
   <a class="nav-link active" href="#">Artifacts</a>
+  <a class="nav-link" id="nav-export" href="#">Export</a>
   <a class="nav-link" id="nav-system" href="#">System</a>
   <span class="nav-spacer"></span>
   <span style="display:flex;align-items:center;gap:5px">
@@ -274,6 +275,7 @@ function pageHref(page, extra = {}) {
 document.getElementById("nav-experiments").href = pageHref("experiments.html");
 document.getElementById("nav-results").href     = pageHref("results.html");
 document.getElementById("nav-logs").href        = pageHref("logs.html");
+document.getElementById("nav-export").href = pageHref("export.html");
 document.getElementById("nav-system").href      = pageHref("system.html");
 
 // ── Theme ──────────────────────────────────────────────────────────────────────

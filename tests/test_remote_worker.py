@@ -2,7 +2,7 @@
 
 These tests cover the changes made to support remote workers without requiring
 the manager to have a public IP:
-  - _launch_tunnel: spawns ssh -N -R to expose the manager's HTTP port remotely
+  - _launch_tunnel: spawns ssh -R to expose the manager's HTTP port remotely
   - _tunnel_monitor_task: restarts the tunnel when it dies
   - _reconnect_worker: hostname stripping (user@host → host for TCP connect)
   - connect_single_worker: no tunnel launched for localhost workers

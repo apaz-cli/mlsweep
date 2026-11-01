@@ -23,6 +23,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -1771,19 +1772,126 @@ def _die_with_parent() -> None:
         _PRCTL(1, signal.SIGTERM)  # PR_SET_PDEATHSIG == 1
 
 
+# How long a relaunched tunnel must stay up before it counts as established.
+# Longer than ssh's ConnectTimeout so a failed connect or forward is caught.
+_TUNNEL_SETTLE_SECS = 15.0
+
+# Where each tunnel records the remote sshd process holding its forward, as
+# ``<port>.<sshd pid>``.  The file holds this manager's identity on line 1 and
+# the sshd's start time on line 2 (so a reused pid is never mistaken for it).
+_TUNNEL_RECORD_DIR = "$HOME/.mlsweep/tunnels"
+
+
+def _read_id_file(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _manager_identity() -> tuple[str, str]:
+    """``(machine, instance)`` naming this host and this manager process.
+
+    The instance includes the boot id, so a manager from before a reboot never
+    matches a new one that happens to get the same pid.
+    """
+    machine = _read_id_file("/etc/machine-id") or socket.gethostname()
+    boot = _read_id_file("/proc/sys/kernel/random/boot_id") or "noboot"
+    return machine, f"{boot}:{os.getpid()}"
+
+
+def _tunnel_remote_cmd(manager_port: int) -> str:
+    """Remote command that records the forward's sshd pid, then idles on stdin.
+
+    ``$PPID`` of the exec'd ``sh`` is the per-connection sshd process, which
+    owns the ``-R`` listener.  The record lets a later manager kill that sshd
+    if this one dies without closing the connection (crash, reboot, network
+    loss), since the remote sshd otherwise holds the port for hours.  ``cat``
+    ends when the connection closes, and the record is removed with it.
+    """
+    machine, instance = _manager_identity()
+    tag = shlex.quote(f"{machine} {instance} {socket.gethostname()}")
+    script = (
+        f'f="{_TUNNEL_RECORD_DIR}/{manager_port}.$PPID"; '
+        f'mkdir -p "${{f%/*}}" && {{ echo {tag}; echo $(ps -o lstart= -p $PPID); }} > "$f"; '
+        'cat; rm -f "$f"'
+    )
+    return f"exec sh -c {shlex.quote(script)}"
+
+
+def _reap_tunnels_script(manager_port: int) -> str:
+    """Remote script that kills sshd sessions left by earlier managers on this machine.
+
+    Prints ``killed <pid>`` for each one killed and ``held <hostname>`` for a
+    live tunnel recorded by another machine's manager, which is left alone.
+    Records of exited processes are removed.
+    """
+    machine, instance = _manager_identity()
+    return f"""
+cd "{_TUNNEL_RECORD_DIR}" 2>/dev/null || exit 0
+for f in {manager_port}.*; do
+  [ -e "$f" ] || continue
+  pid=${{f#{manager_port}.}}
+  {{ read m i h; read st; }} < "$f"
+  if [ "$(echo $(ps -o lstart= -p "$pid" 2>/dev/null))" != "$st" ]; then rm -f "$f"; continue; fi
+  case "$(ps -o comm= -p "$pid")" in sshd*) ;; *) rm -f "$f"; continue ;; esac
+  if [ "$m" = {shlex.quote(machine)} ]; then
+    [ "$i" = {shlex.quote(instance)} ] && continue
+    kill "$pid" && rm -f "$f" && echo "killed $pid"
+  else
+    echo "held $h"
+  fi
+done
+"""
+
+
+async def _reap_stale_tunnels(wc: WorkerConn, manager_port: int) -> str:
+    """Free *manager_port* on the worker host from a dead earlier manager's tunnel.
+
+    Returns a short note for the log describing what was found.
+    """
+    key_args = ["-i", wc.ssh_key] if wc.ssh_key else []
+    try:
+        sshpass_args, sshpass_env = _sshpass_args(wc.password)
+        proc = await asyncio.create_subprocess_exec(
+            *sshpass_args,
+            "ssh", "-o", "ConnectTimeout=10", *key_args, wc.host,
+            f"exec sh -c {shlex.quote(_reap_tunnels_script(manager_port))}",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=sshpass_env,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except (OSError, RuntimeError, asyncio.TimeoutError) as e:
+        return f"could not check for stale tunnels: {e}"
+    lines = out.decode(errors="replace").split()
+    killed = [lines[k + 1] for k in range(len(lines) - 1) if lines[k] == "killed"]
+    holders = [lines[k + 1] for k in range(len(lines) - 1) if lines[k] == "held"]
+    if killed:
+        return f"killed stale sshd session(s) {', '.join(killed)} from an earlier manager"
+    if holders:
+        return f"port {manager_port} is used by the manager on {', '.join(sorted(set(holders)))}"
+    return (
+        f"port {manager_port} is held by an unrecorded process, likely a stale ssh session "
+        "from an older mlsweep; it frees within ~2h, or kill it on the worker host"
+    )
+
+
 async def _launch_tunnel(
     host: str,
     manager_port: int,
     ssh_key: str | None = None,
     password: str | None = None,
 ) -> "asyncio.subprocess.Process | None":
-    """Spawn ssh -N -R {port}:localhost:{port} so the worker can reach the manager's HTTP server."""
+    """Spawn ssh -R {port}:localhost:{port} so the worker can reach the manager's HTTP server."""
     key_args = ["-i", ssh_key] if ssh_key else []
     sshpass_args, sshpass_env = _sshpass_args(password)
     try:
         return await asyncio.create_subprocess_exec(
             *sshpass_args,
-            "ssh", "-N",
+            "ssh",
             "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
@@ -1791,8 +1899,11 @@ async def _launch_tunnel(
             "-R", f"{manager_port}:localhost:{manager_port}",
             *key_args,
             host,
+            _tunnel_remote_cmd(manager_port),
+            # Never written; the remote ``cat`` reads it until the connection ends.
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             env=sshpass_env,
             preexec_fn=_die_with_parent,
         )
@@ -1801,13 +1912,34 @@ async def _launch_tunnel(
         return None
 
 
+async def _tunnel_exit_reason(proc: "asyncio.subprocess.Process") -> str:
+    """Last line ssh wrote to stderr before exiting, or its exit code."""
+    err = b""
+    if proc.stderr is not None:
+        try:
+            err = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+    lines = [ln.strip() for ln in err.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else f"ssh exited with code {proc.returncode}"
+
+
 async def _tunnel_monitor_task(
     wc: WorkerConn,
     manager_port: int,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Keep the SSH reverse tunnel alive, restarting with backoff if it dies."""
+    """Keep the SSH reverse tunnel alive, restarting with backoff if it dies.
+
+    A tunnel only counts as established once ssh has stayed up past its
+    connect timeout.  ssh with ExitOnForwardFailure exits within seconds when
+    the remote port is taken, typically by a stale sshd session left over from
+    a manager that died without closing its connection.  Those are reaped via
+    the records written by ``_tunnel_remote_cmd`` before retrying.
+    """
     backoff = 2.0
+    healthy = False  # becomes True once a tunnel survives the settle window
+    failed = False   # a failure was reported, so announce the recovery
     while True:
         proc = wc.tunnel_proc
         if proc is None or shutdown_event.is_set():
@@ -1816,7 +1948,9 @@ async def _tunnel_monitor_task(
         wait_proc = asyncio.create_task(proc.wait())
         wait_shut = asyncio.create_task(shutdown_event.wait())
         done, pending = await asyncio.wait(
-            {wait_proc, wait_shut}, return_when=asyncio.FIRST_COMPLETED
+            {wait_proc, wait_shut},
+            timeout=None if healthy else _TUNNEL_SETTLE_SECS,
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for t in pending:
             t.cancel()
@@ -1826,17 +1960,30 @@ async def _tunnel_monitor_task(
                 proc.terminate()
             return
 
+        if not done:
+            # Survived the settle window: the forward is up.
+            healthy = True
+            backoff = 2.0
+            if failed:
+                print(f"  {_GREEN}OK{_RESET}    SSH tunnel to {wc.host} re-established")
+                failed = False
+            continue
+
+        reason = await _tunnel_exit_reason(proc)
+        if "remote port forwarding failed" in reason:
+            reason = await _reap_stale_tunnels(wc, manager_port)
+        verb = "lost" if healthy else "failed"
         print(
-            f"  {_YELLOW}WARN{_RESET}  SSH tunnel to {wc.host} lost; "
-            f"reconnecting in {backoff:.0f}s"
+            f"  {_YELLOW}WARN{_RESET}  SSH tunnel to {wc.host} {verb} ({reason}); "
+            f"retrying in {backoff:.0f}s"
         )
+        healthy = False
+        failed = True
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 30.0)
+        backoff = min(backoff * 2, 60.0)
 
         new_proc = await _launch_tunnel(
             wc.host, manager_port, ssh_key=wc.ssh_key, password=wc.password
         )
         if new_proc is not None:
             wc.tunnel_proc = new_proc
-            backoff = 2.0
-            print(f"  {_GREEN}OK{_RESET}    SSH tunnel to {wc.host} re-established")

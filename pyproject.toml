@@ -12,7 +12,7 @@ authors = [{ name = "Aaron Pazdera", email = "aarpazdera@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "tomli >= 2.0; python_version < '3.11'",
-    "aiohttp",
+    "aiohttp>=3.9",
     "aiosqlite >= 0.17",
     "optuna>=3.0",
 ]

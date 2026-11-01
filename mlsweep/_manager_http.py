@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import importlib
 import importlib.metadata
 import itertools
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -36,6 +39,16 @@ from typing import Any, Callable, Awaitable
 import aiosqlite
 from aiohttp import WSMsgType, web
 
+from mlsweep._export import (
+    ExportRun,
+    ExportScope,
+    WandbExport,
+    experiment_labels,
+    tfevents_for_run,
+    tfevents_name,
+    upload_wandb_run,
+    wandb_info,
+)
 from mlsweep._manager_db import (
     ACTIVE_JOB_STATUSES,
     FINISHED_JOB_STATUSES,
@@ -71,6 +84,15 @@ from mlsweep._shared import DEFAULT_CAMPAIGN, _resolve_safe_subpath, validate_ca
 logger = logging.getLogger(__name__)
 
 _VERSION = importlib.metadata.version("mlsweep")
+
+# aiohttp warns when application config uses plain strings; AppKey also gives
+# each lookup a type instead of Any.
+DB_KEY: web.AppKey[aiosqlite.Connection] = web.AppKey("mlsweep_db", aiosqlite.Connection)
+STATE_KEY: web.AppKey[ManagerState] = web.AppKey("mlsweep_state", ManagerState)
+TOKEN_KEY: web.AppKey[str] = web.AppKey("mlsweep_token", str)
+DIR_KEY: web.AppKey[Path] = web.AppKey("mlsweep_dir", Path)
+EXPORTS_KEY: web.AppKey[dict[str, WandbExport]] = web.AppKey("mlsweep_exports")
+EXPORT_TASKS_KEY: web.AppKey[set[asyncio.Task[Any]]] = web.AppKey("mlsweep_export_tasks")
 
 # ===============================================================================
 # JSON helpers
@@ -243,7 +265,7 @@ async def auth_middleware(
     if request.method == "OPTIONS":
         return await handler(request)
 
-    token: str = request.config_dict["mlsweep_token"]
+    token: str = request.config_dict[TOKEN_KEY]
     if not _check_auth(request, token):
         return _error_response("unauthorized — provide ?token= or Authorization: Bearer", status=401)
 
@@ -301,7 +323,7 @@ async def campaign_middleware(
         validate_campaign(campaign)
     except ValueError as exc:
         return _error_response(str(exc))
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     for experiment_id in sorted(await _named_experiments(request)):
         exp = await get_experiment(db, experiment_id)
         if exp is not None and exp.campaign != campaign:
@@ -342,7 +364,7 @@ async def handle_reachable(request: web.Request) -> web.Response:
 
     server_port = request.url.port
     target_url = f"http://{host}:{server_port}/api/health"
-    token: str = request.config_dict["mlsweep_token"]
+    token: str = request.config_dict[TOKEN_KEY]
 
     import aiohttp
 
@@ -366,7 +388,7 @@ async def handle_reachable(request: web.Request) -> web.Response:
 @routes.get("/api/campaigns")
 async def handle_list_campaigns(request: web.Request) -> web.Response:
     """List campaigns with experiment and job counts (always includes the default)."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     return _json_response(await list_campaigns(db))
 
 
@@ -377,7 +399,7 @@ async def handle_update_experiment_campaign(request: web.Request) -> web.Respons
     Body: ``{"campaign": NAME}``.  With ``?campaign=`` the experiment must
     currently be in that campaign (enforced by ``campaign_middleware``).
     """
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     try:
         body = await request.json()
@@ -403,7 +425,7 @@ async def handle_update_experiment_campaign(request: web.Request) -> web.Respons
 @routes.get("/api/experiments")
 async def handle_list_experiments(request: web.Request) -> web.Response:
     """List experiments with job counts, optionally filtered by status and campaign."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     status_filter = request.query.get("status")
     experiments = await list_experiments_with_counts(
         db, status=status_filter, campaign=request.query.get("campaign"),  # type: ignore[arg-type]
@@ -462,8 +484,8 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     the default campaign.  Re-creating an experiment that already exists in
     another campaign is refused with 409.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     try:
         body = await request.json()
     except Exception:
@@ -493,7 +515,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
 @routes.get("/api/experiments/{experiment_id}")
 async def handle_get_experiment(request: web.Request) -> web.Response:
     """Get a single experiment by ID."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.match_info["experiment_id"]
     exp = await get_experiment(db, experiment_id)
     if exp is None:
@@ -513,8 +535,8 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     DB).  ``aborted`` additionally cancels any of its jobs that are still
     in-flight.  Moving back to ``running`` resumes scheduling.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     try:
         body = await request.json()
@@ -546,7 +568,7 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
 @routes.put("/api/experiments/{experiment_id}/name")
 async def handle_update_experiment_name(request: web.Request) -> web.Response:
     """Update an experiment's display name."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     try:
         body = await request.json()
@@ -571,7 +593,7 @@ async def handle_update_experiment_max_concurrent(request: web.Request) -> web.R
     already-running jobs; it just stops new ones from starting until the running
     count drops below the cap.
     """
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     try:
         body = await request.json()
@@ -595,8 +617,8 @@ async def handle_delete_experiment(request: web.Request) -> web.Response:
     leave orphaned processes running for a deleted experiment), then the rows
     are removed.  Pending jobs simply vanish from the scheduler's DB query.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
 
     async with state.lock:
@@ -612,8 +634,8 @@ async def handle_delete_experiment(request: web.Request) -> web.Response:
 @routes.get("/api/experiments/{experiment_id}/summary")
 async def handle_experiment_summary(request: web.Request) -> web.Response:
     """Get a summary of an experiment (metadata + job counts)."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     summary = await experiment_summary(db, experiment_id)
     if summary["name"] is None:
@@ -643,8 +665,8 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
     log/metric progress) and ``stalled`` (whether that exceeds the manager's
     default threshold), merged from in-memory run state.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     status_filter = request.query.get("status")
     jobs = await list_jobs_by_experiment(db, experiment_id, status=status_filter)  # type: ignore[arg-type]
@@ -669,7 +691,7 @@ async def handle_download_experiment(request: web.Request) -> web.StreamResponse
     Returns 404 if the experiment is not found or its directory does not
     exist on disk.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.match_info["experiment_id"]
 
     # Verify experiment exists in DB
@@ -678,7 +700,7 @@ async def handle_download_experiment(request: web.Request) -> web.StreamResponse
         return _not_found("experiment")
 
     # Locate experiment directory on disk
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     exp_dir = mlsweep_dir / "experiments" / experiment_id
 
     if not exp_dir.is_dir():
@@ -736,7 +758,7 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
       - status: filter by status (default: 'pending')
       - limit: max number of results
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.query.get("experiment_id")
     campaign = request.query.get("campaign")
     status = request.query.get("status", "pending")
@@ -759,7 +781,7 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
 @routes.post("/api/jobs")
 async def handle_insert_job(request: web.Request) -> web.Response:
     """Insert a single job."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
 
     try:
         body = await _request_json(request)
@@ -803,7 +825,7 @@ async def handle_insert_job(request: web.Request) -> web.Response:
 @routes.post("/api/jobs/bulk")
 async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
     """Insert multiple jobs in a single transaction."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
 
     try:
         body = await _request_json(request)
@@ -834,8 +856,8 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
     Either the experiment row and every job land, or nothing does.  A duplicate
     run_id inside the experiment aborts the whole submission with 409.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     try:
         experiment_id = _sanitize_experiment_id(experiment_id)
@@ -874,7 +896,7 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
 @routes.get("/api/jobs/pending")
 async def handle_list_pending_jobs(request: web.Request) -> web.Response:
     """List pending jobs, optionally filtered by experiment and campaign."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.query.get("experiment_id")
     limit_str = request.query.get("limit")
     limit = int(limit_str) if limit_str else None
@@ -887,7 +909,7 @@ async def handle_list_pending_jobs(request: web.Request) -> web.Response:
 @routes.get("/api/jobs/{run_id}")
 async def handle_get_job(request: web.Request) -> web.Response:
     """Get a single job by run_id and experiment_id."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
     job = await get_job(db, run_id, experiment_id)
@@ -899,7 +921,7 @@ async def handle_get_job(request: web.Request) -> web.Response:
 @routes.put("/api/jobs/{run_id}/status")
 async def handle_update_job_status(request: web.Request) -> web.Response:
     """Update a job's status (and optionally other fields)."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
     try:
         body = await _request_json(request)
@@ -919,7 +941,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
     # Only result columns may be set alongside the status.
     kwargs = {k: v for k, v in body.items() if k in ("exit_code", "elapsed")}
 
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     async with state.lock:
         # A job in flight must be cancelled instead, so its worker stops it.
         job = await state.db_writer.update_job_status(
@@ -945,7 +967,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
 @routes.put("/api/jobs/{run_id}/priority")
 async def handle_update_job_priority(request: web.Request) -> web.Response:
     """Update a pending job's priority."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
     try:
         body = await _request_json(request)
@@ -979,7 +1001,7 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
 @routes.put("/api/jobs/{run_id}/label")
 async def handle_update_job_label(request: web.Request) -> web.Response:
     """Set or clear a job's human-readable label."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
     try:
         body = await _request_json(request)
@@ -1006,8 +1028,8 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
 @routes.post("/api/jobs/{run_id}/cancel")
 async def handle_cancel_job(request: web.Request) -> web.Response:
     """Cancel a job (pending or running) via the unified cancel path."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
 
@@ -1032,8 +1054,8 @@ async def handle_retry_job(request: web.Request) -> web.Response:
     can be retried.  Running or pending jobs return 409 Conflict.
     ``max_retries`` does not apply here.  It only caps automatic retries.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
 
@@ -1063,8 +1085,8 @@ async def handle_delete_job(request: web.Request) -> web.Response:
     on its worker (freeing its GPUs), the row is marked 'cancelled', and
     job_done is broadcast.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
@@ -1086,8 +1108,8 @@ async def handle_patch_job(request: web.Request) -> web.Response:
     Accepts JSON: {priority: int}.  Updates the DB and re-sorts the in-memory
     pending list if the job is pending.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
@@ -1130,7 +1152,7 @@ async def handle_patch_job(request: web.Request) -> web.Response:
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/metrics")
 async def handle_get_job_metrics(request: web.Request) -> web.Response:
     """Return all logged metrics for a job as JSONL (one row per step)."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
     rows = await get_metrics_for_run(db, run_id, experiment_id)
@@ -1143,7 +1165,7 @@ async def handle_get_job_metrics(request: web.Request) -> web.Response:
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/logs")
 async def handle_get_job_log(request: web.Request) -> web.Response:
     """Return training log for a job from the database."""
-    db = request.config_dict["mlsweep_db"]
+    db = request.config_dict[DB_KEY]
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
@@ -1164,7 +1186,7 @@ async def handle_list_job_artifacts(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
 
     if not artifacts_dir.is_dir():
@@ -1189,7 +1211,7 @@ async def handle_zip_job_artifacts(request: web.Request) -> web.StreamResponse:
     """Serve a zip of all artifact files for a single run."""
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
     if not artifacts_dir.is_dir():
         return _error_response("no artifacts", status=404)
@@ -1204,7 +1226,7 @@ async def handle_zip_job_artifacts(request: web.Request) -> web.StreamResponse:
 async def handle_zip_experiment_artifacts(request: web.Request) -> web.StreamResponse:
     """Serve a zip of all artifact files for every run in an experiment."""
     experiment_id = request.match_info["experiment_id"]
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     exp_dir = mlsweep_dir / "experiments" / experiment_id
     if not exp_dir.is_dir():
         return _error_response("no experiment artifacts", status=404)
@@ -1219,7 +1241,7 @@ async def handle_zip_experiment_artifacts(request: web.Request) -> web.StreamRes
 async def handle_zip_experiment_metrics(request: web.Request) -> web.StreamResponse:
     """Serve a zip of all metrics files (JSONL) for every run in an experiment."""
     experiment_id = request.match_info["experiment_id"]
-    db = request.config_dict["mlsweep_db"]
+    db = request.config_dict[DB_KEY]
 
     jobs = await list_jobs_by_experiment(db, experiment_id)
     if not jobs:
@@ -1240,7 +1262,7 @@ async def handle_zip_experiment_metrics(request: web.Request) -> web.StreamRespo
 async def handle_zip_experiment_logs(request: web.Request) -> web.StreamResponse:
     """Serve a zip of all log files for every run in an experiment."""
     experiment_id = request.match_info["experiment_id"]
-    db = request.config_dict["mlsweep_db"]
+    db = request.config_dict[DB_KEY]
 
     jobs = await list_jobs_by_experiment(db, experiment_id)
     if not jobs:
@@ -1263,7 +1285,7 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
     run_id = request.match_info["run_id"]
     artifact_path = request.match_info["path"]
 
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
 
     try:
         artifacts_root = mlsweep_dir / "experiments" / experiment_id / run_id / "artifacts"
@@ -1277,6 +1299,348 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
         return _not_found("artifact file")
 
     return web.FileResponse(file_path)
+
+
+# ── Export (TensorBoard / W&B) ─────────────────────────────────────────────────
+#
+# Each export covers a scope: one experiment (``/api/experiments/{id}/...`` or
+# ``?experiment_id=``), one campaign (``?campaign=``), or every experiment
+# (neither).  ``campaign_middleware`` already refuses an experiment id from
+# another campaign, so the scope needs no checks of its own.
+
+_MAX_FINISHED_EXPORTS = 20
+# How often an in-flight upload checks whether the export was cancelled.
+_EXPORT_CANCEL_POLL_SECS = 0.25
+
+
+class _NoMetrics(Exception):
+    """No run in the export scope stored any metrics."""
+
+
+def _path_part(s: str) -> str:
+    """*s* made safe to use as one path component inside a zip."""
+    return re.sub(r"[/\\\x00]", "_", s).lstrip(".") or "_"
+
+
+def _unique_path_parts(items: list[tuple[str, str]]) -> dict[str, str]:
+    """Sanitized, unique path components for ``(key, label)`` pairs.
+
+    Distinct labels can sanitize to the same component (``a/b`` and ``a_b``),
+    which would merge their folders and silently drop runs.  Colliding later
+    ones get a short hash of their key.  Sorted by key, so names are stable.
+    """
+    used: set[str] = set()
+    out: dict[str, str] = {}
+    for key, label in sorted(items):
+        base = _path_part(label)
+        candidate = base
+        if candidate in used:
+            suffix = hashlib.blake2b(key.encode(), digest_size=4).hexdigest()
+            candidate = f"{base}_{suffix}"
+            n = 2
+            while candidate in used:
+                candidate = f"{base}_{suffix}_{n}"
+                n += 1
+        used.add(candidate)
+        out[key] = candidate
+    return out
+
+
+def _job_combo(job: Any) -> dict[str, Any]:
+    try:
+        combo = json.loads(job.combo or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return combo if isinstance(combo, dict) else {}
+
+
+async def _export_scope(request: web.Request) -> ExportScope | web.Response:
+    """The request's scope, or a 404."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    experiment_id = request.match_info.get("experiment_id") or request.query.get("experiment_id")
+    campaign = request.query.get("campaign")
+    if experiment_id:
+        exp = await get_experiment(db, experiment_id)
+        if exp is None or (campaign is not None and exp.campaign != campaign):
+            return _not_found("experiment")
+        exps = [(exp.experiment_id, exp.name, exp.campaign)]
+        kind = "experiment"
+    else:
+        exps = [(e["experiment_id"], e["name"], e["campaign"])
+                for e in await list_experiments_with_counts(db, campaign=campaign)]
+        kind = "campaign" if campaign else "all"
+    labels = experiment_labels([(i, name or i) for i, name, _ in exps])
+    return ExportScope(kind=kind, campaign=campaign, experiment_id=experiment_id,
+                       experiments=labels, campaign_of={i: c for i, _, c in exps})
+
+
+async def _scope_jobs(request: web.Request, scope: ExportScope, only_done: bool) -> list[Any]:
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    jobs: list[Any] = []
+    for experiment_id in scope.experiments:
+        jobs += await list_jobs_by_experiment(db, experiment_id, "done" if only_done else None)
+    return jobs
+
+
+def _only_done(request: web.Request, body: Any = None) -> bool:
+    """``?only_done=1`` or ``"only_done": true`` in the JSON body keeps succeeded runs."""
+    return (request.query.get("only_done") in ("1", "true")
+            or bool(isinstance(body, dict) and body.get("only_done")))
+
+
+@routes.get("/api/experiments/{experiment_id}/tensorboard.zip")
+@routes.get("/api/export/tensorboard.zip")
+async def handle_export_tensorboard(request: web.Request) -> web.StreamResponse:
+    """Serve metrics as TensorBoard event files, one directory per run.
+
+    Runs sit under ``EXPERIMENT/RUN/``, with a ``CAMPAIGN/`` level on top when
+    the export spans campaigns.  Each run's combo goes to the HParams dashboard.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    scope = await _export_scope(request)
+    if isinstance(scope, web.Response):
+        return scope
+    jobs = await _scope_jobs(request, scope, _only_done(request))
+    if not jobs:
+        return _error_response("no jobs", status=404)
+    loop = asyncio.get_running_loop()
+    campaign_parts = (_unique_path_parts([(c, c) for c in scope.campaigns])
+                      if scope.kind == "all" else {})
+    experiment_parts = _unique_path_parts(list(scope.experiments.items()))
+    runs_by_experiment: dict[str, list[str]] = {}
+    for job in jobs:
+        runs_by_experiment.setdefault(job.experiment_id, []).append(job.run_id)
+    run_parts = {eid: _unique_path_parts([(r, r) for r in rids])
+                 for eid, rids in runs_by_experiment.items()}
+
+    def folder(job: Any) -> str:
+        parts = [experiment_parts[job.experiment_id], run_parts[job.experiment_id][job.run_id]]
+        if scope.kind == "all":
+            parts.insert(0, campaign_parts[scope.campaign_of[job.experiment_id]])
+        return "/".join(parts)
+
+    async def fill(tmp_path: str) -> None:
+        wrote = False
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for job in jobs:
+                rows = await get_metrics_for_run(db, job.run_id, job.experiment_id)
+                if not rows:
+                    continue
+                wrote = True
+                start = (job.start_time or job.submit_time).timestamp()
+                end = job.finish_time.timestamp() if job.finish_time else None
+                path = f"{folder(job)}/{tfevents_name(start)}"
+                # Encoding and deflating are CPU-bound, so both stay off the loop.
+                await loop.run_in_executor(None, lambda: zf.writestr(path, tfevents_for_run(
+                    rows, hparams=_job_combo(job), status=job.status,
+                    start_time=start, end_time=end,
+                )))
+        if not wrote:
+            raise _NoMetrics
+
+    name = {"experiment": (scope.experiment_id or "")[:16], "campaign": scope.campaign or ""}
+    try:
+        return await _serve_temp_zip(fill, f"{name.get(scope.kind, 'mlsweep')}-tensorboard.zip")
+    except _NoMetrics:
+        return _error_response("no metrics", status=404)
+
+
+@routes.get("/api/export/wandb")
+async def handle_wandb_info(request: web.Request) -> web.Response:
+    """Whether the manager can upload to W&B (wandb installed, key in env)."""
+    return _json_response(wandb_info())
+
+
+def _exports(request: web.Request) -> dict[str, WandbExport]:
+    return request.config_dict[EXPORTS_KEY]
+
+
+def _forget_old_exports(exports: dict[str, WandbExport]) -> None:
+    finished = [e for e in exports.values() if e.status != "running"]
+    finished.sort(key=lambda e: e.finished or 0.0)
+    for e in finished[:-_MAX_FINISHED_EXPORTS]:
+        del exports[e.export_id]
+
+
+async def _cleanup_abandoned(futures: list[asyncio.Future[Any]], path: str) -> None:
+    """Remove *path* after uploads that outlived a cancelled export finish."""
+    await asyncio.gather(*futures, return_exceptions=True)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _consume_future(fut: asyncio.Future[Any]) -> None:
+    """Mark an abandoned future's result as retrieved, so asyncio does not warn."""
+    if not fut.cancelled():
+        fut.exception()
+
+
+def _finish_pending(export: WandbExport) -> None:
+    """Give every run a terminal status, even if the export stopped early."""
+    for run in export.runs:
+        if run.status == "pending":
+            run.status = "skipped"
+            run.error = "cancelled" if export.cancel.is_set() else "not attempted"
+
+
+async def _run_wandb_export(
+    db: aiosqlite.Connection,
+    export: WandbExport,
+    jobs: list[Any],
+    api_key: str | None,
+    background: set[asyncio.Task[Any]],
+) -> None:
+    """Upload *jobs* one at a time, recording progress on *export*."""
+    loop = asyncio.get_running_loop()
+    work_dir = tempfile.mkdtemp(prefix="mlsweep_wandb_")
+    abandoned: list[asyncio.Future[Any]] = []
+    try:
+        wandb = await loop.run_in_executor(None, importlib.import_module, "wandb")
+        for job, run in zip(jobs, export.runs):
+            if export.cancel.is_set():
+                break
+            rows = await get_metrics_for_run(db, job.run_id, job.experiment_id)
+            if not rows:
+                run.status = "skipped"
+                run.error = "no metrics"
+                continue
+            run.status = "uploading"
+            summary = {"mlsweep/status": job.status, "mlsweep/elapsed": job.elapsed,
+                       "mlsweep/exit_code": job.exit_code, "mlsweep/label": job.label,
+                       "mlsweep/experiment_id": job.experiment_id}
+            fut = loop.run_in_executor(None, lambda: upload_wandb_run(
+                wandb, export=export, run_id=job.run_id, rows=rows,
+                config=_job_combo(job), summary=summary, group=run.experiment,
+                tags=[export.scope.campaign_of[job.experiment_id]], api_key=api_key,
+                work_dir=work_dir,
+            ))
+            try:
+                while True:
+                    done, _ = await asyncio.wait({fut}, timeout=_EXPORT_CANCEL_POLL_SECS)
+                    if done:
+                        run.url = fut.result()
+                        break
+                    if export.cancel.is_set():
+                        # wandb.init may be blocked on the network.  Stop
+                        # waiting; the thread sees the cancel flag when init
+                        # returns and finishes its run as failed.  Keep its
+                        # work dir until then.
+                        fut.add_done_callback(_consume_future)
+                        abandoned.append(fut)
+                        break
+                if export.cancel.is_set():
+                    run.status, run.error = "failed", "cancelled"
+                else:
+                    run.status = "done"
+            except Exception as exc:
+                logger.warning("W&B export of %s/%s failed: %s", job.experiment_id, job.run_id, exc)
+                run.status = "failed"
+                run.error = str(exc) or type(exc).__name__
+        if export.cancel.is_set():
+            export.status = "cancelled"
+        elif any(r.status == "failed" for r in export.runs):
+            export.status = "failed"
+            export.error = "some runs failed to upload"
+        else:
+            export.status = "done"
+    except Exception as exc:
+        logger.exception("W&B export %s failed", export.export_id)
+        export.status = "failed"
+        export.error = str(exc) or type(exc).__name__
+    finally:
+        _finish_pending(export)
+        export.finished = time.time()
+        if abandoned:
+            cleanup = asyncio.create_task(_cleanup_abandoned(abandoned, work_dir))
+            background.add(cleanup)
+            cleanup.add_done_callback(background.discard)
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@routes.post("/api/experiments/{experiment_id}/export/wandb")
+@routes.post("/api/export/wandb")
+async def handle_export_wandb(request: web.Request) -> web.Response:
+    """Start uploading the scope's runs to W&B from the manager.
+
+    Body: ``{project, entity?, api_key?, only_done?}``.  Without ``api_key``,
+    wandb uses ``WANDB_API_KEY`` or the login stored for the manager's user.
+    Each run's group is its experiment and its tag is its campaign.  Returns
+    202 with the export; poll ``/api/exports/{export_id}`` for progress.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    try:
+        body = await _request_json(request)
+    except Exception:
+        return _error_response("invalid JSON body")
+    if not isinstance(body, dict):
+        return _error_response("body must be a JSON object")
+    project = str(body.get("project") or "").strip()
+    if not project:
+        return _error_response("project is required")
+    entity = str(body.get("entity") or "").strip() or None
+    api_key = str(body.get("api_key") or "").strip() or None
+    scope = await _export_scope(request)
+    if isinstance(scope, web.Response):
+        return scope
+    if not wandb_info()["available"]:
+        return _error_response(
+            "wandb is not installed in the manager's environment "
+            "(pip install 'mlsweep[wandb]' there and restart the manager)",
+            status=501,
+        )
+    jobs = await _scope_jobs(request, scope, _only_done(request, body))
+    if not jobs:
+        return _error_response("no jobs to export", status=404)
+
+    exports = _exports(request)
+    for other in exports.values():
+        if other.status == "running" and other.scope.experiments.keys() & scope.experiments.keys():
+            return _error_response(
+                f"an export of {other.scope.label} is already running and overlaps this one",
+                status=409)
+    export = WandbExport(scope=scope, project=project, entity=entity, runs=[
+        ExportRun(j.experiment_id, j.run_id, scope.experiments[j.experiment_id]) for j in jobs])
+    _forget_old_exports(exports)
+    exports[export.export_id] = export
+    tasks = request.config_dict[EXPORT_TASKS_KEY]
+    task = asyncio.create_task(_run_wandb_export(db, export, jobs, api_key, tasks))
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return _json_response(export.to_dict(), status=202)
+
+
+@routes.get("/api/exports")
+async def handle_list_exports(request: web.Request) -> web.Response:
+    """Recent W&B exports, newest first.
+
+    ``?experiment_id=`` keeps the ones covering that experiment, and
+    ``?campaign=`` the ones whose experiments are all in that campaign.
+    """
+    experiment_id = request.query.get("experiment_id")
+    campaign = request.query.get("campaign")
+    out = [e.to_dict() for e in _exports(request).values()
+           if (experiment_id is None or experiment_id in e.scope.experiments)
+           and (campaign is None or e.scope.campaigns <= {campaign})]
+    out.sort(key=lambda d: d["started"], reverse=True)
+    return _json_response(out)
+
+
+@routes.get("/api/exports/{export_id}")
+async def handle_get_export(request: web.Request) -> web.Response:
+    export = _exports(request).get(request.match_info["export_id"])
+    if export is None:
+        return _not_found("export")
+    return _json_response(export.to_dict())
+
+
+@routes.post("/api/exports/{export_id}/cancel")
+async def handle_cancel_export(request: web.Request) -> web.Response:
+    """Stop an export.  The run being uploaded is finished early and marked failed in W&B."""
+    export = _exports(request).get(request.match_info["export_id"])
+    if export is None:
+        return _not_found("export")
+    export.cancel.set()
+    return _json_response(export.to_dict())
 
 
 # ── Workers ────────────────────────────────────────────────────────────────────
@@ -1325,8 +1689,8 @@ async def handle_list_workers(request: web.Request) -> web.Response:
     Returns DB records enriched with live GPU occupancy from connected
     workers.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     status_filter = request.query.get("status")
     workers = await list_workers(db, status=status_filter)  # type: ignore[arg-type]
     enriched = [_enrich_worker(wr, state) for wr in workers]
@@ -1336,8 +1700,8 @@ async def handle_list_workers(request: web.Request) -> web.Response:
 @routes.get("/api/workers/{worker_id}")
 async def handle_get_worker(request: web.Request) -> web.Response:
     """Get a single worker by ID, enriched with live GPU occupancy."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
     worker = await get_worker(db, worker_id)
     if worker is None:
@@ -1356,8 +1720,8 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     ``remote_dir`` is optional: the training code is shipped as an artifact and
     the worker falls back to its own working directory when it is empty.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
 
     try:
         body = await request.json()
@@ -1427,8 +1791,8 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     Marks the worker as dead in the DB, sends ``MsgShutdown`` if connected,
     and re-queues any jobs assigned to that worker.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
 
     worker = await get_worker(db, worker_id)
@@ -1449,7 +1813,7 @@ async def handle_patch_worker_concurrency(request: web.Request) -> web.Response:
     Accepts JSON: {"max_jobs_per_gpu": int}.  0 means unlimited.
     Takes effect immediately for the next scheduling pass.
     """
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
 
     try:
@@ -1479,8 +1843,8 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
     Accepts JSON: {"add": [int, ...], "remove": [int, ...]}.
     Removing a GPU evicts any jobs currently using it (they are re-queued).
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
 
     try:
@@ -1516,7 +1880,7 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
 @routes.get("/api/scheduler")
 async def handle_get_scheduler(request: web.Request) -> web.Response:
     """Return the scheduler settings: ``{"placement": "pack" | "spread"}``."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     return _json_response({"placement": state.placement})
 
 
@@ -1528,7 +1892,7 @@ async def handle_patch_scheduler(request: web.Request) -> web.Response:
     restarts.  Applies to jobs dispatched from the next scheduling pass on;
     running jobs stay where they are.
     """
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     try:
         body = await request.json()
     except Exception:
@@ -1549,7 +1913,7 @@ async def handle_patch_scheduler(request: web.Request) -> web.Response:
 @routes.get("/api/artifacts/{artifact_id}/meta")
 async def handle_get_artifact_meta(request: web.Request) -> web.Response:
     """Get artifact metadata by ID."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     artifact_id = request.match_info["artifact_id"]
     artifact = await get_artifact(db, artifact_id)
     if artifact is None:
@@ -1567,7 +1931,7 @@ async def handle_download_artifact(request: web.Request) -> web.StreamResponse:
     """
     artifact_id = request.match_info["artifact_id"]
 
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "artifacts"
     tarball = artifacts_dir / f"{artifact_id}.tar.gz"
 
@@ -1584,13 +1948,13 @@ async def handle_head_artifact(request: web.Request) -> web.StreamResponse:
     Returns 200 if the artifact is registered in the DB *and* its tarball
     file exists on disk; 404 otherwise.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     artifact_id = request.match_info["artifact_id"]
     artifact = await get_artifact(db, artifact_id)
     if artifact is None:
         return _not_found("artifact")
 
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "artifacts"
     tarball = artifacts_dir / f"{artifact_id}.tar.gz"
 
@@ -1603,7 +1967,7 @@ async def handle_head_artifact(request: web.Request) -> web.StreamResponse:
 @routes.post("/api/artifacts")
 async def handle_register_artifact(request: web.Request) -> web.Response:
     """Register or update an artifact."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     try:
         body = await request.json()
     except Exception:
@@ -1628,7 +1992,7 @@ async def handle_register_artifact(request: web.Request) -> web.Response:
 @routes.put("/api/artifacts/{artifact_id}/ref")
 async def handle_increment_artifact_ref(request: web.Request) -> web.Response:
     """Increment or decrement an artifact's reference count."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     artifact_id = request.match_info["artifact_id"]
     try:
         body = await request.json()
@@ -1650,7 +2014,7 @@ async def handle_upload_artifact_data(request: web.Request) -> web.Response:
     Accepts raw binary body.  Saves to
     ``<mlsweep_dir>/artifacts/<artifact_id>.tar.gz``.
     """
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
     artifact_id = request.match_info["artifact_id"]
 
     # Verify artifact exists in DB
@@ -1663,7 +2027,7 @@ async def handle_upload_artifact_data(request: web.Request) -> web.Response:
     body = await request.read()
 
     # Determine storage path
-    mlsweep_dir: Path = request.config_dict["mlsweep_dir"]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1705,8 +2069,8 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
         before the live stream begins.
     """
     experiment_id = request.match_info["experiment_id"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
 
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
@@ -1820,8 +2184,8 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
 @routes.get("/api/health")
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
-    db: aiosqlite.Connection = request.config_dict["mlsweep_db"]
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
     return _json_response({
         "status": "ok",
         "version": _VERSION,
@@ -1872,7 +2236,7 @@ def _broadcast_experiment_event(
     **kwargs: Any,
 ) -> None:
     """Broadcast an event to all WebSocket subscribers of *experiment_id*."""
-    state: ManagerState = request.config_dict["mlsweep_state"]
+    state: ManagerState = request.config_dict[STATE_KEY]
     event = {"type": event_type, "experiment_id": experiment_id, **kwargs}
     state.broadcast(experiment_id, event)
 
@@ -1909,10 +2273,12 @@ def create_app(
     )
 
     # Store shared objects in app config so handlers can access them
-    app["mlsweep_db"] = db
-    app["mlsweep_state"] = state
-    app["mlsweep_token"] = token
-    app["mlsweep_dir"] = Path(mlsweep_dir).expanduser().resolve()
+    app[DB_KEY] = db
+    app[STATE_KEY] = state
+    app[TOKEN_KEY] = token
+    app[DIR_KEY] = Path(mlsweep_dir).expanduser().resolve()
+    app[EXPORTS_KEY] = {}
+    app[EXPORT_TASKS_KEY] = set()
 
     # Register REST routes
     app.add_routes(routes)

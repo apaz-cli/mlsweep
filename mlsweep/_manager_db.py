@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sqlite3
 import dataclasses
 import itertools
@@ -814,10 +815,12 @@ def _job_counts(row: Any) -> dict[str, int]:
 
 
 async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
-    """Every campaign with its experiment and per-status job counts, by name.
+    """Every campaign with its experiment and per-status job counts.
 
-    A campaign exists while some experiment is in it.  The default campaign
-    is always listed so clients have somewhere to start.
+    Most recently modified first, meaning the newest experiment submit time.
+    Campaigns with no experiments go last, by name.  A campaign exists while
+    some experiment is in it.  The default campaign is always listed so
+    clients have somewhere to start.
     """
     rows = await _exec_all(
         db,
@@ -836,14 +839,19 @@ async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
         "campaign": DEFAULT_CAMPAIGN, "experiments": 0, "last_submit": None,
         "job_counts": _job_counts(None),
     }}
+    latest: dict[str, float] = {}
     for r in rows:
+        latest[r["campaign"]] = r["last_submit"]
         by_name[r["campaign"]] = {
             "campaign": r["campaign"],
             "experiments": r["experiments"],
             "job_counts": _job_counts(r),
             "last_submit": _utc(r["last_submit"]).isoformat(),
         }
-    return sorted(by_name.values(), key=lambda c: c["campaign"])
+    camps = sorted(by_name.values(), key=lambda c: c["campaign"])
+    # Stable, so ties and empty campaigns stay in name order.
+    camps.sort(key=lambda c: latest.get(c["campaign"], -math.inf), reverse=True)
+    return camps
 
 
 # ===============================================================================

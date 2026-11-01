@@ -235,7 +235,7 @@ mlsweep_manager --workers workers.toml
 
 ## Dashboard
 
-The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, and system status. Open it in a browser while your sweep runs. The Rename buttons on the Experiments and Logs pages set a run's display name, the same one `mlsweep rename` sets.
+The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, export, and system status. Open it in a browser while your sweep runs. The Rename buttons on the Experiments and Logs pages set a run's display name, the same one `mlsweep rename` sets.
 
 ## Useful CLI flags
 
@@ -300,6 +300,15 @@ pip install 'mlsweep[tensorboard]'
 mlsweep run sweeps/my_sweep.py --manager http://localhost:7891 --tensorboard-dir ./tb_logs
 tensorboard --logdir ./tb_logs
 ```
+
+### Exporting finished experiments
+
+The flags above stream metrics while `mlsweep run` is attached. To export afterwards, open the dashboard's Export page. Choose what to export with the toggle at the top. You can pick one experiment, one campaign, or everything on the manager. Each choice can be limited to runs that succeeded.
+
+- **TensorBoard:** downloads a zip with one event file per run, in a folder per experiment. An export of everything adds a folder per campaign above those. It needs no extra packages. Each run's sweep parameters appear in the HParams tab, so a sweep shows up as one table. Unzip it and run `tensorboard --logdir` on the folder.
+- **W&B:** the manager uploads each run itself. A run's sweep parameters become its config, its experiment becomes its group, and its campaign becomes a tag. This needs `pip install 'mlsweep[wandb]'` where the manager runs. The API key comes from the form, else from the manager's `WANDB_API_KEY` or its saved `wandb login`. Set `WANDB_MODE=offline` in the manager's environment to write runs locally instead of uploading (sync them later with `wandb sync`). The form's key is sent in the request body, so keep the dashboard on localhost or behind HTTPS when you enter one.
+
+Over HTTP, `GET /api/export/tensorboard.zip` and `POST /api/export/wandb` take the scope as a query parameter. Use `?experiment_id=EXP` for one experiment, `?campaign=NAME` for one campaign, and neither for everything. Add `only_done=1` for succeeded runs only. The W&B body is `{"project": ..., "entity": ..., "api_key": ...}`, with only `project` required. Track an upload's progress at `GET /api/exports/EXPORT_ID`.
 
 ## Troubleshooting
 

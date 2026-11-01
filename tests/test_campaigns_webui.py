@@ -96,7 +96,8 @@ def _every(mgr):
 
 
 def _campaign_options(mgr):
-    """The campaign select's expected values, All first and then every campaign by name."""
+    """The campaign select's expected values, All first and then every campaign
+    in the server's order (most recently modified first)."""
     return ["*"] + [c["campaign"] for c in ok(mgr, "GET", "/api/campaigns")]
 
 
@@ -177,7 +178,7 @@ def test_links_carry_the_campaign(page, seeded):
     _wait_rows(page, _ids(seeded, "a1", "a2"))
     hrefs = page.eval("""Object.fromEntries([...document.querySelectorAll('a.nav-link')]
         .filter(a => a.id).map(a => [a.id, a.getAttribute('href')]))""")
-    for nav in ("nav-results", "nav-logs", "nav-files", "nav-system"):
+    for nav in ("nav-results", "nav-logs", "nav-files", "nav-export", "nav-system"):
         assert "campaign=alpha" in hrefs[nav], hrefs
     _choose(page, "campaign-select", "beta")
     page.wait_for("document.getElementById('nav-logs').getAttribute('href').includes('campaign=beta')")

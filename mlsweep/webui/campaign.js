@@ -8,7 +8,7 @@ const MLCampaign = (function () {
   const ALL = "*";
   const DEFAULT = "default";
   const KEY = "mlsweep_campaign";
-  const PAGES = /(^|\/)(experiments|results|logs|files|system|index)\.html$/;
+  const PAGES = /(^|\/)(experiments|results|logs|files|export|system|index)\.html$/;
 
   function load() {
     try { return localStorage.getItem(KEY); } catch { return null; }
@@ -54,11 +54,19 @@ const MLCampaign = (function () {
   }
 
   // Campaign names to offer. These are the campaigns of *exps*, plus the default and the current one.
+  // Most recently modified first, meaning the newest experiment submit time;
+  // campaigns with no experiments go last, by name.
   function names(exps) {
-    const s = new Set(exps.map(campaignOf));
+    const latest = new Map();
+    for (const e of exps) {
+      const c = campaignOf(e), t = Date.parse(e.submit_time) || 0;
+      if (!latest.has(c) || t > latest.get(c)) latest.set(c, t);
+    }
+    const s = new Set(latest.keys());
     s.add(DEFAULT);
     if (current !== ALL) s.add(current);
-    return [...s].sort();
+    const at = c => latest.has(c) ? latest.get(c) : -1;
+    return [...s].sort((a, b) => at(b) - at(a) || a.localeCompare(b));
   }
 
   function filter(exps) {
@@ -76,9 +84,9 @@ const MLCampaign = (function () {
   }
 
   // Rebuilt only when the names or the selection change, so polling does not
-  // close an open dropdown.
-  function fill(select, exps) {
-    const opts = [[ALL, "All campaigns"], ...names(exps).map(n => [n, n])];
+  // close an open dropdown.  *includeAll* false leaves out "All campaigns".
+  function fill(select, exps, includeAll = true) {
+    const opts = [...(includeAll ? [[ALL, "All campaigns"]] : []), ...names(exps).map(n => [n, n])];
     const key = current + "\n" + opts.map(o => o[0]).join("\n");
     if (select.dataset.campaignKey === key) return;
     select.dataset.campaignKey = key;

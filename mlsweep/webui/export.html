@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="/static/favicon.ico">
+<title>mlsweep — Export</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
+  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+  --code-bg: #f0f0f0;
+}
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
+  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
+  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+  --code-bg: #1a1a1a;
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; }
+
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-label { font-size: 11px; color: var(--text-muted); }
+
+#content { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 18px; }
+h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
+h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* Experiment picker */
+.picker { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field-label { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+select, .text-input { padding: 5px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
+select { min-width: 200px; }
+select:focus, .text-input:focus { outline: none; border-color: var(--radio-checked-border); }
+.toggle { display: flex; align-self: flex-start; border: 1px solid var(--border-input); border-radius: 4px; overflow: hidden; }
+.toggle button { font-size: 12px; padding: 4px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.toggle button + button { border-left: 1px solid var(--border-input); }
+.toggle button:hover { background: var(--btn-hover); }
+.toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); font-weight: 600; }
+.toggle-lg button { font-size: 13px; padding: 6px 16px; }
+.scope-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+#scope-summary { font-size: 13px; color: var(--text-strong); border-left: 3px solid var(--radio-checked-border); padding: 4px 10px; background: var(--radio-checked-bg); border-radius: 0 4px 4px 0; }
+#scope-summary b { color: var(--radio-checked-color); }
+.raw-note { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+
+/* Cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 14px; align-items: start; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.card-note { font-size: 11px; color: var(--text-muted); }
+.card p { font-size: 12px; color: var(--text-label); line-height: 1.5; }
+code, .cmd { font-family: ui-monospace, Consolas, Monaco, monospace; font-size: 11px; }
+.cmd { display: block; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 7px 9px; color: var(--text-strong); white-space: pre-wrap; word-break: break-all; }
+.form-row { display: flex; flex-direction: column; gap: 4px; }
+.form-row label { font-size: 11px; font-weight: 600; color: var(--text-label); }
+.form-hint { font-size: 10px; color: var(--text-muted); }
+.optional { color: var(--text-muted); font-weight: 400; }
+.actions { display: flex; gap: 8px; align-items: center; }
+.btn-primary { font-size: 12px; padding: 5px 14px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; }
+.btn-primary:hover { opacity: 0.85; }
+.btn-primary.disabled, .btn-primary:disabled { opacity: 0.45; cursor: default; pointer-events: none; }
+.btn-small { text-decoration: none; font-size: 11px; padding: 2px 8px; border-radius: 3px; border: 1px solid var(--border-input); background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.btn-small:hover { background: var(--btn-hover); }
+.dl-list { display: flex; flex-direction: column; gap: 6px; }
+.dl-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.dl-row:last-child { border-bottom: none; }
+.dl-row span { color: var(--text-label); }
+.error { font-size: 11px; color: #d62728; background: #d6272811; border: 1px solid #d6272833; border-radius: 4px; padding: 6px 10px; white-space: pre-wrap; }
+.hidden { display: none !important; }
+
+/* W&B export progress */
+.export-list { display: flex; flex-direction: column; gap: 10px; }
+.export-item { border: 1px solid var(--border); border-radius: 5px; padding: 9px 11px; display: flex; flex-direction: column; gap: 6px; background: var(--bg); }
+.export-top { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.export-dest { font-size: 11px; color: var(--text-strong); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.export-dest code { color: var(--text-label); }
+.bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--radio-checked-border); transition: width 0.4s; }
+.export-runs { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow-y: auto; }
+.export-run { display: flex; gap: 8px; font-size: 11px; align-items: baseline; }
+.export-run .rid { font-family: monospace; color: var(--text-label); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.export-run a { color: var(--radio-checked-color); }
+.export-run .err { color: #d62728; }
+details summary { font-size: 11px; color: var(--text-dim); cursor: pointer; }
+
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+.badge-running   { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-done      { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
+.badge-failed    { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-cancelled { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
+.no-data { color: var(--text-muted); font-size: 12px; }
+</style>
+<script src="dialog.js"></script>
+<script src="campaign.js"></script>
+</head>
+<body>
+<nav>
+  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
+  <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
+  <a class="nav-link" id="nav-results" href="#">Results</a>
+  <a class="nav-link" id="nav-logs" href="#">Logs</a>
+  <a class="nav-link" id="nav-files" href="#">Artifacts</a>
+  <a class="nav-link active" id="nav-export" href="#">Export</a>
+  <a class="nav-link" id="nav-system" href="#">System</a>
+  <span class="nav-spacer"></span>
+  <span style="display:flex;align-items:center;gap:5px">
+    <span id="conn-dot"></span>
+    <span id="conn-label"></span>
+  </span>
+  <button id="theme-toggle" title="Toggle theme">☀</button>
+</nav>
+
+<div id="content">
+  <h2>Export</h2>
+  <div class="scope-panel">
+    <div class="field">
+      <span class="field-label">What to export</span>
+      <div class="toggle toggle-lg" id="scope-toggle">
+        <button data-scope="experiment">One experiment</button>
+        <button data-scope="campaign">One campaign</button>
+        <button data-scope="all">Everything</button>
+      </div>
+    </div>
+    <div class="picker">
+      <div class="field" id="campaign-field">
+        <span class="field-label">Campaign</span>
+        <select id="campaign-select"></select>
+      </div>
+      <div class="field" id="experiment-field">
+        <span class="field-label">Experiment</span>
+        <select id="exp-select"><option disabled selected>Loading…</option></select>
+      </div>
+      <div class="field">
+        <span class="field-label">Runs</span>
+        <div class="toggle" id="runs-toggle">
+          <button data-only-done="0" class="active">All</button>
+          <button data-only-done="1" title="Only runs that finished successfully">Succeeded only</button>
+        </div>
+      </div>
+    </div>
+    <div id="scope-summary">Loading…</div>
+  </div>
+
+  <div class="cards">
+    <!-- TensorBoard -->
+    <div class="card" id="tb-card">
+      <div class="card-head"><h3>TensorBoard</h3><span class="card-note">no extra packages needed</span></div>
+      <p>Downloads a zip with one event file per run, in a folder per experiment. Scalars go to the Scalars tab. Each run's sweep parameters go to the HParams tab, which shows the sweep as a table.</p>
+      <div class="actions">
+        <a class="btn-primary disabled" id="tb-download" href="#">Download event files</a>
+      </div>
+      <code class="cmd" id="tb-cmd"></code>
+    </div>
+
+    <!-- Weights & Biases -->
+    <div class="card" id="wandb-card">
+      <div class="card-head"><h3>Weights &amp; Biases</h3><span class="card-note" id="wandb-version"></span></div>
+      <p>The manager uploads each run to W&amp;B. A run's sweep parameters become its config, its experiment becomes its group, and its campaign becomes a tag.</p>
+      <div class="error hidden" id="wandb-missing">wandb is not installed where the manager runs. Install it there with <code>pip install 'mlsweep[wandb]'</code> and restart the manager.</div>
+      <div class="form-row">
+        <label for="wb-project">Project</label>
+        <input class="text-input" id="wb-project" type="text" placeholder="my-project" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="wb-entity">Entity <span class="optional">(optional)</span></label>
+        <input class="text-input" id="wb-entity" type="text" placeholder="team or username" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="wb-key">API key <span class="optional">(optional)</span></label>
+        <input class="text-input" id="wb-key" type="password" autocomplete="off">
+        <span class="form-hint" id="wb-key-hint">Leave blank to use the manager's <code>WANDB_API_KEY</code> or its saved <code>wandb login</code>. The key is not stored, but it is sent in the request; use HTTPS if the dashboard is remote.</span>
+      </div>
+      <div class="error hidden" id="wandb-error"></div>
+      <div class="actions">
+        <button class="btn-primary" id="wb-submit" disabled>Upload to W&amp;B</button>
+      </div>
+      <h3 id="export-list-title" class="hidden">Recent uploads</h3>
+      <div class="export-list" id="export-list"></div>
+    </div>
+
+    <!-- Raw data -->
+    <div class="card">
+      <div class="card-head"><h3>Raw data</h3><span class="card-note">per experiment</span></div>
+      <div class="dl-list" id="raw-list">
+        <div class="dl-row"><span>Metrics, one JSONL file per run</span><a class="btn-small" id="dl-metrics" href="#">metrics.zip</a></div>
+        <div class="dl-row"><span>Training logs</span><a class="btn-small" id="dl-logs" href="#">logs.zip</a></div>
+        <div class="dl-row"><span>Artifacts</span><a class="btn-small" id="dl-artifacts" href="#">artifacts.zip</a></div>
+        <div class="dl-row"><span>Everything on disk for the experiment</span><a class="btn-small" id="dl-all" href="#">.tar.gz</a></div>
+      </div>
+      <div class="raw-note hidden" id="raw-note">Raw downloads cover one experiment at a time. Choose <b>One experiment</b> above to get them.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Token & fetch helpers ─────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const TOKEN  = params.get("token") || localStorage.getItem("mlsweep_token") || "";
+if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
+if (params.get("token")) history.replaceState(null, "", location.pathname + location.hash);
+
+function apiFetch(path, opts = {}) {
+  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+}
+function pageHref(page) {
+  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
+}
+// *path* with query *extra*.  Download links can't send the Authorization
+// header, so with *withToken* the token rides in the query.
+function withQuery(path, extra = {}, withToken = false) {
+  const q = new URLSearchParams(extra);
+  if (withToken && TOKEN) q.set("token", TOKEN);
+  const s = q.toString();
+  return s ? `${path}?${s}` : path;
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function store(key, value) { try { localStorage.setItem(key, value); } catch {} }
+function recall(key) { try { return localStorage.getItem(key) || ""; } catch { return ""; } }
+function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
+
+document.getElementById("nav-experiments").href = pageHref("experiments.html");
+document.getElementById("nav-results").href     = pageHref("results.html");
+document.getElementById("nav-logs").href        = pageHref("logs.html");
+document.getElementById("nav-files").href       = pageHref("files.html");
+document.getElementById("nav-system").href      = pageHref("system.html");
+
+function setConnStatus(state) {
+  document.getElementById("conn-dot").className = state === "connected" ? "" : state;
+  document.getElementById("conn-label").textContent = state === "disconnected" ? "Disconnected" : "";
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+(function() {
+  const btn  = document.getElementById("theme-toggle");
+  const root = document.documentElement;
+  function applyTheme(dark) {
+    dark ? root.setAttribute("data-theme", "dark") : root.removeAttribute("data-theme");
+    btn.textContent = dark ? "☀" : "☾";
+  }
+  applyTheme(localStorage.getItem("theme") !== "light");
+  btn.addEventListener("click", () => {
+    const dark = root.getAttribute("data-theme") !== "dark";
+    localStorage.setItem("theme", dark ? "dark" : "light");
+    applyTheme(dark);
+  });
+})();
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const campaignSelect = document.getElementById("campaign-select");
+const expSelect      = document.getElementById("exp-select");
+const scopeSummary   = document.getElementById("scope-summary");
+const tbDownload     = document.getElementById("tb-download");
+const tbCmd          = document.getElementById("tb-cmd");
+const wbProject      = document.getElementById("wb-project");
+const wbEntity       = document.getElementById("wb-entity");
+const wbKey          = document.getElementById("wb-key");
+const wbSubmit       = document.getElementById("wb-submit");
+const wbError        = document.getElementById("wandb-error");
+const exportList     = document.getElementById("export-list");
+
+const SCOPES = ["experiment", "campaign", "all"];
+let scope = params.get("experiment") ? "experiment"
+          : SCOPES.includes(recall("mlsweep_export_scope")) ? recall("mlsweep_export_scope") : "experiment";
+let allExps = [];
+let currentExpId = null;
+let onlyDone = false;
+let wandbAvailable = false;
+let pollTimer = null;
+let firstLoad = true;
+
+wbProject.value = recall("mlsweep_wandb_project");
+wbEntity.value  = recall("mlsweep_wandb_entity");
+
+// ── Scope ─────────────────────────────────────────────────────────────────────
+// The experiments the current scope covers.
+function scopeExps() {
+  if (scope === "experiment") return allExps.filter(e => e.experiment_id === currentExpId);
+  if (scope === "campaign") return allExps.filter(e => MLCampaign.campaignOf(e) === MLCampaign.get());
+  return allExps;
+}
+
+// Query parameters that select the scope on the export endpoints.
+function scopeQuery() {
+  if (scope === "experiment") return { experiment_id: currentExpId };
+  if (scope === "campaign") return { campaign: MLCampaign.get() };
+  return {};
+}
+
+function scopeReady() {
+  return scope !== "experiment" || !!currentExpId;
+}
+
+function zipName() {
+  if (scope === "experiment") return `${(currentExpId || "experiment").slice(0, 16)}-tensorboard.zip`;
+  if (scope === "campaign") return `${MLCampaign.get()}-tensorboard.zip`;
+  return "mlsweep-tensorboard.zip";
+}
+
+// The campaign select lists real campaigns only in campaign scope; "All
+// campaigns" there would mean the Everything scope.
+function fillCampaigns() {
+  if (scope === "campaign" && MLCampaign.get() === MLCampaign.ALL) MLCampaign.set(MLCampaign.DEFAULT);
+  MLCampaign.fill(campaignSelect, allExps, scope !== "campaign");
+}
+
+function showScope(prefer) {
+  store("mlsweep_export_scope", scope);
+  document.querySelectorAll("#scope-toggle button").forEach(b => b.classList.toggle("active", b.dataset.scope === scope));
+  document.getElementById("campaign-field").classList.toggle("hidden", scope === "all");
+  document.getElementById("experiment-field").classList.toggle("hidden", scope !== "experiment");
+  fillCampaigns();
+  if (scope === "experiment") {
+    currentExpId = MLCampaign.fillExperiments(expSelect, MLCampaign.filter(allExps), prefer, currentExpId);
+  }
+  render();
+  pollExports();
+}
+
+function render() {
+  const exps = scopeExps();
+  const total = exps.reduce((n, e) => n + (onlyDone ? e.job_counts.done : e.job_counts.total), 0);
+  const runs = plural(total, onlyDone ? "succeeded run" : "run");
+  const nCampaigns = new Set(exps.map(MLCampaign.campaignOf)).size;
+  let where;
+  if (scope === "experiment") where = exps.length ? `experiment <b>${esc(exps[0].name || exps[0].experiment_id)}</b>` : null;
+  else if (scope === "campaign") where = `${plural(exps.length, "experiment")} in campaign <b>${esc(MLCampaign.get())}</b>`;
+  else where = `${plural(exps.length, "experiment")} across ${plural(nCampaigns, "campaign")}`;
+  scopeSummary.innerHTML = where ? `Exporting <b>${esc(runs)}</b> from ${where}.` : "No experiment selected.";
+
+  const ready = scopeReady() && total > 0;
+  const q = { ...scopeQuery(), ...(onlyDone ? { only_done: "1" } : {}) };
+  tbDownload.classList.toggle("disabled", !ready);
+  tbDownload.href = ready ? withQuery("/api/export/tensorboard.zip", q, true) : "#";
+  tbCmd.textContent = `unzip ${zipName()} -d tb_logs\ntensorboard --logdir tb_logs`;
+
+  wbSubmit.disabled = !ready || !wandbAvailable || !wbProject.value.trim();
+  wbSubmit.textContent = total ? `Upload ${runs} to W&B` : "Upload to W&B";
+
+  const single = scope === "experiment" && currentExpId;
+  const enc = single ? encodeURIComponent(currentExpId) : "";
+  for (const [elId, path] of [["dl-metrics", "metrics.zip"], ["dl-logs", "logs.zip"],
+                              ["dl-artifacts", "artifacts.zip"], ["dl-all", "download"]]) {
+    document.getElementById(elId).href = single ? withQuery(`/api/experiments/${enc}/${path}`, {}, true) : "#";
+  }
+  document.getElementById("raw-list").classList.toggle("hidden", !single);
+  document.getElementById("raw-note").classList.toggle("hidden", scope === "experiment");
+}
+
+async function loadExperiments() {
+  try {
+    const r = await apiFetch("/api/experiments");
+    if (!r.ok) { setConnStatus("disconnected"); return; }
+    allExps = await r.json();
+    setConnStatus("connected");
+    const urlExp = firstLoad ? params.get("experiment") : null;
+    firstLoad = false;
+    MLCampaign.follow(allExps, urlExp);
+    showScope(urlExp);
+  } catch {
+    setConnStatus("disconnected");
+  }
+}
+
+MLCampaign.bind(campaignSelect, () => showScope(null));
+expSelect.addEventListener("change", () => { currentExpId = expSelect.value; render(); });
+document.querySelectorAll("#scope-toggle button").forEach(b => {
+  b.addEventListener("click", () => { scope = b.dataset.scope; showScope(null); });
+});
+document.querySelectorAll("#runs-toggle button").forEach(b => {
+  b.addEventListener("click", () => {
+    onlyDone = b.dataset.onlyDone === "1";
+    document.querySelectorAll("#runs-toggle button").forEach(x => x.classList.toggle("active", x === b));
+    render();
+  });
+});
+// Job counts change as sweeps run.  Refresh them without rebuilding the
+// selects, which would close one the user has open.
+setInterval(async () => {
+  try {
+    const r = await apiFetch("/api/experiments");
+    if (r.ok) { allExps = await r.json(); render(); }
+  } catch {}
+}, 15000);
+
+// ── W&B ───────────────────────────────────────────────────────────────────────
+async function loadWandbInfo() {
+  try {
+    const r = await apiFetch("/api/export/wandb");
+    if (!r.ok) return;
+    const info = await r.json();
+    wandbAvailable = info.available;
+    document.getElementById("wandb-missing").classList.toggle("hidden", info.available);
+    document.getElementById("wandb-version").textContent =
+      info.available ? `wandb ${info.version || ""}`.trim() : "not installed";
+    if (info.env_key) {
+      document.getElementById("wb-key-hint").innerHTML =
+        "Leave blank to use the <code>WANDB_API_KEY</code> the manager was started with. " +
+        "The key is not stored, but it is sent in the request; use HTTPS if the dashboard is remote.";
+    }
+    for (const el of [wbProject, wbEntity, wbKey]) el.disabled = !info.available;
+    render();
+  } catch {}
+}
+
+wbProject.addEventListener("input", render);
+
+wbSubmit.addEventListener("click", async () => {
+  if (!scopeReady()) return;
+  const project = wbProject.value.trim();
+  const entity  = wbEntity.value.trim();
+  store("mlsweep_wandb_project", project);
+  store("mlsweep_wandb_entity", entity);
+  wbError.classList.add("hidden");
+  wbSubmit.disabled = true;
+  try {
+    const r = await apiFetch(withQuery("/api/export/wandb", scopeQuery()), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project, entity: entity || null, api_key: wbKey.value.trim() || null, only_done: onlyDone }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    wbKey.value = "";
+    pollExports();
+  } catch (e) {
+    wbError.textContent = e.message;
+    wbError.classList.remove("hidden");
+  } finally {
+    render();
+  }
+});
+
+function renderExports(exports) {
+  document.getElementById("export-list-title").classList.toggle("hidden", !exports.length);
+  exportList.innerHTML = exports.map(e => {
+    const dest = (e.entity ? e.entity + "/" : "") + e.project;
+    const pct = e.total ? Math.round(100 * e.done / e.total) : 0;
+    const many = e.scope !== "experiment";
+    const runs = e.runs.filter(r => r.status !== "pending").map(r => {
+      const detail = r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">open</a>`
+                   : r.error ? `<span class="err">${esc(r.error)}</span>`
+                   : `<span>${esc(r.status)}</span>`;
+      const name = many ? `${r.experiment} / ${r.run_id}` : r.run_id;
+      return `<div class="export-run"><span class="rid" title="${esc(name)}">${esc(name)}</span>${detail}</div>`;
+    }).join("");
+    return `<div class="export-item">
+      <div class="export-top">
+        <span class="badge badge-${esc(e.status)}">${esc(e.status)}</span>
+        <span class="export-dest" title="${esc(e.scope_label)} → ${esc(dest)}">${esc(e.scope_label)} → <code>${esc(dest)}</code></span>
+        <span class="card-note">${e.done}/${e.total}</span>
+        ${e.status === "running" ? `<button class="btn-small" data-cancel="${esc(e.export_id)}">Cancel</button>` : ""}
+      </div>
+      <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
+      ${e.error ? `<div class="error">${esc(e.error)}</div>` : ""}
+      ${runs ? `<details${e.status !== "done" ? " open" : ""}><summary>Runs</summary><div class="export-runs">${runs}</div></details>` : ""}
+    </div>`;
+  }).join("");
+}
+
+exportList.addEventListener("click", async ev => {
+  const id = ev.target.dataset && ev.target.dataset.cancel;
+  if (!id) return;
+  ev.target.disabled = true;
+  await apiFetch(`/api/exports/${encodeURIComponent(id)}/cancel`, { method: "POST" }).catch(() => {});
+  pollExports();
+});
+
+// Every recent upload is listed, whatever the scope.  Poll every 2s while
+// one is running; stop once all have finished.
+async function pollExports() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  try {
+    const r = await apiFetch("/api/exports");
+    if (!r.ok) return;
+    const exports = await r.json();
+    // Keep a <details> the user toggled open or shut across re-renders.
+    const open = [...exportList.querySelectorAll("details")].map(d => d.open);
+    renderExports(exports);
+    exportList.querySelectorAll("details").forEach((d, i) => { if (i < open.length) d.open = open[i]; });
+    if (exports.some(e => e.status === "running")) pollTimer = setTimeout(pollExports, 2000);
+  } catch {}
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadWandbInfo();
+loadExperiments();
+</script>
+</body>
+</html>

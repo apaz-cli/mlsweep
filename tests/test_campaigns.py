@@ -192,9 +192,9 @@ def test_db_list_campaigns_counts():
         await _job(db, "a1", "r2", "done")
         await _job(db, "a2", "r1", "failed")
         await _job(db, "b1", "r1", "done")
-        camps = await list_campaigns(db)
-        assert [c["campaign"] for c in camps] == ["alpha", "beta", "default"]
-        alpha, beta, default = camps
+        camps = {c["campaign"]: c for c in await list_campaigns(db)}
+        assert camps.keys() == {"alpha", "beta", "default"}
+        alpha, beta, default = camps["alpha"], camps["beta"], camps["default"]
         assert alpha["experiments"] == 2
         assert alpha["job_counts"] == {"total": 3, "done": 1, "failed": 1, "running": 0, "pending": 1,
                                       "xfailed": 0, "cancelled": 0, "dispatched": 0}
@@ -209,6 +209,17 @@ def test_db_list_campaigns_counts():
     _db_test(body)
 
 
+def test_db_list_campaigns_most_recent_first():
+    async def body(db):
+        for exp, camp, t in [("a1", "alpha", 100.0), ("b1", "beta", 200.0),
+                             ("a2", "alpha", 300.0), ("c1", "gamma", 200.0)]:
+            await create_experiment(db, experiment_id=exp, name=exp, campaign=camp)
+            await db.execute("UPDATE experiments SET submit_time = ? WHERE experiment_id = ?", (t, exp))
+        # Newest submit first, ties by name, the empty default last.
+        assert [c["campaign"] for c in await list_campaigns(db)] == ["alpha", "beta", "gamma", "default"]
+    _db_test(body)
+
+
 def test_db_list_campaigns_empty_db_lists_default_only():
     async def body(db):
         camps = await list_campaigns(db)
@@ -220,9 +231,9 @@ def test_db_list_campaigns_default_not_duplicated():
     async def body(db):
         await create_experiment(db, experiment_id="d1", name="d1")
         await create_experiment(db, experiment_id="z1", name="z1", campaign="zeta")
-        camps = await list_campaigns(db)
-        assert [c["campaign"] for c in camps] == ["default", "zeta"]
-        assert camps[0]["experiments"] == 1
+        camps = {c["campaign"]: c for c in await list_campaigns(db)}
+        assert sorted(camps) == ["default", "zeta"]
+        assert camps["default"]["experiments"] == 1
     _db_test(body)
 
 
@@ -332,6 +343,11 @@ _ROUTES = {
     "artifacts_zip": ("GET", "/api/experiments/{e}/artifacts.zip", None, 200),
     "metrics_zip": ("GET", "/api/experiments/{e}/metrics.zip", None, 200),
     "logs_zip": ("GET", "/api/experiments/{e}/logs.zip", None, 200),
+    "tensorboard_zip": ("GET", "/api/experiments/{e}/tensorboard.zip", None, 404),  # no metrics logged
+    "export_wandb": ("POST", "/api/experiments/{e}/export/wandb", {}, 400),  # no project: starts nothing
+    "list_exports": ("GET", "/api/exports?experiment_id={e}", None, 200),
+    "scoped_tensorboard_zip": ("GET", "/api/export/tensorboard.zip?experiment_id={e}", None, 404),  # no metrics logged
+    "scoped_export_wandb": ("POST", "/api/export/wandb?experiment_id={e}", {}, 400),
     "run_metrics": ("GET", "/api/experiments/{e}/jobs/r1/metrics", None, 404),  # none logged
     "run_logs": ("GET", "/api/experiments/{e}/jobs/r1/logs", None, 404),  # none logged
     "run_artifacts": ("GET", "/api/experiments/{e}/jobs/r1/artifacts", None, 200),
@@ -550,7 +566,7 @@ def test_list_campaigns_endpoint(mgr):
     _seed(mgr, cx)
     camps = _ok(mgr, "GET", "/api/campaigns")
     names = [c["campaign"] for c in camps]
-    assert names == sorted(names)
+    assert names[0] == cx  # just seeded, so the most recent
     assert "default" in names
     mine = next(c for c in camps if c["campaign"] == cx)
     assert mine["experiments"] == 2
