@@ -116,7 +116,7 @@ def test_metrics_websocket_broadcast(manager_with_worker, tmp_path):
     proc = subprocess.run(
         [*MLSWEEP_RUN, "tests/sweeps/integration_grid.py",
          "--output-dir", str(tmp_path),
-         "--experiment", "ws_metrics",
+         "--experiment", "ws_metrics", "--append",
          "--manager", url, "--token", token,
          "--fetch"],
         cwd=REPO_ROOT,

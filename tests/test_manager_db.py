@@ -18,6 +18,7 @@ from mlsweep._manager_db import (
     get_experiment,
     update_experiment_status,
     experiment_summary,
+    list_experiments_with_counts,
     insert_job,
     insert_jobs_bulk,
     get_job,
@@ -1009,6 +1010,26 @@ def test_increment_artifact_ref():
             art = await increment_artifact_ref(db, "sha256:abc", delta=-1)
             assert art.ref_count == 1
             assert await increment_artifact_ref(db, "sha256:nope") is None
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_experiment_counts_include_runs_with_artifacts():
+    """The experiments listing says how many runs have an artifact archive."""
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="exp1", name="t")
+            await register_artifact(db, artifact_id="sha256:abc")
+            await insert_job(db, run_id="r1", experiment_id="exp1", command=["echo"],
+                             status="done", artifact_id="sha256:abc")
+            await insert_job(db, run_id="r2", experiment_id="exp1", command=["echo"],
+                             status="done")
+            rows = await list_experiments_with_counts(db)
+            assert rows[0]["job_counts"]["with_artifacts"] == 1
+            assert rows[0]["job_counts"]["total"] == 2
         finally:
             await db.close()
 

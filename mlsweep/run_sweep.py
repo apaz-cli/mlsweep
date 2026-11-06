@@ -95,11 +95,16 @@ def _manager_token(args: argparse.Namespace) -> tuple[str, str]:
 
 def _add_manager_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared --manager / --token / --campaign / --all-campaigns flags."""
+    _add_connection_args(parser)
+    _add_campaign_args(parser)
+
+
+def _add_connection_args(parser: argparse.ArgumentParser) -> None:
+    """Add --manager and --token."""
     parser.add_argument("--manager", default=os.environ.get("MLSWEEP_MANAGER", DEFAULT_MANAGER_URL),
                         help=f"Manager URL (env: MLSWEEP_MANAGER, default: {DEFAULT_MANAGER_URL})")
     parser.add_argument("--token", default=None,
                         help="Manager auth token (or set MLSWEEP_TOKEN env)")
-    _add_campaign_args(parser)
 
 
 def _add_campaign_args(parser: argparse.ArgumentParser) -> None:
@@ -929,6 +934,17 @@ def _leaderboard_header(metric: str, goal: str, summary: str) -> None:
     sweep_print(rule)
 
 
+def _leaderboard_summary(rows: list[dict[str, Any]], ranked: int) -> str:
+    """``N completed runs, best step shown``, plus every run the ranking leaves out."""
+    counts = collections.Counter(r["status"] for r in rows if r["value"] is None)
+    missing = counts.pop("done", 0)
+    left_out = [f"{n} {status}" for status, n in sorted(counts.items())]
+    if missing:
+        left_out.append(f"{missing} without this metric")
+    summary = f"{_GREEN}{ranked}{_RESET} completed runs, best step shown"
+    return f"{summary}; not ranked: {_YELLOW}{', '.join(left_out)}{_RESET}" if left_out else summary
+
+
 def _leaderboard_row(i: int, r: dict[str, Any], prefix: str = "") -> None:
     """Print one ranked run; *prefix* goes just before the run name."""
     final = f"  final={r['final']:.6f}" if isinstance(r["final"], (int, float)) else ""
@@ -944,7 +960,7 @@ def print_leaderboard(
 ) -> None:
     """Print the ranked runs."""
     done = [r for r in rows if r["value"] is not None]
-    _leaderboard_header(metric, goal, f"{_GREEN}{len(done)}{_RESET} completed runs")
+    _leaderboard_header(metric, goal, _leaderboard_summary(rows, len(done)))
     if not done:
         sweep_print(f"  {_YELLOW}(no completed runs with a metric value){_RESET}")
         return
@@ -967,17 +983,29 @@ def _wait_until_settled(
     """
     print(f"Waiting for {experiment_id} to settle (Ctrl+C to stop)...", file=sys.stderr, flush=True)
     while True:
-        resp = manager_get_experiment_summary(manager, token, experiment_id, quiet=True,
-                                              campaign=campaign)
-        if resp:
+        status, resp = _http_request(
+            "GET", _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}/summary", campaign)),
+            token, quiet=True)
+        if status == 404:
+            print(f"Error: no experiment {experiment_id}. Check the ID with `mlsweep ls`.",
+                  file=sys.stderr, flush=True)
+            sys.exit(1)
+        if status == 200 and isinstance(resp, dict):
             counts = resp.get("job_counts") or {}
             active = sum(int(counts.get(s, 0)) for s in _ACTIVE_JOB_STATUSES)
+            # Runs added after a `stop`, or left by a stop from an older version, never start.
+            if active == int(counts.get("pending", 0)) and resp.get("status") == "aborted":
+                active = 0
             if active == 0:
                 failed = int(counts.get("failed", 0)) > 0
                 if failed:
                     print("  experiment settled with failures.", file=sys.stderr, flush=True)
                 else:
                     print("  experiment settled.", file=sys.stderr, flush=True)
+                if awaits_more_runs(manager, token, experiment_id, campaign):
+                    print(f"  warning: its Bayesian budget is not used up. If no submitter is attached, "
+                          f"continue with `mlsweep resume {experiment_id} --sweep FILE`.",
+                          file=sys.stderr, flush=True)
                 return failed
         time.sleep(interval)
 
@@ -1006,6 +1034,36 @@ def resolve_ranking(
             stored_goal = summary.get("goal")
             goal = stored_goal if stored_goal in ("minimize", "maximize") else "minimize"
     return metric, goal
+
+
+def _get_experiment(manager: str, token: str, experiment_id: str, campaign: str | None) -> dict[str, Any]:
+    status, resp = _http_request(
+        "GET", _manager_url(manager, _with_campaign(f"/api/experiments/{experiment_id}", campaign)),
+        token, quiet=True)
+    return resp if status == 200 and isinstance(resp, dict) else {}
+
+
+def experiment_status(manager: str, token: str, experiment_id: str, campaign: str | None = None) -> str | None:
+    """The experiment's status (running, paused, completed, aborted), or None if unknown."""
+    return _get_experiment(manager, token, experiment_id, campaign).get("status")
+
+
+def awaits_more_runs(manager: str, token: str, experiment_id: str, campaign: str | None = None) -> bool:
+    """True if a Bayesian sweep's budget is not used up, so no active runs doesn't mean finished."""
+    exp = _get_experiment(manager, token, experiment_id, campaign)
+    return exp.get("status") == "running" and bool(exp.get("expected_jobs"))
+
+
+def metric_keys(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    run_id: str,
+    campaign: str | None = None,
+) -> list[str]:
+    """The metric names *run_id* logged."""
+    rows = manager_get_job_metrics(manager, token, experiment_id, run_id, campaign=campaign) or []
+    return sorted({k for row in rows for k, v in row.items() if isinstance(v, (int, float)) and k != "step"})
 
 
 def manager_check_artifact(
@@ -1810,23 +1868,22 @@ def main() -> None:
             "  mlsweep_run fetch --manager URL --experiment EXP_ID   fetch results + summary\n"
             "  mlsweep_run watch EXP_ID --manager URL                live status\n\n"
             "Environment variables:\n"
-            "  MLSWEEP_MANAGER  Manager URL for fetch/watch (default: http://localhost:7891)\n"
+            "  MLSWEEP_MANAGER  Manager URL (default: http://localhost:7891)\n"
             "  MLSWEEP_TOKEN    Authentication token for manager\n"
             "  MLSWEEP_CAMPAIGN Campaign to submit under (default: default)\n"
             "  MLSWEEP_DIR      Local state dir holding manager.token (default: ~/.mlsweep)\n"
         ),
     )
     parser.add_argument("sweep_file", help="Path to sweep .py file")
-    parser.add_argument("--manager", default=None,
-                        help="Manager URL (http://host:port)")
-    parser.add_argument("--token", default=None,
-                        help="Manager auth token (or set MLSWEEP_TOKEN env)")
+    _add_connection_args(parser)
     _add_campaign_args(parser)
     parser.add_argument("--output-dir", default=str(_mlsweep_dir() / "submissions"),
                         help="Directory for local submit-side artifacts (submit log + manifest). "
                              "Results themselves live on the manager under ~/.mlsweep/experiments/.")
     parser.add_argument("--experiment", default=None,
                         help="Experiment name (default: <sweep>_<timestamp>)")
+    parser.add_argument("--append", action="store_true",
+                        help="Add this sweep's runs to the experiment named by --experiment, if it exists")
     parser.add_argument("--resume", default=None,
                         help="Resume an existing experiment (experiment_id)")
     parser.add_argument("--note", default=None,
@@ -2009,13 +2066,12 @@ def main() -> None:
         sweep_print(f"{_CYAN}{'=' * 80}{_RESET}")
         return
 
-    # ── Manager required ───────────────────────────────────────────────────
-    if not args.manager:
-        sweep_print(f"\n{_RED}Error: --manager URL is required.{_RESET}")
-        sweep_print(f"Usage: mlsweep_run <sweep.py> --manager http://host:port [--stream]")
-        sys.exit(1)
-
     manager, token = _manager_token(args)
+
+    if args.experiment and not resume and not args.append and _get_experiment(manager, token, args.experiment, campaign):
+        sweep_print(f"{_RED}Error: experiment {args.experiment} already exists.{_RESET} "
+                    "Pass --append to add these runs to it, or choose another name.")
+        sys.exit(1)
 
     sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
     sweep_print(f"{_BOLD}Connecting to manager:{_RESET} {_CYAN}{manager}{_RESET}")
@@ -2032,43 +2088,40 @@ def main() -> None:
         sweep_print(f"  Experiment: {summary['name']}")
         sweep_print(f"  Status:     {summary['status']}")
 
-        done_jobs = manager_list_experiment_jobs(manager, token, experiment_id, status_filter="done",  # type: ignore[assignment]
-                                                 campaign=campaign)
-        if done_jobs is None:
-            done_jobs = []
+        all_jobs = manager_list_experiment_jobs(manager, token, experiment_id, campaign=campaign) or []
+        done_jobs = [j for j in all_jobs if j.get("status") == "done"]
         sweep_print(f"  Completed jobs: {len(done_jobs)}")
 
         # Rebuild optimizer from completed jobs
         assert optimizer is not None
         metric_name = optimize_cfg["metric"]
         goal = optimize_cfg["goal"]
-        told_count = 0
+        finished: list[tuple[dict[str, Any], float | None]] = []
         for job in done_jobs:
             combo = _parse_combo(job["combo"])
             if combo is None:
                 continue
-            run_id = job["run_id"]
-            metrics_list = manager_get_job_metrics(manager, token, experiment_id, run_id,
+            metrics_list = manager_get_job_metrics(manager, token, experiment_id, job["run_id"],
                                                    campaign=campaign)
             if metrics_list is None:
                 continue
-            best = _best_metric(metrics_list, metric_name, goal)
-            if best is not None:
-                optimizer.tell(combo, best)
-                told_count += 1
-            else:
-                # No metric found — tell as failure so TPE can learn
-                optimizer.tell(combo, None)
-        sweep_print(f"  Replayed {told_count} metrics into optimizer")
+            # No metric found: told as a failure so TPE can learn.
+            finished.append((combo, _best_metric(metrics_list, metric_name, goal)))
+        active_combos = [c for c in (_parse_combo(j["combo"]) for j in all_jobs
+                                     if j.get("status") in _ACTIVE_JOB_STATUSES) if c is not None]
+        n_active = optimizer.restore(finished, active_combos, [j["run_id"] for j in all_jobs])
+        sweep_print(f"  Replayed {optimizer._told} metrics into optimizer ({n_active} still active)")
 
-        # Generate remaining suggestions
-        remaining = budget - optimizer._told
-        if remaining <= 0:
-            sweep_print(f"  {_GREEN}Budget exhausted — all {budget} jobs already done.{_RESET}")
+        # Generate remaining suggestions.  With --stream each result asks for the next one.
+        remaining = budget - optimizer._told - n_active
+        if optimizer.exhausted or (remaining <= 0 and not args.stream):
+            sweep_print(f"  {_GREEN}Nothing to submit: {optimizer._told} of {budget} told, "
+                        f"{n_active} still active.{_RESET}")
             if _log_file:
                 _log_file.close()
             return
-        variations = optimizer.suggest(n=remaining)
+        n_new = remaining if not args.stream else (0 if n_active else min(1, remaining))
+        variations = optimizer.suggest(n=n_new) if n_new > 0 else []
         sweep_print(f"  Submitting {len(variations)} new job(s) (budget {budget}, {optimizer._told} told)")
     elif method == "bayes":
         # Fresh Bayes: if streaming, submit first job only (iterative loop

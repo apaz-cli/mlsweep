@@ -35,6 +35,7 @@ import queue
 import shutil
 import signal
 import socket
+import hmac
 import subprocess
 import sys
 import tempfile
@@ -145,6 +146,8 @@ _IPC_DRAIN_TIMEOUT = 10.0
 _scratch_dir: str = DEFAULT_SCRATCH_DIR
 _remote_dir: str = ""
 _token: str = ""
+_MAX_HELLO_BYTES = 1 << 20
+_HELLO_TIMEOUT_SECS = 30.0
 _device_override: list[int] | None = None  # None = use all visible
 _device_probe: bool = True  # probe each visible GPU with a real CUDA context at hello
 _probed_ok: set[int] = set()  # GPUs that passed the probe once; not re-probed on reconnect
@@ -307,8 +310,14 @@ def _write_thread(conn: ConnState) -> None:
 
 def _read_thread(conn: ConnState) -> None:
     """Read protocol messages from a controller connection and dispatch them."""
-    # First message must be MsgHello
-    payload = read_msg(conn.sock)
+    # First message must be MsgHello.  Nothing has authenticated yet, so it gets
+    # a size cap and a deadline; a stalled or oversized sender is dropped.
+    try:
+        conn.sock.settimeout(_HELLO_TIMEOUT_SECS)
+    except OSError:
+        conn.send_queue.put(None)
+        return
+    payload = read_msg(conn.sock, limit=_MAX_HELLO_BYTES)
     if not payload:
         conn.send_queue.put(None)
         return
@@ -320,7 +329,12 @@ def _read_thread(conn: ConnState) -> None:
     if not isinstance(msg, MsgHello):
         conn.send_queue.put(None)
         return
-    if _token and msg.token != _token:
+    if _token and not hmac.compare_digest(str(msg.token).encode(), _token.encode()):
+        conn.send_queue.put(None)
+        return
+    try:
+        conn.sock.settimeout(None)
+    except OSError:
         conn.send_queue.put(None)
         return
 

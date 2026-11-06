@@ -4,39 +4,10 @@
 <meta charset="utf-8">
 <link rel="icon" href="/static/favicon.ico">
 <title>mlsweep — Experiments</title>
+<link rel="stylesheet" href="common.css">
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
-  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
-  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
-  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
-  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
-  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
-  --plot-bg: white; --plot-grid: #eee; --plot-text: #444;
-  --swatch-border: rgba(0,0,0,0.15);
-}
-[data-theme=dark] {
-  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
-  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
-  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
-  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
-  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
-  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa;
-  --swatch-border: rgba(255,255,255,0.15);
-}
-
-body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; }
-
-/* Nav */
-nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
-.nav-title { font-size: 13px; font-weight: 700; color: var(--text-strong); margin-right: 10px; }
-.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
-.nav-link:hover { background: var(--btn-hover); }
-.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
-.nav-spacer { flex: 1; }
-#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
-#theme-toggle:hover { color: var(--text); }
+body { display: flex; flex-direction: column; height: 100vh; }
 
 /* Content */
 #content { flex: 1; overflow-y: auto; padding: 18px 24px; }
@@ -48,16 +19,6 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .campaign-tag { font-size: 10px; color: var(--text-dim); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; margin-left: 8px; }
 
 /* Status badges */
-.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
-.badge-pending  { background: #44444466; color: var(--text-dim); }
-.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
-.badge-running  { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
-.badge-done     { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
-.badge-failed   { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
-.badge-xfailed  { background: #44444422; color: var(--text-dim); border: 1px solid #44444433; }
-.badge-cancelled { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
-[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
-[data-theme=dark] .badge-done    { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }
 
 /* Experiments table */
 .exp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -76,7 +37,25 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .btn-link { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; text-decoration: none; white-space: nowrap; }
 .btn-link:hover { background: var(--btn-hover); }
 .btn-delete { color: #c0392b; border-color: #c0392b44; }
+.runs-tools td { padding: 6px 10px 6px 28px !important; background: var(--bg) !important; border-bottom: 1px solid var(--border); }
 .btn-delete:hover { background: #c0392b18; }
+
+/* Two controls per row: View ▾ for the pages, Manage for the verbs.  The menu is
+   fixed-positioned, so it can overhang the table however narrow the window is. */
+.btn-menu, .btn-manage { padding: 2px 7px; }
+.row-menu { position: fixed; z-index: 50; min-width: 170px; padding: 4px; background: var(--surface); border: 1px solid var(--border-input); border-radius: 5px; box-shadow: 0 6px 20px rgba(0,0,0,.28); display: flex; flex-direction: column; }
+.row-menu-item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; font: inherit; font-size: 12px; padding: 5px 9px; border: 0; border-radius: 3px; background: none; color: var(--text); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.row-menu-item:hover { background: var(--btn-hover); }
+.row-menu-item.danger { color: #d62728; }
+.row-menu-item.disabled { color: var(--text-muted); cursor: default; }
+.row-menu-item.disabled:hover { background: none; }
+.mi-icon { display: flex; flex-shrink: 0; color: var(--text-dim); }
+.mi-icon svg { width: 12px; height: 12px; display: block; }
+.row-menu-item:hover .mi-icon { color: inherit; }
+.mi-label { flex: 1; }
+.mi-count { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.row-menu-item:hover .mi-count { color: var(--text-label); }
+.row-menu hr { border: 0; border-top: 1px solid var(--border); margin: 4px 2px; }
 
 /* Runs: rows of the experiments table, right after their experiment's row,
    so they share its columns.  Worker, Elapsed and Combo span the count columns. */
@@ -110,32 +89,14 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 #error-msg { color: #d62728; font-size: 12px; margin-bottom: 10px; }
 
 /* Connection indicator */
-#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
-[data-theme=dark] #conn-dot { background: #5cd65c; }
-#conn-dot.disconnected { background: #d62728 !important; }
-#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
-@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
-#conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
+<script src="chrome.js"></script>
 <script src="dialog.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
-<nav>
-  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
-  <a class="nav-link active" id="nav-experiments" href="#">Experiments</a>
-  <a class="nav-link" id="nav-results" href="#">Results</a>
-  <a class="nav-link" id="nav-logs" href="#">Logs</a>
-  <a class="nav-link" id="nav-files" href="#">Artifacts</a>
-  <a class="nav-link" id="nav-export" href="#">Export</a>
-  <a class="nav-link" id="nav-system" href="#">System</a>
-  <span class="nav-spacer"></span>
-  <span style="display:flex;align-items:center;gap:5px">
-    <span id="conn-dot"></span>
-    <span id="conn-label"></span>
-  </span>
-  <button id="theme-toggle" title="Toggle theme">☀</button>
-</nav>
+<nav data-page="experiments"></nav>
+<script src="nav.js"></script>
 <div id="content">
   <div id="exp-header">
     <h2>Experiments</h2>
@@ -146,7 +107,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
   <table class="exp-table" id="exp-table">
     <thead>
       <tr>
-        <th style="width:28%">Name</th>
+        <th style="width:38%">Name</th>
         <th style="width:8%">Status</th>
         <th style="width:6%;text-align:right">Done</th>
         <th style="width:6%;text-align:right">Failed</th>
@@ -154,472 +115,13 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
         <th style="width:6%;text-align:right">Running</th>
         <th style="width:6%;text-align:right">Finished</th>
         <th style="width:12%">Submitted</th>
-        <th style="width:22%">Actions</th>
+        <th style="width:12%">Actions</th>
       </tr>
     </thead>
     <tbody id="exp-tbody"></tbody>
   </table>
 </div>
 
-<script>
-// ── Connection indicator ──────────────────────────────────────────────────────
-function setConnStatus(state) {
-  const dot = document.getElementById("conn-dot");
-  const lbl = document.getElementById("conn-label");
-  if (!dot) return;
-  dot.className = (state === "connected") ? "" : state;
-  lbl.textContent = state === "disconnected" ? "Disconnected"
-                  : state === "reconnecting" ? "Reconnecting…"
-                  : "";
-}
-
-// ── Token handling ────────────────────────────────────────────────────────────
-const params = new URLSearchParams(location.search);
-const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
-if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
-if (params.get("token")) history.replaceState(null, "", location.pathname + location.hash);
-
-function apiFetch(path, opts = {}) {
-  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
-}
-function pageHref(page) {
-  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
-}
-
-// ── Nav links ─────────────────────────────────────────────────────────────────
-document.getElementById("nav-results").href = pageHref("results.html");
-document.getElementById("nav-files").href   = pageHref("files.html");
-document.getElementById("nav-logs").href    = pageHref("logs.html");
-document.getElementById("nav-export").href = pageHref("export.html");
-document.getElementById("nav-system").href  = pageHref("system.html");
-
-// ── Theme ─────────────────────────────────────────────────────────────────────
-(function() {
-  const btn  = document.getElementById("theme-toggle");
-  const root = document.documentElement;
-  function applyTheme(dark) {
-    dark ? root.setAttribute("data-theme","dark") : root.removeAttribute("data-theme");
-    btn.textContent = dark ? "☀" : "☾";
-  }
-  applyTheme(localStorage.getItem("theme") !== "light");
-  btn.addEventListener("click", () => {
-    const dark = root.getAttribute("data-theme") !== "dark";
-    localStorage.setItem("theme", dark ? "dark" : "light");
-    applyTheme(dark);
-  });
-})();
-
-// ── State ─────────────────────────────────────────────────────────────────────
-const expandedExps = new Set();
-const expandedJobs = new Set();  // "expId/runId"
-const jobsCache = {};  // experiment_id → [jobs]
-let experiments = [];     // experiments in the selected campaign
-let allExperiments = [];  // every experiment, for the campaign list
-
-// ── Status badge ──────────────────────────────────────────────────────────────
-function badge(status) {
-  return `<span class="badge badge-${status}">${status}</span>`;
-}
-
-// ── Relative time ─────────────────────────────────────────────────────────────
-function relTime(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso), now = Date.now(), diff = now - d.getTime();
-  if (diff < 60e3) return "just now";
-  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
-  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
-  return Math.floor(diff / 86400e3) + "d ago";
-}
-
-function fmtElapsed(s) {
-  if (s == null) return "—";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
-  if (h > 0) return `${h}h${m}m`;
-  if (m > 0) return `${m}m${sec}s`;
-  return `${sec}s`;
-}
-
-
-async function deleteExperiment(expId) {
-  if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
-  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
-  if (r.ok) {
-    document.getElementById(`exp-row-${expId}`)?.remove();
-    runRowsOf(expId).forEach(r => r.remove());
-    experiments = experiments.filter(e => e.experiment_id !== expId);
-    allExperiments = allExperiments.filter(e => e.experiment_id !== expId);
-  } else {
-    await mlAlert(`Delete failed: ${r.status}`);
-  }
-}
-
-async function moveExperiment(expId) {
-  const exp = allExperiments.find(e => e.experiment_id === expId);
-  const current = MLCampaign.campaignOf(exp);
-  const target = await mlPrompt(`Move "${exp?.name || expId}" to campaign:`, current, { okLabel: "Move" });
-  if (target === null || target.trim() === current) return;
-  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/campaign`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ campaign: target.trim() }),
-  });
-  if (r.ok) {
-    await fetchExperiments();
-  } else {
-    const body = await r.json().catch(() => ({}));
-    await mlAlert(`Move failed: ${body.error || r.status}`);
-  }
-}
-
-async function renameExperiment(expId) {
-  const exp = experiments.find(e => e.experiment_id === expId);
-  const current = exp?.name || expId;
-  const newName = await mlPrompt("Rename experiment:", current, { okLabel: "Rename" });
-  if (newName === null || newName === current) return;
-  if (!newName) { await mlAlert("Name cannot be empty."); return; }
-  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/name`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: newName }),
-  });
-  if (r.ok) {
-    if (exp) exp.name = newName;
-    renderExperiments(experiments);
-  } else {
-    await mlAlert(`Rename failed: ${r.status}`);
-  }
-}
-
-async function renameJob(expId, runId) {
-  const job = (jobsCache[expId] || []).find(j => j.run_id === runId);
-  const label = await mlRenameRun(apiFetch, expId, runId, job?.label);
-  if (label === undefined) return;
-  if (job) job.label = label;
-  renderRuns(expId);
-  // Then redraw from the manager, which also brings in anything else that changed.
-  await refreshAll();
-}
-
-// ── Job detail panel ──────────────────────────────────────────────────────────
-function fmtTime(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
-       + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
-function renderJobDetail(j) {
-  const cmd = (() => { try { return JSON.parse(j.command || "[]").join(" "); } catch { return j.command || ""; } })();
-  const gpuIds = (() => { try { return JSON.parse(j.dispatched_gpu_ids || "null"); } catch { return null; } })();
-  const retryStr = j.retry_count > 0 ? `${j.retry_count} / ${j.max_retries}` : `0 / ${j.max_retries}`;
-  const exitStr  = j.exit_code != null ? String(j.exit_code) : "—";
-  const resources = [
-    j.gpus_per_run > 1  ? `${j.gpus_per_run} GPUs/run` : "1 GPU/run",
-    j.nodes_per_run > 1 ? `${j.nodes_per_run} nodes` : null,
-    gpuIds              ? `GPU IDs: ${gpuIds.join(",")}` : null,
-  ].filter(Boolean).join(" · ");
-
-  return `<div class="job-detail-panel">
-    <div class="job-detail-section">
-      <div class="job-detail-item"><span class="job-detail-label">Submitted</span><span class="job-detail-value">${fmtTime(j.submit_time)}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Dispatched</span><span class="job-detail-value">${fmtTime(j.dispatch_time)}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Started</span><span class="job-detail-value">${fmtTime(j.start_time)}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Finished</span><span class="job-detail-value">${fmtTime(j.finish_time)}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Exit code</span><span class="job-detail-value ${j.exit_code ? 'muted' : ''}">${exitStr}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Retries</span><span class="job-detail-value ${j.retry_count === 0 ? 'muted' : ''}">${retryStr}</span></div>
-      <div class="job-detail-item"><span class="job-detail-label">Priority</span><span class="job-detail-value">${j.priority}</span></div>
-      ${resources ? `<div class="job-detail-item"><span class="job-detail-label">Resources</span><span class="job-detail-value">${resources}</span></div>` : ""}
-    </div>
-    ${cmd ? `<div><div class="job-detail-label" style="margin-bottom:3px">Command</div><div class="job-cmd-block">${cmd.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</div></div>` : ""}
-  </div>`;
-}
-
-function toggleJobDetail(expId, runId) {
-  const key = `${expId}/${runId}`;
-  const detailRow = document.getElementById(`job-detail-${expId}-${runId}`);
-  const toggleEl  = document.getElementById(`job-toggle-${expId}-${runId}`);
-  if (!detailRow) return;
-  const isOpen = expandedJobs.has(key);
-  if (isOpen) {
-    expandedJobs.delete(key);
-    detailRow.style.display = "none";
-    if (toggleEl) toggleEl.textContent = "▶";
-  } else {
-    expandedJobs.add(key);
-    detailRow.style.display = "";
-    if (toggleEl) toggleEl.textContent = "▼";
-    // Populate if empty (in case job was added after initial render)
-    const jobs = jobsCache[expId] || [];
-    const j = jobs.find(x => x.run_id === runId);
-    if (j) detailRow.querySelector("td").innerHTML = renderJobDetail(j);
-  }
-}
-
-// ── Render runs ───────────────────────────────────────────────────────────────
-// An experiment's runs are rows of the experiments table, tagged with
-// data-runs-of so they can be replaced together.
-function runsHtml(expId) {
-  const jobs = jobsCache[expId] || [];
-  const rows = jobs.map(j => {
-    const comboObj = j.combo ? (typeof j.combo === "string" ? (() => { try { return JSON.parse(j.combo); } catch { return {}; } })() : j.combo) : {};
-    const comboStr = escHtml(Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" "));
-    const filesHref = `files.html?${TOKEN?"token="+encodeURIComponent(TOKEN)+"&":""}experiment=${encodeURIComponent(expId)}&run=${encodeURIComponent(j.run_id)}`;
-    const key = `${expId}/${j.run_id}`;
-    const isOpen = expandedJobs.has(key);
-    const safeExpId = JSON.stringify(expId).replace(/"/g, '&quot;');
-    const safeRunId = JSON.stringify(j.run_id).replace(/"/g, '&quot;');
-    return `<tr class="run-row" style="cursor:pointer" onclick="toggleJobDetail(${safeExpId}, ${safeRunId})">
-      <td class="mono"><span class="job-toggle" id="job-toggle-${expId}-${j.run_id}">${isOpen ? "▼" : "▶"}</span>${runNameHtml(j)}</td>
-      <td>${badge(j.status)}</td>
-      <td colspan="2">${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
-      <td>${fmtElapsed(j.elapsed)}</td>
-      <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
-      <td class="actions-cell" onclick="event.stopPropagation()"><div class="actions">
-        <a class="btn-link" href="${filesHref}">Artifacts</a>
-        <button class="btn-link" onclick="event.stopPropagation();renameJob(${safeExpId},${safeRunId})">Rename</button>
-      </div></td>
-    </tr>
-    <tr id="job-detail-${expId}-${j.run_id}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
-      <td colspan="9">${isOpen ? renderJobDetail(j) : ""}</td>
-    </tr>`;
-  }).join("");
-  const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
-      <td>Elapsed</td><td colspan="3">Combo</td><td></td></tr>`;
-  return rows ? head + rows : `<tr class="runs-empty"><td colspan="9">No jobs</td></tr>`;
-}
-
-function runRowsOf(expId) {
-  return [...document.querySelectorAll(`#exp-tbody tr[data-runs-of="${CSS.escape(expId)}"]`)];
-}
-
-// Replace an experiment's run rows: drawn under its row when it is expanded,
-// removed when it is not.
-function renderRuns(expId) {
-  runRowsOf(expId).forEach(r => r.remove());
-  const expRow = document.getElementById(`exp-row-${expId}`);
-  if (!expRow || !expandedExps.has(expId) || !jobsCache[expId]) return;
-  const tmp = document.createElement("tbody");
-  tmp.innerHTML = runsHtml(expId);
-  const rows = [...tmp.rows];
-  rows.forEach(r => { r.dataset.runsOf = expId; });
-  expRow.after(...rows);
-}
-
-// ── Toggle expand ──────────────────────────────────────────────────────────────
-async function toggleExpand(expId) {
-  const expRow  = document.getElementById(`exp-row-${expId}`);
-  const toggle  = expRow ? expRow.querySelector(".exp-toggle") : null;
-
-  if (expandedExps.has(expId)) {
-    expandedExps.delete(expId);
-    renderRuns(expId);
-    if (toggle) toggle.textContent = "▶";
-    expRow && expRow.classList.remove("expanded");
-    return;
-  }
-
-  expandedExps.add(expId);
-  if (toggle) toggle.textContent = "▼";
-  expRow && expRow.classList.add("expanded");
-
-  if (!jobsCache[expId]) {
-    try {
-      const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
-    } catch {
-      jobsCache[expId] = [];
-    }
-  }
-
-  renderRuns(expId);
-}
-
-// ── Refresh jobs for expanded experiments ─────────────────────────────────────
-async function refreshExpandedJobs() {
-  for (const expId of expandedExps) {
-    try {
-      const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
-      renderRuns(expId);
-    } catch {}
-  }
-}
-
-// ── Empty state: run instructions ────────────────────────────────────────────
-let publicUrl = null;  // set when the manager is reachable from its public IP
-
-function cmdBlock(url) {
-  const lines = [
-    `mlsweep_run`,
-    `     --manager ${url}`,
-  ];
-  if (TOKEN) lines.push(`     --token ${TOKEN}`);
-  const c = MLCampaign.get();
-  if (c !== MLCampaign.ALL && c !== MLCampaign.DEFAULT) lines.push(`     --campaign ${c}`);
-  lines.push(`    sweep.py`);
-  const maxLen = Math.max(...lines.map(l => l.length));
-  return `<code class="run-cmd">${lines.map((l, i) =>
-    i < lines.length - 1 ? l + " ".repeat(maxLen - l.length + 1) + "\\" : l
-  ).join("\n")}</code>`;
-}
-
-function emptyHtml() {
-  const c = MLCampaign.get();
-  const lead = allExperiments.length && c !== MLCampaign.ALL
-    ? `No experiments in campaign <b>${c}</b>. Submit one with:`
-    : `No experiments yet. Submit one with:`;
-  let html = `${lead}<br>${cmdBlock(window.location.origin)}`;
-  if (publicUrl) html += `<div class="run-label">From a remote machine:</div>${cmdBlock(publicUrl)}`;
-  return html;
-}
-
-(async function findPublicUrl() {
-  try {
-    const r = await fetch("https://api.ipify.org?format=json");
-    if (r.ok) {
-      const { ip } = await r.json();
-      if (ip && ip !== window.location.hostname) {
-        const url = `${window.location.protocol}//${ip}:${window.location.port}`;
-        const check = await apiFetch(`/api/reachable?host=${encodeURIComponent(ip)}`);
-        if (check.ok) {
-          const { reachable } = await check.json();
-          if (reachable) publicUrl = url;
-        }
-      }
-    }
-  } catch (_) {}
-  document.getElementById("empty-msg").innerHTML = emptyHtml();
-})();
-
-// ── Render experiments table ──────────────────────────────────────────────────
-function renderExperiments(exps) {
-  const tbody = document.getElementById("exp-tbody");
-  const emptyMsg = document.getElementById("empty-msg");
-  const table = document.getElementById("exp-table");
-
-  if (exps.length === 0) {
-    tbody.innerHTML = "";
-    table.style.display = "none";
-    emptyMsg.innerHTML = emptyHtml();
-    emptyMsg.style.display = "";
-    return;
-  }
-  table.style.display = "";
-  emptyMsg.style.display = "none";
-
-  // Keep track of which rows already exist to avoid full re-render.
-  const existingIds = new Set(
-    [...tbody.querySelectorAll(".exp-row")].map(r => r.dataset.expId)
-  );
-  const newIds = new Set(exps.map(e => e.experiment_id));
-
-  // Remove stale rows.
-  for (const id of existingIds) {
-    if (!newIds.has(id)) {
-      document.getElementById(`exp-row-${id}`)?.remove();
-      runRowsOf(id).forEach(r => r.remove());
-    }
-  }
-
-  // Insert/update rows.
-  exps.forEach((exp, idx) => {
-    const expId = exp.experiment_id;
-    const existingRow = document.getElementById(`exp-row-${expId}`);
-    const isExpanded = expandedExps.has(expId);
-
-    const c = exp.job_counts || {};
-    const running = (c.running || 0) + (c.dispatched || 0);
-    const total = c.total || exp.expected_jobs || 0;
-    const done = exp.status && exp.status !== "running" && exp.status !== "pending";
-    const html = `<td>
-        <div class="exp-name-cell">
-          <span class="exp-toggle" onclick="toggleExpand('${expId}')">${isExpanded ? "▼" : "▶"}</span>
-          <span class="exp-name" onclick="toggleExpand('${expId}')" style="cursor:pointer">${exp.name || expId}</span>
-          ${exp.note ? `<span class="exp-note">${exp.note}</span>` : ""}
-          ${MLCampaign.get() === MLCampaign.ALL ? `<span class="campaign-tag">${MLCampaign.campaignOf(exp)}</span>` : ""}
-        </div>
-      </td>
-      <td>${badge(exp.status || "unknown")}</td>
-      <td class="count-cell">${c.done || 0}</td>
-      <td class="count-cell">${c.failed ? `<span style="color:#d62728">${c.failed}</span>` : (done ? "0" : "—")}</td>
-      <td class="count-cell">${c.xfailed || (done ? "0" : "—")}</td>
-      <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : (done ? "0" : "—")}</td>
-      <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
-      <td>${relTime(exp.submit_time)}</td>
-      <td class="actions-cell"><div class="actions">
-        <a class="btn-link" href="${pageHref("results.html")}&experiment=${encodeURIComponent(expId)}">Results</a>
-        <a class="btn-link" href="${pageHref("files.html")}&experiment=${encodeURIComponent(expId)}">Artifacts</a>
-        <button class="btn-link" onclick="event.stopPropagation();renameExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Rename</button>
-        <button class="btn-link" onclick="event.stopPropagation();moveExperiment(${JSON.stringify(expId).replace(/"/g,'&quot;')})">Move</button>
-        <button class="btn-link btn-delete" onclick="deleteExperiment('${expId}')">Delete</button>
-      </div></td>`;
-
-    if (existingRow) {
-      existingRow.innerHTML = html;
-      existingRow.classList.toggle("expanded", isExpanded);
-    } else {
-      // Insert new row at correct position.
-      const tr = document.createElement("tr");
-      tr.className = "exp-row";
-      tr.id = `exp-row-${expId}`;
-      tr.dataset.expId = expId;
-      tr.innerHTML = html;
-
-      // Before the idx-th experiment row; the previous experiment's runs stay above it.
-      const allRows = tbody.querySelectorAll(".exp-row");
-      tbody.insertBefore(tr, idx < allRows.length ? allRows[idx] : null);
-    }
-
-    if (isExpanded) renderRuns(expId);
-  });
-}
-
-// ── Fetch and refresh ─────────────────────────────────────────────────────────
-async function fetchExperiments() {
-  try {
-    const r = await apiFetch("/api/experiments");
-    if (!r.ok) {
-      setConnStatus("disconnected");
-      document.getElementById("error-msg").textContent = r.status === 401
-        ? `Unauthorized — open the dashboard URL printed by the manager (it includes ?token=…).`
-        : `API error: ${r.status}`;
-      document.getElementById("error-msg").style.display = "";
-      document.getElementById("empty-msg").style.display = "none";
-      document.getElementById("exp-table").style.display = "none";
-      return;
-    }
-    allExperiments = await r.json();
-    showCampaign();
-    setConnStatus("connected");
-    document.getElementById("error-msg").style.display = "none";
-  } catch (e) {
-    setConnStatus("disconnected");
-    document.getElementById("error-msg").textContent = `Failed to fetch: ${e}`;
-    document.getElementById("error-msg").style.display = "";
-  }
-}
-
-// ── Campaign ──────────────────────────────────────────────────────────────────
-const campaignSelect = document.getElementById("campaign-select");
-
-function showCampaign() {
-  MLCampaign.fill(campaignSelect, allExperiments);
-  experiments = MLCampaign.filter(allExperiments);
-  renderExperiments(experiments);
-}
-
-MLCampaign.bind(campaignSelect, showCampaign);
-
-async function refreshAll() {
-  await fetchExperiments();
-  await refreshExpandedJobs();
-}
-
-fetchExperiments();
-setInterval(fetchExperiments, 5000);
-setInterval(refreshExpandedJobs, 10000);
-// A rename made in another tab or from the CLI shows as soon as you come back.
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAll(); });
-</script>
+<script src="page-experiments.js"></script>
 </body>
 </html>

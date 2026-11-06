@@ -435,7 +435,7 @@ OPTIMIZE = {
     "metric": "val_loss",    # metric name logged via MLSweepLogger
     "goal": "minimize",      # "minimize" or "maximize"
     "budget": 50,            # number of successful lex evaluations to run
-    "n_initial": 5,          # combos to queue upfront before the event loop starts (default: max(5, n_params*2))
+    "n_initial": 5,          # random combos before TPE takes over (default: max(8, n_params*2))
 }
 ```
 
@@ -447,7 +447,9 @@ OPTIMIZE = {
 | `metric` | yes (bayes) | Metric name to optimize (must be logged via `MLSweepLogger`) |
 | `goal` | yes (bayes) | `"minimize"` or `"maximize"` |
 | `budget` | yes (bayes) | Number of successful lex evaluations to run |
-| `n_initial` | no | Number of combos to suggest and queue upfront before the event loop starts. Default: `max(8, n_params * 2)`. These runs count toward `budget`. |
+| `n_initial` | no | Number of random combos before TPE starts using results. Default: `max(8, n_params * 2)`. These runs count toward `budget`. |
+
+Submit with `--stream` for adaptive sampling. That process chooses each run from the results so far and submits them one at a time, so it has to stay alive. Without `--stream`, the whole budget is submitted up front with no results to learn from. If the process dies, running runs finish but no new ones start. `mlsweep resume EXP --sweep FILE --stream` restores the earlier results, counts runs still active, and continues.
 
 ### Continuous dimensions
 
@@ -686,10 +688,15 @@ mlsweep wait EXP --until stalled --stalled-after 900
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | Settled cleanly (no failed runs), or the requested condition was met with no failure. |
+| `0` | Every run finished successfully. |
 | `1` | At least one run finished as `failed`. |
-| `2` | `--timeout` elapsed before the condition was met (`0` = wait forever). |
+| `2` | `--timeout` elapsed with work outstanding (`0` = wait forever). Waiting again is safe. |
 | `3` | `--until stalled` and a running run made no log/metric progress for `--stalled-after` seconds (default `900`). |
+| `4` | No answer: the manager is unreachable, the ID is unknown, or the experiment has no runs. |
+| `5` | No failures, but some runs were cancelled or the sweep was stopped, so the results are partial. |
+
+`--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs
+stuck in `pending`. A Bayesian sweep with budget left is not settled, even with no active runs.
 
 `--interval` controls the poll period (default `10` seconds). `mlsweep fetch
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
@@ -751,7 +758,8 @@ page lists only the selected campaign's experiments, or every experiment under
 "All campaigns". The choice is kept in the page URL (`?campaign=NAME`), carried
 by the navigation links, and remembered by the browser. A first visit shows
 `default`. A link to one experiment (`?experiment=ID`) switches to that
-experiment's campaign. Each row on the Experiments page has a Move button.
+experiment's campaign. Each row on the Experiments page moves with `Manage` → Move to
+campaign.
 
 ### Campaigns in the HTTP API
 
@@ -792,10 +800,10 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `ls [exp_id]` | List experiments, or the runs within one experiment. |
 | `logs <run_id>` | Print (and optionally follow) a run's training log. |
 | `metrics` | Print runs' logged metrics as tables, fetched on demand. `--keys REGEX` selects keys; `--pivot` turns keys into rows using the regex's capture group (e.g. `val/nll@r(\d+)` becomes value vs. r, one column per run); `--step`, `--tail` (table view only), `--json`, `--csv`. |
-| `cancel <exp_id>` | Cancel runs (`--failed` / `--running` / `--all`). |
-| `retry <exp_id>` | Re-queue finished runs (`--failed` / `--cancelled` / run IDs). Each gets a fresh `--max-retries` budget. |
-| `resume <exp_id>` | Continue an experiment. |
-| `stop <exp_id>` | Abort a sweep (requires `--yes`). |
+| `cancel <exp_id>` | Cancel runs (`--running` / `--pending` / run IDs / `--all`). |
+| `retry <exp_id>` | Re-queue finished runs (`--failed` / `--cancelled` / run IDs) with the code submitted with the experiment. Each gets a fresh `--max-retries` budget. |
+| `resume <exp_id>` | Re-queue failed and cancelled runs, with the same code. With `--sweep FILE`, continue a Bayesian sweep (add `--stream` to stay adaptive). It does not undo `pause`. |
+| `stop <exp_id>` | Abort a sweep (requires `--yes`). Every unfinished run is cancelled. |
 | `pause <exp_id>` | Stop dispatching new jobs. |
 | `unpause <exp_id>` | Resume dispatching. |
 | `campaign [ls]` | List campaigns with experiment and job counts (`--json`). |
@@ -803,9 +811,8 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `docs [topic]` | Print the bundled runbook. |
 | `version` | Print the mlsweep version. |
 
-`watch`, `fetch`, `best`, `status`, `ls`, and `logs` default `--manager` to
-`http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`). `run`
-requires `--manager`. `fetch` and `best` rank by `--metric` / `--goal`, defaulting
+Every command defaults `--manager` to `http://localhost:7891` (override with
+`--manager` or `MLSWEEP_MANAGER`). `fetch` and `best` rank by `--metric` / `--goal`, defaulting
 to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`) and finally
 `loss`/`minimize`. `fetch` also takes `--wait` and `--top`.
 `status`, `ls`, `best`, and `fetch` also accept `--json`. `watch` accepts
@@ -833,10 +840,11 @@ Every subcommand that talks to the manager takes `--campaign NAME` and
 
 | Option | Description |
 |--------|-------------|
-| `--manager <url>` | Manager URL (required, e.g. `http://localhost:7891`). |
+| `--manager <url>` | Manager URL (default: `$MLSWEEP_MANAGER`, then `http://localhost:7891`). |
 | `--token <tok>` | Auth token. Resolved in order: `--token`, `MLSWEEP_TOKEN`, then `~/.mlsweep/manager.token`. |
 | `--output-dir <dir>` | Directory for local submit-side artifacts (submit log + manifest). Default: `~/.mlsweep/submissions`. |
-| `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. |
+| `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. A name already in use is refused unless you pass `--append`. |
+| `--append` | Add this sweep's runs to the existing experiment named by `--experiment`. Run names must not clash with its runs. |
 | `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
 | `--campaign <name>` | Campaign to submit under (env: `MLSWEEP_CAMPAIGN`, default: `default`). |
 | `--all-campaigns` | With `--resume`, find the experiment in any campaign. Refused for a new sweep. |

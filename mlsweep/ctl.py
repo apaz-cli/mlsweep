@@ -22,12 +22,16 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 from mlsweep._shared import _BLUE, _BOLD, _BRIGHT_BLUE, _CYAN, _DIM, _GREEN, _MAGENTA, _RED, _RESET, _YELLOW
 from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
+    _http_request,
+    _manager_url,
+    _report_failure,
+    _with_campaign,
     _leaderboard_header,
     _leaderboard_row,
     _campaign_argv,
@@ -40,7 +44,10 @@ from mlsweep.run_sweep import (
     manager_cancel_job,
     manager_get_experiment_summary,
     manager_get_job_logs,
+    awaits_more_runs,
+    experiment_status,
     manager_get_job_metrics,
+    metric_keys,
     manager_list_campaigns,
     manager_list_experiment_jobs,
     manager_list_experiments,
@@ -761,7 +768,9 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
     verb = "retry" if retry else "cancel"
     parser = _common_parser(
         f"mlsweep {verb}",
-        f"{'Re-queue' if retry else 'Cancel'} runs in an experiment.",
+        "Re-queue runs in an experiment. They rerun the code submitted with the experiment, so "
+        "after fixing a bug submit a new sweep with `mlsweep run`." if retry
+        else "Cancel runs in an experiment.",
     )
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("runs", nargs="*", help="Run IDs to act on")
@@ -787,6 +796,8 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
 
     if retry:
         failures = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
+        sweep_print("  These rerun the code submitted with the experiment. "
+                    "To run changed code, submit with `mlsweep run`.")
     else:
         failures = _apply(targets, manager_cancel_job, verb, manager, token, args.experiment,
                           args.dry_run, campaign)
@@ -812,10 +823,28 @@ def rename_cmd(argv: list[str]) -> None:
         "dashboard. The run ID itself never changes.",
     )
     parser.add_argument("experiment", help="Experiment ID")
-    parser.add_argument("run", help="Run ID")
+    parser.add_argument("run", nargs="?", help="Run ID")
     parser.add_argument("name", nargs="?", default=None, help="New display name")
     parser.add_argument("--clear", action="store_true", help="Remove the display name")
+    parser.add_argument("--experiment-name", metavar="NAME",
+                        help="Rename the experiment itself (its ID never changes)")
     args = parser.parse_args(argv)
+    if args.experiment_name is not None:
+        if args.run or args.clear:
+            parser.error("--experiment-name takes no RUN, NAME or --clear")
+        new = args.experiment_name.strip()
+        if not new:
+            parser.error("--experiment-name must not be empty")
+        manager, token, campaign = _connect(args, args.experiment)
+        status, resp = _http_request(
+            "PUT", _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/name", campaign)),
+            token, json_data={"name": new})
+        _report(status == 200, f"renamed experiment {args.experiment} to {new!r}")
+        if status != 200:
+            _fail("rename", status, resp)
+        return
+    if not args.run:
+        parser.error("give RUN and NAME (or --clear), or --experiment-name NAME")
     name = (args.name or "").strip()
     if args.clear == bool(name):
         parser.error("give a non-empty NAME or --clear, not both")
@@ -847,7 +876,7 @@ def _set_status_cmd(argv: list[str], name: str, description: str, status: str, d
 
 
 def stop_cmd(argv: list[str]) -> None:
-    _set_status_cmd(argv, "stop", "Abort an experiment (cancels in-flight + stops dispatch).",
+    _set_status_cmd(argv, "stop", "Abort an experiment (cancels every unfinished run).",
                     "aborted", "stopped", confirm=True)
 
 
@@ -867,6 +896,8 @@ WAIT_EXIT_SETTLED = 0   # settled cleanly, or the requested condition was met
 WAIT_EXIT_FAILURE = 1   # at least one run failed
 WAIT_EXIT_TIMEOUT = 2   # --timeout elapsed before the condition was met
 WAIT_EXIT_STALLED = 3   # a running run made no progress for --stalled-after seconds
+WAIT_EXIT_UNKNOWN = 4   # no answer: manager unreachable, unknown experiment, or no runs
+WAIT_EXIT_CANCELLED = 5 # settled with no failures, but runs were cancelled or the sweep stopped
 
 _WAIT_ACTIVE_STATUSES = ("pending", "dispatched", "running")
 
@@ -901,10 +932,12 @@ def wait_cmd(argv: list[str]) -> None:
     them without parsing text:
 
     \b
-      0  settled cleanly (no failed runs)
+      0  every run finished successfully
       1  at least one run failed
-      2  --timeout elapsed first
+      2  --timeout elapsed first, and runs are still active
       3  --until stalled and a running run stopped making progress
+      4  no answer: manager unreachable, unknown experiment, or no runs
+      5  no failures, but some runs were cancelled or the sweep was stopped
     """
     parser = argparse.ArgumentParser(
         prog="mlsweep wait",
@@ -912,10 +945,12 @@ def wait_cmd(argv: list[str]) -> None:
         description=(
             "Wait until an experiment settles, fails, or stalls.\n\n"
             "Exit codes:\n"
-            "  0  settled cleanly\n"
+            "  0  every run finished successfully\n"
             "  1  at least one run failed\n"
-            "  2  timed out (--timeout)\n"
-            "  3  a running run stalled (--until stalled)"
+            "  2  timed out (--timeout), runs still active; waiting again is safe\n"
+            "  3  a running run stalled (--until stalled)\n"
+            "  4  no answer: manager unreachable, unknown experiment, or no runs\n"
+            "  5  no failures, but some runs were cancelled or the sweep was stopped"
         ),
     )
     _add_manager_args(parser)
@@ -945,7 +980,10 @@ def wait_cmd(argv: list[str]) -> None:
         jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign)
         if jobs is None:
             sweep_print(f"{_RED}FAIL{_RESET}  Cannot list jobs for {args.experiment}")
-            sys.exit(WAIT_EXIT_FAILURE)
+            sys.exit(WAIT_EXIT_UNKNOWN)
+        if not jobs:
+            sweep_print(f"{_RED}FAIL{_RESET}  {args.experiment} has no runs. Check the ID with `mlsweep ls`.")
+            sys.exit(WAIT_EXIT_UNKNOWN)
 
         failed = _wait_failed(jobs)
         active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
@@ -955,6 +993,13 @@ def wait_cmd(argv: list[str]) -> None:
             sweep_print(f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}")
             sys.exit(WAIT_EXIT_FAILURE)
 
+        # Runs added after a `stop`, or left by a stop from an older version, never start.
+        if active and all(j.get("status") == "pending" for j in active) \
+                and experiment_status(manager, token, args.experiment, campaign) == "aborted":
+            sweep_print(f"{_YELLOW}STOPPED{_RESET}  {args.experiment} was stopped, leaving "
+                        f"{len(active)} run(s) that will not start.")
+            sys.exit(WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED)
+
         if not active:
             # Settled: nothing pending/dispatched/running.
             if failed:
@@ -962,8 +1007,23 @@ def wait_cmd(argv: list[str]) -> None:
                 sweep_print(f"{_RED}FAILURE{_RESET}  {args.experiment} settled with "
                             f"{len(failed)} failed run(s): {names}")
                 sys.exit(WAIT_EXIT_FAILURE)
-            sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
-            sys.exit(WAIT_EXIT_SETTLED)
+            cancelled = sum(1 for j in jobs if j.get("status") == "cancelled")
+            if cancelled:
+                sweep_print(f"{_YELLOW}CANCELLED{_RESET}  {args.experiment} settled with "
+                            f"{cancelled} of {len(jobs)} run(s) cancelled.")
+                sys.exit(WAIT_EXIT_CANCELLED)
+            # A Bayesian sweep's submitter adds runs one at a time, so a gap isn't the end.
+            awaiting = awaits_more_runs(manager, token, args.experiment, campaign)
+            if not awaiting:
+                sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
+                sys.exit(WAIT_EXIT_SETTLED)
+            if args.timeout and time.monotonic() - start >= args.timeout:
+                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs, but its "
+                            f"Bayesian budget is not used up. If its submitter is gone, continue with "
+                            f"`mlsweep resume {args.experiment} --sweep FILE --stream`.")
+                sys.exit(WAIT_EXIT_TIMEOUT)
+            time.sleep(args.interval)
+            continue
 
         if args.until == "stalled":
             stalled = _wait_stalled(jobs, args.stalled_after)
@@ -985,9 +1045,14 @@ def wait_cmd(argv: list[str]) -> None:
 
 
 def resume_cmd(argv: list[str]) -> None:
-    parser = _common_parser("mlsweep resume", "Continue an experiment.")
+    parser = _common_parser(
+        "mlsweep resume",
+        "Re-queue an experiment's failed and cancelled runs, or continue a Bayesian sweep with "
+        "--sweep. It does not undo `pause`; use `unpause` for that.")
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("--sweep", default=None, help="Sweep file (required to continue a Bayesian sweep)")
+    parser.add_argument("--stream", action="store_true",
+                        help="With a Bayesian --sweep: stay attached and choose each run from the last result")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
@@ -1000,7 +1065,7 @@ def resume_cmd(argv: list[str]) -> None:
             from mlsweep.cli import _forward
             from mlsweep.run_sweep import main as _run_main
             fwd = [args.sweep, "--resume", args.experiment, "--manager", manager,
-                   *_campaign_argv(campaign)]
+                   *_campaign_argv(campaign), *(["--stream"] if args.stream else [])]
             if args.token:
                 fwd += ["--token", args.token]
             _forward("mlsweep run", _run_main, fwd)
@@ -1110,6 +1175,12 @@ def best_cmd(argv: list[str]) -> None:
         _print_metric_table(rows, args.table, metric, goal)
     else:
         print_leaderboard(rows, metric, goal, args.top)
+    done = [r["run_id"] for r in rows if r["status"] == "done"]
+    if not args.json and done and all(r["value"] is None for r in rows):
+        logged = metric_keys(manager, token, args.experiment, done[0], campaign=campaign)
+        print(f"Error: no finished run logged {metric!r}. {done[0]} logged: "
+              f"{', '.join(logged) or 'no metrics'}. Pass --metric.", file=sys.stderr)
+        sys.exit(1)
     if had_failure:
         sys.exit(1)
 
@@ -1164,3 +1235,409 @@ def campaign_cmd(argv: list[str]) -> None:
                     f"{_counts_str(c.get('job_counts'))}")
     if current is not None:
         sweep_print("  (* = current campaign, from --campaign, $MLSWEEP_CAMPAIGN, or the default)")
+
+
+# ── move / purge / gc ──────────────────────────────────────────────────────────
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            break
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+
+
+def _select_runs(manager: str, token: str, experiment: str, campaign: str | None,
+                 run_ids: list[str], statuses: list[str]) -> list[str]:
+    jobs = manager_list_experiment_jobs(manager, token, experiment, campaign=campaign)
+    if jobs is None:
+        sys.exit(1)
+    known = {j.get("run_id") for j in jobs}
+    missing = [r for r in run_ids if r not in known]
+    if missing:
+        sweep_print(f"{_RED}Error: no such run(s) in {experiment}: {', '.join(missing)}{_RESET}")
+        sys.exit(1)
+    return [j["run_id"] for j in _select_jobs(jobs, run_ids, statuses)]
+
+
+def _fail(verb: str, status: int, resp: Any) -> NoReturn:
+    """Print the server's per-run ``problems`` (or the generic failure), then exit 1."""
+    problems = (resp.get("problems") if isinstance(resp, dict) else None) or []
+    for p in problems:
+        _report(False, p)
+    if not problems:
+        _report_failure(verb, status, resp)
+    sys.exit(1)
+
+
+def _add_run_flags(parser: argparse.ArgumentParser, flags: tuple[str, ...], help_text: str) -> None:
+    """Add one flag per status in *flags*, selecting the runs with that status."""
+    for st in flags:
+        parser.add_argument(f"--{st}", action="store_true", help=help_text.format(st))
+
+
+def _chosen_runs(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, flags: tuple[str, ...],
+) -> tuple[str, str, str | None, list[str]]:
+    """``(manager, token, campaign, run_ids)`` for the runs a command names or selects."""
+    statuses = [s for s in flags if getattr(args, s)]
+    if not args.runs and not statuses:
+        parser.error("name runs, or select them with " + "/".join(f"--{s}" for s in flags))
+    manager, token, campaign = _connect(args, args.experiment)
+    return manager, token, campaign, _select_runs(manager, token, args.experiment, campaign, args.runs, statuses)
+
+
+def _post_runs(
+    verb: str, args: argparse.Namespace, manager: str, token: str, campaign: str | None, body: dict[str, Any],
+) -> Any:
+    """POST to the experiment's ``jobs/<verb>`` route; print JSON if asked, exit 1 on failure."""
+    status, resp = _http_request(
+        "POST",
+        _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/jobs/{verb}", campaign)),
+        token, json_data=body,
+    )
+    if args.json:
+        print(json.dumps(resp, indent=2))
+    if status != 200:
+        _fail(verb, status, resp)
+    return resp
+
+
+def move_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep move",
+        "Move finished runs to another experiment, with their metrics, logs and files. "
+        "Runs still pending or running must be cancelled first.",
+    )
+    parser.add_argument("experiment", help="Experiment the runs are in")
+    parser.add_argument("runs", nargs="*", help="Run IDs to move")
+    parser.add_argument("--to", required=True, metavar="EXPERIMENT", help="Experiment to move them to")
+    flags = ("done", "failed", "cancelled", "xfailed")
+    _add_run_flags(parser, flags, "also every {} run")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    manager, token, campaign, run_ids = _chosen_runs(parser, args, flags)
+    if not run_ids:
+        sweep_print("No runs selected.")
+        return
+    resp = _post_runs("move", args, manager, token, campaign, {"run_ids": run_ids, "to": args.to})
+    if not args.json:
+        _report(True, f"moved {len(resp['moved'])} run(s) from {args.experiment} to {args.to}")
+        for rid in resp.get("files_not_moved", []):
+            _report(False, f"{rid}: its files could not be moved (see the manager log)")
+
+
+def purge_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep purge",
+        "Delete finished runs for good: their records, metrics, logs and files. "
+        "Use it to clear out failed or cancelled attempts.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("runs", nargs="*", help="Run IDs to delete")
+    flags = ("failed", "cancelled", "xfailed", "done")
+    _add_run_flags(parser, flags, "every {} run")
+    parser.add_argument("--yes", action="store_true", help="Actually delete (otherwise list what would go)")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    manager, token, campaign, run_ids = _chosen_runs(parser, args, flags)
+    if not run_ids:
+        sweep_print("No runs selected.")
+        return
+    if not args.yes:
+        sweep_print(f"Would delete {len(run_ids)} run(s) from {args.experiment}:")
+        for rid in run_ids:
+            sweep_print(f"  {rid}")
+        sweep_print(f"{_YELLOW}Nothing deleted. Pass --yes to delete them (this cannot be undone).{_RESET}")
+        return
+    resp = _post_runs("purge", args, manager, token, campaign, {"run_ids": run_ids})
+    if not args.json:
+        _report(True, f"deleted {len(resp['purged'])} run(s), freed {_fmt_bytes(resp.get('bytes_freed', 0))}")
+
+
+def gc_cmd(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="mlsweep gc",
+        description="Find what nothing refers to any more: files of deleted experiments and runs, "
+                    "database rows of deleted runs, code archives no run uses, and (with "
+                    "--downloads) local downloads of experiments the manager no longer has. "
+                    "Lists them; --yes deletes them.",
+    )
+    _add_manager_args(parser)
+    parser.add_argument("--yes", action="store_true", help="Delete what is listed")
+    parser.add_argument("--vacuum", action="store_true", help="Also compact the manager's database file")
+    parser.add_argument("--downloads", action="store_true",
+                        help="Also check this machine's ~/.mlsweep/downloads (from `mlsweep fetch`)")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+    status, plan = _http_request("POST", _manager_url(manager, "/api/gc"), token,
+                                 json_data={"dry_run": not args.yes, "vacuum": args.vacuum and args.yes},
+                                 timeout=3600)
+    if status != 200 or not isinstance(plan, dict):
+        _fail("gc", status, plan)
+
+    local: list[tuple[str, int]] = []
+    if args.downloads:
+        from mlsweep._shared import _dir_size, _mlsweep_dir
+        exps = manager_list_experiments(manager, token)
+        if exps is None:
+            sys.exit(1)
+        known = {e["experiment_id"] for e in exps}
+        root = _mlsweep_dir() / "downloads"
+        if root.is_dir():
+            for child in sorted(root.iterdir()):
+                if child.is_dir() and not child.is_symlink() and child.name not in known:
+                    local.append((str(child), _dir_size(child)))
+        if args.yes:
+            import shutil
+            for path, _ in local:
+                shutil.rmtree(path, ignore_errors=True)
+        plan["local_downloads"] = [{"path": p, "bytes": b} for p, b in local]
+
+    if args.json:
+        print(json.dumps(plan, indent=2))
+        return
+    db = plan["database"]
+    verb = "Deleted" if args.yes else "Would delete"
+    total = plan["bytes"] + sum(b for _, b in local)
+    rows = sum(db.values())
+    sweep_print(f"{_BOLD}{verb}{_RESET} {_fmt_bytes(total)}:")
+    for d in plan["directories"]:
+        sweep_print(f"  {d['path']:<70} {_fmt_bytes(d['bytes']):>9}  ({d['reason']})")
+    for f in plan["artifact_files"]:
+        sweep_print(f"  {f['path'][:70]:<70} {_fmt_bytes(f['bytes']):>9}  ({f['reason']})")
+    for p, b in local:
+        sweep_print(f"  {p:<70} {_fmt_bytes(b):>9}  (download of a deleted experiment)")
+    sweep_print(f"  database: {db['metric_rows']} metric rows, {db['log_rows']} log rows, "
+                f"{db['job_node_rows']} run-node rows, {plan['artifact_rows']} archive records")
+    if not args.yes:
+        if total or rows or plan["artifact_rows"]:
+            sweep_print(f"{_YELLOW}Nothing deleted. Pass --yes to delete these "
+                        f"(add --vacuum to also shrink the database file).{_RESET}")
+        else:
+            sweep_print("Nothing to collect.")
+    elif plan.get("vacuumed"):
+        sweep_print("Database compacted.")
+
+
+# ── delete / export / workers / scheduler (what the dashboard can do) ──────────
+
+
+def delete_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep delete",
+        "Delete an experiment and all its runs (in-flight runs are stopped first). "
+        "Its files stay on disk until `mlsweep gc --yes`.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("--yes", action="store_true", help="Confirm")
+    args = parser.parse_args(argv)
+    if not args.yes:
+        sweep_print(f"{_RED}Deleting an experiment removes its runs, metrics and logs. "
+                    f"Pass --yes to confirm.{_RESET}")
+        sys.exit(1)
+    manager, token, campaign = _connect(args, args.experiment)
+    status, resp = _http_request(
+        "DELETE", _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}", campaign)), token)
+    _report(status == 200, f"deleted {args.experiment}")
+    if status != 200:
+        _fail("delete", status, resp)
+
+
+def _export_query(args: argparse.Namespace) -> str:
+    from urllib.parse import urlencode
+    q: dict[str, str] = {}
+    if args.experiment:
+        q["experiment_id"] = args.experiment
+    else:
+        campaign = _resolve_campaign(args)
+        if campaign is not None:
+            q["campaign"] = campaign
+    if args.only_done:
+        q["only_done"] = "1"
+    return urlencode(q)
+
+
+def export_cmd(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="mlsweep export",
+        description="Export finished runs' metrics: `tensorboard` writes a zip of event files "
+                    "here; `wandb` makes the manager upload them to W&B. The scope is one "
+                    "experiment (--experiment), the current campaign (default), or everything "
+                    "(--all-campaigns).",
+    )
+    sub = parser.add_subparsers(dest="target", required=True)
+    tb = sub.add_parser("tensorboard", help="Download a zip of TensorBoard event files")
+    wb = sub.add_parser("wandb", help="Upload to Weights & Biases from the manager")
+    for p in (tb, wb):
+        _add_manager_args(p)
+        p.add_argument("--experiment", help="Only this experiment")
+        p.add_argument("--only-done", action="store_true", help="Only runs that succeeded")
+    tb.add_argument("-o", "--output", help="Zip file to write (default: <scope>-tensorboard.zip)")
+    wb.add_argument("--project", required=True)
+    wb.add_argument("--entity")
+    wb.add_argument("--api-key", help="Default: the manager's WANDB_API_KEY or saved login")
+    wb.add_argument("--no-wait", action="store_true", help="Start the upload and return")
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+    query = _export_query(args)
+
+    if args.target == "tensorboard":
+        import urllib.request
+        label = args.experiment or _resolve_campaign(args) or "mlsweep"
+        out = args.output or f"{label}-tensorboard.zip"
+        req = urllib.request.Request(_manager_url(manager, f"/api/export/tensorboard.zip?{query}"),
+                                     headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as resp, open(out, "wb") as f:
+                while chunk := resp.read(1 << 20):
+                    f.write(chunk)
+        except Exception as exc:  # urllib.error.HTTPError or network trouble
+            sweep_print(f"  {_RED}FAIL{_RESET}  tensorboard export: {exc}")
+            sys.exit(1)
+        _report(True, f"wrote {out}  (tensorboard --logdir on the unzipped folder)")
+        return
+
+    body = {"project": args.project, "entity": args.entity, "api_key": args.api_key}
+    status, resp = _http_request("POST", _manager_url(manager, f"/api/export/wandb?{query}"), token,
+                                 json_data={k: v for k, v in body.items() if v})
+    if status not in (200, 202) or not isinstance(resp, dict):
+        _fail("wandb export", status, resp)
+    eid = resp["export_id"]
+    sweep_print(f"  started W&B export {eid}: {resp['total']} run(s) of {resp['scope_label']} "
+                f"to {args.entity + '/' if args.entity else ''}{args.project}")
+    if args.no_wait:
+        return
+    last = -1
+    while True:
+        time.sleep(2)
+        status, st = _http_request("GET", _manager_url(manager, f"/api/exports/{eid}"), token, quiet=True)
+        if status != 200 or not isinstance(st, dict):
+            continue
+        if st["done"] != last:
+            last = st["done"]
+            sweep_print(f"  {st['done']}/{st['total']} uploaded")
+        if st["status"] != "running":
+            ok = st["status"] == "done"
+            _report(ok, f"W&B export {st['status']}" + (f": {st['error']}" if st.get("error") else ""))
+            if not ok:
+                sys.exit(1)
+            return
+
+
+def _parse_ints(s: str | None) -> list[int] | None:
+    if s is None:
+        return None
+    try:
+        return [int(x) for x in s.split(",") if x.strip()]
+    except ValueError:
+        sweep_print(f"{_RED}Error: expected comma-separated GPU indices, got {s!r}{_RESET}")
+        sys.exit(2)
+
+
+def _report_request(verb: str, success: str, method: str, url: str, token: str, **kwargs: Any) -> bool:
+    """Make a request and report how it went; True if the manager answered 200."""
+    status, resp = _http_request(method, url, token, **kwargs)
+    _report(status == 200, success)
+    if status != 200:
+        _report_failure(verb, status, resp)
+    return status == 200
+
+
+def workers_cmd(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="mlsweep workers",
+        description="List, connect, disconnect and tune workers (the System page's controls).",
+    )
+    sub = parser.add_subparsers(dest="action")
+    ls = sub.add_parser("ls", help="List workers (the default)")
+    add = sub.add_parser("add", help="Connect a worker over SSH (mlsweep is installed there for you)")
+    rm = sub.add_parser("rm", help="Disconnect and forget a worker")
+    st = sub.add_parser("set", help="Change a live worker's jobs per GPU or its GPUs")
+    for p in (ls, add, rm, st):
+        _add_manager_args(p)
+    ls.add_argument("--json", action="store_true")
+    add.add_argument("host", help="SSH destination, e.g. user@host")
+    add.add_argument("--remote-dir", default="", help="Project dir on the worker (optional)")
+    add.add_argument("--ssh-key", help="SSH private key")
+    add.add_argument("--venv", help="Existing venv for the worker binary (advanced)")
+    add.add_argument("--devices", help="GPU indices to use, e.g. 0,1 (default: all)")
+    rm.add_argument("worker_id")
+    st.add_argument("worker_id")
+    st.add_argument("--jobs", type=int, help="Max concurrent jobs per GPU (0 = unlimited)")
+    st.add_argument("--add-devices", help="GPU indices to start using, e.g. 2,3")
+    st.add_argument("--remove-devices", help="GPU indices to stop using")
+    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "-h", "--help")
+                             else ["ls", *argv])
+    manager, token = _manager_token(args)
+
+    if args.action == "add":
+        body = {"host": args.host, "remote_dir": args.remote_dir, "ssh_key": args.ssh_key,
+                "venv": args.venv, "devices": _parse_ints(args.devices)}
+        status, resp = _http_request("POST", _manager_url(manager, "/api/workers"), token,
+                                     json_data={k: v for k, v in body.items() if v not in (None, "")},
+                                     timeout=600)
+        ok = status in (200, 201) and isinstance(resp, dict)
+        _report(ok, f"connected {resp.get('worker_id', args.host) if ok else args.host}")
+        if not ok:
+            _fail("add worker", status, resp)
+        return
+    if args.action == "rm":
+        if not _report_request("remove worker", f"removed {args.worker_id}", "DELETE",
+                               _manager_url(manager, f"/api/workers/{args.worker_id}"), token):
+            sys.exit(1)
+        return
+    if args.action == "set":
+        if args.jobs is None and not args.add_devices and not args.remove_devices:
+            parser.error("give --jobs, --add-devices or --remove-devices")
+        ok = True
+        if args.jobs is not None:
+            ok &= _report_request("set concurrency", f"{args.worker_id}: {args.jobs or 'unlimited'} job(s) per GPU",
+                                  "PATCH", _manager_url(manager, f"/api/workers/{args.worker_id}/concurrency"),
+                                  token, json_data={"max_jobs_per_gpu": args.jobs})
+        if args.add_devices or args.remove_devices:
+            body = {"add": _parse_ints(args.add_devices) or [], "remove": _parse_ints(args.remove_devices) or []}
+            ok &= _report_request("set devices", f"{args.worker_id}: devices updated",
+                                  "PATCH", _manager_url(manager, f"/api/workers/{args.worker_id}/devices"),
+                                  token, json_data=body)
+        if not ok:
+            sys.exit(1)
+        return
+
+    status, workers = _http_request("GET", _manager_url(manager, "/api/workers"), token)
+    if status != 200 or not isinstance(workers, list):
+        _fail("list workers", status, workers)
+    if args.json:
+        print(json.dumps(workers, indent=2))
+        return
+    if not workers:
+        sweep_print("No workers.")
+        return
+    for w in workers:
+        st_ = w.get("status", "?")
+        color = _GREEN if st_ == "connected" else _YELLOW if st_ in ("connecting", "launching") else _DIM
+        devs = w.get("devices") or w.get("gpus") or ""
+        sweep_print(f"  {color}{st_:<11}{_RESET} {w.get('worker_id')}  {_DIM}{w.get('host', '')}"
+                    f"{'  gpus ' + str(devs) if devs else ''}"
+                    f"{'  ' + str(w.get('last_error')) if w.get('last_error') else ''}{_RESET}")
+
+
+def scheduler_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep scheduler",
+        "Show or set GPU placement: pack fills busy GPUs first (keeps whole GPUs and machines "
+        "free for big jobs); spread puts each job on the least busy GPU.",
+    )
+    parser.add_argument("--placement", choices=("pack", "spread"))
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+    if args.placement:
+        status, resp = _http_request("PATCH", _manager_url(manager, "/api/scheduler"), token,
+                                     json_data={"placement": args.placement})
+    else:
+        status, resp = _http_request("GET", _manager_url(manager, "/api/scheduler"), token)
+    if status != 200 or not isinstance(resp, dict):
+        _fail("scheduler", status, resp)
+    sweep_print(f"  placement: {resp.get('placement')}")

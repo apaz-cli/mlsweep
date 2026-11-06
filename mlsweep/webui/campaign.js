@@ -8,7 +8,7 @@ const MLCampaign = (function () {
   const ALL = "*";
   const DEFAULT = "default";
   const KEY = "mlsweep_campaign";
-  const PAGES = /(^|\/)(experiments|results|logs|files|export|system|index)\.html$/;
+  const PAGES = new RegExp(`(^|/)(${[...MLChrome.PAGES, "index"].join("|")})\\.html$`);
 
   function load() {
     try { return localStorage.getItem(KEY); } catch { return null; }

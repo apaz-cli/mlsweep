@@ -2,7 +2,7 @@
 
 All tests run against a real manager subprocess (``manager_server`` fixture
 from conftest.py).  They cover experiment / job / worker / artifact /
-reachable / auth / health endpoints.
+auth / health endpoints.
 """
 
 import io
@@ -579,9 +579,6 @@ def test_artifact_ref(manager_server):
     assert updated["ref_count"] == 6
 
 
-# ── /api/reachable ──────────────────────────────────────────────────────────────
-
-
 def _api_put_raw(url, token, path, body):
     headers = {"Authorization": f"Bearer {token}",
                "Content-Type": "application/octet-stream"}
@@ -589,38 +586,3 @@ def _api_put_raw(url, token, path, body):
         f"{url}{path}", data=body, headers=headers, method="PUT",
     )
     return urllib.request.urlopen(req, timeout=10)
-
-
-@pytest.mark.parametrize("host,expected_code", [
-    (None, 400),
-    ("", 400),
-    ("http://evil.com", 400),
-    ("evil.com/path", 400),
-    ("foo?bar=1", 400),
-    ("user@host", 400),
-])
-def test_reachable_rejects_bad_hosts(manager_server, host, expected_code):
-    _, url = manager_server
-    # Build the URL manually to handle chars urllib would otherwise strip/encode
-    path = f"/api/reachable?host={host}" if host else "/api/reachable"
-    req = urllib.request.Request(
-        f"{url}{path}",
-        headers={"Authorization": f"Bearer {_TOKEN}"},
-    )
-    try:
-        urllib.request.urlopen(req, timeout=10)
-        pytest.fail(f"expected HTTP {expected_code} for host={host!r}")
-    except urllib.error.HTTPError as e:
-        assert e.code == expected_code
-
-
-def test_reachable_loopback(manager_server):
-    _, url = manager_server
-    data = _api_get(url, _TOKEN, "/api/reachable?host=127.0.0.1")
-    assert data["reachable"] is True
-
-
-def test_reachable_unreachable(manager_server):
-    _, url = manager_server
-    data = _api_get(url, _TOKEN, "/api/reachable?host=192.0.2.1")
-    assert data["reachable"] is False

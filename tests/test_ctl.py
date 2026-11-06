@@ -517,10 +517,13 @@ def test_best_human_output(manager_server, capsys):
     _mk_job(url, "e", "r1")
     _set_status(url, "e", "r1", "done")
 
-    ctl.best_cmd(_base(url, server) + ["--experiment", "e"])
-    out = capsys.readouterr().out
-    assert "LEADERBOARD" in out
-    assert "no completed runs with a metric value" in out  # no worker → no metrics
+    with pytest.raises(SystemExit) as exc:
+        ctl.best_cmd(_base(url, server) + ["--experiment", "e"])
+    assert exc.value.code == 1  # finished, but nothing logged the metric
+    captured = capsys.readouterr()
+    assert "LEADERBOARD" in captured.out
+    assert "no completed runs with a metric value" in captured.out  # no worker → no metrics
+    assert "no finished run logged 'loss'" in captured.err
 
 
 def test_best_wait_waits_for_active_jobs(manager_server, capsys):
@@ -815,3 +818,83 @@ def test_rename_refuses_run_in_another_campaign(manager_server, capsys):
         ctl.rename_cmd(_base(url, server) + ["e", "r1", "x", "--campaign", "default"])
     assert exc.value.code == 1
     assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["label"] is None
+
+
+def test_wait_unknown_experiment_is_not_success(manager_server):
+    server, url = manager_server
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["does_not_exist", "--timeout", "1", "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
+
+
+def test_wait_unreachable_manager_is_not_a_run_failure(monkeypatch, manager_server):
+    server, url = manager_server
+    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: None)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e"])
+    assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
+
+
+def test_wait_cancelled_runs_are_not_a_clean_finish(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")
+    _set_status(url, "e", "r1", "cancelled")
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_CANCELLED
+
+
+def test_wait_until_settled_exits_on_unknown_experiment(manager_server):
+    server, url = manager_server
+    with pytest.raises(SystemExit) as exc:
+        run_sweep._wait_until_settled(url, server.token, "does_not_exist", interval=1)
+    assert exc.value.code == 1
+
+
+def test_leaderboard_names_the_runs_it_leaves_out(capsys):
+    rows = [
+        {"run_id": "a", "label": None, "status": "done", "combo": {}, "value": 1.0, "final": 2.0},
+        {"run_id": "b", "label": None, "status": "failed", "combo": {}, "value": None, "final": None},
+        {"run_id": "c", "label": None, "status": "done", "combo": {}, "value": None, "final": None},
+    ]
+    run_sweep.print_leaderboard(rows, "m")
+    out = capsys.readouterr().out
+    assert "1 failed" in out and "1 without this metric" in out and "best step" in out
+
+
+def test_run_reads_manager_from_env_with_no_flag(monkeypatch):
+    import argparse
+    monkeypatch.setenv("MLSWEEP_MANAGER", "http://elsewhere:1")
+    parser = argparse.ArgumentParser()
+    run_sweep._add_connection_args(parser)
+    assert parser.parse_args([]).manager == "http://elsewhere:1"
+
+
+def test_wait_does_not_call_an_unfinished_bayesian_budget_done(monkeypatch, manager_server):
+    server, url = manager_server
+    jobs = [{"run_id": "r1", "status": "done"}]
+    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
+    monkeypatch.setattr(ctl, "awaits_more_runs", lambda *a, **k: True)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--timeout", "0.1", "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+
+
+def test_wait_after_stop_does_not_wait_for_pending_runs_forever(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")  # pending: no worker
+    ctl.stop_cmd(_base(url, server) + ["e", "--yes"])
+    assert _api_get(url, _TOKEN, "/api/experiments/e/jobs")[0]["status"] == "cancelled"
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["e", "--timeout", "5", "--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_CANCELLED
+
+
+def test_fetch_wait_settles_after_stop(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    _mk_job(url, "e", "r1")  # pending: no worker
+    ctl.stop_cmd(_base(url, server) + ["e", "--yes"])
+    assert run_sweep._wait_until_settled(url, server.token, "e", interval=1) is False

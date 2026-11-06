@@ -13,16 +13,34 @@ Usage::
     logger.log({"loss": 0.5})   # step auto-increments; logger.step becomes 1
     logger.close()
 
+Steps never go backwards, and a metric is logged at most once per step:
+``log()`` raises ``ValueError`` rather than overwrite an earlier value.
+Several calls at the same step are fine when their keys differ
+(``log({"loss": l}, step=s)`` then ``log({"val_loss": v}, step=s)``).
+
 All methods are silent no-ops when ``MLSWEEP_WORKER_SOCKET`` is not set, or when
 ``MLSWEEP_GPU_RANK`` / ``MLSWEEP_NODE_RANK`` indicate a non-lead rank (see
 ``rank_zero_only`` parameter).
 """
 
 import json
+import operator
 import os
 import socket
 import threading
 from typing import Any
+
+
+def _as_step(step: Any) -> int:
+    """*step* as an int.  Accepts numpy/torch integers and whole floats (5.0)."""
+    if isinstance(step, bool):
+        raise TypeError("step must be an integer, got bool")
+    try:
+        return operator.index(step)
+    except TypeError:
+        if isinstance(step, float) and step.is_integer():
+            return int(step)
+        raise TypeError(f"step must be an integer, got {step!r}") from None
 
 
 
@@ -68,6 +86,8 @@ class MLSweepLogger:
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self.step: int = 0
+        self._logged_any = False
+        self._step_keys: set[str] = set()   # keys already logged at self.step
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
@@ -103,11 +123,32 @@ class MLSweepLogger:
             metrics: Mapping of metric name to scalar value.
             step:    Training step.  If omitted, ``self.step`` is incremented
                      by 1 and the new value is used.
+
+        Raises:
+            ValueError: *step* is lower than the last logged step, or a key in
+                *metrics* was already logged at *step*.  Either would
+                overwrite a value already recorded.
         """
         if step is not None:
+            step = _as_step(step)
+            if self._logged_any and step < self.step:
+                raise ValueError(
+                    f"step {step} is before the last logged step {self.step}; "
+                    "steps must not go backwards (that would overwrite logged metrics)")
+            if self._logged_any and step == self.step:
+                again = sorted(self._step_keys.intersection(metrics))
+                if again:
+                    raise ValueError(
+                        f"{', '.join(map(repr, again))} already logged at step {step}; "
+                        "log each metric once per step")
+            else:
+                self._step_keys = set()
             self.step = step
         else:
             self.step += 1
+            self._step_keys = set()
+        self._step_keys.update(metrics)
+        self._logged_any = True
         self._send({
             "type": "metric",
             "run_id": self._run_id,

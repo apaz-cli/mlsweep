@@ -70,11 +70,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              f"(env: MLSWEEP_SCRATCH_DIR, default: {DEFAULT_SCRATCH_DIR})",
     )
     parser.add_argument(
+        "--notes",
+        default=os.environ.get("MLSWEEP_NOTES", ""),
+        metavar="DIR",
+        help="Notes folder (a git repo, see `mlsweep docs notes`) for the Notes tab and git remote "
+             "(env: MLSWEEP_NOTES; default: <mlsweep-dir>/notes, created if missing)",
+    )
+    parser.add_argument(
+        "--no-notes",
+        action="store_true",
+        help="Do not serve a notes folder",
+    )
+    parser.add_argument(
         "--color",
         action="store_true",
         help="Enable ANSI color in human-readable output (default: off)",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_notes_dir(arg: str, mlsweep_dir: Path) -> Path | None:
+    """The notes repo to serve: --notes DIR, else <mlsweep-dir>/notes, created
+    (as a git repo with the starter files) if it does not exist yet."""
+    from mlsweep._notes_git import GitError, init_repo, is_repo
+
+    path = Path(arg).expanduser().resolve() if arg else mlsweep_dir / "notes"
+    if is_repo(path):
+        return path
+    if arg and path.exists() and any(path.iterdir()):
+        print(f"--notes {arg}: not the top of a git repo. Run `git init` there first.", file=sys.stderr)
+        sys.exit(2)
+    try:
+        init_repo(path)
+    except GitError as exc:
+        print(f"Notes disabled: could not create {path} ({exc}).", file=sys.stderr)
+        return None
+    print(f"Created notes folder {path} (see `mlsweep docs notes` to share it)")
+    return path
 
 
 def _check_pid_file(pid_file: Path) -> None:
@@ -128,14 +160,13 @@ async def _find_reachable_urls(port: int, token: str) -> list[tuple[str, str]]:
         pass
 
     # Probe each candidate
+    # No token: an address can belong to anyone, and any answer shows it is reachable.
     reachable: list[tuple[str, str]] = []
-    headers = {"Authorization": f"Bearer {token}"}
     async with aiohttp.ClientSession() as session:
         for host, label in candidates:
             try:
                 async with session.get(
                     f"http://{host}:{port}/api/health",
-                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=4),
                 ) as resp:
                     if resp.status < 500:
@@ -215,7 +246,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     # Jobs a previous manager left dispatched/running stay that way.  Each
     # worker's hello reports what it is still running, and the jobs of
     # workers that do not come back are requeued (see _handle_worker_hello).
-    from mlsweep._manager_db import count_pending_jobs, get_setting
+    from mlsweep._manager_db import count_pending_jobs, get_setting, unfinished_jobs_with_unsafe_ids
 
     state = ManagerState()
     state.db_writer = writer
@@ -223,6 +254,9 @@ async def _async_main(args: argparse.Namespace) -> None:
     for p in PLACEMENTS:
         if p == placement:
             state.placement = p
+    for run_id, experiment_id in await unfinished_jobs_with_unsafe_ids(read_db):
+        print(f"Failing job {run_id!r} of {experiment_id}: its ID is not safe to use in a path", file=sys.stderr)
+        await writer.update_job_status(run_id, experiment_id, "failed")
     print(f"{await count_pending_jobs(read_db)} pending job(s) in database")
 
     # ── Shutdown coordination ────────────────────────────────────────────
@@ -240,7 +274,8 @@ async def _async_main(args: argparse.Namespace) -> None:
             pass
 
     # ── HTTP server ──────────────────────────────────────────────────────
-    from mlsweep._manager_http import create_app
+    from mlsweep._manager_http import create_app, setup_audit_log
+    from mlsweep._notes_http import setup_notes
     from mlsweep._manager_workers import (
         connect_workers,
         reconnect_known_workers,
@@ -255,7 +290,12 @@ async def _async_main(args: argparse.Namespace) -> None:
     state.scratch_dir = args.scratch_dir
     scheduler_task = asyncio.create_task(scheduler_loop(read_db, state), name="scheduler")
 
+    notes_dir = None if args.no_notes else _resolve_notes_dir(args.notes, mlsweep_dir)
+    setup_audit_log(mlsweep_dir)
     app = create_app(read_db, state, token, mlsweep_dir=mlsweep_dir)
+    setup_notes(app, notes_dir)
+    if notes_dir:
+        print(f"Notes: {notes_dir}")
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -267,6 +307,9 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     async def _print_dashboard() -> None:
         reachable = await _find_reachable_urls(args.port, token)
+        for url, label in reachable:
+            if label == "public":
+                state.public_url = url.split("/?", 1)[0]
         if len(reachable) == 1:
             print(f"Dashboard: {reachable[0][0]}")
         else:

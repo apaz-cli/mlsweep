@@ -251,7 +251,7 @@ def test_abort_kills_in_flight_runs_and_starts_nothing_more(cluster_factory):
     c.set_exp_status(eid, "aborted")
     aborted = time.time()
     _no_live(c, eid)
-    assert c.statuses(eid) == {"cancelled": 2, "pending": 3}
+    assert c.statuses(eid) == {"cancelled": 5}
     c.submit(eid, "late", 1)  # added after the abort
     stays(lambda: not c.live_pids(eid), 4, "nothing runs in an aborted experiment")
     assert all(s.start < aborted for s in c.spans(eid))

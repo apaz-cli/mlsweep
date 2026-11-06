@@ -93,10 +93,11 @@ def _build_banner() -> str:
 def _build_help(include_banner: bool = False) -> str:
     workflow = [
         (f"1. {_GREEN}mlsweep manager{_RESET}", "start the persistent manager (once)"),
-        (f"2. {_GREEN}mlsweep run my_sweep.py --stream{_RESET}", "submit a sweep (validate/dry-run first)"),
-        (f"3. {_GREEN}mlsweep watch <experiment_id>{_RESET}", "live terminal status"),
-        (f"4. {_GREEN}mlsweep fetch --experiment <id>{_RESET}", "download results + summary"),
-        (f"5. {_GREEN}mlsweep status{_RESET}", "manager / token / GPU / result paths"),
+        (f"2. {_GREEN}mlsweep run my_sweep.py{_RESET}", "submit a sweep (--validate first)"),
+        (f"3. {_GREEN}mlsweep wait <experiment_id>{_RESET}", "block until it settles (or `watch` for live status)"),
+        (f"4. {_GREEN}mlsweep best --experiment <id>{_RESET}", "rank the runs (`fetch` also downloads them)"),
+        (f"5. {_GREEN}mlsweep notes clone DIR{_RESET}", "record what you learned in the shared notes"),
+        (f"   {_GREEN}mlsweep status{_RESET}", "diagnose manager / token / GPUs / result paths"),
     ]
     sections = [
         ("Run", [
@@ -109,24 +110,37 @@ def _build_help(include_banner: bool = False) -> str:
             ("watch EXP_ID", "live status for an experiment"),
             ("fetch", "download + summarize an experiment's results (leaderboard)"),
             ("best", "top runs by metric"),
-            ("wait EXP", "block until done/failed/stalled (exit 0/1/2/3)"),
+            ("wait EXP", "block until done/failed/stalled (exit codes in --help)"),
             ("status | doctor", "diagnose the environment"),
             ("ls [EXP]", "list experiments / runs"),
             ("logs RUN", "tail a run's training.log"),
             ("metrics", "print runs' logged metrics as tables (--keys, --json, --csv)"),
+            ("export tensorboard|wandb", "export finished runs (one experiment, a campaign, or all)"),
         ]),
         ("Control", [
-            ("cancel EXP", "cancel runs (--failed/--running/--all)"),
+            ("cancel EXP", "cancel runs (--running/--pending/--all)"),
             ("retry EXP", "re-queue failed runs"),
-            ("rename EXP RUN NAME", "give a run a display name (--clear removes it)"),
-            ("resume EXP", "continue an experiment"),
+            ("rename EXP RUN NAME", "give a run a display name (--clear; --experiment-name NAME)"),
+            ("move EXP RUN... --to EXP2", "move finished runs to another experiment"),
+            ("purge EXP --failed --yes", "delete finished runs with their metrics, logs and files"),
+            ("gc [--yes]", "clean up files and records nothing refers to"),
+            ("delete EXP --yes", "delete an experiment and its runs"),
+            ("resume EXP", "re-queue failed and cancelled runs (Bayesian: --sweep FILE)"),
             ("stop EXP", "abort a sweep"),
             ("pause EXP", "stop dispatching new jobs"),
-            ("unpause EXP", "resume dispatching"),
+            ("unpause EXP", "undo pause"),
+        ]),
+        ("Cluster", [
+            ("workers [ls|add|rm|set]", "list, connect, remove and tune workers"),
+            ("scheduler [--placement P]", "show or set GPU placement (pack | spread)"),
         ]),
         ("Campaigns", [
             ("campaign [ls]", "list campaigns with experiment and job counts"),
             ("campaign move EXP NAME", "move an experiment to another campaign"),
+        ]),
+        ("Notes", [
+            ("notes clone DIR", "clone the shared research notes from the manager, then use git"),
+            ("notes lint [DIR]", "check links, experiment IDs and conflict markers"),
         ]),
         ("Docs", [
             ("docs [topic]", "read the bundled runbook (README by default)"),
@@ -146,13 +160,12 @@ def _build_help(include_banner: bool = False) -> str:
         lines.append(_align(rows))
         lines.append("")
     lines += [
-        "watch/fetch/best/status/ls/logs default --manager to $MLSWEEP_MANAGER or http://localhost:7891.",
-        "`run` requires --manager explicitly.",
+        "Every command defaults --manager to $MLSWEEP_MANAGER, then http://localhost:7891.",
         "Each command works in the campaign named by --campaign, else $MLSWEEP_CAMPAIGN, else",
         "`default`. --all-campaigns covers every campaign (not allowed when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
         f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
-        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, skill)",
+        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, skill)",
         f"      or {_CYAN}mlsweep docs{_RESET}. {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
     ]
     return "\n".join(lines) + "\n"
@@ -169,6 +182,7 @@ _DOC_ALIASES = {
     "mlsweep": "mlsweep.md",
     "skill": "SKILL.md",
     "examples": "examples.md",
+    "notes": "notes.md",
 }
 
 def _build_makefile_template() -> str:
@@ -183,9 +197,9 @@ def _build_makefile_template() -> str:
         ("make sweep-best", "E=<id>", "top runs by metric"),
         ("make sweep-ls", "E=<id>", "list experiments / runs"),
         ("make sweep-logs", "R=<id> E=<id>", "tail a run's training.log"),
-        ("make sweep-cancel", "E=<id>", "cancel failed runs"),
+        ("make sweep-cancel", "E=<id>", "cancel running runs"),
         ("make sweep-retry", "E=<id>", "re-queue failed runs"),
-        ("make sweep-resume", "E=<id>", "continue an experiment"),
+        ("make sweep-resume", "E=<id>", "re-queue failed and cancelled runs"),
         ("make sweep-stop", "E=<id>", "abort a sweep (destructive)"),
         ("make sweep-docs", "", "read the full runbook"),
     ]
@@ -239,7 +253,7 @@ def _build_makefile_template() -> str:
         "\tmlsweep logs $(R) --experiment $(E) --manager $(MLSWEEP_MANAGER)\n"
         "\n"
         "sweep-cancel:\n"
-        "\tmlsweep cancel $(E) --failed --manager $(MLSWEEP_MANAGER)\n"
+        "\tmlsweep cancel $(E) --running --manager $(MLSWEEP_MANAGER)\n"
         "\n"
         "sweep-retry:\n"
         "\tmlsweep retry $(E) --failed --manager $(MLSWEEP_MANAGER)\n"
@@ -325,13 +339,15 @@ def _status_cmd(argv: list[str]) -> None:
     print(f"{_BOLD}{_CYAN}mlsweep status{_RESET}")
     print(f"  {_label('manager:')}{manager}")
     print(f"  {_label('campaign:')}{campaign or 'all (--all-campaigns)'}")
-    print(f"  {_label('results:')}{mlsweep_dir / 'experiments'}")
+    print(f"  {_label('results:')}{mlsweep_dir / 'experiments'} (on the manager's machine; "
+          "read them with metrics, logs, fetch)")
     print(f"  {_label('dashboard:')}{manager}/?token=<token>")
     print()
 
     if status == 0:
         print(f"  {_label('manager:')}{_RED}DOWN{_RESET}, no response from {manager}")
-        print(f"{_CONT}start it with: {_GREEN}mlsweep manager{_RESET}")
+        print(f"{_CONT}wrong URL? set --manager or MLSWEEP_MANAGER")
+        print(f"{_CONT}to host one on this machine: {_GREEN}mlsweep manager{_RESET} (its worker takes all visible GPUs)")
     elif status == 401:
         print(f"  {_label('manager:')}{_YELLOW}UP{_RESET}, but rejected the token (401)")
         if not token:
@@ -355,11 +371,11 @@ def _status_cmd(argv: list[str]) -> None:
     print(f"  {_label('disk:')}{disk.free / 1e9:.1f}G free of {disk.total / 1e9:.1f}G on {mlsweep_dir}")
 
     if gpus:
-        print(f"  {_label('gpus:')}{len(gpus)} visible")
+        print(f"  {_label('gpus here:')}{len(gpus)} visible on this machine (cluster: see workers)")
         for g in gpus:
             print(f"{_CONT}gpu{g['gpu']}  util={g['util_pct']}%  mem={g['mem_used_mb']}/{g['mem_total_mb']} MiB")
     else:
-        print(f"  {_label('gpus:')}{_YELLOW}none visible{_RESET} (no nvidia-smi / rocm-smi output)")
+        print(f"  {_label('gpus here:')}{_YELLOW}none visible{_RESET} on this machine (cluster: see workers)")
 
     if manager_up and workers:
         print(f"  {_label('workers:')}{len(workers)}")
@@ -464,7 +480,7 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
 _CTL_CMDS = frozenset({
     "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "stop", "pause", "unpause", "best",
-    "wait", "campaign",
+    "wait", "campaign", "move", "purge", "gc", "delete", "export", "workers", "scheduler",
 })
 
 
@@ -534,6 +550,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "gen_makefile":
         _gen_makefile_cmd(rest)
+        return
+
+    if cmd == "notes":
+        from mlsweep.notes_cli import main as _notes_main
+        _notes_main(rest)
         return
 
     if cmd in _CTL_CMDS:

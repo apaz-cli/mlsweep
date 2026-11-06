@@ -1,6 +1,6 @@
-# mlsweep skill
+# mlsweep guide
 
-Use this skill when a user needs help using the `mlsweep` package. That covers writing sweep files, instrumenting training scripts, running sweeps, and understanding configuration options.
+This guide is for using the `mlsweep` package. It covers writing sweep files, instrumenting training scripts, running sweeps, and understanding configuration options.
 
 ## Architecture
 
@@ -49,11 +49,11 @@ mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM,
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
 
 # 4. Control a running sweep
-mlsweep cancel EXP_ID --failed             # cancel jobs (--running / --all --yes)
-mlsweep retry  EXP_ID --failed             # re-queue failed jobs
-mlsweep resume EXP_ID                      # continue an experiment
+mlsweep cancel EXP_ID --running            # cancel jobs (--pending / --all --yes)
+mlsweep retry  EXP_ID --failed             # re-queue failed jobs, with the code they were submitted with
+mlsweep resume EXP_ID                      # re-queue failed and cancelled jobs (Bayesian: --sweep FILE --stream)
 mlsweep pause EXP_ID                       # stop dispatching new jobs
-mlsweep unpause EXP_ID                     # resume dispatching
+mlsweep unpause EXP_ID                     # undo pause
 mlsweep stop EXP_ID --yes                  # abort a sweep
 mlsweep rename EXP_ID RUN_ID NAME          # display name for a run (--clear removes it)
 
@@ -259,7 +259,7 @@ OPTIMIZE = {
     "metric": "val_loss",   # metric name logged via MLSweepLogger
     "goal": "minimize",     # "minimize" or "maximize"
     "budget": 40,           # number of successful runs
-    "n_initial": 8,         # runs to queue upfront before adaptive sampling starts (default: max(8, n_params*2))
+    "n_initial": 8,         # random runs before adaptive sampling starts (default: max(8, n_params*2))
 }
 ```
 
@@ -272,7 +272,7 @@ Continuous dims (bayes only; use `"samples"` for grid mode):
 
 Discrete dims and subdims work unchanged in bayes mode (optuna treats them as categorical). Singular dims are invisible to the optimizer; the full singular probe sequence is generated for each optimizer suggestion.
 
-Bayes runs are named `{sweep_name}_bayes_{N:04d}`. Resume a bayes sweep: `mlsweep_run sweep.py --manager ... --resume EXP_ID`.
+Bayes runs are named `{sweep_name}_bayes_{N:04d}`. Submit with `--stream` for adaptive sampling. That process picks each run from the results so far, one at a time, so keep it alive. Without `--stream` the whole budget is submitted up front. If the process dies, continue with `mlsweep resume EXP_ID --sweep sweep.py --stream`, which restores the earlier results.
 
 ## Logger
 
@@ -284,6 +284,8 @@ with MLSweepLogger() as logger:
         logger.log({"loss": 0.42, "lr": 1e-3}, step=step)  # step auto-increments if omitted
         logger.sync()  # fire-and-forget rsync of MLSWEEP_RUN_DIR artifacts mid-training
 ```
+
+Steps never go backwards and each metric is logged at most once per step: `log()` raises `ValueError` instead of silently overwriting a value it already recorded. Several calls at one step are fine when their keys differ, e.g. `log({"loss": l}, step=s)` then `log({"val_loss": v}, step=s)`. This holds when running the script directly too, so the mistake shows up before you launch a sweep.
 
 `MLSweepLogger` is only active when `MLSWEEP_WORKER_SOCKET` is set, which the worker sets before launching the script. Run the script directly and it's a no-op; no import guard is needed.
 
@@ -337,6 +339,63 @@ as `unhealthy=[...]` on the worker's line and `/api/workers` exposes the same as
 `unhealthy_gpus`. Pass `--no-device-probe` to a worker to skip the probe (e.g. on
 a host where creating a context is itself restricted).
 
+## Moving, deleting and cleaning up
+
+```sh
+mlsweep move EXP RUN... --to EXP2       # also --done --failed --cancelled --xfailed
+mlsweep purge EXP --failed              # lists what would go; add --yes to delete
+mlsweep delete EXP --yes                # the experiment and its runs
+mlsweep gc                              # lists what nothing refers to
+mlsweep gc --yes [--vacuum]             # deletes it; --vacuum also shrinks the database
+mlsweep gc --downloads                  # also this machine's downloads of deleted experiments
+```
+
+`move` takes finished runs, with their metrics, logs and files. It refuses a run still
+pending or running, and one whose ID the target already has. `purge` removes finished runs
+for good. `delete` leaves the experiment's files on disk until `gc --yes`.
+
+`gc` finds files of deleted experiments and runs, database rows of deleted runs, and code
+archives no run uses. Files and archives younger than an hour are left alone, in case
+they're about to be used. The System page's Storage cleanup does the same.
+
+Each row on the Experiments page has `View ▾` (Results, Logs, Artifacts, Notes, Export)
+and `Manage` (Rename, Move to campaign, Delete). A run's row has the same two: `View ▾`
+for its Artifacts and Logs, `Manage` for Rename, Cancel or Retry, Move and Delete. The
+page has
+Pause, Unpause, Stop, Retry failed, Cancel active and Delete failed above an expanded
+experiment's runs.
+
+## Exporting
+
+```sh
+mlsweep export tensorboard [--experiment EXP] [--only-done] [-o FILE.zip]
+mlsweep export wandb --project P [--entity E] [--api-key K] [--experiment EXP] [--only-done] [--no-wait]
+```
+
+The scope is one experiment, else the current campaign, else everything with
+`--all-campaigns`. `wandb` uploads from the manager, for real, using the key given or the
+manager's own login; set `WANDB_MODE=offline` where the manager runs to try it safely.
+
+## Workers and placement
+
+```sh
+mlsweep workers                         # list
+mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1]
+mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0]
+mlsweep workers rm WORKER
+mlsweep scheduler [--placement pack|spread]
+```
+
+`pack` fills busy GPUs first, keeping whole GPUs and machines free for big jobs. `spread`
+puts each job on the least busy GPU. `mlsweep rename EXP --experiment-name NAME` renames an
+experiment; its ID never changes.
+
+## Notes
+
+Research notes live in `<mlsweep-dir>/notes` and show in the dashboard's Notes tab. See
+`docs/notes.md` (`mlsweep docs notes`) for the tab, the markdown it renders, sharing between
+machines, and lint.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -344,7 +403,6 @@ a host where creating a context is itself restricted).
 | `COMMAND is required` | Add `COMMAND = ["python", "train.py"]` to the sweep file |
 | `Dimension key must start with '.'` | All `OPTIONS` keys (and subdim keys) need a `.` prefix |
 | `has both 'values' and subdimensions` | A dim can have a value list or subdim branches; it cannot have both |
-| `--manager URL is required` | Pass `--manager http://host:7891`. `mlsweep_run` is a submission client and needs a running manager |
 | Token errors | Check `~/.mlsweep/manager.token` or pass `--token` / set `MLSWEEP_TOKEN` |
 | `experiment X is in campaign 'Y', not 'Z'` | Pass `--campaign Y` (or `--all-campaigns`), or set `MLSWEEP_CAMPAIGN=Y` |
 | Singular/monotonic not skipping | Only jobs still pending when a result arrives are skipped; lower `--max-concurrent` so fewer run at once |
@@ -358,4 +416,5 @@ a host where creating a context is itself restricted).
 
 - `docs/sweep_configuration.md` is the complete reference for dim types, flag behavior, CLI options and the output layout
 - `docs/examples.md` has worked examples for DDP, multi-node runs, TorchTitan and Prime-RL
-- `docs/SKILL.md` is the agent-facing quick reference (readable via `mlsweep --help skill`)
+- `docs/notes.md` covers the Notes tab, its markdown, sync, the git server and lint
+- `mlsweep/docs/SKILL.md` is the agent-facing quick reference. Read it with `mlsweep docs skill`. The README's "Running an agent" section covers installing it and starting an agent

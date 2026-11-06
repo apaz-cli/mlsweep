@@ -163,14 +163,14 @@ mlsweep best --experiment EXP_ID                     # top runs by metric (--gro
 mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
 
-`watch`, `fetch`, `status`, `ls`, `logs`, and `best` default `--manager` to
-`http://localhost:7891` (override with `--manager` or `MLSWEEP_MANAGER`). `run`
-requires `--manager`. Add `--json` to `status`, `ls`, `best`, or `fetch` for
+Every command defaults `--manager` to `http://localhost:7891` (override with
+`--manager` or `MLSWEEP_MANAGER`). Add `--json` to `status`, `ls`, `best`, or `fetch` for
 machine-readable output.
 
-Control a running sweep with `mlsweep cancel EXP --failed`, `mlsweep retry EXP --failed`,
+Control a running sweep with `mlsweep cancel EXP --running`, `mlsweep retry EXP --failed`,
 `mlsweep resume EXP`, `mlsweep pause EXP`, `mlsweep unpause EXP`, or `mlsweep stop EXP --yes`.
-`cancel`, `retry`, and `resume` exit non-zero if any targeted run fails.
+`cancel`, `retry`, and `resume` exit non-zero if any targeted run fails. `retry` and `resume`
+rerun the code submitted with the experiment, so after fixing a bug submit a new sweep.
 
 Generated run IDs get long. `mlsweep rename EXP RUN_ID "warmup ablation"` gives a run a
 display name, and `--clear` removes it. The name appears next to the run ID in `ls`, `best`,
@@ -270,7 +270,7 @@ mlsweep best  --experiment EXP_ID    mlsweep ls [EXP_ID]
 mlsweep logs RUN_ID --experiment EXP_ID    mlsweep status
 
 # control
-mlsweep cancel EXP --failed          mlsweep retry EXP --failed
+mlsweep cancel EXP --running         mlsweep retry EXP --failed
 mlsweep resume EXP                   mlsweep pause EXP
 mlsweep unpause EXP                  mlsweep stop EXP --yes
 mlsweep rename EXP RUN_ID NAME       # display name for a run; --clear removes it
@@ -278,8 +278,20 @@ mlsweep rename EXP RUN_ID NAME       # display name for a run; --clear removes i
 # campaigns (every command also takes --campaign NAME / --all-campaigns)
 mlsweep campaign [ls]                mlsweep campaign move EXP NAME
 
+# runs and storage
+mlsweep move EXP RUN... --to EXP2    mlsweep purge EXP --failed --yes
+mlsweep delete EXP --yes             mlsweep gc [--yes] [--vacuum] [--downloads]
+mlsweep export tensorboard|wandb     mlsweep rename EXP --experiment-name NAME
+
+# cluster (the System page)
+mlsweep workers [ls|add|rm|set]      mlsweep scheduler [--placement pack|spread]
+
+# notes (a shared research notes folder in a git repo the manager hosts; mlsweep docs notes)
+mlsweep notes clone DIR              mlsweep notes status
+mlsweep notes lint                   mlsweep notes links|mentions|search|history|mv
+
 # docs
-mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, skill
+mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, notes, skill
 ```
 
 ### Using with W&B
@@ -309,6 +321,77 @@ The flags above stream metrics while `mlsweep run` is attached. To export afterw
 - **W&B:** the manager uploads each run itself. A run's sweep parameters become its config, its experiment becomes its group, and its campaign becomes a tag. This needs `pip install 'mlsweep[wandb]'` where the manager runs. The API key comes from the form, else from the manager's `WANDB_API_KEY` or its saved `wandb login`. Set `WANDB_MODE=offline` in the manager's environment to write runs locally instead of uploading (sync them later with `wandb sync`). The form's key is sent in the request body, so keep the dashboard on localhost or behind HTTPS when you enter one.
 
 Over HTTP, `GET /api/export/tensorboard.zip` and `POST /api/export/wandb` take the scope as a query parameter. Use `?experiment_id=EXP` for one experiment, `?campaign=NAME` for one campaign, and neither for everything. Add `only_done=1` for succeeded runs only. The W&B body is `{"project": ..., "entity": ..., "api_key": ...}`, with only `project` required. Track an upload's progress at `GET /api/exports/EXPORT_ID`.
+
+## Notes
+
+The dashboard's **Notes** tab is an editor for a shared folder of research notes,
+papers and plots: an Obsidian-style file tree, markdown with `[[links]]`, search,
+graph, history and diffs. Experiment IDs in a note link to their results.
+
+The folder is a git repo that the manager hosts. Agents on any machine run
+`mlsweep notes clone DIR`, then pull, commit, merge and push with normal git.
+`mlsweep notes lint` checks links and experiment IDs, and reports leftover conflict
+markers.
+
+The manager serves `~/.mlsweep/notes` (creating it) by default, so the tab and the
+remote work out of the box. Math renders with `$…$` and `$$…$$`.
+
+See [notes.md](docs/notes.md) (`mlsweep docs notes`).
+
+## Dashboard and command line
+
+Everything the dashboard does, an agent can do from the command line, and the
+other way round (watching live is the exception; `mlsweep watch` and
+`mlsweep wait` cover it in a terminal):
+
+| Dashboard | Command |
+|---|---|
+| Experiments: rename, move campaign, delete | `mlsweep rename EXP --experiment-name N`, `mlsweep campaign move`, `mlsweep delete` |
+| Experiments: pause, unpause, stop, retry failed, cancel active, delete failed | `mlsweep pause`, `unpause`, `stop`, `retry --failed`, `cancel --running`, `purge --failed` |
+| Runs: rename, cancel, retry, move, delete | `mlsweep rename`, `cancel`, `retry`, `move`, `purge` |
+| Results, Logs, Artifacts | `mlsweep metrics`, `mlsweep best`, `mlsweep logs`, `mlsweep fetch` |
+| Export (TensorBoard, W&B) | `mlsweep export tensorboard`, `mlsweep export wandb` |
+| System: workers, devices, jobs per GPU, placement | `mlsweep workers ...`, `mlsweep scheduler --placement` |
+| System: storage cleanup | `mlsweep gc` |
+| Notes | `mlsweep notes ...` (see [notes.md](docs/notes.md)) |
+
+## Running an agent
+
+An agent working from your copy of the code can edit it, submit sweeps, watch them and record
+results, on the manager's machine or any other. Three things need setting up first.
+
+Install the skill, and run this again after upgrading mlsweep, since it writes a copy:
+
+```sh
+mkdir -p ~/.claude/skills/mlsweep && mlsweep docs skill > ~/.claude/skills/mlsweep/SKILL.md
+```
+
+Other agents can read it with `mlsweep docs skill`.
+
+Keep a manager running somewhere the agent's session can't end it, such as tmux or a service.
+The agent should use this manager and not start its own, because a manager's worker takes
+every visible GPU.
+
+On another machine, tell the agent how to connect:
+
+```sh
+export MLSWEEP_MANAGER=http://MANAGER:7891
+export MLSWEEP_TOKEN=...                     # from ~/.mlsweep/manager.token on the manager
+export MLSWEEP_CAMPAIGN=my_campaign          # optional: keeps this work grouped
+```
+
+Then give it the question and its limits. The skill covers the rest:
+
+```
+Use the mlsweep skill. Find out which warmup schedule gives the lowest val_loss on the
+small model. Use at most 40 runs, 2 at a time (--max-concurrent 2). Stop when
+three seeds agree on a winner, or when the budget runs out. Record findings and dead
+ends in the notes as you go.
+```
+
+Limits are yours to set, and the agent asks if something is unclear. By default the skill lets
+an agent stop and cancel its own experiments, and asks it to leave others' alone, to get
+permission before changing workers or placement, and to delete or publish only on request.
 
 ## Troubleshooting
 

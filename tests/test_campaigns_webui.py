@@ -182,8 +182,11 @@ def test_links_carry_the_campaign(page, seeded):
         assert "campaign=alpha" in hrefs[nav], hrefs
     _choose(page, "campaign-select", "beta")
     page.wait_for("document.getElementById('nav-logs').getAttribute('href').includes('campaign=beta')")
-    # Row links are built at render time and rewritten when clicked.
-    href = page.eval("""(() => { const a = document.querySelector('.exp-row a.btn-link');
+    # Row links live in the View menu, are built at render time, and are
+    # rewritten when clicked.
+    page.eval("document.querySelector('.exp-row .btn-menu').click()")
+    page.wait_for("!!document.querySelector('.row-menu a')")
+    href = page.eval("""(() => { const a = document.querySelector('.row-menu a');
         a.addEventListener('click', e => e.preventDefault(), { once: true });
         a.click(); return a.getAttribute('href'); })()""")
     assert "campaign=beta" in href and "experiment=" in href
@@ -213,8 +216,11 @@ def _prompt(b, value):
 
 
 def _click_move(b, eid):
-    b.eval(f"""[...document.getElementById('exp-row-{eid}').querySelectorAll('button')]
-        .find(x => x.textContent === 'Move').click()""")
+    """Move lives in the row's ⋯ menu."""
+    b.eval(f"document.querySelector('#exp-row-{eid} .btn-manage').click()")
+    b.wait_for("!!document.querySelector('.row-menu')")
+    b.eval("""[...document.querySelectorAll('.row-menu-item')]
+        .find(x => x.textContent.startsWith('Move to campaign')).click()""")
 
 
 def test_move_button_moves_experiment(page, mgr):

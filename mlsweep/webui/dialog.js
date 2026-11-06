@@ -80,16 +80,18 @@
         actions.appendChild(btn);
       }
 
+      if (extraContent) dlg.append(msg, extraContent, actions);
+      else dlg.append(msg, actions);
+      backdrop.appendChild(dlg);
+      document.body.appendChild(backdrop);
+      // Focus once the dialog is in the document; focusing a detached
+      // element does nothing, and keystrokes would go to the page behind.
       if (extraContent) {
-        dlg.append(msg, extraContent, actions);
         extraContent.focus();
         extraContent.select?.();
       } else {
-        dlg.append(msg, actions);
         actions.querySelector("button:last-child").focus();
       }
-      backdrop.appendChild(dlg);
-      document.body.appendChild(backdrop);
     });
   }
 
@@ -144,7 +146,40 @@
 function escHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Human-readable byte count ("" for null).
+function fmtSize(b) {
+  if (b == null) return "";
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+  return (b / 1073741824).toFixed(2) + " GB";
+}
+
+// A status badge.  common.css has the colors.
+function badge(cls, label = cls) {
+  return `<span class="badge badge-${escHtml(cls)}">${escHtml(label)}</span>`;
+}
+
+// "5m ago" from an ISO time.
+function relTime(iso) {
+  if (!iso) return "—";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60e3) return "just now";
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
+  return Math.floor(diff / 86400e3) + "d ago";
+}
+
+// "1h2m" from seconds; *empty* for null.
+function fmtElapsed(s, empty = "—") {
+  if (s == null) return empty;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m${sec}s`;
+  return `${sec}s`;
 }
 
 // A run's display name: its label, or its run ID if it has none.
@@ -160,8 +195,7 @@ function runNameHtml(j) {
 
 // Ask for a run's new display name and save it.  Resolves to the new label
 // (null = cleared), or undefined if cancelled, unchanged, or the save failed.
-// *apiFetch* is the page's authenticated fetch.
-async function mlRenameRun(apiFetch, expId, runId, current) {
+async function mlRenameRun(expId, runId, current) {
   const input = await mlPrompt(`Rename run ${runId}:`, current || "", { okLabel: "Rename", placeholder: runId });
   if (input === null) return undefined;
   const label = input.trim() || null;

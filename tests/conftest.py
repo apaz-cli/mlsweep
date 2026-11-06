@@ -144,7 +144,8 @@ def _log_tail(tmp_path, lines=40):
     return "manager.log:\n" + "\n".join(text.splitlines()[-lines:])
 
 
-def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int = 0):
+def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int = 0,
+                   extra_args: tuple[str, ...] = ()):
     """Start a real mlsweep manager process and return (proc, server, url).
 
     with_worker=False (default): passes an empty workers file so no local
@@ -199,6 +200,8 @@ def _start_manager(tmp_path, *, with_worker: bool = False, n_local_workers: int 
         workers_file = tmp_path / "workers.toml"
         workers_file.write_text("")
         cmd += ["--workers", str(workers_file)]
+
+    cmd += list(extra_args)
 
     # A file rather than a pipe.  Nothing reads the output, and a full pipe
     # would block the manager.

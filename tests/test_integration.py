@@ -251,12 +251,15 @@ def test_gpus_per_run(manager_with_worker, tmp_path):
 
 # ── Tests: missing manager (error path) ────────────────────────────────────────
 
-def test_missing_manager_fails(tmp_path):
-    """Running without --manager should exit non-zero with an error message."""
-    result = _run("tests/sweeps/integration_grid.py", tmp_path,
-                  expect_failure=True)
+def test_run_uses_manager_from_env_with_no_flag():
+    """`run` finds the manager the way every other command does."""
+    url = "http://127.0.0.1:9"  # nothing listens here, so no sweep can land anywhere
+    result = subprocess.run(
+        [sys.executable, "-m", "mlsweep.run_sweep", "tests/sweeps/integration_grid.py"],
+        capture_output=True, text=True, env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": "x"},
+    )
     assert result.returncode != 0
-    assert "--manager" in result.stderr or "--manager" in result.stdout
+    assert url in result.stdout + result.stderr
 
 
 # ── Tests: subcommands (watch / fetch) ─────────────────────────────────────────
@@ -470,3 +473,15 @@ def test_logs_sweep_end_to_end(manager_with_worker, tmp_path):
             assert "epochs=1 " in text and "bs=512 " in text, text[:600]
         except urllib.error.HTTPError as e:
             pytest.fail(f"Log endpoint returned {e.code} for {job['run_id']}")
+
+
+def test_reusing_an_experiment_name_needs_append(manager_with_worker, tmp_path):
+    server, url = manager_with_worker
+    assert _run("tests/sweeps/integration_grid.py", tmp_path, manager_url=url).returncode == 0
+
+    refused = _run("tests/sweeps/integration_grid.py", tmp_path, manager_url=url, expect_failure=True)
+    assert refused.returncode == 1 and "--append" in refused.stdout
+
+    # --append gets past the check; these run names are taken, so the manager still says no.
+    clash = _run("tests/sweeps/integration_grid.py", tmp_path, "--append", manager_url=url, expect_failure=True)
+    assert "already exists" not in clash.stdout and "duplicate run_id" in clash.stdout

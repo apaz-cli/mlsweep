@@ -57,6 +57,42 @@ def validate_campaign(name: str) -> str:
     return name
 
 
+_ARTIFACT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:+=\-]{0,199}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def validate_artifact_id(artifact_id: Any) -> str:
+    """Return *artifact_id* if it is safe in a file name; raise ValueError otherwise."""
+    if not isinstance(artifact_id, str) or not _ARTIFACT_ID_RE.match(artifact_id):
+        raise ValueError("artifact_id must be 1-200 chars of [a-zA-Z0-9._:+=-], starting with a letter or digit")
+    return artifact_id
+
+
+def validate_run_id(run_id: Any) -> str:
+    """Return *run_id* if it stays inside its experiment's directory; raise ValueError otherwise.
+
+    Run names come from sweep option values, so a ``/`` is allowed and makes a
+    nested directory.  Empty, ``.`` and ``..`` components are not.
+    """
+    if not isinstance(run_id, str) or not run_id or len(run_id) > 1024 or _CONTROL_CHARS_RE.search(run_id):
+        raise ValueError("run_id must be 1-1024 chars with no control characters")
+    if any(part in ("", ".", "..") for part in run_id.split("/")):
+        raise ValueError(f"run_id must not have empty, '.' or '..' path components: {run_id!r}")
+    return run_id
+
+
+def validate_experiment_dir(experiment_id: Any) -> str:
+    """Return *experiment_id* if it names one directory; raise ValueError otherwise.
+
+    New experiments are held to the stricter ``_sanitize_experiment_id``.  This
+    is the check for looking one up, so an older name still resolves.
+    """
+    validate_run_id(experiment_id)
+    if "/" in experiment_id:
+        raise ValueError(f"experiment_id must not contain '/': {experiment_id!r}")
+    return str(experiment_id)
+
+
 def _mlsweep_dir() -> Path:
     """mlsweep state directory ($MLSWEEP_DIR, default ~/.mlsweep)."""
     return Path(os.environ.get("MLSWEEP_DIR", "~/.mlsweep")).expanduser()
@@ -355,8 +391,11 @@ async def aread_msg(reader: asyncio.StreamReader) -> bytes:
     return await reader.readexactly(n)
 
 
-def read_msg(sock: socket.socket) -> bytes | None:
-    """Read one length-prefixed message from a blocking socket. Returns None on EOF/error."""
+def read_msg(sock: socket.socket, limit: int | None = None) -> bytes | None:
+    """Read one length-prefixed message from a blocking socket.
+
+    Returns None on EOF, on error, or if the message is longer than *limit*.
+    """
     def _recv_exactly(n: int) -> bytes | None:
         buf = bytearray()
         while len(buf) < n:
@@ -373,4 +412,18 @@ def read_msg(sock: socket.socket) -> bytes | None:
     if hdr is None:
         return None
     (n,) = struct.unpack(">I", hdr)
+    if limit is not None and n > limit:
+        return None
     return _recv_exactly(n)
+
+
+def _dir_size(path: Path) -> int:
+    """Total bytes of files under *path* (symlinks counted as links, not followed)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total

@@ -1,6 +1,7 @@
 """Bayesian optimization backend (optuna TPE) for mlsweep."""
 
 import itertools
+import re
 import warnings
 from typing import Any
 
@@ -220,6 +221,49 @@ class BayesianOptimizer:
         else:
             self._study.tell(trial, metric_value)
             self._told += 1
+
+    def _adopt(self, combo: dict[str, Any]) -> None:
+        """Make a trial for a combo submitted before this process started, so tell() can count it."""
+        singular_names = {k[1:] for k in self._singular_options}
+        self._study.enqueue_trial({k: v for k, v in combo.items()
+                                   if k not in singular_names and v is not None})
+        trial = self._study.ask()
+        lex_combo, _ = _build_lex_combo(trial, self._lex_options)
+        self._lex_key_to_trial[tuple(lex_combo[k] for k in sorted(lex_combo))] = trial
+
+    def restore(
+        self,
+        finished: list[tuple[dict[str, Any], float | None]],
+        active: list[dict[str, Any]],
+        run_ids: list[str],
+    ) -> int:
+        """Rebuild state from an experiment's earlier runs, for resuming a sweep.
+
+        *finished* holds each finished run's (combo, best metric or None), *active* the combos
+        still queued or running, *run_ids* every run ID it has, so new names don't collide.
+        Sibling singular probes count once, as they do live.  Returns how many lex combos are
+        still active.
+        """
+        singular_names = {k[1:] for k in self._singular_options}
+
+        def key(combo: dict[str, Any]) -> tuple[Any, ...]:
+            return tuple(str(combo[k]) for k in sorted(combo) if k not in singular_names)
+
+        results: dict[tuple[Any, ...], tuple[dict[str, Any], float | None]] = {}
+        for combo, value in finished:
+            if key(combo) not in results or results[key(combo)][1] is None:
+                results[key(combo)] = (combo, value)
+        for combo, value in results.values():
+            self._adopt(combo)
+            self.tell(combo, value)
+        waiting = {key(c): c for c in active if key(c) not in results}
+        for combo in waiting.values():
+            self._adopt(combo)
+        for run_id in run_ids:
+            m = re.search(r"_bayes_(\d+)$", run_id)
+            if m:
+                self._run_counter = max(self._run_counter, int(m.group(1)) + 1)
+        return len(waiting)
 
     @property
     def exhausted(self) -> bool:

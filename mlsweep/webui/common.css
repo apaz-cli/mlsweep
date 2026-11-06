@@ -1,0 +1,56 @@
+/* What every dashboard page shares (see chrome.js). Page-specific styles follow in each page. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
+  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555;
+  --text-strong: #333; --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
+  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe; --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
+  --plot-bg: white; --plot-grid: #eee; --plot-text: #444; --swatch-border: rgba(0,0,0,0.15);
+}
+
+[data-theme=dark] {
+  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
+  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa;
+  --text-strong: #ccc; --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
+  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50; --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
+  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa; --swatch-border: rgba(255,255,255,0.15);
+}
+
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+
+/* Nav */
+nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
+.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link:hover { background: var(--btn-hover); }
+/* A text shadow, not bold, so the active tab doesn't shift the tabs beside it. */
+.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
+.nav-spacer { flex: 1; }
+#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
+#theme-toggle:hover { color: var(--text); }
+
+/* Connection indicator */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background .3s; }
+[data-theme=dark] #conn-dot { background: #5cd65c; }
+#conn-dot.disconnected { background: #d62728 !important; }
+#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
+@keyframes conn-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+#conn-label { font-size: 11px; color: var(--text-muted); }
+
+/* Square icon button (downloads, close) */
+.icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
+.icon-btn svg { display: block; }
+.icon-btn:hover { background: var(--btn-hover); }
+
+/* Status badges: jobs and experiments.  A page may resize .badge. */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+.badge-pending    { background: #44444466; color: var(--text-dim); }
+.badge-dispatched { background: #1a56c422; color: #4c9be8; border: 1px solid #4c9be844; }
+.badge-running    { background: #2ca02c22; color: #2ca02c; border: 1px solid #2ca02c44; }
+.badge-done, .badge-completed { background: #17becf22; color: #17becf; border: 1px solid #17becf44; }
+.badge-failed     { background: #d6272822; color: #d62728; border: 1px solid #d6272844; }
+.badge-xfailed    { background: #44444422; color: var(--text-dim); border: 1px solid #44444433; }
+.badge-cancelled, .badge-aborted { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
+.badge-paused     { background: #e07b0022; color: #e07b00; border: 1px solid #e07b0044; }
+[data-theme=dark] .badge-running { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
+[data-theme=dark] .badge-done, [data-theme=dark] .badge-completed { color: #1fd1e8; border-color: #1fd1e844; background: #1fd1e822; }

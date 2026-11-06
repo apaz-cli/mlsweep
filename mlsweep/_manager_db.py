@@ -31,7 +31,12 @@ from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, Type
 
 import aiosqlite
 
-from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES
+from mlsweep._shared import (
+    DEFAULT_CAMPAIGN,
+    NON_SCHEDULABLE_EXPERIMENT_STATUSES,
+    validate_artifact_id,
+    validate_run_id,
+)
 from mlsweep._sweep import SkipIndex
 
 _T = TypeVar("_T")
@@ -41,6 +46,11 @@ ExperimentStatus = Literal["running", "paused", "completed", "aborted"]
 
 ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
 FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled")
+
+
+def _marks(values: Sequence[Any]) -> str:
+    """``?,?,...``: one bound-parameter placeholder per value."""
+    return ",".join("?" * len(values))
 
 
 def _sql_in(statuses: Sequence[str]) -> str:
@@ -808,10 +818,18 @@ _JOB_COUNT_COLUMNS = ",\n               ".join(
 )
 
 
-def _job_counts(row: Any) -> dict[str, int]:
+# Runs with an artifact archive, added only to the experiments listing (the
+# campaign listing has no use for it, and its shape is asserted in tests).
+_ARTIFACT_COUNT_COLUMN = "SUM(CASE WHEN j.artifact_id IS NOT NULL THEN 1 ELSE 0 END) AS artifacts_jobs"
+
+
+def _job_counts(row: Any, artifacts: bool = False) -> dict[str, int]:
     """``job_counts`` from a row selected with ``_JOB_COUNT_COLUMNS`` (None = all zero)."""
     keys = ("total", *_JOB_COUNT_STATUSES)
-    return {k: (row[f"{k}_jobs"] or 0) if row is not None else 0 for k in keys}
+    counts = {k: (row[f"{k}_jobs"] or 0) if row is not None else 0 for k in keys}
+    if artifacts:
+        counts["with_artifacts"] = (row["artifacts_jobs"] or 0) if row is not None else 0
+    return counts
 
 
 async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -1052,6 +1070,9 @@ async def _insert_jobs_and_reopen(
     now = _now_epoch()
     records: list[JobRecord] = []
     for j in jobs:
+        validate_run_id(j.get("run_id"))
+        if j.get("artifact_id"):
+            validate_artifact_id(j["artifact_id"])
         command_json, combo_json, env_json, return_files_json, files_json = _serialize_job_fields(
             j["command"], j.get("combo"), j.get("env"), j.get("return_files"), j.get("files")
         )
@@ -1194,7 +1215,7 @@ async def list_schedulable_jobs(
 
     Ordered by priority DESC, submit_time ASC to match ``idx_jobs_dispatch``.
     """
-    placeholders = ",".join("?" * len(NON_SCHEDULABLE_EXPERIMENT_STATUSES))
+    placeholders = _marks(NON_SCHEDULABLE_EXPERIMENT_STATUSES)
     cursor = await db.execute(
         f"""
         SELECT j.experiment_id, j.run_id, j.gpus_per_run, j.nodes_per_run FROM jobs j
@@ -1392,6 +1413,56 @@ async def list_jobs_by_experiment(
         )
     rows = await cursor.fetchall()
     return [_row_to_job(r) for r in rows]
+
+
+async def job_statuses(db: aiosqlite.Connection, experiment_id: str, run_ids: Sequence[str]) -> dict[str, str]:
+    """``{run_id: status}`` for those of *run_ids* that exist in *experiment_id*."""
+    rows = await _exec_all(
+        db,
+        f"SELECT run_id, status FROM jobs WHERE experiment_id = ? AND run_id IN ({_marks(run_ids)})",
+        (experiment_id, *run_ids),
+    )
+    return {r[0]: r[1] for r in rows}
+
+
+async def list_experiment_meta(db: aiosqlite.Connection) -> dict[str, dict[str, Any]]:
+    """``{experiment_id: {name, campaign, status}}`` for every experiment."""
+    rows = await _exec_all(db, "SELECT experiment_id, name, campaign, status FROM experiments")
+    return {r[0]: {"name": r[1], "campaign": r[2], "status": r[3]} for r in rows}
+
+
+async def list_run_ids(db: aiosqlite.Connection) -> dict[str, list[str]]:
+    """``{run_id: [experiment_id, ...]}`` for every run there has ever been.
+
+    A run ID is unique to its experiment, not to the manager: two experiments
+    can each have a run called ``seed0``.  Notes citing run IDs use this to
+    attribute the citation (see ``_notes_http.notes_mentions``).
+    """
+    rows = await _exec_all(db, "SELECT run_id, experiment_id FROM jobs")
+    out: dict[str, list[str]] = {}
+    for run_id, experiment_id in rows:
+        ids = out.setdefault(run_id, [])
+        if experiment_id not in ids:
+            ids.append(experiment_id)
+    return out
+
+
+async def unfinished_jobs_with_unsafe_ids(db: aiosqlite.Connection) -> list[tuple[str, str]]:
+    """``(run_id, experiment_id)`` of unfinished jobs whose IDs inserts now refuse.
+
+    Dispatching one would build paths outside its directory on the worker and
+    on the manager.  Only a database from before those checks can hold any.
+    """
+    rows = await _exec_all(db, f"SELECT run_id, experiment_id, artifact_id FROM jobs WHERE {_UNFINISHED_IN}")
+    unsafe: list[tuple[str, str]] = []
+    for run_id, experiment_id, artifact_id in rows:
+        try:
+            validate_run_id(run_id)
+            if artifact_id:
+                validate_artifact_id(artifact_id)
+        except ValueError:
+            unsafe.append((run_id, experiment_id))
+    return unsafe
 
 
 async def update_job_status(
@@ -1946,7 +2017,8 @@ async def list_experiments_with_counts(
     cursor = await db.execute(
         f"""
         SELECT e.*,
-               {_JOB_COUNT_COLUMNS}
+               {_JOB_COUNT_COLUMNS},
+               {_ARTIFACT_COUNT_COLUMN}
         FROM experiments e
         LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
         {where}
@@ -1961,7 +2033,7 @@ async def list_experiments_with_counts(
         exp = _row_to_experiment(r)
         d = dataclasses.asdict(exp)
         d["submit_time"] = exp.submit_time.isoformat()
-        d["job_counts"] = _job_counts(r)
+        d["job_counts"] = _job_counts(r, artifacts=True)
         result.append(d)
     return result
 
@@ -1983,6 +2055,124 @@ async def delete_experiment(
     )
     await db.commit()
     return row is not None
+
+
+async def _shrink_expected_jobs(db: aiosqlite.Connection, experiment_id: str, n: int) -> None:
+    """A Bayesian sweep's budget counts its own trials; runs that left it no longer count."""
+    await db.execute(
+        "UPDATE experiments SET expected_jobs = MAX(0, expected_jobs - ?) "
+        "WHERE experiment_id = ? AND expected_jobs > 0",
+        (n, experiment_id),
+    )
+
+
+async def move_jobs(
+    db: aiosqlite.Connection,
+    source: str,
+    target: str,
+    run_ids: Sequence[str],
+) -> list[str]:
+    """Move finished runs from experiment *source* to *target*.
+
+    Metrics and logs follow (they are keyed by job_key).  The caller checks
+    that both experiments exist, that the runs are finished, and that no run
+    ID is already taken in *target*.  Returns the run IDs moved.
+    """
+    if not run_ids:
+        return []
+    rows = await _exec_all(
+        db,
+        f"UPDATE jobs SET experiment_id = ? WHERE experiment_id = ? AND run_id IN ({_marks(run_ids)}) "
+        "RETURNING run_id",
+        (target, source, *run_ids),
+    )
+    moved = [r[0] for r in rows]
+    if moved:
+        await db.execute(
+            f"UPDATE job_nodes SET experiment_id = ? WHERE experiment_id = ? AND run_id IN ({_marks(moved)})",
+            (target, source, *moved),
+        )
+        await _shrink_expected_jobs(db, source, len(moved))
+    await db.commit()
+    return moved
+
+
+async def purge_jobs(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    run_ids: Sequence[str],
+) -> list[str]:
+    """Delete runs with their metrics and logs.  The caller checks they are
+    finished.  Returns the run IDs deleted."""
+    if not run_ids:
+        return []
+    marks = _marks(run_ids)
+    params = (experiment_id, *run_ids)
+    keys = f"SELECT job_key FROM jobs WHERE experiment_id = ? AND run_id IN ({marks})"
+    await db.execute(f"DELETE FROM metrics WHERE job_key IN ({keys})", params)
+    await db.execute(f"DELETE FROM logs WHERE job_key IN ({keys})", params)
+    await db.execute(f"DELETE FROM job_nodes WHERE experiment_id = ? AND run_id IN ({marks})", params)
+    rows = await _exec_all(
+        db, f"DELETE FROM jobs WHERE experiment_id = ? AND run_id IN ({marks}) RETURNING run_id", params,
+    )
+    await _shrink_expected_jobs(db, experiment_id, len(rows))
+    await db.commit()
+    return [r[0] for r in rows]
+
+
+# What garbage collection removes: result key -> (table, WHERE clause).  A job
+# cannot outlive its experiment (jobs.experiment_id is a foreign key).
+_ORPHAN_ROWS = {
+    "metric_rows": ("metrics", "job_key NOT IN (SELECT job_key FROM jobs)"),
+    "log_rows": ("logs", "job_key NOT IN (SELECT job_key FROM jobs)"),
+    "job_node_rows": ("job_nodes", "NOT EXISTS (SELECT 1 FROM jobs j "
+                                   "WHERE j.run_id = job_nodes.run_id AND j.experiment_id = job_nodes.experiment_id)"),
+}
+_UNUSED_ARTIFACT = "artifact_id NOT IN (SELECT artifact_id FROM jobs WHERE artifact_id IS NOT NULL)"
+
+
+async def find_orphans(db: aiosqlite.Connection, *, artifact_min_age: float = 3600.0) -> dict[str, Any]:
+    """What garbage collection would remove from the database (read-only).
+
+    Rows whose job is gone, and code artifacts that no job
+    references and that were stored more than *artifact_min_age* seconds ago
+    (a fresh one may be about to get its jobs).  Also the IDs that exist, for
+    finding files that nothing refers to.
+    """
+    counts: dict[str, int] = {}
+    for key, (table, where) in _ORPHAN_ROWS.items():
+        row = await _exec_one(db, f"SELECT COUNT(*) FROM {table} WHERE {where}")
+        counts[key] = int(row[0]) if row else 0
+    arts = await _exec_all(
+        db,
+        f"SELECT artifact_id, COALESCE(size_bytes, 0) FROM artifacts WHERE stored_at < ? AND {_UNUSED_ARTIFACT}",
+        (_now_epoch() - artifact_min_age,),
+    )
+    return {
+        "rows": counts,
+        "artifacts": [{"artifact_id": r[0], "size_bytes": int(r[1])} for r in arts],
+        "referenced_artifacts": {r[0] for r in await _exec_all(
+            db, "SELECT DISTINCT artifact_id FROM jobs WHERE artifact_id IS NOT NULL")},
+        "known_artifacts": {r[0] for r in await _exec_all(db, "SELECT artifact_id FROM artifacts")},
+        "experiments": {r[0] for r in await _exec_all(db, "SELECT experiment_id FROM experiments")},
+        "runs": {(r[0], r[1]) for r in await _exec_all(db, "SELECT experiment_id, run_id FROM jobs")},
+    }
+
+
+async def delete_orphans(db: aiosqlite.Connection, artifact_ids: Sequence[str]) -> dict[str, int]:
+    """Delete orphaned rows (see ``find_orphans``) and the given artifact rows."""
+    out: dict[str, int] = {}
+    for key, (table, where) in _ORPHAN_ROWS.items():
+        cur = await db.execute(f"DELETE FROM {table} WHERE {where}")
+        out[key] = cur.rowcount
+    out["artifacts"] = 0
+    if artifact_ids:
+        cur = await db.execute(
+            f"DELETE FROM artifacts WHERE artifact_id IN ({_marks(artifact_ids)}) AND {_UNUSED_ARTIFACT}",
+            tuple(artifact_ids))
+        out["artifacts"] = cur.rowcount
+    await db.commit()
+    return out
 
 
 # ===============================================================================
@@ -2017,13 +2207,13 @@ async def insert_metric(
     await db.commit()
 
 
-async def get_metrics_for_run(
+async def metric_rows_for_run(
     db: aiosqlite.Connection,
     run_id: str,
     experiment_id: str,
-) -> list[dict[str, Any]]:
-    """Return the latest attempt's metric rows for a run as dicts, ordered by step."""
-    rows = [(r[0], r[1]) for r in await _exec_all(
+) -> list[tuple[int, str | bytes]]:
+    """The latest attempt's stored metric rows for a run, still packed."""
+    return [(r[0], r[1]) for r in await _exec_all(
         db,
         """
         SELECT m.step, m.data FROM metrics m JOIN jobs j ON m.job_key = j.job_key
@@ -2032,8 +2222,21 @@ async def get_metrics_for_run(
         """,
         (experiment_id, run_id),
     )]
+
+
+def parse_metric_rows(rows: Sequence[tuple[int, str | bytes]]) -> list[dict[str, Any]]:
+    """Rows from ``metric_rows_for_run`` as dicts, ordered by step."""
     by_step = _merge_metric_rows(rows)
     return [{**json.loads(by_step[step]), "step": step} for step in sorted(by_step)]
+
+
+async def get_metrics_for_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> list[dict[str, Any]]:
+    """Return the latest attempt's metric rows for a run as dicts, ordered by step."""
+    return parse_metric_rows(await metric_rows_for_run(db, run_id, experiment_id))
 
 
 # ===============================================================================
@@ -2337,6 +2540,27 @@ class DbWriter:
     async def delete_experiment(self, experiment_id: str) -> bool:
         db = self._db
         return await self._enqueue(lambda: delete_experiment(db, experiment_id))
+
+    async def move_jobs(self, source: str, target: str, run_ids: Sequence[str]) -> list[str]:
+        db = self._db
+        return await self._enqueue(lambda: move_jobs(db, source, target, run_ids))
+
+    async def purge_jobs(self, experiment_id: str, run_ids: Sequence[str]) -> list[str]:
+        db = self._db
+        return await self._enqueue(lambda: purge_jobs(db, experiment_id, run_ids))
+
+    async def delete_orphans(self, artifact_ids: Sequence[str]) -> dict[str, int]:
+        db = self._db
+        return await self._enqueue(lambda: delete_orphans(db, artifact_ids))
+
+    async def vacuum(self) -> None:
+        """Rebuild the database file to return free pages to the filesystem."""
+        db = self._db
+
+        async def _vacuum() -> None:
+            await db.commit()
+            await db.execute("VACUUM")
+        await self._enqueue(_vacuum)
 
     # ── Workers ───────────────────────────────────────────────────────────────
 

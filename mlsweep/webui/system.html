@@ -4,38 +4,10 @@
 <meta charset="utf-8">
 <link rel="icon" href="/static/favicon.ico">
 <title>mlsweep — System</title>
+<link rel="stylesheet" href="common.css">
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
-  --bg: #f5f5f5; --surface: #fff; --border: #ddd; --border-input: #ccc;
-  --text: #222; --text-muted: #999; --text-dim: #888; --text-label: #555; --text-strong: #333;
-  --btn-bg: white; --btn-hover: #f0f0f0; --btn-text: #666;
-  --radio-bg: #fafafa; --radio-checked-bg: #e8f0fe;
-  --radio-checked-border: #4c9be8; --radio-checked-color: #1a56c4;
-  --plot-bg: white; --plot-grid: #eee; --plot-text: #444;
-  --swatch-border: rgba(0,0,0,0.15);
-}
-[data-theme=dark] {
-  --bg: #1c1c1c; --surface: #252525; --border: #383838; --border-input: #444;
-  --text: #ddd; --text-muted: #666; --text-dim: #777; --text-label: #aaa; --text-strong: #ccc;
-  --btn-bg: #2e2e2e; --btn-hover: #383838; --btn-text: #aaa;
-  --radio-bg: #2e2e2e; --radio-checked-bg: #1e2f50;
-  --radio-checked-border: #4c9be8; --radio-checked-color: #82b4f0;
-  --plot-bg: #1e1e1e; --plot-grid: #2e2e2e; --plot-text: #aaa;
-  --swatch-border: rgba(255,255,255,0.15);
-}
-
-body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh; }
-
-nav { background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
-.nav-title { font-size: 13px; font-weight: 700; color: var(--text-strong); margin-right: 10px; }
-.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
-.nav-link:hover { background: var(--btn-hover); }
-.nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); font-weight: 600; }
-.nav-spacer { flex: 1; }
-#theme-toggle { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--text-dim); padding: 0 4px; line-height: 1; }
-#theme-toggle:hover { color: var(--text); }
+body { display: flex; flex-direction: column; height: 100vh; }
 
 #content { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 24px; }
 
@@ -43,16 +15,12 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom
 h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
 
 /* Status badges */
-.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
 .badge-connected    { background: #2ca02c22; color: #2ca02c;  border: 1px solid #2ca02c44; }
 .badge-offline      { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
 .badge-dead         { background: #d6272822; color: #d62728;  border: 1px solid #d6272844; }
 .badge-connecting   { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
 .badge-reconnecting { background: #e07b0022; color: #b85c00;  border: 1px solid #e07b0044; }
-.badge-running      { background: #2ca02c22; color: #2ca02c;  border: 1px solid #2ca02c44; }
-.badge-dispatched   { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
 [data-theme=dark] .badge-connected    { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
-[data-theme=dark] .badge-running      { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
 [data-theme=dark] .badge-reconnecting { color: #ffaa44; border-color: #ffaa4444; background: #ffaa4422; }
 
 /* Workers grid */
@@ -83,7 +51,7 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .placement-toggle button { font-size: 12px; padding: 3px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .placement-toggle button + button { border-left: 1px solid var(--border-input); }
 .placement-toggle button:hover { background: var(--btn-hover); }
-.placement-toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); font-weight: 600; }
+.placement-toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
 
 /* Modal */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
@@ -95,6 +63,15 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .form-row input { font-size: 12px; padding: 5px 8px; border-radius: 4px; border: 1px solid var(--border-input); background: var(--bg); color: var(--text); }
 .form-row input:focus { outline: none; border-color: var(--radio-checked-border); }
 .form-hint { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+.gc-box { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; font-size: 12px; }
+.gc-box table { width: 100%; border-collapse: collapse; }
+.gc-box td { padding: 3px 6px; border-bottom: 1px solid var(--border); font-family: monospace; font-size: 11px; }
+.gc-box td.num { text-align: right; white-space: nowrap; }
+.gc-box td.why { color: var(--text-muted); font-family: inherit; }
+.gc-sum { margin: 2px 0 8px; color: var(--text-label); }
+.gc-check { font-size: 11px; color: var(--text-label); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.gc-delete:not(:disabled) { color: #c0392b; border-color: #c0392b66; }
+.gc-delete:disabled { opacity: .45; cursor: default; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .btn-cancel { font-size: 12px; padding: 5px 14px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .btn-submit { font-size: 12px; padding: 5px 14px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
@@ -140,32 +117,14 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
 
 /* Connection indicator */
-#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ca02c; flex-shrink: 0; transition: background 0.3s; }
-[data-theme=dark] #conn-dot { background: #5cd65c; }
-#conn-dot.disconnected { background: #d62728 !important; }
-#conn-dot.reconnecting { background: #e07b00 !important; animation: conn-pulse 1s ease-in-out infinite; }
-@keyframes conn-pulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
-#conn-label { font-size: 11px; color: var(--text-muted); }
 </style>
+<script src="chrome.js"></script>
 <script src="dialog.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
-<nav>
-  <img src="/static/favicon.ico" width="28" height="28" style="border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px">
-  <a class="nav-link" id="nav-experiments" href="#">Experiments</a>
-  <a class="nav-link" id="nav-results" href="#">Results</a>
-  <a class="nav-link" id="nav-logs" href="#">Logs</a>
-  <a class="nav-link" id="nav-files" href="#">Artifacts</a>
-  <a class="nav-link" id="nav-export" href="#">Export</a>
-  <a class="nav-link active" id="nav-system" href="#">System</a>
-  <span class="nav-spacer"></span>
-  <span style="display:flex;align-items:center;gap:5px">
-    <span id="conn-dot"></span>
-    <span id="conn-label"></span>
-  </span>
-  <button id="theme-toggle" title="Toggle theme">☀</button>
-</nav>
+<nav data-page="system"></nav>
+<script src="nav.js"></script>
 <div id="content">
   <div>
     <h2>System Status</h2>
@@ -192,6 +151,17 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
       <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th></tr></thead>
       <tbody id="inflight-tbody"><tr><td colspan="6" class="no-data">Loading…</td></tr></tbody>
     </table>
+  </div>
+  <div>
+    <div class="section-header">
+      <h3>Storage cleanup</h3>
+      <div class="section-actions">
+        <label class="gc-check"><input type="checkbox" id="gc-vacuum"> Compact database</label>
+        <button class="btn-connect" id="gc-scan">Scan</button>
+        <button class="btn-connect gc-delete" id="gc-run" disabled>Delete</button>
+      </div>
+    </div>
+    <div class="gc-box" id="gc-box"><div class="no-data">Files of deleted experiments and runs, records of deleted runs, and code archives no run uses. Scan lists them; nothing is deleted until you press Delete.</div></div>
   </div>
 </div>
 
@@ -239,445 +209,6 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
   </div>
 </div>
 
-<script>
-// ── Connection indicator ──────────────────────────────────────────────────────
-function setConnStatus(state) {
-  const dot = document.getElementById("conn-dot");
-  const lbl = document.getElementById("conn-label");
-  if (!dot) return;
-  dot.className = (state === "connected") ? "" : state;
-  lbl.textContent = state === "disconnected" ? "Disconnected"
-                  : state === "reconnecting" ? "Reconnecting…"
-                  : "";
-}
-
-// ── Token handling ────────────────────────────────────────────────────────────
-const params = new URLSearchParams(location.search);
-const TOKEN = params.get("token") || localStorage.getItem("mlsweep_token") || "";
-if (TOKEN) localStorage.setItem("mlsweep_token", TOKEN);
-if (params.get("token")) history.replaceState(null, "", location.pathname + location.hash);
-
-function apiFetch(path, opts = {}) {
-  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
-}
-function pageHref(page) {
-  return `${page}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
-}
-
-document.getElementById("nav-experiments").href = pageHref("experiments.html");
-document.getElementById("nav-results").href    = pageHref("results.html");
-document.getElementById("nav-files").href      = pageHref("files.html");
-document.getElementById("nav-logs").href       = pageHref("logs.html");
-document.getElementById("nav-export").href = pageHref("export.html");
-
-// ── Theme ─────────────────────────────────────────────────────────────────────
-(function() {
-  const btn  = document.getElementById("theme-toggle");
-  const root = document.documentElement;
-  function applyTheme(dark) {
-    dark ? root.setAttribute("data-theme","dark") : root.removeAttribute("data-theme");
-    btn.textContent = dark ? "☀" : "☾";
-  }
-  applyTheme(localStorage.getItem("theme") !== "light");
-  btn.addEventListener("click", () => {
-    const dark = root.getAttribute("data-theme") !== "dark";
-    localStorage.setItem("theme", dark ? "dark" : "light");
-    applyTheme(dark);
-  });
-})();
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function badge(cls, label) {
-  return `<span class="badge badge-${cls}">${label}</span>`;
-}
-
-function relTime(iso) {
-  if (!iso) return "—";
-  const diff = Date.now() - new Date(iso).getTime();
-  if (diff < 60e3) return "just now";
-  if (diff < 3600e3) return Math.floor(diff / 60e3) + "m ago";
-  if (diff < 86400e3) return Math.floor(diff / 3600e3) + "h ago";
-  return Math.floor(diff / 86400e3) + "d ago";
-}
-
-function fmtElapsed(s) {
-  if (s == null) return "—";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
-  if (h > 0) return `${h}h${m}m`;
-  if (m > 0) return `${m}m${sec}s`;
-  return `${sec}s`;
-}
-
-// ── Connect worker modal ──────────────────────────────────────────────────────
-(function() {
-  const modal     = document.getElementById("connect-modal");
-  const errEl     = document.getElementById("connect-error");
-  const submit    = document.getElementById("connect-submit");
-  const knownList = document.getElementById("known-workers-list");
-  const divider   = document.getElementById("connect-divider");
-
-  // Workers fetched on open; keyed by worker_id for reconnect lookups.
-  let _knownWorkers = [];
-
-  function clearForm() {
-    ["fw-host","fw-remote-dir","fw-venv","fw-ssh-key","fw-devices"].forEach(id => {
-      document.getElementById(id).value = "";
-    });
-    errEl.textContent = "";
-    errEl.classList.add("hidden");
-  }
-
-  async function openModal() {
-    clearForm();
-    knownList.innerHTML = "";
-    knownList.classList.add("hidden");
-    divider.classList.add("hidden");
-
-    modal.classList.remove("hidden");
-    document.getElementById("fw-host").focus();
-
-    // Fetch all known workers; show inactive ones as quick-reconnect options.
-    try {
-      const res = await apiFetch("/api/workers");
-      if (res.ok) {
-        const workers = await res.json();
-        _knownWorkers = workers;
-        const inactive = workers.filter(w => w.status !== "connected");
-        if (inactive.length) {
-          knownList.innerHTML = inactive.map(w => `
-            <div class="known-worker-row">
-              <div class="known-worker-info">
-                <span class="known-worker-host">${escHtml(w.host)}</span>
-                <span class="known-worker-dir">${escHtml(w.remote_dir)}</span>
-              </div>
-              <button class="btn-reconnect" data-worker-id="${escHtml(w.worker_id)}">Reconnect</button>
-            </div>`).join("");
-          knownList.classList.remove("hidden");
-          divider.classList.remove("hidden");
-        }
-      }
-    } catch (_) {}
-  }
-
-  function closeModal() { modal.classList.add("hidden"); }
-
-  // Reconnect a previously registered worker with one click.
-  knownList.addEventListener("click", async e => {
-    const btn = e.target.closest(".btn-reconnect");
-    if (!btn) return;
-    const workerId = btn.dataset.workerId;
-    const w = _knownWorkers.find(x => x.worker_id === workerId);
-    if (!w) return;
-
-    btn.disabled = true;
-    btn.textContent = "Connecting…";
-    errEl.classList.add("hidden");
-
-    const devices = w.gpus && w.gpus.length ? w.gpus : null;
-
-    try {
-      const res = await apiFetch("/api/workers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          worker_id: w.worker_id,
-          host: w.host, remote_dir: w.remote_dir,
-          venv: w.venv || null, ssh_key: w.ssh_key || null,
-          devices,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        errEl.textContent = data.error || `Error ${res.status}`;
-        errEl.classList.remove("hidden");
-        btn.disabled = false;
-        btn.textContent = "Reconnect";
-        return;
-      }
-      closeModal();
-      refresh();
-    } catch (e) {
-      errEl.textContent = "Network error: " + e.message;
-      errEl.classList.remove("hidden");
-      btn.disabled = false;
-      btn.textContent = "Reconnect";
-    }
-  });
-
-  document.getElementById("btn-connect-worker").addEventListener("click", openModal);
-  document.getElementById("connect-cancel").addEventListener("click", closeModal);
-  modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
-
-  document.addEventListener("keydown", e => {
-    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeModal();
-  });
-
-  submit.addEventListener("click", async () => {
-    const host       = document.getElementById("fw-host").value.trim();
-    const remote_dir = document.getElementById("fw-remote-dir").value.trim();
-    const venv       = document.getElementById("fw-venv").value.trim() || null;
-    const ssh_key    = document.getElementById("fw-ssh-key").value.trim() || null;
-    const devStr     = document.getElementById("fw-devices").value.trim();
-    const devices    = devStr ? devStr.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)) : null;
-
-    if (!host) {
-      errEl.textContent = "Host is required.";
-      errEl.classList.remove("hidden");
-      return;
-    }
-
-    submit.disabled = true;
-    submit.textContent = "Connecting…";
-    errEl.classList.add("hidden");
-
-    try {
-      const res = await apiFetch("/api/workers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host, remote_dir, venv, ssh_key, devices }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        errEl.textContent = data.error || `Error ${res.status}`;
-        errEl.classList.remove("hidden");
-        return;
-      }
-      closeModal();
-      refresh();
-    } catch (e) {
-      errEl.textContent = "Network error: " + e.message;
-      errEl.classList.remove("hidden");
-    } finally {
-      submit.disabled = false;
-      submit.textContent = "Connect";
-    }
-  });
-})();
-
-// ── Disconnect worker ─────────────────────────────────────────────────────────
-async function disconnectWorker(workerId) {
-  if (!await mlConfirm(`Disconnect worker "${workerId}"?\nIn-flight jobs will be re-queued.`, { confirmLabel: "Disconnect" })) return;
-  try {
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      await mlAlert("Failed to disconnect: " + (data.error || res.status));
-      return;
-    }
-    refresh();
-  } catch (e) {
-    await mlAlert("Network error: " + e.message);
-  }
-}
-
-// ── Worker live controls ───────────────────────────────────────────────────────
-async function setWorkerConcurrency(workerId, value) {
-  try {
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}/concurrency`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ max_jobs_per_gpu: value }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      await mlAlert("Failed: " + (data.error || res.status));
-    }
-  } catch (e) {
-    await mlAlert("Network error: " + e.message);
-  }
-}
-
-async function setWorkerGpus(el, workerId, currentGpus) {
-  const newIds = el.value.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
-  const oldSet = new Set(currentGpus);
-  const newSet = new Set(newIds);
-  const add    = newIds.filter(n => !oldSet.has(n));
-  const remove = currentGpus.filter(n => !newSet.has(n));
-  if (!add.length && !remove.length) return;
-  if (remove.length) {
-    const gpuList = remove.join(", ");
-    if (!await mlConfirm(`Remove GPU${remove.length > 1 ? "s" : ""} ${gpuList}?\nAny jobs using them will be re-queued.`, { confirmLabel: "Remove" })) {
-      el.value = currentGpus.join(",");
-      return;
-    }
-  }
-  try {
-    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}/devices`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ add, remove }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      await mlAlert("Failed: " + (data.error || res.status));
-      el.value = currentGpus.join(",");
-      return;
-    }
-    refresh();
-  } catch (e) {
-    await mlAlert("Network error: " + e.message);
-    el.value = currentGpus.join(",");
-  }
-}
-
-// ── Scheduler placement ────────────────────────────────────────────────────────
-function renderPlacement(placement) {
-  for (const btn of document.querySelectorAll("#placement-toggle button")) {
-    btn.classList.toggle("active", btn.dataset.placement === placement);
-  }
-}
-
-async function setPlacement(placement) {
-  try {
-    const res = await apiFetch("/api/scheduler", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ placement }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      await mlAlert("Failed: " + (data.error || res.status));
-      return;
-    }
-    renderPlacement((await res.json()).placement);
-  } catch (e) {
-    await mlAlert("Network error: " + e.message);
-  }
-}
-
-for (const btn of document.querySelectorAll("#placement-toggle button")) {
-  btn.addEventListener("click", () => setPlacement(btn.dataset.placement));
-}
-
-// ── GPU stat list ──────────────────────────────────────────────────────────────
-function renderGpuList(gpus, occ, gpuStats) {
-  if (!gpus.length) return "";
-  const header = `<div class="gpu-stat-row">
-    <span class="gpu-stat-id"></span>
-    <div class="gpu-bar-wrap" style="background:none"></div>
-    <span class="gpu-stat-pct gpu-stat-col-label">util</span>
-    <span class="gpu-stat-mem gpu-stat-col-label">memory</span>
-    <span class="gpu-stat-jobs gpu-stat-col-label">jobs</span>
-  </div>`;
-  return `<div class="gpu-stat-list">${header}${gpus.map(gid => {
-    const used  = occ[gid] ?? occ[String(gid)] ?? 0;
-    const stat  = gpuStats && (gpuStats[gid] ?? gpuStats[String(gid)]);
-    const util  = stat?.util_pct ?? null;
-    const memUsed  = stat?.mem_used_mb  ?? -1;
-    const memTotal = stat?.mem_total_mb ?? -1;
-    const memStr = memTotal > 0
-      ? `${(memUsed / 1024).toFixed(1)}/${Math.round(memTotal / 1024)}G`
-      : "";
-    return `<div class="gpu-stat-row">
-      <span class="gpu-stat-id">GPU ${gid}</span>
-      <div class="gpu-bar-wrap"><div class="gpu-bar-fill" style="width:${util ?? 0}%"></div></div>
-      <span class="gpu-stat-pct">${util !== null ? util + "%" : "—"}</span>
-      <span class="gpu-stat-mem">${memStr}</span>
-      <span class="gpu-stat-jobs">${used}</span>
-    </div>`;
-  }).join("")}</div>`;
-}
-
-// ── Render workers ─────────────────────────────────────────────────────────────
-function renderWorkers(workers) {
-  const grid = document.getElementById("workers-grid");
-  // Don't clobber an input the user is actively editing
-  const active = document.activeElement;
-  if (active && active.tagName === "INPUT" && grid.contains(active)) return;
-  if (!workers.length) {
-    grid.innerHTML = `<div class="no-data">No workers connected.</div>`;
-    return;
-  }
-
-  grid.innerHTML = workers.map(w => {
-    const gpus     = w.gpus || [];
-    const occ      = w.gpu_occupancy || {};
-    const gpuStats = w.gpu_stats || {};
-    const status   = w.status || "offline";
-    const isLive   = status === "connected";
-    const canDisconnect = status !== "dead";
-    const wIdJson  = JSON.stringify(w.worker_id).replace(/"/g, '&quot;');
-    const gpusJson = JSON.stringify(gpus).replace(/"/g, '&quot;');
-    const maxJobs  = w.max_jobs_per_gpu || 0;
-
-    return `<div class="worker-card">
-      <div class="worker-header">
-        <span class="worker-host">${w.host}${w.port ? `:${w.port}` : ""}</span>
-        ${badge(status, status)}
-      </div>
-      ${w.last_error ? `<div class="worker-error">${escHtml(w.last_error)}</div>` : ""}
-      ${renderGpuList(gpus, occ, gpuStats)}
-      ${isLive ? `<div class="worker-controls">
-        <div class="worker-control-row">
-          <span class="worker-control-label">GPUs</span>
-          <input class="worker-control-input" type="text" value="${gpus.join(",")}"
-            placeholder="e.g. 0,1,2,3"
-            onchange="setWorkerGpus(this, ${wIdJson}, ${gpusJson})">
-        </div>
-        <div class="worker-control-row">
-          <span class="worker-control-label">Jobs/GPU</span>
-          <input class="worker-control-input worker-control-narrow" type="number" min="0" value="${maxJobs}"
-            onchange="setWorkerConcurrency(${wIdJson}, +this.value)">
-          <span class="worker-control-hint">0 = unlimited</span>
-        </div>
-      </div>` : ""}
-      <div class="worker-detail">
-        ${w.remote_dir  ? `<div><span>dir</span> ${w.remote_dir}</div>` : ""}
-        ${w.venv        ? `<div><span>venv</span> ${w.venv}</div>` : ""}
-        ${w.ssh_key     ? `<div><span>key</span> ${w.ssh_key}</div>` : ""}
-        ${w.scratch_dir ? `<div><span>scratch</span> ${w.scratch_dir}</div>` : ""}
-      </div>
-      <div class="worker-actions">
-        <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
-        ${canDisconnect ? `<button class="btn-disconnect" onclick="disconnectWorker(${wIdJson})">Disconnect</button>` : ""}
-      </div>
-    </div>`;
-  }).join("");
-}
-
-// ── Render in-flight jobs ──────────────────────────────────────────────────────
-function renderInFlight(jobs) {
-  const tbody = document.getElementById("inflight-tbody");
-  if (!jobs.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="no-data">No jobs currently running.</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = jobs.map(j => `<tr>
-    <td class="mono id-cell">${runNameHtml(j)}</td>
-    <td class="mono id-cell">${escHtml(j.experiment_id || "—")}</td>
-    <td>${badge(j.status, j.status)}</td>
-    <td class="mono">${j.worker_id ? j.worker_id.split(":")[0] : "—"}</td>
-    <td class="mono">${j.dispatched_gpu_ids ? JSON.parse(j.dispatched_gpu_ids || "[]").join(",") : "—"}</td>
-    <td>${fmtElapsed(j.elapsed)}</td>
-  </tr>`).join("");
-}
-
-// ── Poll ──────────────────────────────────────────────────────────────────────
-async function refresh() {
-  try {
-    const [wRes, jRes, dRes, sRes] = await Promise.all([
-      apiFetch("/api/workers"),
-      apiFetch("/api/jobs?status=running"),
-      apiFetch("/api/jobs?status=dispatched"),
-      apiFetch("/api/scheduler"),
-    ]);
-    if (!wRes.ok || !jRes.ok || !dRes.ok || !sRes.ok) {
-      setConnStatus("disconnected");
-      return;
-    }
-    const workers = await wRes.json();
-    const jobs    = [...(await jRes.json()), ...(await dRes.json())];
-    setConnStatus("connected");
-    renderPlacement((await sRes.json()).placement);
-    renderWorkers(workers);
-    renderInFlight(jobs);
-  } catch (e) {
-    setConnStatus("disconnected");
-  }
-}
-
-refresh();
-setInterval(refresh, 5000);
-</script>
+<script src="page-system.js"></script>
 </body>
 </html>

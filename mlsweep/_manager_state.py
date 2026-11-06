@@ -126,6 +126,7 @@ class ManagerState:
         self.artifact_base_url: str = artifact_base_url
         self.token: str = token
         self.manager_port: int = 0
+        self.public_url: str = ""  # set once the manager has reached itself at its public IP
         self.scratch_dir: str = DEFAULT_SCRATCH_DIR  # for workers that do not set their own
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}

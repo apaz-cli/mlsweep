@@ -7,7 +7,8 @@ Provides:
 
 All endpoints accept authentication via ``?token=...`` query parameter or
 ``Authorization: Bearer <token>`` header.  The token is the manager token
-stored in ``manager.token``.
+stored in ``manager.token``.  Requests that change anything, and refused
+logins, are recorded in ``audit.log`` (see ``audit_middleware``).
 
 Any endpoint also accepts ``?campaign=NAME``.  Listings return only that
 campaign's experiments and jobs, a new experiment is created in it, and a
@@ -18,13 +19,20 @@ request naming an experiment from another campaign is refused with 404 (see
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import dataclasses
 import hashlib
+import hmac
 import importlib
 import importlib.metadata
+import ipaddress
 import itertools
 import json
 import logging
+import logging.handlers
+import math
+import mimetypes
 import os
 import re
 import shutil
@@ -33,8 +41,8 @@ import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable, Awaitable
+from pathlib import Path, PurePosixPath
+from typing import Any, AsyncContextManager, Callable, Awaitable
 
 import aiosqlite
 from aiohttp import WSMsgType, web
@@ -55,9 +63,11 @@ from mlsweep._manager_db import (
     WorkerRecord,
     count_pending_jobs,
     experiment_summary,
+    find_orphans,
     get_artifact,
     get_experiment,
     get_job,
+    job_statuses,
     get_logs_for_run,
     get_metrics_for_run,
     get_worker,
@@ -77,9 +87,18 @@ from mlsweep._manager_workers import (
     connect_single_worker,
     declare_worker_dead,
     requeue_runs_locked,
+    validate_worker_host,
     worker_id_for,
 )
-from mlsweep._shared import DEFAULT_CAMPAIGN, _resolve_safe_subpath, validate_campaign
+from mlsweep._shared import (
+    DEFAULT_CAMPAIGN,
+    _dir_size,
+    _resolve_safe_subpath,
+    validate_artifact_id,
+    validate_campaign,
+    validate_experiment_dir,
+    validate_run_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +112,15 @@ TOKEN_KEY: web.AppKey[str] = web.AppKey("mlsweep_token", str)
 DIR_KEY: web.AppKey[Path] = web.AppKey("mlsweep_dir", Path)
 EXPORTS_KEY: web.AppKey[dict[str, WandbExport]] = web.AppKey("mlsweep_exports")
 EXPORT_TASKS_KEY: web.AppKey[set[asyncio.Task[Any]]] = web.AppKey("mlsweep_export_tasks")
+THROTTLE_KEY: web.AppKey["_AuthThrottle"] = web.AppKey("mlsweep_auth_throttle", object)  # type: ignore[arg-type]
+
+_MAX_JSON_BODY_BYTES = 128 * 1024 * 1024
+_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+_MAX_WS_MESSAGE_BYTES = 1024 * 1024
+# Zip exports build a temp file first; more than this at once wait their turn.
+_ZIP_SLOTS = asyncio.Semaphore(4)
+
+_audit = logging.getLogger("mlsweep.audit")
 
 # ===============================================================================
 # JSON helpers
@@ -124,6 +152,12 @@ def _json_response(data: Any, *, status: int = 200) -> web.Response:
 def _error_response(message: str, *, status: int = 400) -> web.Response:
     """Return a JSON error ``Response``."""
     return _json_response({"error": message}, status=status)
+
+
+def _internal_error(exc: Exception) -> web.Response:
+    """A 500 that keeps the details (paths, SQL) in the manager's log."""
+    logger.error("request failed: %s", exc, exc_info=exc)
+    return _error_response("internal error; see the manager's log", status=500)
 
 
 def _not_found(entity: str) -> web.Response:
@@ -161,6 +195,20 @@ def _stall_seconds(run: InFlightRun, now: float) -> float:
     return max(0.0, now - run.last_progress)
 
 
+def _run_dir(mlsweep_dir: Path, experiment_id: str, run_id: str) -> Path:
+    """A run's directory under *mlsweep_dir*; ValueError for an ID that could leave it."""
+    validate_run_id(run_id)
+    return Path(_resolve_safe_subpath(mlsweep_dir / "experiments", f"{experiment_id}/{run_id}"))
+
+
+def _run_dir_exists(mlsweep_dir: Path, experiment_id: str, run_id: str) -> bool:
+    """Whether *run_id* has files in *experiment_id*, treating an unsafe ID as having none."""
+    try:
+        return _run_dir(mlsweep_dir, experiment_id, run_id).exists()
+    except ValueError:
+        return False
+
+
 def _experiment_runs(state: ManagerState, experiment_id: str) -> list[Any]:
     """In-memory runs belonging to *experiment_id*."""
     return [r for r in state.runs.values() if r.experiment_id == experiment_id]
@@ -173,8 +221,9 @@ async def _serve_temp_zip(
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="mlsweep_")
     os.close(fd)
     try:
-        await fill(tmp_path)
-    except Exception:
+        async with _ZIP_SLOTS:
+            await fill(tmp_path)
+    except BaseException:
         os.unlink(tmp_path)
         raise
     _schedule_cleanup(tmp_path)
@@ -234,13 +283,96 @@ def _check_auth(request: web.Request, token: str) -> bool:
     if not token:
         return False
     # Query parameter
-    if request.query.get("token") == token:
+    if _same_token(request.query.get("token", ""), token):
         return True
     # Authorization header
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == token:
+    if auth.startswith("Bearer ") and _same_token(auth[7:], token):
         return True
+    # git sends the token as a Basic password; the username does not matter.
+    if auth.startswith("Basic "):
+        try:
+            password = base64.b64decode(auth[6:], validate=True).partition(b":")[2].decode()
+        except ValueError:
+            return False
+        return _same_token(password, token)
     return False
+
+
+def _same_token(given: str, token: str) -> bool:
+    """Compare in constant time, so the response time reveals nothing about *token*."""
+    return hmac.compare_digest(given.encode(), token.encode())
+
+
+_MAX_AUTH_FAILURES = 30
+_AUTH_FAILURE_WINDOW = 300.0
+_AUTH_BLOCK_SECS = 60.0
+_MAX_TRACKED_ADDRESSES = 4096
+
+
+class _AuthThrottle:
+    """Refuses, per address, clients that keep presenting bad tokens.
+
+    Loopback is exempt.  That keeps a mistyped token on the manager's own
+    machine from locking out its CLI, and a reverse proxy, whose clients would
+    all share its address, from locking out everyone.
+    """
+
+    def __init__(self) -> None:
+        # address -> (failures, window start, blocked until)
+        self._seen: dict[str, tuple[int, float, float]] = {}
+
+    @staticmethod
+    def _exempt(address: str | None) -> bool:
+        try:
+            return address is None or ipaddress.ip_address(address).is_loopback
+        except ValueError:
+            return False
+
+    def retry_after(self, address: str | None) -> float:
+        """Seconds *address* must wait, or 0 if it may try now."""
+        if self._exempt(address):
+            return 0.0
+        entry = self._seen.get(str(address))
+        return max(0.0, entry[2] - time.monotonic()) if entry else 0.0
+
+    def failed(self, address: str | None) -> None:
+        if self._exempt(address):
+            return
+        now = time.monotonic()
+        count, start, _ = self._seen.get(str(address), (0, now, 0.0))
+        if now - start > _AUTH_FAILURE_WINDOW:
+            count, start = 0, now
+        count += 1
+        if str(address) not in self._seen and len(self._seen) >= _MAX_TRACKED_ADDRESSES:
+            self._seen = {a: e for a, e in self._seen.items() if now - e[1] <= _AUTH_FAILURE_WINDOW}
+            if len(self._seen) >= _MAX_TRACKED_ADDRESSES:
+                return
+        self._seen[str(address)] = (count, start, now + _AUTH_BLOCK_SECS if count >= _MAX_AUTH_FAILURES else 0.0)
+
+
+def _is_static(request: web.Request) -> bool:
+    return request.path.startswith("/static/")
+
+
+@web.middleware
+async def error_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Turn an unexpected exception into a JSON 500 that hides its details.
+
+    Once a response has started there is nothing left to replace, and a client
+    going away is not an error, so those go on to aiohttp.
+    """
+    try:
+        return await handler(request)
+    except (web.HTTPException, ConnectionError):
+        raise
+    except Exception as exc:
+        if request.writer.output_size > 0:
+            raise
+        return _internal_error(exc)
 
 
 @web.middleware
@@ -250,26 +382,168 @@ async def auth_middleware(
 ) -> web.StreamResponse:
     """Middleware that enforces token authentication on all routes.
 
-    Skips static file routes (prefix ``/static/``) so the web UI can load
+    Skips static file routes (see ``_is_static``) so the web UI can load
     without a token in every asset request.  Static files are marked
     ``no-cache`` so a browser revalidates them (a cheap 304) on every load
     instead of pairing fresh HTML with a stale cached ``dialog.js``.
     """
     # Allow static files without auth
-    if request.path.startswith("/static/"):
+    if _is_static(request):
         response = await handler(request)
         response.headers["Cache-Control"] = "no-cache"
         return response
 
-    # Allow OPTIONS (CORS preflight) without auth
-    if request.method == "OPTIONS":
-        return await handler(request)
+    throttle = request.config_dict[THROTTLE_KEY]
+    wait = throttle.retry_after(request.remote)
+    if wait:
+        response = _error_response("too many failed logins; try again later", status=429)
+        response.headers["Retry-After"] = str(math.ceil(wait))
+        return response
 
     token: str = request.config_dict[TOKEN_KEY]
     if not _check_auth(request, token):
-        return _error_response("unauthorized — provide ?token= or Authorization: Bearer", status=401)
+        git_remote = request.path.startswith("/notes.git/")
+        # git's first request never carries credentials, so that is not a failed login.
+        if not git_remote or "Authorization" in request.headers:
+            throttle.failed(request.remote)
+        response = _error_response(
+            "wrong or missing token: open the link the manager printed at startup, "
+            "or send Authorization: Bearer <token>",
+            status=401,
+        )
+        if git_remote:
+            response.headers["WWW-Authenticate"] = 'Basic realm="mlsweep notes"'
+        return response
 
     return await handler(request)
+
+
+@web.middleware
+async def id_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Refuse IDs that could leave their directory, on every route that takes one.
+
+    Route patterns do not protect these.  aiohttp decodes ``%2F`` after matching,
+    so ``{run_id}`` can hold ``../..``, and handlers join them into paths.
+    """
+    info = request.match_info
+    try:
+        if "experiment_id" in info:
+            validate_experiment_dir(info["experiment_id"])
+        if "run_id" in info:
+            validate_run_id(info["run_id"])
+        if "artifact_id" in info:
+            validate_artifact_id(info["artifact_id"])
+    except ValueError as exc:
+        return _error_response(str(exc))
+    return await handler(request)
+
+
+@web.middleware
+async def audit_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Record every request that can change something, and every refused login.
+
+    Logs the path but never the query string, which can hold the token.
+    """
+    status: int | None = None
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    finally:
+        if request.method not in ("GET", "HEAD", "OPTIONS") or status in (401, 429):
+            _audit.info(json.dumps({
+                "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "remote": request.remote,
+                "method": request.method,
+                "path": request.path,
+                "status": status,
+            }))
+
+
+def setup_audit_log(mlsweep_dir: Path) -> None:
+    """Send the audit log to ``<mlsweep_dir>/audit.log``, keeping a few old files."""
+    for old in list(_audit.handlers):
+        _audit.removeHandler(old)
+        old.close()
+    handler = logging.handlers.RotatingFileHandler(
+        mlsweep_dir / "audit.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+    )
+    _audit.addHandler(handler)
+    _audit.setLevel(logging.INFO)
+    _audit.propagate = False
+
+
+# Pages load scripts only from this server, and inline script does not run.
+# Inline styles stay allowed: the pages set them throughout.
+_PAGE_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+# A note can show an image from anywhere, so the notes page allows those too.
+_NOTES_PAGE_CSP = _PAGE_CSP.replace("img-src 'self' data: blob:", "img-src 'self' data: blob: https: http:")
+_API_CSP = "default-src 'none'; frame-ancestors 'self'"
+
+
+async def _add_security_headers(request: web.Request, response: web.StreamResponse) -> None:
+    """Headers for every response.  A handler's own Content-Security-Policy wins."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if "Content-Security-Policy" in response.headers:
+        return
+    if _is_static(request):
+        if request.path.endswith(".html"):
+            notes = request.path.endswith("/notes.html")
+            response.headers["Content-Security-Policy"] = _NOTES_PAGE_CSP if notes else _PAGE_CSP
+    elif response.content_type != "application/pdf":
+        # PDFs are left out: Chrome's viewer will not run under this policy.
+        response.headers["Content-Security-Policy"] = _API_CSP
+
+
+_INLINE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".webp": "image/webp", ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
+    ".svg": "image/svg+xml", ".pdf": "application/pdf",
+}
+
+
+def untrusted_file_headers(name: str, *, as_text: bool, download: bool = False) -> dict[str, str]:
+    """Response headers for a file whose contents the server does not trust.
+
+    Only images and PDFs display inline, *as_text* files are served as
+    text/plain and everything else as a download, so no such file can run
+    script on the dashboard's origin.
+    """
+    ext = PurePosixPath(name).suffix.lower()
+    headers = {"Cache-Control": "no-cache"}   # _add_security_headers adds the rest
+    safe_name = PurePosixPath(name).name.replace('"', "")
+    if ext in _INLINE_MIME and not download:
+        ctype = _INLINE_MIME[ext]
+        headers["Content-Disposition"] = f'inline; filename="{safe_name}"'
+        if ext != ".pdf":
+            # Chrome's PDF viewer will not run under a sandbox CSP; PDFs are
+            # rendered by the browser's own viewer, not on this origin.
+            headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+    else:
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+        if as_text and not download:
+            ctype = "text/plain; charset=utf-8"
+        else:
+            ctype = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+            headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+            if ctype.startswith(("text/html", "application/xhtml", "image/svg")):
+                ctype = "application/octet-stream"
+    headers["Content-Type"] = ctype
+    return headers
 
 
 async def _request_json(request: web.Request) -> Any:
@@ -277,6 +551,22 @@ async def _request_json(request: web.Request) -> Any:
     if "json_body" in request:
         return request["json_body"]
     return await request.json()
+
+
+def _bad_request(message: str) -> web.HTTPBadRequest:
+    """A JSON 400 to raise from a helper."""
+    return web.HTTPBadRequest(text=_json_dumps({"error": message}), content_type="application/json")
+
+
+async def _json_body(request: web.Request) -> dict[str, Any]:
+    """The request's JSON object; a 400 for anything else."""
+    try:
+        body = await _request_json(request)
+    except ValueError:
+        raise _bad_request("invalid JSON body") from None
+    if not isinstance(body, dict):
+        raise _bad_request("body must be a JSON object")
+    return body
 
 
 async def _named_experiments(request: web.Request) -> set[str]:
@@ -317,7 +607,7 @@ async def campaign_middleware(
     left to the handler (usually a 404 of its own).
     """
     campaign = request.query.get("campaign")
-    if campaign is None or request.path.startswith("/static/"):
+    if campaign is None or _is_static(request):
         return await handler(request)
     try:
         validate_campaign(campaign)
@@ -336,50 +626,6 @@ async def campaign_middleware(
 # ===============================================================================
 
 routes = web.RouteTableDef()
-
-
-# ── Reachability check ────────────────────────────────────────────────────────
-
-
-@routes.get("/api/reachable")
-async def handle_reachable(request: web.Request) -> web.Response:
-    """Check whether this manager is reachable via an external host.
-
-    Accepts a bare *host* (hostname or IP, no scheme / path / port)
-    and makes an outbound GET to ``http://{host}:{port}/api/health``.
-    The manager constructs the full URL internally to prevent URL
-    injection and token leakage.
-    """
-    host = (request.query.get("host", "") or "").strip()
-    if not host:
-        return _error_response("'host' query parameter is required")
-
-    # Reject anything that looks like a URL rather than a bare host.
-    if any(c in host for c in ("://", "/", "?", "#", "@")):
-        return _error_response("'host' must be a bare hostname or IP, not a URL")
-
-    # Reject obviously invalid host patterns without reaching DNS.
-    if not re.match(r"^[a-zA-Z0-9.\-:\[\]]+$", host):
-        return _error_response("'host' contains invalid characters")
-
-    server_port = request.url.port
-    target_url = f"http://{host}:{server_port}/api/health"
-    token: str = request.config_dict[TOKEN_KEY]
-
-    import aiohttp
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                target_url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=aiohttp.ClientTimeout(total=4),
-            ) as resp:
-                reachable = resp.status == 200
-    except Exception:
-        reachable = False
-
-    return _json_response({"reachable": reachable})
 
 
 # ── Campaigns ──────────────────────────────────────────────────────────────────
@@ -504,10 +750,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     fields = await _experiment_fields(request, db, body, experiment_id)
     if isinstance(fields, web.Response):
         return fields
-    try:
-        exp = await state.db_writer.create_experiment(**fields)
-    except Exception as exc:
-        return _error_response(str(exc), status=500)
+    exp = await state.db_writer.create_experiment(**fields)
 
     return _json_response(exp, status=201)
 
@@ -532,8 +775,8 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
 
     ``paused`` and ``aborted`` cause the scheduler to stop dispatching this
     experiment's pending jobs (the scheduler reads experiment status from the
-    DB).  ``aborted`` additionally cancels any of its jobs that are still
-    in-flight.  Moving back to ``running`` resumes scheduling.
+    DB).  ``aborted`` also cancels all its unfinished jobs, so a stopped sweep
+    has one label for them.  Moving back to ``running`` resumes scheduling.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -553,9 +796,10 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
         exp = await state.db_writer.update_experiment_status(experiment_id, status)
         if exp is None:
             return _not_found("experiment")
-        # Aborting stops the sweep for good, so cancel anything still in flight.
+        # Aborting stops the sweep for good, so cancel everything unfinished.
         if status == "aborted":
-            await cancel_runs_locked(db, state, state.runs_of(experiment_id))
+            pending = await list_jobs_by_experiment(db, experiment_id, status="pending")
+            await cancel_runs_locked(db, state, [*state.runs_of(experiment_id), *(j.key for j in pending)])
         # Its last job may have finished while it was paused.
         await _check_experiments_complete_locked(db, state, {experiment_id})
     state.request_schedule()
@@ -814,8 +1058,6 @@ async def handle_insert_job(request: web.Request) -> web.Response:
         )
     except ValueError as exc:
         return _error_response(str(exc))
-    except Exception as exc:
-        return _error_response(str(exc), status=500)
 
     state.request_schedule()
 
@@ -841,8 +1083,6 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
         records = await state.db_writer.insert_jobs_bulk(jobs_data)
     except ValueError as exc:
         return _error_response(str(exc))
-    except Exception as exc:
-        return _error_response(str(exc), status=500)
 
     state.request_schedule()
 
@@ -1101,6 +1341,257 @@ async def handle_delete_job(request: web.Request) -> web.Response:
     return _json_response(updated if updated is not None else job)
 
 
+def _run_ids_from(body: dict[str, Any]) -> list[str] | None:
+    ids = body.get("run_ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
+        return None
+    return list(dict.fromkeys(ids))
+
+
+async def _not_finished(
+    db: aiosqlite.Connection, state: ManagerState, experiment_id: str, run_ids: list[str],
+) -> dict[str, str]:
+    """``{run_id: why}`` for runs that do not exist or could still change.  Hold ``state.lock``."""
+    statuses = await job_statuses(db, experiment_id, run_ids)
+    problems: dict[str, str] = {}
+    for rid in run_ids:
+        status = statuses.get(rid)
+        if status is None:
+            problems[rid] = f"{rid}: no such run in {experiment_id}"
+        elif status not in FINISHED_JOB_STATUSES or (experiment_id, rid) in state.runs:
+            problems[rid] = f"{rid}: still {status}; cancel it first"
+    return problems
+
+
+def _run_conflict(problems: dict[str, str]) -> web.Response:
+    return _json_response({"error": "; ".join(problems.values()), "problems": list(problems.values())}, status=409)
+
+
+@routes.post("/api/experiments/{experiment_id}/jobs/move")
+async def handle_move_jobs(request: web.Request) -> web.Response:
+    """Move finished runs to another experiment, with their metrics, logs and files.
+
+    Body: ``{"run_ids": [...], "to": TARGET_EXPERIMENT}``.  Refused (409) if a
+    run is still pending or running, or if TARGET already has a run with the
+    same ID.  With ``?campaign=``, both experiments must be in that campaign.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    source = request.match_info["experiment_id"]
+    body = await _json_body(request)
+    run_ids = _run_ids_from(body)
+    target = body.get("to")
+    if run_ids is None or not isinstance(target, str) or not target:
+        return _error_response("expected {run_ids: [...], to: EXPERIMENT_ID}")
+    if target == source:
+        return _error_response("source and target are the same experiment")
+    src_exp, dst_exp = await get_experiment(db, source), await get_experiment(db, target)
+    if src_exp is None:
+        return _not_found("experiment")
+    if dst_exp is None:
+        return _not_found(f"target experiment {target!r}")
+    campaign = request.query.get("campaign")
+    if campaign is not None and dst_exp.campaign != campaign:
+        return _wrong_campaign(target, dst_exp.campaign, campaign)
+    try:
+        _sanitize_experiment_id(target)
+    except ValueError as exc:
+        return _error_response(str(exc))
+
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
+    async with state.lock:
+        problems = await _not_finished(db, state, source, run_ids)
+        taken = await job_statuses(db, target, run_ids)
+
+        def _dirs_taken() -> set[str]:
+            return {rid for rid in run_ids if _run_dir_exists(mlsweep_dir, target, rid)}
+        dirs_taken = await asyncio.to_thread(_dirs_taken)
+        for rid in run_ids:
+            if rid in problems:
+                continue
+            if rid in taken:
+                problems[rid] = f"{rid}: {target} already has a run with this ID"
+            elif rid in dirs_taken:
+                problems[rid] = f"{rid}: {target} already has files for a run with this ID"
+        if problems:
+            return _run_conflict(problems)
+        moved = await state.db_writer.move_jobs(source, target, run_ids)
+
+        def _move_dirs() -> list[str]:
+            failed = []
+            for rid in moved:
+                try:
+                    src_dir = _run_dir(mlsweep_dir, source, rid)
+                    if not src_dir.exists():
+                        continue
+                    dst_dir = _run_dir(mlsweep_dir, target, rid)
+                    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src_dir), str(dst_dir))
+                except (OSError, ValueError) as exc:
+                    logger.warning("moving files of %s/%s: %s", source, rid, exc)
+                    failed.append(rid)
+            return failed
+        failed = await asyncio.to_thread(_move_dirs)
+    for eid in (source, target):
+        _broadcast_experiment_event(request, eid, "jobs_moved", run_ids=moved, source=source, target=target)
+    result: dict[str, Any] = {"moved": moved, "from": source, "to": target}
+    if failed:
+        result["files_not_moved"] = failed
+    return _json_response(result)
+
+
+@routes.post("/api/experiments/{experiment_id}/jobs/purge")
+async def handle_purge_jobs(request: web.Request) -> web.Response:
+    """Delete finished runs for good: rows, metrics, logs and their files.
+
+    Body: ``{"run_ids": [...]}``.  Refused (409) for runs still pending or
+    running; cancel them first.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    experiment_id = request.match_info["experiment_id"]
+    run_ids = _run_ids_from(await _json_body(request))
+    if run_ids is None:
+        return _error_response("expected {run_ids: [...]}")
+    if await get_experiment(db, experiment_id) is None:
+        return _not_found("experiment")
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
+    async with state.lock:
+        problems = await _not_finished(db, state, experiment_id, run_ids)
+        if problems:
+            return _run_conflict(problems)
+        purged = await state.db_writer.purge_jobs(experiment_id, run_ids)
+
+    def _rm() -> int:
+        freed = 0
+        for rid in purged:
+            try:
+                d = _run_dir(mlsweep_dir, experiment_id, rid)
+            except ValueError:  # an old row with a bad ID: its row is gone, leave the disk alone
+                continue
+            if d.is_dir():
+                freed += _dir_size(d)
+                shutil.rmtree(d, ignore_errors=True)
+        return freed
+    freed = await asyncio.to_thread(_rm)
+    _broadcast_experiment_event(request, experiment_id, "jobs_purged", run_ids=purged)
+    return _json_response({"purged": purged, "bytes_freed": freed})
+
+
+_GC_MIN_AGE = 3600.0     # younger files may be about to be used
+
+
+def _orphan_dirs(root: Path, orphans: dict[str, Any], active: set[Any], now: float) -> list[dict[str, Any]]:
+    """Run directories under *root* whose experiment or run no longer exists."""
+    if not root.is_dir():
+        return []
+    found: list[dict[str, Any]] = []
+    for exp_dir in sorted(root.iterdir()):
+        if not exp_dir.is_dir() or exp_dir.is_symlink():
+            continue
+        if exp_dir.name not in orphans["experiments"]:
+            if now - exp_dir.stat().st_mtime > _GC_MIN_AGE:
+                found.append({"path": f"experiments/{exp_dir.name}", "reason": "experiment deleted",
+                              "bytes": _dir_size(exp_dir)})
+            continue
+        for run_dir in sorted(exp_dir.iterdir()):
+            key = (exp_dir.name, run_dir.name)
+            if key not in orphans["runs"] and key not in active and run_dir.is_dir() \
+                    and not run_dir.is_symlink() and now - run_dir.stat().st_mtime > _GC_MIN_AGE:
+                found.append({"path": f"experiments/{exp_dir.name}/{run_dir.name}",
+                              "reason": "run deleted", "bytes": _dir_size(run_dir)})
+    return found
+
+
+def _orphan_archives(art_dir: Path, orphans: dict[str, Any], now: float) -> list[dict[str, Any]]:
+    """Code archives under *art_dir* that no run uses."""
+    if not art_dir.is_dir():
+        return []
+    unreferenced = {a["artifact_id"] for a in orphans["artifacts"]}
+    found: list[dict[str, Any]] = []
+    for f in sorted(art_dir.iterdir()):
+        if not f.name.endswith(".tar.gz") or not f.is_file():
+            continue
+        aid = f.name[: -len(".tar.gz")]
+        untracked = aid not in orphans["known_artifacts"] and aid not in orphans["referenced_artifacts"]
+        if aid in unreferenced or (untracked and now - f.stat().st_mtime > _GC_MIN_AGE):
+            found.append({"path": f"artifacts/{f.name}", "reason": "code archive no run uses",
+                          "bytes": f.stat().st_size})
+    return found
+
+
+def _gc_scan(mlsweep_dir: Path, orphans: dict[str, Any], active: set[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    now = time.time()
+    return (_orphan_dirs(mlsweep_dir / "experiments", orphans, active, now),
+            _orphan_archives(mlsweep_dir / "artifacts", orphans, now))
+
+
+@routes.post("/api/gc")
+async def handle_gc(request: web.Request) -> web.Response:
+    """Find (and with ``{"dry_run": false}``, remove) what nothing refers to.
+
+    * run directories of experiments or runs that no longer exist;
+    * database rows (metrics, logs, run nodes) whose run is gone;
+    * uploaded code archives no run uses, older than an hour.
+
+    ``{"vacuum": true}`` also compacts the database file afterwards.  The
+    default is a dry run that changes nothing.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        return _error_response("invalid JSON body")
+    if not isinstance(body, dict):
+        body = {}
+    dry_run = bool(body.get("dry_run", True))
+    vacuum = bool(body.get("vacuum", False))
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
+
+    # A dry run changes nothing, so it does not hold up the scheduler.  A real
+    # one keeps the lock until it has deleted: a run moved in meanwhile would
+    # look like an orphan, since moving keeps a directory's old mtime.
+    guard: AsyncContextManager[Any] = contextlib.nullcontext() if dry_run else state.lock
+    async with guard:
+        orphans = await find_orphans(db, artifact_min_age=_GC_MIN_AGE)
+        active = set(state.runs)
+        dirs, files = await asyncio.to_thread(_gc_scan, mlsweep_dir, orphans, active)
+        plan = {
+            "dry_run": dry_run,
+            "directories": dirs,
+            "artifact_files": files,
+            "database": orphans["rows"],
+            "artifact_rows": len(orphans["artifacts"]),
+            "bytes": sum(item["bytes"] for item in dirs + files),
+        }
+        if dry_run:
+            return _json_response(plan)
+        deleted_rows = await state.db_writer.delete_orphans([a["artifact_id"] for a in orphans["artifacts"]])
+
+        def _delete() -> int:
+            n = 0
+            for item in dirs + files:
+                try:
+                    p = Path(_resolve_safe_subpath(mlsweep_dir, item["path"]))
+                except ValueError:
+                    continue
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    n += 1
+                elif p.is_file():
+                    p.unlink(missing_ok=True)
+                    n += 1
+            return n
+        removed = await asyncio.to_thread(_delete)
+    if vacuum:
+        await state.db_writer.vacuum()
+    plan["removed_paths"] = removed
+    plan["deleted_rows"] = deleted_rows
+    plan["vacuumed"] = vacuum
+    return _json_response(plan)
+
+
 @routes.patch("/api/experiments/{experiment_id}/jobs/{run_id}")
 async def handle_patch_job(request: web.Request) -> web.Response:
     """Update a job's priority (reorder).
@@ -1156,6 +1647,9 @@ async def handle_get_job_metrics(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
     rows = await get_metrics_for_run(db, run_id, experiment_id)
+    import sys as _sys
+    print(f"DBGMETRICS exp={experiment_id} run={run_id} rows={len(rows)} "
+          f"campaign={request.query.get('campaign')!r}", file=_sys.stderr, flush=True)
     if not rows:
         return _not_found("metrics")
     jsonl = "\n".join(json.dumps(row) for row in rows)
@@ -1298,7 +1792,9 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
     if not file_path.is_file():
         return _not_found("artifact file")
 
-    return web.FileResponse(file_path)
+    guessed = mimetypes.guess_type(file_path.name)[0] or ""
+    as_text = (guessed.startswith("text/") and guessed != "text/html") or guessed == "application/json"
+    return web.FileResponse(file_path, headers=untrusted_file_headers(file_path.name, as_text=as_text))
 
 
 # ── Export (TensorBoard / W&B) ─────────────────────────────────────────────────
@@ -1732,6 +2228,10 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     remote_dir = body.get("remote_dir") or ""
     if not host:
         return _error_response("'host' is required")
+    try:
+        validate_worker_host(host)
+    except ValueError as exc:
+        return _error_response(str(exc))
 
     ssh_key = body.get("ssh_key")
     venv = body.get("venv")
@@ -1763,9 +2263,9 @@ async def handle_add_worker(request: web.Request) -> web.Response:
             devices=json.dumps(devices) if devices else None,
             status="offline",
         )
-    except Exception as exc:
+    except Exception:
         state.launching.discard(worker_id)
-        return _error_response(str(exc), status=500)
+        raise
 
     # Connect in the background; a launch failure marks the worker dead with the reason.
     asyncio.create_task(connect_single_worker(
@@ -1976,15 +2476,16 @@ async def handle_register_artifact(request: web.Request) -> web.Response:
     artifact_id = body.get("artifact_id") or body.get("id")
     if not artifact_id:
         return _error_response("'artifact_id' is required")
-
     try:
-        artifact = await state.db_writer.register_artifact(
-            artifact_id=artifact_id,
-            size_bytes=body.get("size_bytes"),
-            setup_command=body.get("setup_command"),
-        )
-    except Exception as exc:
-        return _error_response(str(exc), status=500)
+        validate_artifact_id(artifact_id)
+    except ValueError as exc:
+        return _error_response(str(exc))
+
+    artifact = await state.db_writer.register_artifact(
+        artifact_id=artifact_id,
+        size_bytes=body.get("size_bytes"),
+        setup_command=body.get("setup_command"),
+    )
 
     return _json_response(artifact, status=201)
 
@@ -2023,29 +2524,32 @@ async def handle_upload_artifact_data(request: web.Request) -> web.Response:
     if artifact is None:
         return _not_found("artifact")
 
-    # Read raw body
-    body = await request.read()
-
     # Determine storage path
     mlsweep_dir: Path = request.config_dict[DIR_KEY]
     artifacts_dir = mlsweep_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write tarball
+    # Stream to a temporary file, then rename for an atomic write.
     dest = artifacts_dir / f"{artifact_id}.tar.gz"
-    # Use a temporary file + rename for atomic write
-    tmp = dest.with_suffix(".tar.gz.tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=artifacts_dir, suffix=".tmp")
+    tmp = Path(tmp_name)
+    size = 0
     try:
-        tmp.write_bytes(body)
-        tmp.rename(dest)
-    except OSError as exc:
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in request.content.iter_chunked(1 << 20):
+                size += len(chunk)
+                if size > _MAX_ARTIFACT_BYTES:
+                    return _error_response(
+                        f"artifact is larger than {_MAX_ARTIFACT_BYTES // (1024 * 1024)} MB", status=413)
+                f.write(chunk)
+        tmp.replace(dest)
+    finally:
         tmp.unlink(missing_ok=True)
-        return _error_response(f"Failed to write artifact: {exc}", status=500)
 
-    logger.info("Artifact %s stored (%d bytes)", artifact_id, len(body))
+    logger.info("Artifact %s stored (%d bytes)", artifact_id, size)
 
     return _json_response(
-        {"artifact_id": artifact_id, "size_bytes": len(body)},
+        {"artifact_id": artifact_id, "size_bytes": size},
         status=200,
     )
 
@@ -2072,7 +2576,7 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
     state: ManagerState = request.config_dict[STATE_KEY]
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
 
-    ws = web.WebSocketResponse(max_msg_size=0)
+    ws = web.WebSocketResponse(max_msg_size=_MAX_WS_MESSAGE_BYTES)
     await ws.prepare(request)
 
     # ── ?since= replay ────────────────────────────────────────────────────
@@ -2192,6 +2696,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "workers_connected": sum(wc.status == "connected" for wc in state.workers.values()),
         "jobs_pending": await count_pending_jobs(db),
         "jobs_in_flight": len(state.runs),
+        "public_url": state.public_url or None,
     })
 
 
@@ -2214,7 +2719,7 @@ def _setup_static_routes(app: web.Application, webui_dir: Path) -> None:
      2. ``<mlsweep_package>/webui/`` (development / installed package)
     """
     if webui_dir.exists():
-        app.router.add_static("/static/", path=str(webui_dir), show_index=True)
+        app.router.add_static("/static/", path=str(webui_dir))
         return
 
     # Fallback: look for webui/ directory relative to the mlsweep package
@@ -2223,7 +2728,7 @@ def _setup_static_routes(app: web.Application, webui_dir: Path) -> None:
     pkg_web_dir = pkg_dir / "webui"
     if pkg_web_dir.exists():
         logger.info("Serving web UI from package directory: %s", pkg_web_dir)
-        app.router.add_static("/static/", path=str(pkg_web_dir), show_index=True)
+        app.router.add_static("/static/", path=str(pkg_web_dir))
         return
 
     logger.info("Web UI directory not found — static routes skipped")
@@ -2269,7 +2774,8 @@ def create_app(
         ``<mlsweep_dir>/webui/`` if it exists.
     """
     app = web.Application(
-        middlewares=[auth_middleware, campaign_middleware], client_max_size=512 * 1024 * 1024,
+        middlewares=[audit_middleware, error_middleware, auth_middleware, id_middleware, campaign_middleware],
+        client_max_size=_MAX_JSON_BODY_BYTES,
     )
 
     # Store shared objects in app config so handlers can access them
@@ -2279,6 +2785,7 @@ def create_app(
     app[DIR_KEY] = Path(mlsweep_dir).expanduser().resolve()
     app[EXPORTS_KEY] = {}
     app[EXPORT_TASKS_KEY] = set()
+    app[THROTTLE_KEY] = _AuthThrottle()
 
     # Register REST routes
     app.add_routes(routes)
@@ -2287,29 +2794,7 @@ def create_app(
     webui_dir = Path(mlsweep_dir).expanduser().resolve() / "webui"
     _setup_static_routes(app, webui_dir)
 
-    # CORS support — allow any origin for development convenience.
-    # In production, restrict this to known origins.
-
-    @web.middleware
-    async def cors_middleware(
-        request: web.Request,
-        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
-    ) -> web.StreamResponse:
-        if request.method == "OPTIONS":
-            return web.Response(
-                status=200,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
-                },
-            )
-        response = await handler(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
-
-    # Add CORS middleware after auth so OPTIONS skips auth
-    app.middlewares.insert(0, cors_middleware)
+    app.on_response_prepare.append(_add_security_headers)
 
     return app
 
@@ -2336,6 +2821,7 @@ def run_app(
 
 __all__ = [
     "create_app",
+    "setup_audit_log",
     "run_app",
     "routes",
 ]

@@ -20,6 +20,7 @@ import fcntl
 import importlib.metadata
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -124,6 +125,7 @@ def _parse_workers_file(
             raise ValueError(
                 f"{path}: workers entry {i + 1} missing required field 'host' or 'remote_dir'"
             )
+        validate_worker_host(host)
         result.append(
             {
                 "host": host,
@@ -301,6 +303,7 @@ async def _bootstrap_worker_venv(
             *sshpass_args,
             "ssh", *ssh_opts,
             *key_args,
+            "--",
             host,
             check_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -339,6 +342,7 @@ async def _bootstrap_worker_venv(
             *sshpass_args,
             "ssh", *ssh_opts,
             *key_args,
+            "--",
             host,
             "mkdir -p /tmp/mlsweep_wheels",
             stdout=asyncio.subprocess.PIPE,
@@ -361,6 +365,7 @@ async def _bootstrap_worker_venv(
             *sshpass_args,
             "scp", *ssh_opts,
             *key_args,
+            "--",
             *wheel_files,
             f"{host}:/tmp/mlsweep_wheels/",
             stdout=asyncio.subprocess.PIPE,
@@ -389,6 +394,7 @@ async def _bootstrap_worker_venv(
             *sshpass_args,
             "ssh", *ssh_opts,
             *key_args,
+            "--",
             host,
             (
                 "rm -rf /tmp/mlsweep_venv && "
@@ -490,6 +496,7 @@ async def launch_worker(
     Returns ``(reader, writer, port)`` where *reader* and *writer* are
     asyncio stream objects connected to the worker's TCP port.
     """
+    validate_worker_host(host)
     connect_host = _bare_host(host)
     devices_args = (
         ["--devices", ",".join(str(d) for d in devices)] if devices else []
@@ -548,7 +555,7 @@ async def launch_worker(
             *sshpass_args,
             "ssh", "-o", "ConnectTimeout=10",
             *key_args,
-            host, shell_cmd,
+            "--", host, shell_cmd,
         ]
         proc = await asyncio.create_subprocess_exec(
             *ssh_cmd,
@@ -611,6 +618,13 @@ async def launch_worker(
 # ===============================================================================
 # Worker identity and connection lifecycle
 # ===============================================================================
+
+
+def validate_worker_host(host: Any) -> str:
+    """Return *host* if it can only be read as an SSH destination; raise ValueError otherwise."""
+    if not isinstance(host, str) or not host or host.startswith("-") or re.search(r"[\s\x00-\x1f\x7f]", host):
+        raise ValueError(f"invalid worker host: {host!r}")
+    return host
 
 
 def _bare_host(host: str) -> str:
@@ -1856,7 +1870,7 @@ async def _reap_stale_tunnels(wc: WorkerConn, manager_port: int) -> str:
         sshpass_args, sshpass_env = _sshpass_args(wc.password)
         proc = await asyncio.create_subprocess_exec(
             *sshpass_args,
-            "ssh", "-o", "ConnectTimeout=10", *key_args, wc.host,
+            "ssh", "-o", "ConnectTimeout=10", *key_args, "--", wc.host,
             f"exec sh -c {shlex.quote(_reap_tunnels_script(manager_port))}",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -1898,6 +1912,7 @@ async def _launch_tunnel(
             "-o", "ExitOnForwardFailure=yes",
             "-R", f"{manager_port}:localhost:{manager_port}",
             *key_args,
+            "--",
             host,
             _tunnel_remote_cmd(manager_port),
             # Never written; the remote ``cat`` reads it until the connection ends.

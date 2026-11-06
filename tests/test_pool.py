@@ -146,7 +146,7 @@ def test_abort_experiment_stops_dispatch(manager_with_worker):
 
     With more short jobs than slots, the buggy version would churn through and
     complete all of them; the fixed scheduler reads experiment status from the
-    DB each pass, so once aborted, untouched jobs stay pending.
+    DB each pass, and aborting cancels the jobs that had not started.
     """
     server, url = manager_with_worker
     exp = "exp_abort"
@@ -182,10 +182,10 @@ def test_abort_experiment_stops_dispatch(manager_with_worker):
         by_status[j["status"]] = by_status.get(j["status"], 0) + 1
 
     done = by_status.get("done", 0)
-    pending = by_status.get("pending", 0)
-    # The sweep was halted: not everything ran, and untouched jobs remain pending.
+    # The sweep was halted: not everything ran, and nothing unfinished is left pending.
     assert done < n, f"abort did not stop dispatch; statuses={by_status}"
-    assert pending >= 1, f"expected held pending jobs; statuses={by_status}"
+    assert by_status.get("pending", 0) == 0, f"expected no pending jobs; statuses={by_status}"
+    assert by_status.get("cancelled", 0) >= 1, f"expected cancelled jobs; statuses={by_status}"
 
 
 def test_cancel_running_job_frees_slot(manager_with_worker):
