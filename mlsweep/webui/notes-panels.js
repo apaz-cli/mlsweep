@@ -197,8 +197,8 @@ function openDiff(commit, path, current = null) {
   let t = S.tabs.find(x => x.type === "diff" && x.rev === commit.hash && x.path === path);
   if (!t) {
     t = newTab({ type: "diff", rev: commit.hash, path, current: current || path, commit, title: `${path ? titleFor(path) : "Commit"} @ ${commit.short || commit.hash.slice(0, 7)}` });
-    const cur = activeTab();
-    S.tabs.splice(cur ? S.tabs.indexOf(cur) + 1 : S.tabs.length, 0, t);
+    const g = focusedGroup(), cur = activeTab();
+    addTab(t, g, cur ? g.tabs.indexOf(cur.id) + 1 : g.tabs.length);
   }
   activate(t.id);
 }
@@ -259,18 +259,21 @@ async function showVersion(path, rev, c) {
   try {
     const r = await api(`/api/notes/show?path=${q(path)}&rev=${q(rev)}`);
     if (r.binary) { toast("Binary file; use Restore to bring it back", "err"); return; }
-    const t = newTab({ type: "diff", path, rev, commit: c, title: `${titleFor(path)} @ ${rev.slice(0, 7)}` });
-    S.tabs.splice(S.tabs.indexOf(activeTab()) + 1, 0, t);
-    S.active = t.id; renderTabs();
-    Editor.detach();
-    const view = $("view"); view.innerHTML = ""; $("doc-toolbar").classList.add("hidden"); renderBanner(null);
-    const pane = el("div", "vpane reader"); const doc = el("article", "doc");
-    const note = el("div", "callout c-quote"); note.append(el("div", "callout-title", `Version of ${path} from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : rev.slice(0, 10)} — read only`));
-    doc.append(note);
-    const inner = el("div"); doc.append(inner);
-    if (isMd(path)) renderMarkdown(r.content, path, inner, { depth: 1, footnotePrefix: "p" + hashStr(path) + "-" }); else { const pre = el("pre"); pre.append(el("code", "", r.content)); inner.append(pre); }
-    pane.append(doc); view.append(pane);
+    const t = newTab({ type: "version", path, rev, commit: c, content: r.content, title: `${titleFor(path)} @ ${rev.slice(0, 7)}` });
+    const g = focusedGroup(), cur = activeTab();
+    addTab(t, g, cur ? g.tabs.indexOf(cur.id) + 1 : g.tabs.length);
+    activate(t.id);
   } catch (e) { toast(e.message, "err"); }
+}
+// A read-only old version of a file.
+function renderVersionView(view, t) {
+  const c = t.commit, path = t.path;
+  const pane = el("div", "vpane reader"); const doc = el("article", "doc");
+  const note = el("div", "callout c-quote"); note.append(el("div", "callout-title", `Version of ${path} from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : t.rev.slice(0, 10)} — read only`));
+  doc.append(note);
+  const inner = el("div"); doc.append(inner);
+  if (isMd(path)) renderMarkdown(t.content, path, inner, { depth: 1, footnotePrefix: "p" + hashStr(path) + "-" }); else { const pre = el("pre"); pre.append(el("code", "", t.content)); inner.append(pre); }
+  pane.append(doc); view.append(pane);
 }
 async function restoreVersion(srcPath, rev, c, path = srcPath) {
   if (!(await mlConfirm(`Restore ${path} to the version from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : rev.slice(0, 10)}?\n\nThe current version stays in history.`, { confirmLabel: "Restore", danger: false }))) return;
@@ -452,20 +455,23 @@ function refreshOutline(t) {
     const it = el("div", "outline-item", title);
     it.style.paddingLeft = (12 + (m[1].length - 1) * 12) + "px";
     it.onclick = () => {
-      const reader = $("view").querySelector(".vpane.reader");
+      const g = groupOf(t);
+      if (!g) return;
+      const reader = g.view.querySelector(".vpane.reader"), cm = g.editor.tab === t && g.editor.cm;
       if (t.mode !== "source" && reader) scrollToHeading(reader, title);
-      if (t.mode !== "live" && Editor.cm) { Editor.cm.setCursor({ line: i, ch: 0 }); Editor.cm.scrollIntoView({ line: i, ch: 0 }, 80); Editor.cm.focus(); }
+      if (t.mode !== "live" && cm) { cm.setCursor({ line: i, ch: 0 }); cm.scrollIntoView({ line: i, ch: 0 }, 80); cm.focus(); }
     };
     ob.append(it);
   });
   if (!n) ob.append(el("div", "rempty", "No headings."));
 }
-$("btn-right").onclick = () => {
+function toggleRight() {
   const c = document.body.classList.toggle("right-collapsed");
   store.set("rightCollapsed", c);
   if (!c) refreshRight();
-};
-$("btn-more").onclick = e => {
+  eachEditor(ed => ed.cm.refresh());
+}
+function moreMenu(e) {
   const t = activeTab(); if (!t || !t.path) return;
   const r = e.currentTarget.getBoundingClientRect();
   showMenu(r.right - 200, r.bottom + 4, [
@@ -476,14 +482,17 @@ $("btn-more").onclick = e => {
     { label: "Local graph", run: () => openGraph(t.path) },
     { label: "Find mentions of this note", run: () => searchFor(stemOf(t.path)) },
     "-",
+    { label: "Split right", key: "\\", run: () => splitTab(t, "right") },
+    { label: "Split down", key: "|", run: () => splitTab(t, "down") },
+    "-",
     { label: "Copy path", run: () => copyText(t.path) },
     { label: "Copy wikilink", run: () => copyText(`[[${stemOf(t.path)}]]`) },
     { label: "Download", run: () => downloadFile(t.path) },
-    { label: (document.body.classList.contains("wide-doc") ? "Readable" : "Full") + " line width", run: () => { const w = document.body.classList.toggle("wide-doc"); store.set("wide", w); if (Editor.cm) Editor.cm.refresh(); } },
+    { label: (document.body.classList.contains("wide-doc") ? "Readable" : "Full") + " line width", run: () => { const w = document.body.classList.toggle("wide-doc"); store.set("wide", w); eachEditor(ed => ed.cm.refresh()); } },
     "-",
     { label: "Delete…", danger: true, run: () => deletePath(t.path, false) },
   ]);
-};
+}
 
 // ── Lint ───────────────────────────────────────────────────────────────────────
 let linting = false;
@@ -577,7 +586,7 @@ $("lint-review").onclick = async () => {
 // ── Graph ──────────────────────────────────────────────────────────────────────
 function openGraph(focus = null) {
   let t = S.tabs.find(x => x.type === "graph");
-  if (!t) { t = newTab({ type: "graph", title: "Graph" }); S.tabs.push(t); }
+  if (!t) { t = newTab({ type: "graph", title: "Graph" }); const g = focusedGroup(), cur = activeTab(); addTab(t, g, cur ? g.tabs.indexOf(cur.id) + 1 : g.tabs.length); }
   t.focus = focus || null;
   t.title = focus ? `Graph: ${titleFor(focus)}` : "Graph";
   activate(t.id);
@@ -736,7 +745,7 @@ const Graph = {
     c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     c.clearRect(0, 0, this.w, this.h);
     c.translate(this.w / 2 + v.x, this.h / 2 + v.y); c.scale(v.k, v.k);
-    const hov = this.hover, active = activeTab() && activeTab().focus;
+    const hov = this.hover, active = this.tab && this.tab.focus;
     const nb = new Set();
     if (hov) { nb.add(hov); for (const [a, b] of this.edges) { if (a === hov) nb.add(b); if (b === hov) nb.add(a); } }
     c.lineWidth = 1 / v.k;
@@ -825,7 +834,7 @@ function setupResizer(id, side) {
       const nw = Math.max(180, Math.min(560, start + (side === "left" ? ev.clientX - startX : startX - ev.clientX)));
       document.body.style.setProperty(side === "left" ? "--left-w" : "--right-w", nw + "px");
       store.set(key, nw);
-      if (Editor.cm) Editor.cm.refresh();
+      eachEditor(ed => ed.cm.refresh());
     };
     const up = () => { r.classList.remove("dragging"); window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
@@ -850,6 +859,8 @@ const KEYS = [
     ["N", "new note"],
     ["X", "close tab"],
     ["{ / }", "previous / next tab"],
+    ["\\", "split right: move the tab to a group beside this one"],
+    ["|", "split down"],
     ["/", "search"],
     ["E", "notes: Live ↔ Source"],
     ["S", "notes: split view"],
@@ -897,9 +908,10 @@ function showKeys() {
   back.append(dlg); document.body.append(back); back.focus();
 }
 function cycleTab(d) {
-  if (!S.tabs.length) return;
-  const i = Math.max(0, S.tabs.findIndex(t => t.id === S.active));
-  activate(S.tabs[(i + d + S.tabs.length) % S.tabs.length].id);
+  const g = focusedGroup();
+  if (!g || !g.tabs.length) return;
+  const n = g.tabs.length, i = Math.max(0, g.tabs.indexOf(g.active));
+  activate(g.tabs[(i + d + n) % n]);
 }
 document.addEventListener("keydown", e => {
   const mod = e.ctrlKey || e.metaKey;
@@ -927,7 +939,9 @@ document.addEventListener("keydown", e => {
   const act = {
     "t": () => Switcher.open(), "o": () => Switcher.open(),
     "n": () => newNote(),
-    "x": () => { if (t) closeTab(t.id); },
+    "x": () => { if (t) closeTab(t.id); else closeGroup(focusedGroup()); },
+    "\\": () => { if (t) splitTab(t, "right"); },
+    "|": () => { if (t) splitTab(t, "down"); },
     "{": () => cycleTab(-1), "}": () => cycleTab(1),
     "/": () => { switchPane("search"); $("search-input").select(); },
     "e": () => { if (t && t.type === "file") setMode(t.mode === "live" ? "source" : "live"); },
@@ -946,24 +960,12 @@ document.addEventListener("keydown", e => {
 
 // ── Startup ────────────────────────────────────────────────────────────────────
 async function init() {
+  initLayout();
   await loadExperiments();
   await poll(true);
   if (!S.enabled) return;
-  // Restore tabs, then honour ?path= / ?q= / ?mentions=.
-  const saved = store.get("tabs", []);
-  for (const st of saved) {
-    if (st.type === "graph") S.tabs.push(newTab({ type: "graph", title: "Graph" }));
-    else if (st.path && S.fileMap.has(st.path)) {
-      const mode = { read: "live", edit: "source" }[st.mode] || st.mode || "live";
-      S.tabs.push(newTab({ path: st.path, title: titleFor(st.path), kind: kindOf(st.path), mode }));
-    }
-  }
-  await Promise.all(S.tabs.filter(t => t.type === "file").map(t => loadTabContent(t).catch(() => { t.missing = true; })));
-  S.tabs = S.tabs.filter(t => !t.missing);
-  const act = store.get("activeTab", null);
-  const pick = act && S.tabs.find(t => t.type === act.type && t.path === act.path);
-  S.active = pick ? pick.id : (S.tabs[0] ? S.tabs[0].id : null);
-  renderTabs(); renderActive();
+  // Restore the groups and their tabs, then honour ?path= / ?q= / ?mentions=.
+  await restoreLayout();
   const want = _qp.get("path");
   if (want && S.fileMap.has(want)) await openFile(want, { pushNav: false });
   if (_qp.get("q") || _qp.get("mentions")) searchFor(_qp.get("q") || _qp.get("mentions"));

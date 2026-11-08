@@ -5,28 +5,34 @@
 let tabSeq = 0;
 const titleFor = p => isMd(p) ? stemOf(p) : basename(p);
 function newTab(props) {
-  return { id: ++tabSeq, type: "file", path: null, title: "", kind: null, mode: "live",
+  return { id: ++tabSeq, type: "file", path: null, title: "", kind: null, mode: "live", group: null,
            doc: null, hash: null, saved: "", dirty: false, saving: false, meta: null,
            conflict: null, deleted: false, scroll: {}, ...props };
 }
 const activeTab = () => S.tabs.find(t => t.id === S.active) || null;
 function saveTabs() {
-  store.set("tabs", S.tabs.filter(t => t.type === "file" || t.type === "graph").map(t => ({ type: t.type, path: t.path, mode: t.mode })));
+  if (!S.layout) return;
+  store.set("layout", serializeLayout());
   const t = activeTab();
-  store.set("activeTab", t ? { type: t.type, path: t.path } : null);
   const u = new URL(location.href);
   if (t && t.type === "file" && t.path) u.searchParams.set("path", t.path); else u.searchParams.delete("path");
   history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
 }
 
+const TAB_ICONS = { graph: () => ICONS.graph, diff: () => ICONS.diff, version: () => ICONS.diff };
 function renderTabs() {
-  const strip = $("tabstrip");
+  if (TabDrag) { stripsStale = true; return; }
+  for (const g of Groups.values()) renderStrip(g);
+}
+function renderStrip(g) {
+  const strip = g.strip;
   strip.innerHTML = "";
-  for (const t of S.tabs) {
-    const d = el("div", "dtab" + (t.id === S.active ? " active" : "") + (t.dirty ? " dirty" : ""));
+  for (const t of g.tabs.map(tabById).filter(Boolean)) {
+    const d = el("div", "dtab" + (t.id === g.active ? " active" : "") + (t.dirty ? " dirty" : ""));
     d.dataset.id = t.id;
+    d.draggable = true;
     const ic = el("span", "ti");
-    ic.innerHTML = t.type === "graph" ? ICONS.graph : t.type === "diff" ? ICONS.diff : iconFor(t.path || "");
+    ic.innerHTML = (TAB_ICONS[t.type] || (() => iconFor(t.path || "")))();
     d.append(ic, el("span", "tt", t.title || "Untitled"));
     d.title = t.path || t.title;
     const x = el("span", "x", "×"); x.title = "Close";
@@ -34,48 +40,66 @@ function renderTabs() {
     d.append(x);
     d.onclick = () => activate(t.id);
     d.onauxclick = e => { if (e.button === 1) { e.preventDefault(); closeTab(t.id); } };
+    d.addEventListener("dragstart", e => startTabDrag(e, t, d));
     d.oncontextmenu = e => {
       e.preventDefault();
+      const others = g.tabs.filter(id => id !== t.id);
       showMenu(e.clientX, e.clientY, [
-        { label: "Close", run: () => closeTab(t.id) },
-        { label: "Close others", run: () => S.tabs.filter(o => o.id !== t.id).forEach(o => closeTab(o.id)) },
-        { label: "Close all", run: () => [...S.tabs].forEach(o => closeTab(o.id)) },
+        { label: "Close", key: "X", run: () => closeTab(t.id) },
+        { label: "Close others", run: () => others.forEach(id => closeTab(id)) },
+        { label: "Close all in this group", run: () => [...g.tabs].forEach(id => closeTab(id)) },
+        "-",
+        { label: "Split right", key: "\\", run: () => splitTab(t, "right") },
+        { label: "Split down", key: "|", run: () => splitTab(t, "down") },
         ...(t.path ? ["-", { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(t.path); } }, { label: "Copy path", run: () => copyText(t.path) }] : []),
       ]);
     };
     strip.append(d);
   }
-  const plus = el("button", "icon-btn"); plus.id = "tab-new"; plus.title = "New note (N)";
+  const plus = el("button", "icon-btn tab-new"); plus.title = "New note (N)";
   plus.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>';
   plus.onclick = () => newNote();
   strip.append(plus);
+  if (!g.tabs.length && Groups.size > 1) {
+    const close = el("button", "icon-btn group-close"); close.title = "Close this group (X)";
+    close.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="m4 4 8 8M12 4l-8 8"/></svg>';
+    close.onclick = () => closeGroup(g);
+    strip.append(close);
+  }
   const a = strip.querySelector(".dtab.active");
   if (a) a.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
 function activate(id, { pushNav = true } = {}) {
+  const t = tabById(id);
+  const g = groupOf(t);
+  if (!g) return;
   const prev = activeTab();
-  if (prev && prev.id !== id) stashScroll(prev);
+  const hidden = tabById(g.active);
+  if (hidden && hidden.id !== id) stashScroll(hidden);
   if (pushNav && prev && prev.id !== id && prev.path) { S.navBack.push({ type: prev.type, path: prev.path }); S.navFwd = []; }
-  S.active = id;
-  renderTabs(); renderActive(); saveTabs();
-  const t = activeTab();
-  if (t && t.path) { revealInTree(t.path); pushRecent(t.path); }
+  g.active = id;
+  S.focus = g.id;
+  markFocus();
+  renderTabs(); renderGroup(g); saveTabs();
+  if (t.path) { revealInTree(t.path); pushRecent(t.path); }
 }
 async function closeTab(id, force = false) {
-  const t = S.tabs.find(x => x.id === id);
+  const t = tabById(id);
   if (!t) return;
   if (t.dirty && !force) {
     await saveTab(t);
     if (t.dirty && !(await mlConfirm(`${t.title} has unsaved changes that could not be saved. Close anyway?`, { confirmLabel: "Discard" }))) return;
   }
-  const i = S.tabs.indexOf(t);
-  S.tabs.splice(i, 1);
-  if (S.active === id) {
-    const next = S.tabs[i] || S.tabs[i - 1];
-    S.active = next ? next.id : null;
-  }
-  renderTabs(); renderActive(); saveTabs();
+  const g = groupOf(t);
+  S.tabs = S.tabs.filter(x => x !== t);
+  if (!g) return;
+  const i = g.tabs.indexOf(id);
+  g.tabs.splice(i, 1);
+  if (g.active === id) g.active = g.tabs.length ? g.tabs[Math.min(i, g.tabs.length - 1)] : null;
+  if (!g.tabs.length && removeGroup(g.id)) { renderLayout(); renderTabs(); renderGroup(focusedGroup()); }
+  else { renderTabs(); renderGroup(g); }
+  saveTabs();
 }
 function pushRecent(path) {
   S.recent = [path, ...S.recent.filter(p => p !== path)].slice(0, 30);
@@ -83,33 +107,37 @@ function pushRecent(path) {
 }
 function stashScroll(t) {
   if (t.live && t.live.editing >= 0) lvCommit(t.live);
-  const v = $("view").querySelector(".vpane.reader");
+  const g = groupOf(t);
+  if (!g || g.active !== t.id) return;
+  const v = g.view.querySelector(".vpane.reader");
   if (v) t.scroll.read = v.scrollTop;
-  if (Editor.cm && Editor.tab === t) { t.scroll.edit = Editor.cm.getScrollInfo().top; t.cursor = Editor.cm.getCursor(); }
+  const ed = g.editor;
+  if (ed.cm && ed.tab === t) { t.scroll.edit = ed.cm.getScrollInfo().top; t.cursor = ed.cm.getCursor(); }
 }
 
-// Open a file: reuse its tab, else replace the active file tab (unless newTab).
-async function openFile(path, { newTab: inNew = false, mode = null, line = null, heading = null, focusEnd = false, pushNav = true } = {}) {
+// Open a file: reuse its tab (in whichever group has it), else replace the
+// focused group's file tab (unless newTab), else add a tab at *index*.
+async function openFile(path, { newTab: inNew = false, mode = null, line = null, heading = null, focusEnd = false, pushNav = true, index = null } = {}) {
   if (!path) return;
   let t = S.tabs.find(x => x.type === "file" && x.path === path);
   if (!t) {
+    const g = focusedGroup();
     const cur = activeTab();
     const kind = kindOf(path);
     const defMode = kind === "text" ? "source" : "live";
     if (cur && cur.type === "file" && !inNew && !cur.dirty) {
       stashScroll(cur);
       if (pushNav && cur.path) { S.navBack.push({ type: "file", path: cur.path }); S.navFwd = []; }
-      Object.assign(cur, newTab({ id: cur.id, path, title: titleFor(path), kind, mode: mode || defMode }));
+      Object.assign(cur, newTab({ id: cur.id, group: cur.group, path, title: titleFor(path), kind, mode: mode || defMode }));
       t = cur;
       pushNav = false;
     } else {
       t = newTab({ path, title: titleFor(path), kind, mode: mode || defMode });
-      const idx = cur ? S.tabs.indexOf(cur) + 1 : S.tabs.length;
-      S.tabs.splice(idx, 0, t);
+      addTab(t, g, index != null ? index : (cur ? g.tabs.indexOf(cur.id) + 1 : g.tabs.length));
     }
     try { await loadTabContent(t); }
     catch (e) {
-      if (e.status === 404) { toast(`${path} no longer exists`, "err"); S.tabs = S.tabs.filter(x => x !== t); if (S.active === t.id) S.active = S.tabs.length ? S.tabs[S.tabs.length - 1].id : null; renderTabs(); renderActive(); return; }
+      if (e.status === 404) { toast(`${path} no longer exists`, "err"); closeTab(t.id, true); return; }
       toast("Could not open: " + e.message, "err");
     }
   } else if (mode) t.mode = mode;
@@ -143,18 +171,19 @@ async function reloadTab(t, { quiet = false } = {}) {
     t.meta = meta; t.hash = meta.hash; t.kind = meta.kind;
     if (meta.content != null && t.doc) {
       if (t.doc.getValue() !== meta.content) {
-        const sc = Editor.cm && Editor.tab === t ? Editor.cm.getScrollInfo() : null;
+        const ed = editorOf(t);
+        const sc = ed && ed.cm && ed.tab === t ? ed.cm.getScrollInfo() : null;
         applyRemote(t, meta.content);
-        if (sc) Editor.cm.scrollTo(sc.left, sc.top);
+        if (sc) ed.cm.scrollTo(sc.left, sc.top);
         if (!quiet) toast(`${t.title} was updated by sync`);
       }
       t.saved = meta.content; t.dirty = false;
     } else if (meta.content != null && !t.doc) { await loadTabContent(t); }
     t.conflict = null; t.deleted = false;
-    if (t.id === S.active) renderActive({ keepEditor: true });
+    if (isShown(t)) renderGroup(groupOf(t), { keepEditor: true });
     renderTabs();
   } catch (e) {
-    if (e.status === 404) { t.deleted = true; if (t.id === S.active) renderBanner(t); }
+    if (e.status === 404) { t.deleted = true; renderBanner(t); }
   }
 }
 
@@ -163,7 +192,7 @@ async function checkOpenTabs() {
   for (const t of S.tabs) {
     if (t.type !== "file" || !t.path || t.saving) continue;
     const f = S.fileMap.get(t.path);
-    if (!f) { if (!t.deleted) { t.deleted = true; if (t.id === S.active) renderBanner(t); } continue; }
+    if (!f) { if (!t.deleted) { t.deleted = true; renderBanner(t); } continue; }
     if (t.meta && f.mtime === t.meta.mtime && f.size === t.meta.size) continue;
     let meta;
     try { meta = await api(`/api/notes/file?path=${q(t.path)}`); } catch { continue; }
@@ -174,11 +203,11 @@ async function checkOpenTabs() {
         applyRemote(t, meta.content);
         t.saved = meta.content;
       }
-      if (t.id === S.active) renderActive({ keepEditor: true });
+      if (isShown(t)) renderGroup(groupOf(t), { keepEditor: true });
       toast(`${t.title} was updated by sync`);
     } else {
       t.conflict = { hash: meta.hash, content: meta.content };
-      if (t.id === S.active) renderBanner(t);
+      renderBanner(t);
     }
   }
 }
@@ -192,21 +221,26 @@ function navigate(dir) {
     if (target.type === "file" && S.fileMap.has(target.path)) { openFile(target.path, { pushNav: false }); return; }
   }
 }
-$("btn-back").onclick = () => navigate(-1);
-$("btn-fwd").onclick = () => navigate(1);
-
-// ── Rendering the active tab ───────────────────────────────────────────────────
-function renderActive({ keepEditor = false } = {}) {
-  const t = activeTab();
-  const view = $("view");
-  const toolbar = $("doc-toolbar");
-  if (!keepEditor || !t || t.type !== "file") Editor.detach();
+// ── Rendering a group's active tab ─────────────────────────────────────────────
+// Tab types other than files draw themselves into the view.
+const TAB_VIEWS = {
+  graph: (view, t) => Graph.mount(view, t),
+  diff: (view, t) => renderDiffView(view, t),
+  version: (view, t) => renderVersionView(view, t),
+};
+function renderActive(opts = {}) { const g = focusedGroup(); if (g) renderGroup(g, opts); }
+function renderGroup(g, { keepEditor = false } = {}) {
+  if (!g || !Groups.has(g.id)) return;
+  const t = tabById(g.active);
+  const { view, toolbar } = g;
+  const focused = g.id === S.focus;
+  const right = () => { if (focused) refreshRight(); };
+  if (!keepEditor || !t || t.type !== "file") g.editor.detach();
   view.innerHTML = "";
-  renderBanner(t);
-  if (!S.enabled) { toolbar.classList.add("hidden"); if (S.enabled === false) showSetup(); return; }
-  if (!t) { toolbar.classList.add("hidden"); renderEmpty(); refreshRight(); return; }
-  if (t.type === "graph") { toolbar.classList.add("hidden"); Graph.mount(view, t); refreshRight(); return; }
-  if (t.type === "diff") { toolbar.classList.add("hidden"); renderDiffView(view, t); refreshRight(); return; }
+  renderBanner(t, g);
+  if (!S.enabled) { toolbar.classList.add("hidden"); if (S.enabled === false && focused) showSetup(); return; }
+  if (!t) { toolbar.classList.add("hidden"); renderEmpty(view); right(); return; }
+  if (TAB_VIEWS[t.type]) { toolbar.classList.add("hidden"); TAB_VIEWS[t.type](view, t); right(); return; }
   toolbar.classList.remove("hidden");
   renderCrumbs(t);
   renderModeSeg(t);
@@ -214,12 +248,13 @@ function renderActive({ keepEditor = false } = {}) {
 
   if (!t.meta) { view.append(el("div", "placeholder", "Loading…")); return; }
   const k = t.kind;
+  const ed = g.editor;
   if ((k === "md" || k === "text") && t.doc) {
     if (k === "text" && t.mode !== "source") t.mode = "source";
     if (t.mode === "live") view.append(livePane(t));
-    else if (t.mode === "source") view.append(Editor.attach(t));
-    else { const ed = Editor.attach(t); view.append(ed, el("div", "split-divider"), readerPane(t)); }
-    if (t.mode !== "live") Editor.refresh(t);
+    else if (t.mode === "source") view.append(ed.attach(t));
+    else view.append(ed.attach(t), el("div", "split-divider"), readerPane(t));
+    if (t.mode !== "live") ed.refresh(t);
   } else if (k === "image") {
     const p = el("div", "vpane media-view");
     const img = el("img"); img.src = rawURL(t.path) + "&v=" + (t.hash || t.meta.mtime); img.alt = t.path;
@@ -236,11 +271,11 @@ function renderActive({ keepEditor = false } = {}) {
     const a = el("a", "mini-btn primary", "Download"); a.href = rawURL(t.path, "&download=1"); a.download = basename(t.path);
     card.append(a); p.append(card); view.append(p);
   }
-  refreshRight();
+  right();
 }
 
 function renderCrumbs(t) {
-  const c = $("crumbs");
+  const c = groupOf(t).crumbs;
   c.innerHTML = "";
   const parts = t.path.split("/");
   parts.forEach((p, i) => {
@@ -262,13 +297,13 @@ function renderModeSeg(t) {
   // Live, Source and Split are ways to read a note.  Other files are simply
   // themselves: text/code in the editor, images and PDFs in place.
   const note = t.kind === "md" && !!t.doc;
-  document.querySelectorAll("#mode-seg button").forEach(b => {
+  const seg = groupOf(t).modeSeg;
+  seg.querySelectorAll("button").forEach(b => {
     b.classList.toggle("on", b.dataset.mode === t.mode);
     b.disabled = false;
   });
-  $("mode-seg").style.display = note ? "" : "none";
+  seg.style.display = note ? "" : "none";
 }
-document.querySelectorAll("#mode-seg button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
 function setMode(mode) {
   const t = activeTab();
   if (!t || t.type !== "file" || !t.doc) return;
@@ -276,43 +311,46 @@ function setMode(mode) {
   stashScroll(t);
   t.mode = mode;
   renderActive(); saveTabs();
-  if (mode !== "live") Editor.cm && Editor.cm.focus();
+  const ed = editorOf(t);
+  if (mode !== "live" && ed.cm) ed.cm.focus();
 }
 
-function renderBanner(t) {
-  const b = $("banner");
-  b.className = ""; b.innerHTML = "";
+// The banner of the group showing *t* (or of *g*, which shows nothing to warn about).
+function renderBanner(t, g = null) {
+  if (!g) { if (!isShown(t)) return; g = groupOf(t); }
+  const b = g.banner;
+  b.className = "banner"; b.innerHTML = "";
   if (!t || t.type !== "file") return;
   const msg = el("span", "msg");
   const btn = (label, fn, primary) => { const x = el("button", "mini-btn" + (primary ? " primary" : ""), label); x.onclick = fn; return x; };
   if (t.deleted) {
-    b.className = "show err";
+    b.className = "banner show err";
     msg.textContent = "This file was deleted or moved on another machine.";
     b.append(msg);
     if (t.doc) b.append(btn("Save my copy", async () => { t.hash = null; t.deleted = false; await saveTab(t, { create: true }); renderBanner(t); await loadTree(); }, true));
     b.append(btn("Close", () => closeTab(t.id, true)));
   } else if (t.conflict) {
-    b.className = "show warn";
+    b.className = "banner show warn";
     msg.textContent = "This file changed on another machine while you were editing it.";
     b.append(msg,
       btn("Compare…", () => showMerge(t), true),
       btn("Keep mine", () => keepMine(t)),
       btn("Take theirs", () => takeTheirs(t)));
   } else if (t.saveError) {
-    b.className = "show err";
+    b.className = "banner show err";
     msg.textContent = "Saving failed: " + t.saveError;
     b.append(msg, btn("Retry", () => saveTab(t), true));
   }
 }
 
 function updateSaveState(t) {
-  const s = $("save-state");
-  if (!t || t.type !== "file") { s.textContent = ""; return; }
-  s.className = "";
+  if (!t || t.type !== "file" || !isShown(t)) return;
+  const s = groupOf(t).saveState;
+  s.className = "save-state";
   if (t.saving) s.textContent = "Saving…";
-  else if (t.conflict) { s.textContent = "Conflict"; s.className = "err"; }
-  else if (t.saveError) { s.textContent = "Not saved"; s.className = "err"; }
-  else if (t.dirty) { s.textContent = "Edited"; s.className = "dirty"; }
+  else if (t.conflict) { s.textContent = "Conflict"; s.classList.add("err"); }
+  else if (t.saveError) { s.textContent = "Not saved"; s.classList.add("err"); }
+  else if (t.dirty) { s.textContent = "Edited"; s.classList.add("dirty"); }
   else s.textContent = "";
   if (!t.dirty && !t.saving && t.meta) {
     const lc = t.meta.last_commit;
@@ -321,8 +359,7 @@ function updateSaveState(t) {
   }
 }
 
-function renderEmpty() {
-  const v = $("view");
+function renderEmpty(v) {
   const p = el("div", "vpane");
   const wrap = el("div", "empty-view");
   const st = S.status || {};
@@ -330,10 +367,10 @@ function renderEmpty() {
     <div class="sub">${S.files.length} files · git remote <code>${esc(st.remote || "")}</code>.
     Agents clone it with <code>mlsweep notes clone DIR</code>; their changes arrive when they push.</div>
     <div class="empty-grid">
-      <div><h3>Recent</h3><div class="empty-list" id="empty-recent"></div></div>
-      <div><h3>Recently changed</h3><div class="empty-list" id="empty-changed"></div></div>
+      <div><h3>Recent</h3><div class="empty-list empty-recent"></div></div>
+      <div><h3>Recently changed</h3><div class="empty-list empty-changed"></div></div>
       <div><h3>Start</h3><div class="empty-list">
-        <a id="e-new">Create a note</a><a id="e-open">Open a file…</a><a id="e-graph">Open the graph</a><a id="e-lint">Run lint</a></div></div>
+        <a class="e-new">Create a note</a><a class="e-open">Open a file…</a><a class="e-graph">Open the graph</a><a class="e-lint">Run lint</a></div></div>
       <div><h3>Keys</h3><div class="kbd-list">
         <span><kbd>T</kbd></span><span>Open a file</span>
         <span><kbd>N</kbd></span><span>New note</span>
@@ -345,23 +382,24 @@ function renderEmpty() {
       </div></div>
     </div>`;
   p.append(wrap); v.append(p);
-  const rec = wrap.querySelector("#empty-recent");
+  const rec = wrap.querySelector(".empty-recent");
   const recents = S.recent.filter(r => S.fileMap.has(r)).slice(0, 8);
   if (!recents.length) rec.append(el("div", "muted", "Nothing opened yet."));
   for (const r of recents) { const a = el("a", "", titleFor(r)); a.title = r; a.onclick = () => openFile(r); rec.append(a); }
-  const ch = wrap.querySelector("#empty-changed");
+  const ch = wrap.querySelector(".empty-changed");
   const changed = [...S.files].filter(f => f.kind === "md").sort((a, b) => b.mtime - a.mtime).slice(0, 8);
   for (const f of changed) { const a = el("a", "", `${titleFor(f.path)}`); a.title = `${f.path} · ${ago(f.mtime)}`; a.onclick = () => openFile(f.path); ch.append(a); }
-  wrap.querySelector("#e-new").onclick = () => newNote("");
-  wrap.querySelector("#e-open").onclick = () => Switcher.open();
-  wrap.querySelector("#e-graph").onclick = () => openGraph();
-  wrap.querySelector("#e-lint").onclick = () => { switchPane("lint"); runLint(); };
+  wrap.querySelector(".e-new").onclick = () => newNote("");
+  wrap.querySelector(".e-open").onclick = () => Switcher.open();
+  wrap.querySelector(".e-graph").onclick = () => openGraph();
+  wrap.querySelector(".e-lint").onclick = () => { switchPane("lint"); runLint(); };
 }
 
 function showSetup() {
-  $("doc-toolbar").classList.add("hidden");
+  const g = focusedGroup();
+  g.toolbar.classList.add("hidden");
   $("tree").innerHTML = `<div class="tree-empty">Notes are not enabled on this manager.</div>`;
-  const v = $("view"); v.innerHTML = "";
+  const v = g.view; v.innerHTML = "";
   const p = el("div", "vpane");
   p.innerHTML = `<div class="setup">
     <h1>Notes are off on this manager</h1>
@@ -970,11 +1008,13 @@ function modeForPath(p) {
   return map[e] || null;
 }
 
-const Editor = {
-  cm: null, host: null, tab: null,
+// One editor per group (makeGroup); each shows one tab's CodeMirror doc at a time.
+function makeEditor(group) { return {
+  cm: null, host: null, tab: null, group,
   ensure() {
     if (this.cm) return;
-    this.host = el("div", "vpane"); this.host.id = "editor-wrap";
+    const ed = this;
+    this.host = el("div", "vpane editor-wrap");
     this.cm = CodeMirror(this.host, {
       lineWrapping: true, lineNumbers: false, styleActiveLine: true, autoCloseBrackets: "()[]{}``", theme: "mlnotes",
       indentUnit: 2, tabSize: 2, indentWithTabs: false, viewportMargin: 50, placeholder: "Start writing…",
@@ -986,14 +1026,14 @@ const Editor = {
         "Ctrl-B": cm => wrapSel(cm, "**"), "Cmd-B": cm => wrapSel(cm, "**"),
         "Ctrl-I": cm => wrapSel(cm, "*"), "Cmd-I": cm => wrapSel(cm, "*"),
         "Ctrl-Space": cm => linkHint(cm, true),
-        "Esc": cm => { if (cm.state.completionActive) return CodeMirror.Pass; const t = activeTab(); if (t && t.kind === "md") setMode("live"); else cm.getInputField().blur(); },
+        "Esc": cm => { if (cm.state.completionActive) return CodeMirror.Pass; const t = this.tab; if (t && t.kind === "md") { focusGroup(this.group.id); setMode("live"); } else cm.getInputField().blur(); },
       },
     });
     this.overlay = {
       // CodeMirror overlays cannot be stateful.  Frontmatter and fence ranges
-      // are precomputed by decorateBlocks and read through Editor.mdInfo.
+      // are precomputed by decorateBlocks and read through this editor's mdInfo.
       token(stream) {
-        const info = Editor.mdInfo;
+        const info = ed.mdInfo;
         const lineNo = stream.lineOracle
           ? (stream.lineOracle.lineNo != null ? stream.lineOracle.lineNo : stream.lineOracle.line)
           : null;
@@ -1046,19 +1086,22 @@ const Editor = {
       const cur = cm.getCursor();
       if (/\[\[$/.test(cm.getLine(cur.line).slice(0, cur.ch))) setTimeout(() => linkHint(cm), 0);
     });
+    this.cm.mlEditor = this;
     this.cm.on("paste", (cm, e) => onPaste(cm, e));
     this.cm.on("drop", (cm, e) => {
       if (dragPath) { e.preventDefault(); const pos = cm.coordsChar({ left: e.clientX, top: e.clientY }); cm.replaceRange(embedText(dragPath), pos); dragPath = null; return; }
       if (e.dataTransfer.files.length) {
         e.preventDefault(); e.stopPropagation();
         const pos = cm.coordsChar({ left: e.clientX, top: e.clientY }); cm.setCursor(pos);
-        const t = Editor.tab; uploadFiles(e.dataTransfer.files, attachDir(t)).then(insertEmbeds);
+        const t = this.tab; uploadFiles(e.dataTransfer.files, attachDir(t)).then(insertEmbeds);
       }
     });
-    this.cm.on("scroll", debounce(() => syncSplitScroll(), 30));
+    this.cm.on("scroll", debounce(() => syncSplitScroll(this), 30));
   },
   attach(t) {
     this.ensure();
+    // A CodeMirror doc can be in one editor only; take it from the group it came from.
+    for (const g of Groups.values()) if (g.editor !== this && g.editor.cm && g.editor.cm.getDoc() === t.doc) g.editor.release();
     if (this.tab !== t || this.cm.getDoc() !== t.doc) {
       this.cm.swapDoc(t.doc);
       this.tab = t;
@@ -1137,7 +1180,8 @@ const Editor = {
     });
   },
   detach() { if (this.host && this.host.parentElement) this.host.remove(); },
-};
+  release() { if (this.cm && this.tab) { this.cm.swapDoc(CodeMirror.Doc("")); this.tab = null; } this.detach(); },
+}; }
 function wrapSel(cm, m) {
   const s = cm.getSelection();
   if (s) cm.replaceSelection(m + s + m);
@@ -1153,7 +1197,7 @@ function linkHint(cm, force = false) {
       const typed = m ? m[1] : "";
       const from = { line: cur.line, ch: cur.ch - typed.length };
       const items = rankPaths(typed, S.files.map(f => f.path), 40).map(p => ({
-        text: wikiName(p, Editor.tab && Editor.tab.path) + (m ? "]]" : ""),
+        text: wikiName(p, cm.mlEditor && cm.mlEditor.tab && cm.mlEditor.tab.path) + (m ? "]]" : ""),
         displayText: titleFor(p),
         render(elt, _d, cur) { elt.append(document.createTextNode(cur.displayText)); if (dirname(p)) elt.append(el("span", "hp", dirname(p))); },
       }));
@@ -1169,9 +1213,10 @@ function insertEmbeds(paths) {
   const txt = paths.map(embedText).join("\n");
   const t = activeTab(), ta = t && t.live && t.live.ta;
   if (ta && ta.isConnected) { ta.focus(); document.execCommand("insertText", false, txt); return; }
-  if (!Editor.cm) return;
-  Editor.cm.replaceSelection(txt);
-  Editor.cm.focus();
+  const ed = editorOf(t);
+  if (!ed || !ed.cm || ed.tab !== t) return;
+  ed.cm.replaceSelection(txt);
+  ed.cm.focus();
 }
 async function onPaste(cm, e) {
   const items = [...(e.clipboardData && e.clipboardData.items || [])].filter(i => i.kind === "file");
@@ -1188,12 +1233,12 @@ async function onPaste(cm, e) {
   const folder = joinPath(attachDir(t), "attachments");
   insertEmbeds(await uploadFiles(files, folder));
 }
-function syncSplitScroll() {
-  const t = activeTab();
-  if (!t || t.mode !== "split" || !Editor.cm) return;
-  const reader = $("view").querySelector(".vpane.reader");
+function syncSplitScroll(ed) {
+  const t = ed.tab;
+  if (!t || t.mode !== "split" || !ed.cm || !isShown(t)) return;
+  const reader = ed.group.view.querySelector(".vpane.reader");
   if (!reader) return;
-  const info = Editor.cm.getScrollInfo();
+  const info = ed.cm.getScrollInfo();
   const ratio = info.top / Math.max(1, info.height - info.clientHeight);
   reader.scrollTop = ratio * (reader.scrollHeight - reader.clientHeight);
 }
@@ -1204,7 +1249,7 @@ function onDocChange(t) {
   if (t.applyingRemote) return;
   const dirty = t.doc.getValue() !== t.saved;
   if (dirty !== t.dirty) { t.dirty = dirty; renderTabs(); }
-  if (t.id === S.active) { updateSaveState(t); if (t.rerender) t.rerender(); }
+  if (isShown(t)) { updateSaveState(t); if (t.rerender) t.rerender(); }
   clearTimeout(autosave.get(t.id));
   if (dirty) autosave.set(t.id, setTimeout(() => saveTab(t), 1200));
 }
@@ -1213,7 +1258,7 @@ async function saveTab(t, { create = false } = {}) {
   if (!t.doc || t.saving || t.conflict) return;
   if (!t.dirty && !create) return;
   clearTimeout(autosave.get(t.id));
-  t.saving = true; if (t.id === S.active) updateSaveState(t);
+  t.saving = true; updateSaveState(t);
   const content = t.doc.getValue();
   try {
     const r = await apiJSON("/api/notes/file", "PUT", { path: t.path, content, base_hash: create ? null : t.hash });
@@ -1232,7 +1277,7 @@ async function saveTab(t, { create = false } = {}) {
   } finally {
     t.saving = false;
     renderTabs();
-    if (t.id === S.active) { updateSaveState(t); renderBanner(t); }
+    updateSaveState(t); renderBanner(t);
   }
 }
 async function saveActiveNow() { const t = activeTab(); if (t && t.type === "file") { await saveTab(t); if (!t.dirty && !t.conflict) toast("Saved", "ok"); } }

@@ -243,7 +243,7 @@ def test_chart_block_renders_in_live_mode(mgr, page) -> None:
     ok(mgr, "PUT", "/api/notes/file", {"path": "chart-live.md", "content": note, "base_hash": None})
     page.goto(page.url("notes.html", path="chart-live.md"))
     page.wait_for("document.querySelector('.lv-doc .js-plotly-plot') !== null", timeout=20)
-    assert page.eval("getComputedStyle(document.getElementById('mode-seg')).display") != "none"
+    assert page.eval("getComputedStyle(document.querySelector('.group.focused .mode-seg')).display") != "none"
     assert page.eval("document.querySelector('.lv-doc figure.note-fig').id") == "fig-live"
     page.wait_for("document.querySelector('.lv-doc a.metric-ev.ev-ok') !== null")
 
@@ -284,7 +284,7 @@ def test_shell_selection_starts_at_the_line(mgr, page) -> None:
     notes.mkdir(parents=True, exist_ok=True)
     (notes / "selection-test.sh").write_text("#!/bin/sh\necho hello\n")
     page.goto(page.url("notes.html", path="selection-test.sh"))
-    page.wait_for("!!document.querySelector('#editor-wrap .CodeMirror')", timeout=20)
+    page.wait_for("!!document.querySelector('.editor-wrap .CodeMirror')", timeout=20)
     page.eval("const cm = document.querySelector('.CodeMirror').CodeMirror;"
               " cm.focus(); cm.execCommand('selectAll')")
     geom = page.eval(
@@ -298,11 +298,11 @@ def test_shell_selection_starts_at_the_line(mgr, page) -> None:
     assert geom["n"] > 0
     assert geom["pad"] == "0px"
     assert geom["sels"] and all(abs(geom["line"] - left) <= 1 for left in geom["sels"])
-    assert page.eval("getComputedStyle(document.getElementById('mode-seg')).display") == "none"
+    assert page.eval("getComputedStyle(document.querySelector('.group.focused .mode-seg')).display") == "none"
     # Even a stale stored mode cannot put a text file into Live or Split.
     page.eval("activeTab().mode = 'split'; renderActive()")
     assert page.eval("document.querySelectorAll('.split-divider').length") == 0
-    assert page.eval("document.querySelectorAll('#editor-wrap .CodeMirror').length") == 1
+    assert page.eval("document.querySelectorAll('.editor-wrap .CodeMirror').length") == 1
 
 
 def test_source_heading_hash_matches_the_heading(mgr, page) -> None:
@@ -312,7 +312,7 @@ def test_source_heading_hash_matches_the_heading(mgr, page) -> None:
     page.goto(page.url("notes.html", path="heading-style.md"))
     page.wait_for("!!document.querySelector('.lv-doc')", timeout=20)
     page.eval("setMode('source')")
-    page.wait_for("!!document.querySelector('#editor-wrap .CodeMirror-line')", timeout=20)
+    page.wait_for("!!document.querySelector('.editor-wrap .CodeMirror-line')", timeout=20)
     styles = page.eval(
         "(() => { const line = [...document.querySelectorAll('.CodeMirror-line')]"
         ".find(l => l.textContent.startsWith('#'));"
@@ -344,12 +344,13 @@ def test_sidebar_rows_line_up_with_the_center_panes(mgr, page) -> None:
     notes = mgr.mlsweep_dir / "notes"
     (notes / "align-test.md").write_text("# Align\n\nText\n")
     page.goto(page.url("notes.html", path="align-test.md"))
-    page.wait_for("!!document.getElementById('doc-toolbar')", timeout=20)
+    page.wait_for("!!document.querySelector('.group.focused .doc-toolbar:not(.hidden)')", timeout=20)
     geom = page.eval(
-        "(() => { const r = id => document.getElementById(id).getBoundingClientRect();"
-        " return [r('left-head').bottom, r('tabstrip').bottom,"
-        "         r('left-tabs').bottom, r('doc-toolbar').bottom,"
-        "         r('left-body').top, r('view').top]; })()")
+        "(() => { const r = s => document.querySelector(s).getBoundingClientRect();"
+        " const g = '.group.focused ';"
+        " return [r('#left-head').bottom, r(g + '.tabstrip').bottom,"
+        "         r('#left-tabs').bottom, r(g + '.doc-toolbar').bottom,"
+        "         r('#left-body').top, r(g + '.view').top]; })()")
     assert abs(geom[0] - geom[1]) <= 1   # header row / tab strip
     assert abs(geom[2] - geom[3]) <= 1   # pane tabs / doc toolbar
     assert abs(geom[4] - geom[5]) <= 1   # content starts at the same y
@@ -368,9 +369,9 @@ def test_markdown_source_highlights_notes_syntax_and_code(mgr, page) -> None:
         "```go\nfunc main() { x := 1 }\n```\n")
     page.goto(page.url("notes.html", path="highlight-test.md"))
     page.wait_for("!!document.querySelector('.lv-doc')", timeout=20)
-    assert page.eval("document.getElementById('editor-wrap') === null")
+    assert page.eval("document.querySelector('.editor-wrap') === null")
     page.eval("setMode('source')")
-    page.wait_for("!!document.querySelector('#editor-wrap.md-source .CodeMirror-line')", timeout=20)
+    page.wait_for("!!document.querySelector('.editor-wrap.md-source .CodeMirror-line')", timeout=20)
     time.sleep(0.4)
     counts = page.eval(
         "(() => { const out = {}; for (const c of ["

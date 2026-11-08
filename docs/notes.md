@@ -79,10 +79,11 @@ of it, as for the rest of the manager.
 
 ### Layout
 
-The left sidebar has Files, Search, Changes and Lint. The centre has note tabs and
-the open file. The right panel shows details about that file. Drag the edges to
+The left sidebar has Files, Search, Changes and Lint. The centre holds one or more
+groups, each with its own tabs, toolbar and open file. The right panel shows
+details about the file in the group you last clicked into. Drag the edges to
 resize the sidebars; the toolbar button at the far right hides the right panel.
-Open tabs, their views, folder state and sizes are remembered per browser.
+Groups, their tabs and views, folder state and sizes are remembered per browser.
 `notes.html?path=FILE` links to a file, and `?q=WORDS` or `?mentions=EXPERIMENT`
 opens a search.
 
@@ -116,8 +117,30 @@ anything else, or a file over 8 MB, as a download card.
 ### Tabs and the toolbar
 
 Close a tab with `X`, its ×, or a middle-click. Right-click a tab to close others or
-all, reveal it in the tree, or copy its path. `{` and `}` switch tabs; `[` and `]`
-(or the arrows) go back and forward through what you've opened.
+all in its group, split it off, reveal it in the tree, or copy its path. `{` and `}`
+switch tabs within the group; `[` and `]` (or the arrows) go back and forward through
+what you've opened.
+
+### Splitting and arranging
+
+Drag a tab to arrange the centre:
+
+- Along a tab strip, to reorder it, or onto another group's strip to move it there.
+- Onto the edge of a group, to split that group and put the tab in the new half. A
+  highlight shows where it will land.
+- Onto the middle of another group, to move it there.
+
+`\` splits right and `|` splits down, as do Split right and Split down in the tab's
+menu and in `⋯`. A file is open in one group at a time, so splitting moves the tab.
+Splitting the only tab in a group leaves an empty group beside it to open something
+in. Alt+click a file in the tree, or choose Open to the side, to open it in the group
+to the right. Dragging a file from the tree works like dragging a tab, except over a
+text editor, where it inserts a link.
+
+A group closes when its last tab closes or moves away. Close an empty group with its
+× or `X`. Drag the line between two groups to resize them, and double-click it to
+make them equal. Clicking into a group makes its file the one the right panel,
+the keys and the `⋯` menu act on.
 
 The `⋯` menu has Rename, Move, Reveal in file tree, Show history, Local graph, Find
 mentions of this note, Copy path, Copy wikilink, Download, line width, and Delete.
@@ -225,7 +248,8 @@ shows this list in the tab.
 | `T` or `O` | open a file |
 | `N` | new note |
 | `X` | close tab |
-| `{` `}` | previous, next tab |
+| `{` `}` | previous, next tab in the group |
+| `\` `\|` | split right, split down |
 | `[` `]` | back, forward |
 | `E` | notes: Live or Source |
 | `S` | notes: Split |

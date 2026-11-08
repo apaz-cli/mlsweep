@@ -139,9 +139,31 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 .review-file:hover { background: var(--btn-hover); color: var(--text); }
 .ok-msg { font-size: 12px; color: var(--ok); padding: 14px 12px; }
 
+/* ── Groups: a tree of splits, each leaf a tab strip with its view ─────────── */
+#groups { flex: 1; display: flex; min-width: 0; min-height: 0; }
+.split { display: flex; min-width: 0; min-height: 0; }
+.split.row { flex-direction: row; }
+.split.col { flex-direction: column; }
+.group { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; overflow: hidden; background: var(--doc-bg); }
+.sash { flex: 0 0 1px; background: var(--border); position: relative; z-index: 6; }
+.sash::before { content: ""; position: absolute; }
+.split.row > .sash { cursor: col-resize; }
+.split.row > .sash::before { inset: 0 -3px; }
+.split.col > .sash { cursor: row-resize; }
+.split.col > .sash::before { inset: -3px 0; }
+.sash:hover, .sash.dragging { background: var(--radio-checked-border); }
+#groups.multi .group:not(.focused) .dtab.active { color: var(--text-label); text-shadow: none; }
+#groups.multi .group.focused .dtab.active { box-shadow: inset 0 2px 0 var(--radio-checked-border); }
+.dtab.dragging { opacity: .45; }
+.dtab.drop-before { box-shadow: inset 2px 0 0 var(--radio-checked-border) !important; }
+.dtab.drop-after { box-shadow: inset -2px 0 0 var(--radio-checked-border) !important; }
+.drop-zone { position: absolute; display: none; background: var(--accent-soft); pointer-events: none; z-index: 20; transition: left .08s, top .08s, width .08s, height .08s; }
+.drop-zone.show { display: block; }
+.tabstrip .group-close { margin: 0 0 3px auto; }
+
 /* ── Center: tabs, toolbar, views ────────────────────────────────────────── */
-#tabstrip { display: flex; align-items: flex-end; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); height: 34px; padding: 0 6px; flex-shrink: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
-#tabstrip::-webkit-scrollbar { display: none; }
+.tabstrip { display: flex; align-items: flex-end; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); height: 34px; padding: 0 6px; flex-shrink: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.tabstrip::-webkit-scrollbar { display: none; }
 .dtab { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px 0 12px; font-size: 12px; color: var(--btn-text); border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; cursor: pointer; max-width: 220px; min-width: 90px; flex-shrink: 0; position: relative; user-select: none; }
 .dtab:hover { background: var(--btn-hover); }
 .dtab.active { background: var(--doc-bg); border-color: var(--border); color: var(--text-strong); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; margin-bottom: -1px; height: 29px; }
@@ -153,20 +175,20 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 .dtab.dirty .x:hover::before { content: "×"; font-size: 13px; color: var(--text); }
 .dtab .ti { color: var(--text-muted); display: inline-flex; }
 .dtab .ti svg { width: 12px; height: 12px; }
-#tab-new { margin: 0 0 3px 4px; }
+.tab-new { margin: 0 0 3px 4px; }
 
-#doc-toolbar { display: flex; align-items: center; gap: 6px; padding: 0 10px; height: 36px; border-bottom: 1px solid var(--border); background: var(--doc-bg); flex-shrink: 0; }
-#doc-toolbar.hidden { display: none; }
-#crumbs { flex: 1; min-width: 0; font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 2px; }
-#crumbs .c { cursor: pointer; padding: 1px 3px; border-radius: 3px; }
-#crumbs .c:hover { background: var(--btn-hover); color: var(--text); }
-#crumbs .c.last { color: var(--text-strong); font-weight: 600; cursor: default; }
-#crumbs .c.last:hover { background: none; }
-#crumbs .sep { color: var(--border-input); }
-#crumbs .lockbadge { font-size: 10px; margin-left: 6px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border-input); color: var(--text-dim); }
-#save-state { font-size: 11px; color: var(--text-muted); white-space: nowrap; min-width: 60px; text-align: right; }
-#save-state.dirty { color: var(--accent); }
-#save-state.err { color: var(--bad); }
+.doc-toolbar { display: flex; align-items: center; gap: 6px; padding: 0 10px; height: 36px; border-bottom: 1px solid var(--border); background: var(--doc-bg); flex-shrink: 0; }
+.doc-toolbar.hidden { display: none; }
+.crumbs { flex: 1; min-width: 0; font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 2px; }
+.crumbs .c { cursor: pointer; padding: 1px 3px; border-radius: 3px; }
+.crumbs .c:hover { background: var(--btn-hover); color: var(--text); }
+.crumbs .c.last { color: var(--text-strong); font-weight: 600; cursor: default; }
+.crumbs .c.last:hover { background: none; }
+.crumbs .sep { color: var(--border-input); }
+.crumbs .lockbadge { font-size: 10px; margin-left: 6px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border-input); color: var(--text-dim); }
+.save-state { font-size: 11px; color: var(--text-muted); white-space: nowrap; min-width: 60px; text-align: right; }
+.save-state.dirty { color: var(--accent); }
+.save-state.err { color: var(--bad); }
 .seg { display: inline-flex; border: 1px solid var(--border-input); border-radius: 4px; overflow: hidden; flex-shrink: 0; }
 .seg button { font-size: 11px; padding: 3px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; border-right: 1px solid var(--border-input); }
 .seg button:last-child { border-right: none; }
@@ -174,17 +196,17 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 .seg button.on { background: var(--radio-checked-bg); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
 .seg button:disabled { opacity: .4; cursor: default; }
 
-#banner { display: none; align-items: center; gap: 10px; padding: 8px 14px; font-size: 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-#banner.show { display: flex; }
-#banner.warn { background: #e07b0018; color: var(--text); border-bottom-color: #e07b0055; }
-#banner.err { background: #d6272818; border-bottom-color: #d6272855; }
-#banner .msg { flex: 1; }
+.banner { display: none; align-items: center; gap: 10px; padding: 8px 14px; font-size: 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.banner.show { display: flex; }
+.banner.warn { background: #e07b0018; color: var(--text); border-bottom-color: #e07b0055; }
+.banner.err { background: #d6272818; border-bottom-color: #d6272855; }
+.banner .msg { flex: 1; }
 
-#view { flex: 1; min-height: 0; position: relative; display: flex; }
+.view { flex: 1; min-height: 0; position: relative; display: flex; }
 .vpane { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
 .split-divider { width: 1px; background: var(--border); flex-shrink: 0; }
-#editor-wrap { display: flex; flex-direction: column; }
-#editor-wrap .CodeMirror { flex: 1; height: auto; }
+.editor-wrap { display: flex; flex-direction: column; }
+.editor-wrap .CodeMirror { flex: 1; height: auto; }
 
 /* Reading view */
 .doc { max-width: var(--doc-w, 780px); margin: 0 auto; padding: 34px 48px 120px; font-size: 15px; line-height: 1.68; color: var(--text); word-wrap: break-word; }
@@ -446,9 +468,9 @@ body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
 /* No left inset: CodeMirror starts the selection at the line box, so padding-left
    made the blue highlight start to the right of the line.  The line-like element
    is CodeMirror's padding measuring stick, so it needs the same rule. */
-#editor-wrap .CodeMirror pre.CodeMirror-line,
-#editor-wrap .CodeMirror pre.CodeMirror-line-like { padding: 0 16px 0 0; }
-#editor-wrap .CodeMirror-lines { padding-top: 12px; }
+.editor-wrap .CodeMirror pre.CodeMirror-line,
+.editor-wrap .CodeMirror pre.CodeMirror-line-like { padding: 0 16px 0 0; }
+.editor-wrap .CodeMirror-lines { padding-top: 12px; }
 .CodeMirror-cursor { border-left: 2px solid var(--radio-checked-border); }
 .CodeMirror-gutters { background: var(--doc-bg); border-right: 1px solid var(--border); }
 .CodeMirror-linenumber { color: var(--text-muted); padding: 0 10px 0 8px; }
@@ -459,8 +481,8 @@ body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
 .CodeMirror-placeholder { color: var(--text-muted) !important; }
 .cm-header { color: var(--tok-kw); font-weight: 700; }
 .cm-strong { font-weight: 700; color: var(--tok-num); } .cm-em { font-style: italic; color: var(--tok-def); }
-#editor-wrap.md-source .cm-link { color: var(--tok-link); text-decoration: underline; text-underline-offset: 2px; }
-#editor-wrap.md-source .cm-url { color: var(--tok-link); opacity: .65; text-decoration: none; }
+.editor-wrap.md-source .cm-link { color: var(--tok-link); text-decoration: underline; text-underline-offset: 2px; }
+.editor-wrap.md-source .cm-url { color: var(--tok-link); opacity: .65; text-decoration: none; }
 .cm-quote { color: var(--text-label); font-style: italic; }
 .cm-comment { color: var(--tok-str); } /* markdown code spans */
 .cm-formatting { color: var(--text-muted) !important; font-weight: 400; }
@@ -481,46 +503,46 @@ body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
 .cm-strikethrough { text-decoration: line-through; }
 
 /* Note-specific tokens, only in the markdown source/split editor. */
-#editor-wrap.md-source .cm-wikilink { color: var(--tok-link); }
-#editor-wrap.md-source .cm-wikilink-embed {
+.editor-wrap.md-source .cm-wikilink { color: var(--tok-link); }
+.editor-wrap.md-source .cm-wikilink-embed {
   color: var(--tok-tag);
   background: color-mix(in srgb, var(--tok-tag) 14%, transparent);
   border-radius: 2px;
 }
-#editor-wrap.md-source .cm-formatting.cm-wikilink { color: var(--tok-link) !important; }
-#editor-wrap.md-source .cm-formatting.cm-wikilink-embed { color: var(--tok-tag) !important; }
-#editor-wrap.md-source .cm-footnote-ref { color: var(--tok-foot); }
-#editor-wrap.md-source .cm-footnote-def { color: var(--tok-foot); font-weight: 600; }
-#editor-wrap.md-source .cm-evidence { color: var(--tok-evidence); border-bottom: 1px dotted var(--tok-evidence); }
-#editor-wrap.md-source .cm-tag { color: var(--tok-tag); }
-#editor-wrap.md-source .cm-blockid { color: var(--tok-foot); opacity: .85; }
-#editor-wrap.md-source .cm-caption { color: var(--tok-kw); font-weight: 700; }
-#editor-wrap.md-source .cm-callout { font-weight: 700; font-style: normal; }
-#editor-wrap.md-source .cm-callout-warning, #editor-wrap.md-source .cm-callout-caution,
-#editor-wrap.md-source .cm-callout-attention { color: var(--warn); }
-#editor-wrap.md-source .cm-callout-danger, #editor-wrap.md-source .cm-callout-error,
-#editor-wrap.md-source .cm-callout-bug, #editor-wrap.md-source .cm-callout-failure,
-#editor-wrap.md-source .cm-callout-fail { color: var(--bad); }
-#editor-wrap.md-source .cm-callout-success, #editor-wrap.md-source .cm-callout-check,
-#editor-wrap.md-source .cm-callout-done, #editor-wrap.md-source .cm-callout-tip,
-#editor-wrap.md-source .cm-callout-hint { color: var(--ok); }
-#editor-wrap.md-source .cm-callout-note, #editor-wrap.md-source .cm-callout-info,
-#editor-wrap.md-source .cm-callout-important, #editor-wrap.md-source .cm-callout-example,
-#editor-wrap.md-source .cm-callout-quote, #editor-wrap.md-source .cm-callout-abstract,
-#editor-wrap.md-source .cm-callout-summary, #editor-wrap.md-source .cm-callout-todo,
-#editor-wrap.md-source .cm-callout-idea { color: var(--accent); }
-#editor-wrap.md-source .cm-frontmatter-key { color: var(--tok-def); font-weight: 400; }
-#editor-wrap.md-source .cm-frontmatter-value { color: var(--tok-str); font-weight: 400; }
-#editor-wrap.md-source .cm-frontmatter-mark { color: var(--text-muted); }
-#editor-wrap.md-source .cm-table-pipe { color: var(--tok-table); }
-#editor-wrap.md-source .cm-formatting-list { color: var(--tok-num) !important; }
-#editor-wrap.md-source .cm-strikethrough { color: var(--text-muted); }
+.editor-wrap.md-source .cm-formatting.cm-wikilink { color: var(--tok-link) !important; }
+.editor-wrap.md-source .cm-formatting.cm-wikilink-embed { color: var(--tok-tag) !important; }
+.editor-wrap.md-source .cm-footnote-ref { color: var(--tok-foot); }
+.editor-wrap.md-source .cm-footnote-def { color: var(--tok-foot); font-weight: 600; }
+.editor-wrap.md-source .cm-evidence { color: var(--tok-evidence); border-bottom: 1px dotted var(--tok-evidence); }
+.editor-wrap.md-source .cm-tag { color: var(--tok-tag); }
+.editor-wrap.md-source .cm-blockid { color: var(--tok-foot); opacity: .85; }
+.editor-wrap.md-source .cm-caption { color: var(--tok-kw); font-weight: 700; }
+.editor-wrap.md-source .cm-callout { font-weight: 700; font-style: normal; }
+.editor-wrap.md-source .cm-callout-warning, .editor-wrap.md-source .cm-callout-caution,
+.editor-wrap.md-source .cm-callout-attention { color: var(--warn); }
+.editor-wrap.md-source .cm-callout-danger, .editor-wrap.md-source .cm-callout-error,
+.editor-wrap.md-source .cm-callout-bug, .editor-wrap.md-source .cm-callout-failure,
+.editor-wrap.md-source .cm-callout-fail { color: var(--bad); }
+.editor-wrap.md-source .cm-callout-success, .editor-wrap.md-source .cm-callout-check,
+.editor-wrap.md-source .cm-callout-done, .editor-wrap.md-source .cm-callout-tip,
+.editor-wrap.md-source .cm-callout-hint { color: var(--ok); }
+.editor-wrap.md-source .cm-callout-note, .editor-wrap.md-source .cm-callout-info,
+.editor-wrap.md-source .cm-callout-important, .editor-wrap.md-source .cm-callout-example,
+.editor-wrap.md-source .cm-callout-quote, .editor-wrap.md-source .cm-callout-abstract,
+.editor-wrap.md-source .cm-callout-summary, .editor-wrap.md-source .cm-callout-todo,
+.editor-wrap.md-source .cm-callout-idea { color: var(--accent); }
+.editor-wrap.md-source .cm-frontmatter-key { color: var(--tok-def); font-weight: 400; }
+.editor-wrap.md-source .cm-frontmatter-value { color: var(--tok-str); font-weight: 400; }
+.editor-wrap.md-source .cm-frontmatter-mark { color: var(--text-muted); }
+.editor-wrap.md-source .cm-table-pipe { color: var(--tok-table); }
+.editor-wrap.md-source .cm-formatting-list { color: var(--tok-num) !important; }
+.editor-wrap.md-source .cm-strikethrough { color: var(--text-muted); }
 /* Inline code is a colour, not a little code block. */
-#editor-wrap.md-source .cm-formatting-code + .cm-comment {
+.editor-wrap.md-source .cm-formatting-code + .cm-comment {
   color: var(--tok-str);
   background: none; border: 0; padding: 0;
 }
-#editor-wrap.md-source .cm-table-header-text { font-weight: 700; color: var(--text-strong); }
+.editor-wrap.md-source .cm-table-header-text { font-weight: 700; color: var(--text-strong); }
 .doc pre code .cm-comment { color: var(--tok-com); font-style: italic; }
 .CodeMirror-hints { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 26px #0005; font-family: system-ui, sans-serif; font-size: 12.5px; padding: 3px 0; max-height: 16em; z-index: 600; }
 .CodeMirror-hint { color: var(--text); padding: 3px 12px; }
@@ -586,29 +608,33 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
   </aside>
   <div class="resizer" id="resize-left"></div>
 
-  <main id="center">
-    <div id="tabstrip"></div>
-    <div id="doc-toolbar" class="hidden">
-      <button class="icon-btn" id="btn-back" title="Back ([)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 5 8l5 5"/></svg></button>
-      <button class="icon-btn" id="btn-fwd" title="Forward (])"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg></button>
-      <div id="crumbs"></div>
-      <span id="save-state"></span>
-      <div class="seg" id="mode-seg">
-        <button data-mode="live" title="The rendered note; click a block to edit its markdown (E toggles with Source)">Live</button>
-        <button data-mode="source" title="The whole file as markdown">Source</button>
-        <button data-mode="split" title="Source and preview side by side">Split</button>
-      </div>
-      <button class="icon-btn" id="btn-more" title="More"><svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>
-      <button class="icon-btn" id="btn-right" title="Toggle side panel"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10.5 2.5v11"/></svg></button>
-    </div>
-    <div id="banner"><span class="msg"></span></div>
-    <div id="view"></div>
-  </main>
+  <main id="center"><div id="groups"></div></main>
 
   <div class="resizer" id="resize-right"></div>
   <aside id="right"><div id="right-body"></div></aside>
 </div>
 
+<template id="group-tpl">
+  <section class="group">
+    <div class="tabstrip"></div>
+    <div class="doc-toolbar hidden">
+      <button class="icon-btn btn-back" title="Back ([)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 5 8l5 5"/></svg></button>
+      <button class="icon-btn btn-fwd" title="Forward (])"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg></button>
+      <div class="crumbs"></div>
+      <span class="save-state"></span>
+      <div class="seg mode-seg">
+        <button data-mode="live" title="The rendered note; click a block to edit its markdown (E toggles with Source)">Live</button>
+        <button data-mode="source" title="The whole file as markdown">Source</button>
+        <button data-mode="split" title="Source and preview side by side">Split</button>
+      </div>
+      <button class="icon-btn btn-more" title="More"><svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3.5" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.5" cy="8" r="1.3"/></svg></button>
+      <button class="icon-btn btn-right" title="Toggle side panel"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10.5 2.5v11"/></svg></button>
+    </div>
+    <div class="banner"><span class="msg"></span></div>
+    <div class="view"></div>
+    <div class="drop-zone"></div>
+  </section>
+</template>
 <div id="switcher-back"><div id="switcher">
   <input id="switcher-input" placeholder="Open a file…" spellcheck="false" autocomplete="off">
   <div id="switcher-list"></div>
@@ -620,6 +646,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
 <div id="lightbox"><img id="lightbox-img" alt=""></div>
 
 <script src="notes.js"></script>
+<script src="notes-layout.js"></script>
 <script src="notes-view.js"></script>
 <script src="notes-blocks.js"></script>
 <script src="notes-live.js"></script>

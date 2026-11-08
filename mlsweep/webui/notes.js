@@ -156,8 +156,7 @@ const S = {
   index: null,            // {links, mentions, experiments}
   indexVersion: "",
   experiments: new Map(), // id -> {status, campaign, name}
-  tabs: [],               // see newTab()
-  active: null,           // tab id
+  tabs: [],               // see newTab(); each is in one group (notes-layout.js)
   openDirs: new Set(store.get("openDirs", [])),
   recent: store.get("recent", []),
   navBack: [], navFwd: [],
@@ -272,7 +271,7 @@ async function poll(force = false) {
       await loadTree();
       if (!first) await checkOpenTabs();
       S.index = null;
-      if (activeTab() && activeTab().type !== "file") renderActive();
+      for (const g of Groups.values()) { const t = tabById(g.active); if (!t || t.type !== "file") renderGroup(g); }
       refreshRight();
     }
   } catch (e) {
@@ -375,6 +374,7 @@ $("tree").addEventListener("click", e => {
   const row = e.target.closest(".tnode");
   if (!row || e.target.tagName === "INPUT") return;
   if (row.dataset.dir) toggleDir(row);
+  else if (e.altKey) openToSide(row.dataset.path);
   else openFile(row.dataset.path, { newTab: e.ctrlKey || e.metaKey });
 });
 $("tree").addEventListener("auxclick", e => {
@@ -430,7 +430,8 @@ $("tree").addEventListener("contextmenu", e => {
   const folder = isDir ? path : dirname(path);
   const items = [];
   if (row && !isDir) {
-    items.push({ label: "Open", run: () => openFile(path) }, { label: "Open in new tab", key: "Ctrl+Click", run: () => openFile(path, { newTab: true }) });
+    items.push({ label: "Open", run: () => openFile(path) }, { label: "Open in new tab", key: "Ctrl+Click", run: () => openFile(path, { newTab: true }) },
+      { label: "Open to the side", key: "Alt+Click", run: () => openToSide(path) });
     if (kindOf(path) === "md" || kindOf(path) === "text") items.push({ label: "Edit", run: () => openFile(path, { mode: "source" }) });
     items.push("-");
   }
@@ -526,7 +527,7 @@ async function movePath(from, to) {
     if (S.openDirs.has(from)) { S.openDirs.delete(from); S.openDirs.add(to); }
     await loadTree();
     for (const p of r.links_updated_in || []) { const t = S.tabs.find(t => t.path === p); if (t) await reloadTab(t, { quiet: true }); }
-    renderTabs(); renderActive(); saveTabs();
+    renderAll(); saveTabs();
     toast(r.links_updated_in && r.links_updated_in.length ? `Moved; updated links in ${r.links_updated_in.length} note(s)` : "Moved", "ok");
   } catch (e) { toast("Move failed: " + e.message, "err"); renderTree(); }
 }
