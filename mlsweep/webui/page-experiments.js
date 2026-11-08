@@ -564,10 +564,8 @@ async function fetchExperiments() {
     const r = await apiFetch("/api/experiments");
     if (!r.ok) {
       setConnStatus("disconnected");
-      document.getElementById("error-msg").textContent = r.status === 401
-        ? `Unauthorized — open the dashboard URL printed by the manager (it includes ?token=…).`
-        : `API error: ${r.status}`;
-      document.getElementById("error-msg").style.display = "";
+      document.getElementById("error-msg").textContent = `API error: ${r.status}`;
+      document.getElementById("error-msg").style.display = r.status === 401 ? "none" : "";
       document.getElementById("empty-msg").style.display = "none";
       document.getElementById("exp-table").style.display = "none";
       return;

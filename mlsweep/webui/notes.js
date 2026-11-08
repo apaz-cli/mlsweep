@@ -35,6 +35,8 @@ const joinPath = (d, n) => d ? d + "/" + n : n;
 const extOf = p => { const n = basename(p); const i = n.lastIndexOf("."); return i <= 0 ? "" : n.slice(i + 1).toLowerCase(); };
 const stemOf = p => { const n = basename(p); const i = n.lastIndexOf("."); return i <= 0 ? n : n.slice(0, i); };
 const isMd = p => /\.(md|markdown)$/i.test(p);
+// The display name for an experiment; the full ID stays in titles and links.
+const shortExp = id => (S.experiments.get(id) || {}).name || id;
 const HEADING_RE = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
 const TASK_RE = /^(\s*(?:[-*+]|\d+[.)])\s+\[)( |x|X)(\])/;
 const LV_FENCE = /^\s{0,3}(`{3,}|~{3,})/;

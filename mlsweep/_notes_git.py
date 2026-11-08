@@ -91,8 +91,10 @@ Never force-push.
    line or a new note that links to it (`[[old note]]`); do not delete what it said.
 3. `sources/` is read-only for you, except to add new files.
 4. Every number about an experiment must come from that experiment's logged
-   metrics, and the note must name the experiment ID. Check each one with
-   `mlsweep metrics`, since lint does not check numbers.
+   metrics, and the note must name the experiment and run. Write it as an evidence
+   link, `[0.42](mlsweep:EXPERIMENT/RUN/metric@STEP)`, so a reader can check it with
+   one click and lint reports a number that disagrees with the log. Plot with a
+   `mlsweep-chart` block instead of pasting a screenshot.
 5. State the conditions a result holds under (steps, seeds, model size).
    One seed is one seed.
 6. Record dead ends too, with the reason, so nobody retries them.
@@ -100,9 +102,11 @@ Never force-push.
    running, with experiment IDs, and what comes next. Read it when you start, and update
    it before you stop.
 
-Markdown is GitHub-flavored plus `[[links]]`, `![[embeds]]`, `$math$` and `> [!note]` callouts;
-footnotes and pandoc ::: divs do not render. Rename notes with `mlsweep notes mv`, which
-keeps links working. Full reference: `mlsweep docs notes`.
+Markdown is GitHub-flavored plus `[[links]]`, `![[embeds]]`, `$math$`, `> [!note]`
+callouts, `[^footnotes]`, numbered figure captions (`Figure: ...`), and two live data
+blocks fetched from the manager: `mlsweep-chart` and `mlsweep-table`. Pandoc
+`:::` divs do not render. Rename notes with `mlsweep notes mv`, which keeps links
+working. Full reference: `mlsweep docs notes`.
 """
 
 SOURCES_README = """\

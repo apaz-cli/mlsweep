@@ -12,7 +12,6 @@ import argparse
 import base64
 import collections
 import fnmatch
-import functools
 import hashlib
 import importlib.metadata
 import json
@@ -38,9 +37,14 @@ from urllib.request import Request, urlopen
 
 from mlsweep._sweep import (
     _write_manifest,
+    build_job_payloads as _build_job_payloads,
     count_expected,
     generate_variations,
     load_sweep_file,
+    metric_values,
+    options_to_wire,
+    singular_dims,
+    validate_optimize_spec,
     validate_options,
 )
 from mlsweep._writers import (
@@ -225,6 +229,16 @@ def _http_request(
     return (status, raw.decode("utf-8", errors="replace") if raw else None)
 
 
+def _ws_refusal(header: str, body: bytes) -> str:
+    """One line saying why a WebSocket upgrade was refused: the status and the manager's error."""
+    status = " ".join(header.splitlines()[0].split()[1:]) if header else "no status"
+    try:
+        detail = json.loads(body)["error"]
+    except (ValueError, KeyError, TypeError):
+        detail = body.decode("utf-8", errors="replace").strip()
+    return f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+
+
 def _report_failure(label: str, status: int, resp: Any) -> None:
     """Print a FAIL line with the manager's ``error`` message, else its body.
 
@@ -305,10 +319,10 @@ class _WebSocket:
                 raise ConnectionError("WebSocket handshake: no response")
             resp += chunk
 
-        header, _ = resp.split(b"\r\n\r\n", 1)
+        header, body = resp.split(b"\r\n\r\n", 1)
         header_str = header.decode("utf-8", errors="replace")
         if "101" not in header_str.splitlines()[0] if header_str else "":
-            raise ConnectionError(f"WebSocket upgrade rejected:\n{header_str}")
+            raise ConnectionError(_ws_refusal(header_str, body))
 
         # Store any leftover data after headers
         _, leftover = resp.split(b"\r\n\r\n", 1)
@@ -485,6 +499,7 @@ def manager_create_experiment(
     goal: str | None = None,
     campaign: str = DEFAULT_CAMPAIGN,
     jobs: list[dict[str, Any]] | None = None,
+    optimize: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Create an experiment in *campaign* on the manager. Returns the response dict or None.
 
@@ -510,6 +525,7 @@ def manager_create_experiment(
             "metric": metric,
             "goal": goal,
             **({"jobs": jobs} if jobs else {}),
+            **({"optimize": optimize} if optimize else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -654,15 +670,18 @@ def manager_list_experiments(
     token: str,
     status_filter: str | None = None,
     campaign: str | None = None,
+    quiet: bool = False,
 ) -> list[dict[str, Any]] | None:
     """List experiments on the manager, only *campaign*'s unless it is None."""
     path = "/api/experiments"
     if status_filter:
         path += f"?status={status_filter}"
     path = _with_campaign(path, campaign)
-    status, resp = _http_request("GET", _manager_url(manager, path), token, timeout=10)
+    status, resp = _http_request("GET", _manager_url(manager, path), token, timeout=10, quiet=quiet)
     if status == 200 and isinstance(resp, list):
         return resp
+    if not quiet:
+        _report_failure("List experiments", status, resp)
     return None
 
 
@@ -846,24 +865,6 @@ def _run_str(run_id: Any, label: Any) -> str:
     return f"{_GREEN}{run_id}{_RESET}" + (f"  ({label})" if label else "")
 
 
-def _metric_values(metrics: list[dict[str, Any]] | None, metric: str) -> list[float]:
-    """Finite values of *metric* across metric rows, in step order."""
-    return [
-        float(r[metric])
-        for r in (metrics or [])
-        if isinstance(r, dict) and isinstance(r.get(metric), (int, float))
-        and math.isfinite(float(r[metric]))
-    ]
-
-
-def _best_metric(metrics: list[dict[str, Any]] | None, metric: str, goal: str) -> float | None:
-    """Best finite value of *metric* under *goal*, or None if it was never logged."""
-    vals = _metric_values(metrics, metric)
-    if not vals:
-        return None
-    return min(vals) if goal == "minimize" else max(vals)
-
-
 def build_leaderboard(
     manager: str,
     token: str,
@@ -902,7 +903,7 @@ def rank_leaderboard(
         run_id = j.get("run_id") or ""
         value = final = None
         if st == "done":
-            vals = _metric_values(all_metrics.get(run_id), metric)
+            vals = metric_values(all_metrics.get(run_id), metric)
             if vals:
                 value = min(vals) if goal == "minimize" else max(vals)
                 final = vals[-1]
@@ -996,16 +997,13 @@ def _wait_until_settled(
             # Runs added after a `stop`, or left by a stop from an older version, never start.
             if active == int(counts.get("pending", 0)) and resp.get("status") == "aborted":
                 active = 0
-            if active == 0:
+            # A Bayesian sweep adds runs as results come in, so a gap between them isn't the end.
+            if active == 0 and not awaits_more_runs(manager, token, experiment_id, campaign):
                 failed = int(counts.get("failed", 0)) > 0
                 if failed:
                     print("  experiment settled with failures.", file=sys.stderr, flush=True)
                 else:
                     print("  experiment settled.", file=sys.stderr, flush=True)
-                if awaits_more_runs(manager, token, experiment_id, campaign):
-                    print(f"  warning: its Bayesian budget is not used up. If no submitter is attached, "
-                          f"continue with `mlsweep resume {experiment_id} --sweep FILE`.",
-                          file=sys.stderr, flush=True)
                 return failed
         time.sleep(interval)
 
@@ -1049,9 +1047,12 @@ def experiment_status(manager: str, token: str, experiment_id: str, campaign: st
 
 
 def awaits_more_runs(manager: str, token: str, experiment_id: str, campaign: str | None = None) -> bool:
-    """True if a Bayesian sweep's budget is not used up, so no active runs doesn't mean finished."""
+    """True if the manager still expects runs here, so no active runs doesn't mean finished.
+
+    That's a running Bayesian sweep, or an experiment created with ``expected_jobs``.
+    """
     exp = _get_experiment(manager, token, experiment_id, campaign)
-    return exp.get("status") == "running" and bool(exp.get("expected_jobs"))
+    return exp.get("status") == "running" and bool(exp.get("optimize") or exp.get("expected_jobs"))
 
 
 def metric_keys(
@@ -1292,7 +1293,6 @@ def _stream_status_live(
     experiment_id: str,
     *,
     max_idle: float = 120.0,
-    on_event: Any = None,
     writer_factory: Any = None,
     variations: list[dict[str, Any]] | None = None,
     output_dir: str = "",
@@ -1300,13 +1300,10 @@ def _stream_status_live(
 ) -> None:
     """Connect to manager WebSocket and display live job status until idle timeout.
 
-    If *on_event* is callable, it is invoked as ``on_event(event, manager, token, experiment_id)``
-    for every received event.  This allows the Bayes controller to react to
-    job completions (tell + suggest + submit) inline.
-
     If *writer_factory* is provided (e.g. MultiWriterFactory), run writers are
     created lazily for each run and fed metric / finish events.
-    *variations* is used to look up combos when creating writers.
+    *variations* is used to look up combos when creating writers.  A Bayesian sweep
+    has none up front, so a run not listed there is looked up on the manager.
     """
     ws_url = _ws_stream_url(manager, experiment_id, token, campaign)
 
@@ -1343,7 +1340,14 @@ def _stream_status_live(
         for v in variations:
             if v["name"] == run_id:
                 return v["combo"]  # type: ignore[no-any-return]
-        return {}
+        status, job = _http_request(
+            "GET",
+            _manager_url(manager, _with_campaign(f"/api/jobs/{run_id}?experiment_id={experiment_id}", campaign)),
+            token,
+            quiet=True,
+        )
+        combo = _parse_combo(job.get("combo")) if status == 200 and isinstance(job, dict) else None
+        return combo or {}
 
     try:
         for event in ws.iter_events(max_idle=max_idle):
@@ -1404,13 +1408,6 @@ def _stream_status_live(
             elif event_type == "experiment_done":
                 sweep_print(f"\n  {_GREEN}Experiment complete!{_RESET}")
                 break
-
-            # ── Invoke callback for iterative Bayes / custom logic ──
-            if callable(on_event):
-                try:
-                    on_event(event, manager, token, experiment_id)
-                except Exception as e:
-                    sweep_print(f"  {_RED}Error in event callback: {e}{_RESET}")
 
             # Print current status table
             _render_status_table(job_status, total_jobs)
@@ -1594,57 +1591,6 @@ def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
         "Give each dimension a 'name' (or distinct values) so every run name is unique."
     )
     sys.exit(1)
-
-
-def _build_job_payloads(
-    variations: list[dict[str, Any]],
-    experiment_id: str,
-    artifact_id: str,
-    command: list[str],
-    cli_overrides: list[str],
-    gpus_per_run: int,
-    nodes_per_run: int,
-    set_dist_env: bool,
-    run_from: str | None,
-    priority: int,
-    max_retries: int,
-    setup_command: str | None = None,
-) -> list[dict[str, Any]]:
-    """Convert sweep variations into job payloads for the manager API.
-
-    Each payload is a dict with keys matching the JobRecord fields expected
-    by POST /api/jobs/bulk.  A run's command is ``COMMAND + EXTRA_FLAGS +
-    OPTIONS flags + -- overrides``; each variation's ``overrides`` already
-    starts with EXTRA_FLAGS.
-    """
-    jobs = []
-    for var in variations:
-        full_command = list(command) + var["overrides"] + list(cli_overrides)
-        env_dict: dict[str, str] = {}
-        tag_parts = [f"{k}={v}" for k, v in var["combo"].items() if v is not None]
-        if tag_parts:
-            env_dict["EXP_TAGS"] = ",".join(tag_parts)
-
-        job = {
-            "run_id": var["name"],
-            "experiment_id": experiment_id,
-            "priority": priority,
-            "command": full_command,
-            "combo": var["combo"],
-            "env": env_dict,
-            "status": "pending",
-            "gpus_per_run": gpus_per_run,
-            "nodes_per_run": nodes_per_run,
-            "set_dist_env": set_dist_env,
-            "run_from": run_from,
-            "artifact_id": artifact_id,
-            "max_retries": max_retries,
-            "return_files": [],  # could configure via sweep file
-        }
-        if setup_command:
-            job["setup_command"] = setup_command
-        jobs.append(job)
-    return jobs
 
 
 # ===============================================================================
@@ -1884,14 +1830,13 @@ def main() -> None:
                         help="Experiment name (default: <sweep>_<timestamp>)")
     parser.add_argument("--append", action="store_true",
                         help="Add this sweep's runs to the experiment named by --experiment, if it exists")
-    parser.add_argument("--resume", default=None,
-                        help="Resume an existing experiment (experiment_id)")
     parser.add_argument("--note", default=None,
                         help="Human-readable note stored with the experiment")
     parser.add_argument("--priority", type=int, default=0,
                         help="Job priority (higher = earlier, default: 0)")
     parser.add_argument("--stream", action="store_true",
-                        help="Subscribe to WebSocket event stream for live status")
+                        help="Watch live status over the manager's WebSocket stream. Only watches: "
+                             "the sweep carries on without it, Bayesian sweeps included.")
     parser.add_argument("--fetch", action="store_true",
                         help="Fetch results after submission (if --stream not used)")
     parser.add_argument("--dry-run", action="store_true",
@@ -1914,7 +1859,8 @@ def main() -> None:
     parser.add_argument(
         "--max-concurrent", type=int, default=0, metavar="K",
         help="Cap on this sweep's simultaneously-running jobs across the whole "
-             "cluster (0 = unlimited). Use it to take only a slice of a shared cluster.")
+             "cluster (0 = unlimited). Use it to take only a slice of a shared cluster. "
+             "In a Bayesian sweep it is also how many trials run at once (default: n_initial).")
     parser.add_argument("--color", action="store_true",
                         help="Enable ANSI color in human-readable output (default: off)")
 
@@ -1922,7 +1868,7 @@ def main() -> None:
     if extra and extra[0] == "--":
         extra = extra[1:]
     campaign = _resolve_campaign(args)
-    if campaign is None and args.resume is None and not args.validate:
+    if campaign is None and not args.validate:
         sweep_print(f"{_RED}Error: a new sweep needs one campaign. Pick it with --campaign NAME "
                     f"instead of --all-campaigns.{_RESET}")
         sys.exit(1)
@@ -1960,6 +1906,22 @@ def main() -> None:
 
     validate_options(options, method=method)
     assert options is not None and command is not None
+
+    spec: dict[str, Any] | None = None
+    if method == "bayes":
+        try:
+            spec = validate_optimize_spec({
+                **optimize_cfg, "sweep_name": sweep_name, "options": options_to_wire(options),
+                "extra_flags": list(extra_flags), "job": {
+                    "command": command, "cli_overrides": extra, "gpus_per_run": gpus_per_run,
+                    "nodes_per_run": nodes_per_run, "set_dist_env": set_dist_env, "run_from": run_from,
+                    "priority": args.priority, "max_retries": args.max_retries,
+                    "setup_command": args.setup_command,
+                },
+            })
+        except ValueError as e:
+            sweep_print(f"{_RED}Error: {e}{_RESET}")
+            sys.exit(1)
 
     # ── Validate mode ──────────────────────────────────────────────────────
     if args.validate:
@@ -2000,14 +1962,7 @@ def main() -> None:
     # ── Generate variations ────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     rand_suffix = secrets.token_hex(2)  # 4 hex chars
-    resume = args.resume is not None
-    if resume and method != "bayes":
-        sweep_print(f"{_RED}Error: --resume is only supported for method='bayes'{_RESET}")
-        sys.exit(1)
-    if resume:
-        experiment_id = args.resume
-    else:
-        experiment_id = args.experiment or f"{sweep_name}_{timestamp}_{rand_suffix}"
+    experiment_id = args.experiment or f"{sweep_name}_{timestamp}_{rand_suffix}"
     output_dir = os.path.abspath(args.output_dir)
     exp_dir = os.path.join(output_dir, experiment_id)
     os.makedirs(exp_dir, exist_ok=True)
@@ -2015,21 +1970,15 @@ def main() -> None:
     if not args.dry_run:
         _log_file = open(os.path.join(exp_dir, "sweep.log"), "w")
 
-    if method == "bayes":
-        from mlsweep._bayes import BayesianOptimizer
-        optimizer = BayesianOptimizer(
-            sweep_name, options, optimize_cfg, extra_flags=list(extra_flags)
-        )
-        budget: int = optimize_cfg["budget"]
-        expected = budget
-        done_jobs: list[dict[str, Any]] = []
+    if spec is not None:
+        if args.append:
+            sweep_print(f"{_RED}Error: --append can't add a Bayesian sweep to an existing experiment.{_RESET}")
+            sys.exit(1)
+        expected = spec["budget"]
         variations: list[dict[str, Any]] = []
     else:
-        optimizer = None
         variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
         expected = count_expected(options)
-        budget = len(variations)
-        done_jobs = []
 
     # ── Header (before network calls) ──────────────────────────────────────
     sweep_print(f"{_BOLD}Command:{_RESET} {' '.join(command)}")
@@ -2048,10 +1997,9 @@ def main() -> None:
         sweep_print(f"{_BOLD}Extra overrides:{_RESET} {' '.join(extra)}")
 
     if args.dry_run:
-        if method == "bayes":
-            assert optimizer is not None
-            n_initial = optimizer.n_initial
-            variations = optimizer.suggest(n=n_initial)
+        if spec is not None:
+            from mlsweep._bayes import suggest
+            variations = suggest(spec, [], min(spec["n_initial"], spec["budget"]))
         for var in variations:
             colored = []
             for ci, (key, val) in enumerate(var["combo"].items()):
@@ -2068,7 +2016,7 @@ def main() -> None:
 
     manager, token = _manager_token(args)
 
-    if args.experiment and not resume and not args.append and _get_experiment(manager, token, args.experiment, campaign):
+    if args.experiment and not args.append and _get_experiment(manager, token, args.experiment, campaign):
         sweep_print(f"{_RED}Error: experiment {args.experiment} already exists.{_RESET} "
                     "Pass --append to add these runs to it, or choose another name.")
         sys.exit(1)
@@ -2076,61 +2024,6 @@ def main() -> None:
     sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
     sweep_print(f"{_BOLD}Connecting to manager:{_RESET} {_CYAN}{manager}{_RESET}")
     sweep_print(f"{_CYAN}{'=' * 80}{_RESET}\n")
-
-    # ── Resume: fetch completed jobs and rebuild optimizer ─────────────────
-    if resume:
-        sweep_print("Resuming experiment...")
-        require_campaign(manager, token, experiment_id, campaign)
-        summary = manager_get_experiment_summary(manager, token, experiment_id, campaign=campaign)
-        if summary is None:
-            sweep_print(f"  {_RED}FAIL{_RESET}  Cannot fetch experiment summary — is manager reachable?")
-            sys.exit(1)
-        sweep_print(f"  Experiment: {summary['name']}")
-        sweep_print(f"  Status:     {summary['status']}")
-
-        all_jobs = manager_list_experiment_jobs(manager, token, experiment_id, campaign=campaign) or []
-        done_jobs = [j for j in all_jobs if j.get("status") == "done"]
-        sweep_print(f"  Completed jobs: {len(done_jobs)}")
-
-        # Rebuild optimizer from completed jobs
-        assert optimizer is not None
-        metric_name = optimize_cfg["metric"]
-        goal = optimize_cfg["goal"]
-        finished: list[tuple[dict[str, Any], float | None]] = []
-        for job in done_jobs:
-            combo = _parse_combo(job["combo"])
-            if combo is None:
-                continue
-            metrics_list = manager_get_job_metrics(manager, token, experiment_id, job["run_id"],
-                                                   campaign=campaign)
-            if metrics_list is None:
-                continue
-            # No metric found: told as a failure so TPE can learn.
-            finished.append((combo, _best_metric(metrics_list, metric_name, goal)))
-        active_combos = [c for c in (_parse_combo(j["combo"]) for j in all_jobs
-                                     if j.get("status") in _ACTIVE_JOB_STATUSES) if c is not None]
-        n_active = optimizer.restore(finished, active_combos, [j["run_id"] for j in all_jobs])
-        sweep_print(f"  Replayed {optimizer._told} metrics into optimizer ({n_active} still active)")
-
-        # Generate remaining suggestions.  With --stream each result asks for the next one.
-        remaining = budget - optimizer._told - n_active
-        if optimizer.exhausted or (remaining <= 0 and not args.stream):
-            sweep_print(f"  {_GREEN}Nothing to submit: {optimizer._told} of {budget} told, "
-                        f"{n_active} still active.{_RESET}")
-            if _log_file:
-                _log_file.close()
-            return
-        n_new = remaining if not args.stream else (0 if n_active else min(1, remaining))
-        variations = optimizer.suggest(n=n_new) if n_new > 0 else []
-        sweep_print(f"  Submitting {len(variations)} new job(s) (budget {budget}, {optimizer._told} told)")
-    elif method == "bayes":
-        # Fresh Bayes: if streaming, submit first job only (iterative loop
-        # in callback submits the rest).  Otherwise submit all budget upfront.
-        assert optimizer is not None
-        if args.stream:
-            variations = optimizer.suggest(n=1)
-        else:
-            variations = optimizer.suggest(n=budget)
 
     n = len(variations)
     _check_duplicate_run_names(variations)
@@ -2147,58 +2040,50 @@ def main() -> None:
         sweep_print(f"{' '.join(list(command) + var['overrides'] + list(extra))}\n")
 
     # ── 1. Pack and upload artifact ────────────────────────────────────────
-    if resume:
-        sweep_print("Resuming — skipping artifact upload")
-        # Fetch artifact_id from a completed job
-        artifact_id = None
-        if done_jobs:
-            artifact_id = done_jobs[0]["artifact_id"]
-        if not artifact_id:
-            sweep_print(f"  {_YELLOW}WARN{_RESET}  Cannot determine artifact_id; jobs may fail without artifact")
-    else:
-        sweep_print("Packing project artifact...")
+    sweep_print("Packing project artifact...")
+    try:
+        tarball_path, artifact_hash = _pack_project(_PROJECT_ROOT)
+        sweep_print(f"  Artifact created: {os.path.basename(tarball_path)} "
+                    f"({os.path.getsize(tarball_path)} bytes, sha256={artifact_hash[:16]}...)")
+    except Exception as e:
+        sweep_print(f"  {_RED}FAIL{_RESET}  Cannot pack project: {e}")
+        sys.exit(1)
+
+    artifact_id = f"sha256:{artifact_hash}"
+
+    # Check if artifact already exists on manager
+    if manager_check_artifact(manager, token, artifact_id):
+        sweep_print(f"  {_GREEN}OK{_RESET}    Artifact already on manager, skipping upload")
         try:
-            tarball_path, artifact_hash = _pack_project(_PROJECT_ROOT)
-            sweep_print(f"  Artifact created: {os.path.basename(tarball_path)} "
-                        f"({os.path.getsize(tarball_path)} bytes, sha256={artifact_hash[:16]}...)")
-        except Exception as e:
-            sweep_print(f"  {_RED}FAIL{_RESET}  Cannot pack project: {e}")
+            os.unlink(tarball_path)
+        except OSError:
+            pass
+    else:
+        # Register artifact
+        if not manager_register_artifact(
+            manager, token, artifact_id,
+            size_bytes=os.path.getsize(tarball_path),
+            setup_command=args.setup_command,
+        ):
+            os.unlink(tarball_path)
             sys.exit(1)
 
-        artifact_id = f"sha256:{artifact_hash}"
+        # Upload artifact data
+        if not manager_upload_artifact_data(manager, token, artifact_id, tarball_path):
+            os.unlink(tarball_path)
+            sys.exit(1)
 
-        # Check if artifact already exists on manager
-        if manager_check_artifact(manager, token, artifact_id):
-            sweep_print(f"  {_GREEN}OK{_RESET}    Artifact already on manager, skipping upload")
-            try:
-                os.unlink(tarball_path)
-            except OSError:
-                pass
-        else:
-            # Register artifact
-            if not manager_register_artifact(
-                manager, token, artifact_id,
-                size_bytes=os.path.getsize(tarball_path),
-                setup_command=args.setup_command,
-            ):
-                os.unlink(tarball_path)
-                sys.exit(1)
-
-            # Upload artifact data
-            if not manager_upload_artifact_data(manager, token, artifact_id, tarball_path):
-                os.unlink(tarball_path)
-                sys.exit(1)
-
-            # Clean up tarball
-            try:
-                os.unlink(tarball_path)
-            except OSError:
-                pass
+        # Clean up tarball
+        try:
+            os.unlink(tarball_path)
+        except OSError:
+            pass
 
     # ── 2. Build job payloads ───────────────────────────────────────────────
-    build_payloads = functools.partial(
-        _build_job_payloads,
-        artifact_id=artifact_id or "",
+    job_payloads = _build_job_payloads(
+        variations=variations,
+        experiment_id=experiment_id,
+        artifact_id=artifact_id,
         command=command,
         cli_overrides=extra,
         gpus_per_run=gpus_per_run,
@@ -2209,30 +2094,24 @@ def main() -> None:
         max_retries=args.max_retries,
         setup_command=args.setup_command,
     )
-    job_payloads = build_payloads(variations=variations, experiment_id=experiment_id)
 
     # ── 3. Create experiment and submit jobs atomically ────────────────────
-    if resume:
-        sweep_print("Resuming — experiment already exists")
     if job_payloads:
         sweep_print("Submitting jobs...")
-    if resume:
-        if job_payloads and manager_submit_jobs_bulk(
-                manager, token, job_payloads, campaign=campaign) is None:
-            sys.exit(1)
-    elif not manager_create_experiment(
+    if spec is not None:
+        spec["job"]["artifact_id"] = artifact_id
+    if not manager_create_experiment(
         manager, token, experiment_id,
         name=sweep_name,
         note=args.note,
-        expected_jobs=expected if method == "bayes" else 0,
-        singular_dims=[k[1:] for k, v in options.items() if v.get("singular")],
+        singular_dims=singular_dims(options),
         max_concurrent=args.max_concurrent,
-        # The Bayes controller handles singular probes itself.
         skip_rules=_skip_rules(options) if method == "grid" else None,
         metric=info.get("metric"),
         goal=info.get("goal"),
         campaign=campaign or DEFAULT_CAMPAIGN,
         jobs=job_payloads,
+        optimize=spec,
     ):
         sys.exit(1)
 
@@ -2245,119 +2124,11 @@ def main() -> None:
         sweep_print(f"Streaming live status (Ctrl+C to stop)")
         sweep_print(f"{'=' * 80}\n")
 
-        if method == "bayes" and optimizer is not None:
-            # Build iterative Bayes callback
-            metric_name = optimize_cfg["metric"]
-            goal = optimize_cfg["goal"]
-
-            # Track probes per lex combo so we only tell/suggest once per
-            # completed lex evaluation (not once per singular probe).
-            # singular probes all share the same lex_key.
-            _sing_dim_names = frozenset(k[1:] for k in optimizer._singular_options)
-
-            def _lex_key(c: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-                return tuple((k, str(c[k])) for k in sorted(c) if k not in _sing_dim_names)
-
-            _lex_pending: dict[tuple[tuple[str, str], ...], int] = {}   # lex_key → outstanding probes
-            _lex_done: set[tuple[tuple[str, str], ...]] = set()          # lex_keys already told
-
-            def _register_vars(vs: list[dict[str, Any]]) -> None:
-                for v in vs:
-                    lk = _lex_key(v["combo"])
-                    _lex_pending[lk] = _lex_pending.get(lk, 0) + 1
-
-            _register_vars(variations)
-
-            def _submit_new(eid: str) -> None:
-                assert optimizer is not None
-                if optimizer.exhausted:
-                    return
-                new_vars = optimizer.suggest(n=1)
-                if not new_vars:
-                    return
-                new_job = build_payloads(variations=new_vars, experiment_id=eid)
-                if new_job:
-                    submitted = manager_submit_jobs_bulk(manager, token, new_job, campaign=campaign)
-                    if submitted:
-                        variations.extend(new_vars)
-                        _register_vars(new_vars)
-                        names = ", ".join(v["name"] for v in new_vars)
-                        sweep_print(f"  {_CYAN}→ SUBMITTED {_RESET} {names} "
-                                    f"(told: {optimizer._told}/{budget})")
-
-            def _bayes_on_event(
-                event: dict[str, Any],
-                mgr: str,
-                tok: str,
-                eid: str,
-            ) -> None:
-                nonlocal optimizer, variations
-                assert optimizer is not None
-                # Only act on job completions
-                event_type = event.get("type", "")
-                if event_type not in ("job_done", "run_result"):
-                    return
-                # If budget already exhausted, nothing to do
-                if optimizer.exhausted:
-                    return
-                run_id = event.get("run_id", "")
-                success = event.get("success", False)
-                # Try to find the combo from local variations first
-                combo = None
-                for v in variations:
-                    if v["name"] == run_id:
-                        combo = v["combo"]
-                        break
-                if combo is None:
-                    # Fetch job from manager to get combo
-                    status_code, job_resp = _http_request(
-                        "GET",
-                        _manager_url(mgr, _with_campaign(f"/api/jobs/{run_id}?experiment_id={eid}", campaign)),
-                        tok,
-                    )
-                    if status_code == 200 and isinstance(job_resp, dict):
-                        combo = _parse_combo(job_resp["combo"])
-
-                if combo is None:
-                    return
-
-                lk = _lex_key(combo)
-
-                # Decrement the outstanding probe count for this lex combo.
-                _lex_pending[lk] = max(0, _lex_pending.get(lk, 1) - 1)
-
-                # If this lex combo is already told (a sibling probe already
-                # reported), do nothing — only suggest/tell once per lex combo.
-                if lk in _lex_done:
-                    return
-
-                if success:
-                    # First success for this lex combo: tell optimizer and
-                    # immediately submit a replacement.
-                    metrics_list = manager_get_job_metrics(mgr, tok, eid, run_id, campaign=campaign)
-                    optimizer.tell(combo, _best_metric(metrics_list, metric_name, goal))
-                    _lex_done.add(lk)
-                    _submit_new(eid)
-                elif _lex_pending.get(lk, 0) == 0:
-                    # All probes for this lex combo failed — tell optimizer and
-                    # submit a replacement.
-                    optimizer.tell(combo, None)
-                    _lex_done.add(lk)
-                    _submit_new(eid)
-                # else: more singular probes are still pending; wait.
-
-            _stream_status_live(manager, token, experiment_id,
-                                on_event=_bayes_on_event,
-                                writer_factory=writer_factory,
-                                variations=variations,
-                                output_dir=exp_dir,
-                                campaign=campaign)
-        else:
-            _stream_status_live(manager, token, experiment_id,
-                                writer_factory=writer_factory,
-                                variations=variations,
-                                output_dir=exp_dir,
-                                campaign=campaign)
+        _stream_status_live(manager, token, experiment_id,
+                            writer_factory=writer_factory,
+                            variations=variations,
+                            output_dir=exp_dir,
+                            campaign=campaign)
     elif args.fetch:
         sweep_print(f"\n{'=' * 80}")
         sweep_print(f"Fetching results...")
@@ -2373,8 +2144,13 @@ def main() -> None:
         manager_download_experiment(manager, token, experiment_id, exp_dir, campaign=campaign)
     else:
         sweep_print(f"\n{'=' * 80}")
-        sweep_print(f"{n} jobs submitted.")
         scope = " ".join(_campaign_argv(campaign))
+        if spec is not None:
+            sweep_print(f"Bayesian sweep submitted. The manager chooses the runs, up to {spec['budget']} "
+                        f"trials with results.")
+            sweep_print(f"Control: mlsweep optimize {experiment_id} --manager {manager} {scope}")
+        else:
+            sweep_print(f"{n} jobs submitted.")
         sweep_print(f"Watch:   mlsweep watch {experiment_id} --manager {manager} {scope}")
         sweep_print(f"Fetch:   mlsweep fetch --experiment {experiment_id} --manager {manager} {scope} --wait")
         sweep_print(f"Results: ~/.mlsweep/experiments/{experiment_id}/")

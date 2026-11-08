@@ -17,8 +17,24 @@ const TOKEN = (() => {
   return token;
 })();
 
-function apiFetch(path, opts = {}) {
-  return fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+  if (r.status === 401) showLoginProblem("The manager rejected this page's token. Open the link it printed at startup, or run `mlsweep status` to find it.");
+  else if (r.status === 429) showLoginProblem("Too many failed logins from this address. Try again in a minute.");
+  return r;
+}
+
+// Every page calls the API first thing, so a bad token is explained in one place
+// and pages need only handle their own failures.
+function showLoginProblem(message) {
+  if (document.getElementById("login-problem")) return;
+  const box = document.createElement("div");
+  box.id = "login-problem";
+  box.setAttribute("role", "alert");
+  box.textContent = message;
+  box.style.cssText = "position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:1000;max-width:90vw;"
+    + "padding:10px 14px;border:1px solid #d62728;border-radius:6px;background:var(--surface);color:var(--text);font-size:13px";
+  document.body.append(box);
 }
 
 // *path* for the places a request can't carry a header: images, downloads.

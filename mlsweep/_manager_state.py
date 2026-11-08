@@ -13,7 +13,8 @@ status transitions, in-flight tracking, worker membership) happens inside one
 ``async with state.lock`` block, so no coroutine ever observes the two out of
 step.  Slow I/O (rsync, SSH, launching workers) never runs under the lock.
 
-Jobs are dispatched only by the scheduler task (``scheduler_loop``).  Anything
+Jobs are dispatched only by the scheduler task (``scheduler_loop``), which also
+adds the next trials of Bayesian sweeps (``_manager_optimizer``).  Anything
 that may free capacity or add work calls ``state.request_schedule()``, which
 just wakes that task; the task also runs periodically, so a missed wake-up
 delays scheduling by seconds instead of stalling it.
@@ -133,6 +134,8 @@ class ManagerState:
         self.launching: set[str] = set()  # worker ids with a launch in progress
         self.runs: dict[RunKey, InFlightRun] = {}
         self.placement: Placement = DEFAULT_PLACEMENT
+        # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.
+        self.run_values: dict[tuple[int, int], float | None] = {}
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self.lock: asyncio.Lock = asyncio.Lock()
         self.schedule_event: asyncio.Event = asyncio.Event()

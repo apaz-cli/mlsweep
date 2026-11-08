@@ -271,3 +271,148 @@ def test_mentions_count_runs_and_roll_them_up(notes_manager) -> None:  # type: i
     # The note names exp_runs, not exp_other, so the shared run ID credits only it.
     assert "exp_other" not in body["mentions"]
     assert "exp_other" not in body["runs"]
+
+
+def _seed_metrics(db_path: Path, experiment: str, rows: dict[str, list[tuple[int, dict]]]) -> None:
+    """Write metric rows straight into the manager's DB (WAL allows a second writer)."""
+    import sqlite3
+    con = sqlite3.connect(db_path)
+    try:
+        for run_id, points in rows.items():
+            found = con.execute(
+                "SELECT job_key, attempt FROM jobs WHERE experiment_id = ? AND run_id = ?",
+                (experiment, run_id)).fetchone()
+            assert found, (experiment, run_id)
+            job_key, attempt = found
+            for step, data in points:
+                con.execute(
+                    "INSERT OR REPLACE INTO metrics (job_key, attempt, step, data) VALUES (?, ?, ?, ?)",
+                    (job_key, attempt, step, json.dumps(data)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_chart_and_table_blocks(notes_manager, tmp_path) -> None:
+    url = notes_manager.url
+    exp = "e_notes_blocks"
+    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    for run, lr in (("r0", 0.001), ("r1", 0.001), ("r2", 0.01)):
+        status, _, _ = _req(url, "POST", "/api/jobs", {
+            "run_id": run, "experiment_id": exp, "command": ["echo"], "combo": {"lr": lr}})
+        assert status == 201
+    _seed_metrics(tmp_path / "manager.db", exp, {
+        "r0": [(1, {"loss": 1.0}), (2, {"loss": 0.8})],
+        "r1": [(1, {"loss": 1.2}), (2, {"loss": 1.0})],
+        "r2": [(1, {"loss": 2.0}), (2, {"loss": 1.5})],
+    })
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart",
+        "spec": f"experiments: [{exp}]\nmetric: loss\nsplit_by: lr\nband: minmax",
+    })
+    assert status == 200, data
+    groups = {s["name"]: s for s in data["series"]}
+    assert groups["lr=0.001"]["y"] == [1.1, 0.9]
+    assert groups["lr=0.001"]["lo"] == [1.0, 0.8]
+    assert groups["lr=0.001"]["hi"] == [1.2, 1.0]
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "table",
+        "spec": f"experiments: {exp}\nmetrics: [loss]\nsort: loss\norder: desc",
+    })
+    assert status == 200, data
+    assert [c["key"] for c in data["columns"]] == ["run", "lr", "loss"]
+    assert [r["run"] for r in data["rows"]] == ["r2", "r1", "r0"]
+    assert data["rows"][-1]["metrics"]["loss"]["final"] == 0.8
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": f"experiments: [{exp}]\nmetric: loss\nruns: [{exp}/r0]"})
+    assert status == 200 and [s["name"] for s in data["series"]] == ["r0"]
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": "runs: [" + exp + "/r0]\nmetric: loss"})
+    assert status == 200 and [s["name"] for s in data["series"]] == ["r0"]
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": "runs: [r0]\nmetric: loss"})
+    assert status == 200 and [(s["experiment"], s["run"]) for s in data["series"]] == [(exp, "r0")]
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": f"experiments: [{exp}]\nmetric: loss\nwhere: lr=0.01"})
+    assert status == 200 and [s["name"] for s in data["series"]] == ["r2"]
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": f"experiments: [no_such_exp]\nmetric: loss"})
+    assert status == 200 and data["series"] == []
+    assert any("unknown experiment" in w for w in data["warnings"])
+
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "chart", "spec": "metric: loss"})
+    assert status == 400 and "experiments" in data["error"]
+    status, data, _ = _req(url, "POST", "/api/notes/block", {
+        "kind": "nope", "spec": "experiments: x"})
+    assert status == 400
+
+
+def test_evidence_links(notes_manager, tmp_path) -> None:
+    url = notes_manager.url
+    exp = "e_evidence"
+    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": exp, "command": ["echo"]})
+    _seed_metrics(tmp_path / "manager.db", exp, {
+        "r0": [(100, {"loss": 2.0}), (200, {"loss": 1.25})],
+    })
+
+    status, data, _ = _req(url, "POST", "/api/notes/evidence", {"refs": [
+        f"{exp}/r0/loss@200", f"{exp}/r0/loss", f"{exp}/nope/loss@1", "broken",
+    ]})
+    assert status == 200, data
+    res = data["results"]
+    assert res[f"{exp}/r0/loss@200"]["value"] == 1.25
+    assert res[f"{exp}/r0/loss"]["value"] == 1.25
+    assert res[f"{exp}/nope/loss@1"]["ok"] is False
+    assert res["broken"]["ok"] is False
+
+    status, data, _ = _req(url, "POST", "/api/notes/evidence", {"refs": "not a list"})
+    assert status == 400
+
+
+def test_data_endpoints_need_a_token(notes_manager) -> None:
+    for path in ("/api/notes/block", "/api/notes/evidence", "/api/notes/run-ids"):
+        if path.endswith("run-ids"):
+            assert _req(notes_manager.url, "GET", path, token=None)[0] == 401
+        else:
+            assert _req(notes_manager.url, "POST", path, {"kind": "chart", "spec": "x"},
+                        token=None)[0] == 401
+    status, data, _ = _req(notes_manager.url, "GET", "/api/notes/run-ids")
+    assert status == 200 and data["runs"] == {}
+
+
+def test_run_ids_endpoint(notes_manager) -> None:
+    url = notes_manager.url
+    _req(url, "POST", "/api/experiments", {"experiment_id": "e_run_ids"})
+    _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": "e_run_ids",
+                                    "command": ["echo"]})
+    status, data, _ = _req(url, "GET", "/api/notes/run-ids")
+    assert status == 200 and data["runs"]["r0"] == ["e_run_ids"]
+
+
+def test_lint_flags_stale_evidence_numbers(notes_manager, tmp_path) -> None:
+    url = notes_manager.url
+    exp = "e_lint_stale"
+    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": exp, "command": ["echo"]})
+    _seed_metrics(tmp_path / "manager.db", exp, {"r0": [(2, {"loss": 2.0})]})
+    note = (f"Matches [2.0](mlsweep:{exp}/r0/loss@2) and "
+            f"is stale [3.0](mlsweep:{exp}/r0/loss@2).\n")
+    status, _, _ = _req(url, "PUT", "/api/notes/file",
+                        {"path": "stale.md", "content": note, "base_hash": None})
+    assert status == 200
+    status, data, _ = _req(url, "GET", "/api/notes/lint")
+    assert status == 200
+    stale = [f for f in data["findings"] if f["kind"] == "stale-evidence"]
+    assert len(stale) == 1
+    assert stale[0]["path"] == "stale.md" and stale[0]["line"] == 1
+    assert data["stats"]["evidence_checked"] is True
+    assert data["kinds"]["stale-evidence"]

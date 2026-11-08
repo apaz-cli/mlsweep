@@ -8,10 +8,13 @@ itself on disk.
 
 import asyncio
 import json
+import os
 import re
 import socket
 import sqlite3
 import struct
+import subprocess
+import sys
 import types
 import urllib.error
 import urllib.parse
@@ -26,8 +29,9 @@ from browser import Browser, find_chromium
 from campaign_helpers import ok, shared_manager, static_url, uid
 from mlsweep._manager_db import init_db, insert_job, create_experiment, unfinished_jobs_with_unsafe_ids
 from mlsweep._manager_http import _AuthThrottle, _MAX_AUTH_FAILURES, error_middleware
+from mlsweep.run_sweep import _ws_refusal
 from mlsweep._manager_workers import _parse_workers_file, validate_worker_host
-from mlsweep._shared import read_msg, validate_artifact_id, validate_run_id
+from mlsweep._shared import MsgHello, encode, read_msg, validate_artifact_id, validate_run_id
 
 WEBUI = Path(__file__).resolve().parent.parent / "mlsweep" / "webui"
 CHROME = find_chromium()
@@ -411,3 +415,136 @@ def test_error_middleware_cannot_replace_a_response_already_started():
         raise RuntimeError("mid-stream")
     with pytest.raises(RuntimeError):
         asyncio.run(error_middleware(_middleware_request(output_size=100), boom))
+
+
+# ── Mistakes get an answer that says what to fix ───────────────────────────────
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/experiments"), ("POST", "/api/jobs"), ("POST", "/api/workers"), ("POST", "/api/artifacts"),
+    ("PATCH", "/api/scheduler"), ("PUT", "/api/experiments/nope/status"), ("PUT", "/api/jobs/r/priority"),
+    ("PUT", "/api/artifacts/a/ref"), ("POST", "/api/experiments/nope/jobs/bulk"),
+    ("PATCH", "/api/workers/w/concurrency"),
+])
+def test_a_body_that_is_not_an_object_is_the_clients_mistake(mgr, method, path):
+    status, body, _ = _req(mgr, method, path, [1, 2])
+    assert status == 400 and json.loads(body)["error"] == "body must be a JSON object"
+
+
+def test_bulk_insert_explains_bad_shapes(mgr):
+    assert _req(mgr, "POST", "/api/jobs/bulk", 7)[0] == 400
+    assert _req(mgr, "POST", "/api/jobs/bulk", [1])[0] == 400
+    assert _req(mgr, "POST", "/api/jobs/bulk", [{"run_id": "r", "experiment_id": _experiment(mgr)}])[0] == 400
+    assert _req(mgr, "POST", f"/api/experiments/{uid('sec')}/jobs/bulk", {"jobs": [1]})[0] == 400
+
+
+def test_job_conflicts_name_the_problem(mgr):
+    eid = _experiment(mgr)
+    job = {"experiment_id": eid, "run_id": "r", "command": ["true"]}
+    assert _req(mgr, "POST", "/api/jobs", job)[0] == 201
+    status, body, _ = _req(mgr, "POST", "/api/jobs", job)
+    assert status == 409 and b"duplicate run_id" in body
+    assert _req(mgr, "POST", "/api/jobs/bulk", [job])[0] == 409
+    status, body, _ = _req(mgr, "POST", "/api/jobs", {**job, "experiment_id": "no_such_experiment"})
+    assert status == 404 and b"experiment not found" in body
+
+
+@pytest.mark.parametrize("field", [
+    {"status": "bogus"}, {"priority": "high"}, {"priority": True}, {"gpus_per_run": "x"}, {"gpus_per_run": -1},
+    {"nodes_per_run": 1.5}, {"max_retries": "x"}, {"command": {"a": 1}}, {"command": [1]}, {"combo": [1]},
+    {"env": "A=1"}, {"files": []}, {"return_files": "a"},
+], ids=str)
+def test_bad_job_fields_are_refused_rather_than_stored(mgr, field):
+    eid = _experiment(mgr)
+    status, body, _ = _req(mgr, "POST", "/api/jobs", {"experiment_id": eid, "run_id": "r", "command": ["true"], **field})
+    assert status == 400 and next(iter(field)) in json.loads(body)["error"]
+    assert json.loads(_req(mgr, "GET", f"/api/experiments/{eid}/jobs")[1]) == []
+
+
+def test_good_job_fields_still_work(mgr):
+    eid = _experiment(mgr)
+    job = {"experiment_id": eid, "run_id": "r", "command": "echo hi", "priority": 1.5, "gpus_per_run": 0,
+           "combo": {"lr": 0.1}, "env": {"A": "1"}, "files": {"a": "b"}, "return_files": ["x"], "max_retries": 0}
+    assert _req(mgr, "POST", "/api/jobs", job)[0] == 201
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/api/experiments", {"experiment_id": 123}),
+    ("PUT", "/api/jobs/r/priority", {"priority": "high", "experiment_id": "e"}),
+    ("PUT", "/api/jobs/r/status", {"status": "bogus", "experiment_id": "e"}),
+    ("PUT", "/api/jobs/r/status", {"status": "done", "experiment_id": "e", "exit_code": "x"}),
+    ("PUT", "/api/artifacts/a/ref", {"delta": "x"}),
+    ("POST", "/api/artifacts", {"artifact_id": "a2", "size_bytes": "x"}),
+    ("POST", "/api/workers", {"host": "h1", "port": "x"}),
+    ("POST", "/api/workers", {"host": "h1", "port": 70000}),
+    ("POST", "/api/workers", {"host": "h1", "devices": "0,1"}),
+    ("POST", "/api/workers", {"host": "h1", "ssh_key": 5}),
+], ids=str)
+def test_bad_values_elsewhere_are_refused(mgr, method, path, body):
+    assert _req(mgr, method, path, body)[0] == 400
+
+
+@pytest.mark.parametrize("path", [
+    "/api/jobs?limit=abc", "/api/jobs?limit=-1", "/api/jobs/pending?limit=abc",
+    "/api/jobs?status=bogus", "/api/experiments/e/jobs?status=bogus",
+])
+def test_bad_query_parameters_are_refused(mgr, path):
+    status, body, _ = _req(mgr, "GET", path)
+    assert status == 400 and "error" in json.loads(body)
+
+
+def test_notes_upload_explains_a_wrong_content_type(mgr):
+    status, body, _ = _req(mgr, "POST", "/api/notes/upload", raw=b"x", headers={"Content-Type": "text/plain"})
+    assert status == 400 and b"multipart" in body
+
+
+def test_an_oversized_body_says_so(mgr):
+    assert _req(mgr, "POST", "/api/experiments", raw=b"x" * (129 * 1024 * 1024),
+                headers={"Content-Type": "application/json"})[0] == 413
+
+
+def _cli(mgr, *args):
+    env = {**os.environ, "MLSWEEP_MANAGER": mgr.url}
+    return subprocess.run([sys.executable, "-m", "mlsweep", *args, "--token", "wrong"],
+                          capture_output=True, text=True, env=env, timeout=30)
+
+
+@pytest.mark.parametrize("args", [("ls",), ("workers",), ("cancel", "x", "--all"), ("retry", "x", "--all")], ids=str)
+def test_the_cli_says_why_and_fails_on_a_wrong_token(mgr, args):
+    r = _cli(mgr, *args)
+    assert r.returncode != 0, r.stdout
+    assert "wrong or missing token" in r.stdout
+    assert "No matching runs" not in r.stdout
+
+
+def test_watch_reports_a_refused_websocket_in_one_line():
+    refusal = _ws_refusal("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json", b'{"error": "wrong token"}')
+    assert refusal == "HTTP 401 Unauthorized: wrong token"
+    assert _ws_refusal("HTTP/1.1 400 Bad Request", b"plain") == "HTTP 400 Bad Request: plain"
+    assert _ws_refusal("HTTP/1.1 500 Oops", b"") == "HTTP 500 Oops"
+
+
+def test_a_worker_says_why_it_refused_a_connection(tmp_path):
+    w = subprocess.Popen([sys.executable, "-m", "mlsweep.worker", "--token", "right", "--port", "0",
+                          "--scratch-dir", str(tmp_path / "s"), "--remote-dir", str(tmp_path)],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        port = int(w.stdout.readline().strip().split("=")[1])
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as c:
+            c.settimeout(10)
+            c.sendall(encode(MsgHello(token="wrong", controller_id="m")))
+            assert c.recv(100) == b""
+    finally:
+        w.terminate()
+    err = w.communicate(timeout=10)[1]
+    assert "token does not match" in err and "wrong" not in err.replace("does not match", "")
+
+
+@pytest.mark.skipif(CHROME is None, reason="no Chromium-family browser installed")
+@pytest.mark.parametrize("page", sorted(p.name for p in WEBUI.glob("*.html") if p.name != "index.html"))
+def test_every_page_explains_a_rejected_token(mgr, browser, page):
+    browser.goto(f"{mgr.url}/static/{page}?token=wrong")
+    text = browser.wait_for("document.getElementById('login-problem')?.textContent")
+    assert "rejected this page's token" in text
+    # Leave the remembered token right for the other tests in this browser.
+    browser.goto(static_url(mgr, "experiments.html"))

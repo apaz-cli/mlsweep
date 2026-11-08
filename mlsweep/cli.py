@@ -125,7 +125,8 @@ def _build_help(include_banner: bool = False) -> str:
             ("purge EXP --failed --yes", "delete finished runs with their metrics, logs and files"),
             ("gc [--yes]", "clean up files and records nothing refers to"),
             ("delete EXP --yes", "delete an experiment and its runs"),
-            ("resume EXP", "re-queue failed and cancelled runs (Bayesian: --sweep FILE)"),
+            ("resume EXP", "re-queue failed and cancelled runs (Bayesian: choose new trials)"),
+            ("optimize EXP", "show or adjust a Bayesian sweep (--budget, --finish, --max-concurrent)"),
             ("stop EXP", "abort a sweep"),
             ("pause EXP", "stop dispatching new jobs"),
             ("unpause EXP", "undo pause"),
@@ -309,7 +310,7 @@ def _status_cmd(argv: list[str]) -> None:
     gpus = _query_gpu_stats()
     disk = shutil.disk_usage(mlsweep_dir)
 
-    exps = (manager_list_experiments(manager, token, campaign=campaign) or []) if manager_up else []
+    exps = (manager_list_experiments(manager, token, campaign=campaign, quiet=True) or []) if manager_up else []
     experiments = [e["experiment_id"] for e in exps if isinstance(e, dict) and e.get("experiment_id")]
     workers = (manager_list_workers(manager, token) or []) if manager_up else []
 
@@ -479,7 +480,7 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 # Subcommands implemented in mlsweep.ctl as ``<name>_cmd(argv)``.
 _CTL_CMDS = frozenset({
-    "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "stop", "pause", "unpause", "best",
+    "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "optimize", "stop", "pause", "unpause", "best",
     "wait", "campaign", "move", "purge", "gc", "delete", "export", "workers", "scheduler",
 })
 

@@ -886,6 +886,14 @@ def test_result_rules_apply_monotonic_and_singular():
             await update_job_status(db, "b8", "s", "done", exit_code=0)
             assert sorted(await apply_result_rules(db, "s", "b8", True)) == ["b16", "b32"]
 
+            # Probes run at once, so one can also fail after another succeeded.
+            await create_experiment(db, experiment_id="late", name="t", singular_dims=["bs"])
+            await insert_job(db, run_id="ok", experiment_id="late", command=["c"], combo={"bs": 8, "lr": 1})
+            await insert_job(db, run_id="late", experiment_id="late", command=["c"], combo={"bs": 16, "lr": 1})
+            await db.execute("UPDATE jobs SET status = 'done' WHERE run_id = 'ok' AND experiment_id = 'late'")
+            await db.execute("UPDATE jobs SET status = 'failed' WHERE run_id = 'late' AND experiment_id = 'late'")
+            assert await apply_result_rules(db, "late", "late", False) == ["late"]
+
             # With only singular_dims set (as Bayesian sweeps do), a success turns
             # failed probes of the same non-singular combo into xfailed.
             await create_experiment(db, experiment_id="b", name="t", singular_dims=["bs"])

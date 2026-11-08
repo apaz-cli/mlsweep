@@ -116,7 +116,9 @@ OPTIONS = {
 }
 ```
 
-See [sweep_configuration.md](docs/sweep_configuration.md) for continuous ranges, singular dims, and all `OPTIMIZE` fields.
+The manager runs the sweep, choosing each trial from the results so far. So `mlsweep run` can exit, and the sweep survives a manager restart. Watch and adjust it with `mlsweep optimize EXP_ID` (`--budget`, `--finish`, `--max-concurrent`), and control it with `pause`, `stop` and `cancel` like any other sweep.
+
+See [sweep_configuration.md](docs/sweep_configuration.md) for continuous ranges, singular dims, all `OPTIMIZE` fields, and the controls.
 
 ## Run
 
@@ -326,15 +328,19 @@ Over HTTP, `GET /api/export/tensorboard.zip` and `POST /api/export/wandb` take t
 
 The dashboard's **Notes** tab is an editor for a shared folder of research notes,
 papers and plots: an Obsidian-style file tree, markdown with `[[links]]`, search,
-graph, history and diffs. Experiment IDs in a note link to their results.
+graph, history and diffs. Experiment IDs in a note link to their results, and
+`mlsweep-chart` / `mlsweep-table` blocks plot live metrics instead of pasting
+screenshots. A number written as `[0.42](mlsweep:EXP/RUN/loss@20000)` is checked
+against the logged metric when the note is opened.
 
 The folder is a git repo that the manager hosts. Agents on any machine run
 `mlsweep notes clone DIR`, then pull, commit, merge and push with normal git.
-`mlsweep notes lint` checks links and experiment IDs, and reports leftover conflict
-markers.
+`mlsweep notes lint` checks links, experiment and run IDs, chart/table specs, the
+numbers behind evidence links, and leftover conflict markers.
 
 The manager serves `~/.mlsweep/notes` (creating it) by default, so the tab and the
-remote work out of the box. Math renders with `$…$` and `$$…$$`.
+remote work out of the box. Math renders with `$…$` and `$$…$$`, and footnotes
+with `[^1]`.
 
 See [notes.md](docs/notes.md) (`mlsweep docs notes`).
 

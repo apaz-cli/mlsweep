@@ -51,7 +51,8 @@ mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard 
 # 4. Control a running sweep
 mlsweep cancel EXP_ID --running            # cancel jobs (--pending / --all --yes)
 mlsweep retry  EXP_ID --failed             # re-queue failed jobs, with the code they were submitted with
-mlsweep resume EXP_ID                      # re-queue failed and cancelled jobs (Bayesian: --sweep FILE --stream)
+mlsweep resume EXP_ID                      # re-queue failed and cancelled jobs (Bayesian: choose new trials)
+mlsweep optimize EXP_ID                    # show or adjust a Bayesian sweep (--budget N|+N, --finish, --max-concurrent K)
 mlsweep pause EXP_ID                       # stop dispatching new jobs
 mlsweep unpause EXP_ID                     # undo pause
 mlsweep stop EXP_ID --yes                  # abort a sweep
@@ -258,8 +259,9 @@ OPTIMIZE = {
     "method": "bayes",      # required
     "metric": "val_loss",   # metric name logged via MLSweepLogger
     "goal": "minimize",     # "minimize" or "maximize"
-    "budget": 40,           # number of successful runs
-    "n_initial": 8,         # random runs before adaptive sampling starts (default: max(8, n_params*2))
+    "budget": 40,           # how many trials need results
+    "n_initial": 8,         # random trials before adaptive sampling starts (default: max(8, n_params*2))
+    "max_failures": 8,      # failed trials in a row before the sweep pauses (default: max(3, n_initial))
 }
 ```
 
@@ -272,7 +274,19 @@ Continuous dims (bayes only; use `"samples"` for grid mode):
 
 Discrete dims and subdims work unchanged in bayes mode (optuna treats them as categorical). Singular dims are invisible to the optimizer; the full singular probe sequence is generated for each optimizer suggestion.
 
-Bayes runs are named `{sweep_name}_bayes_{N:04d}`. Submit with `--stream` for adaptive sampling. That process picks each run from the results so far, one at a time, so keep it alive. Without `--stream` the whole budget is submitted up front. If the process dies, continue with `mlsweep resume EXP_ID --sweep sweep.py --stream`, which restores the earlier results.
+Bayes runs are named `{sweep_name}_bayes_{N:04d}`.
+
+The manager runs the sweep, so `mlsweep run` submits it and exits. It chooses new trials from the results so far as each one comes in, and it carries on across a manager restart. It keeps up to `--max-concurrent` trials going, or `n_initial` if that isn't set. After `max_failures` failed trials in a row it pauses the sweep, and `mlsweep optimize EXP_ID` shows why.
+
+| Do this | With | What happens |
+|---------|------|--------------|
+| See where it stands | `mlsweep optimize EXP` | Budget used, trials running and failed, the best run. `--json` for scripts. |
+| Change the budget | `mlsweep optimize EXP --budget N` or `+N` | Takes effect on the next trial. A completed sweep with budget left runs again. Lowering it leaves existing runs alone. |
+| End it gently | `mlsweep optimize EXP --finish` | No new trials. Runs already queued or running end, then the sweep completes. `--budget` undoes this. |
+| Change how many run at once | `mlsweep optimize EXP --max-concurrent K` | Raising it starts more trials now. Lowering it lets running runs finish. |
+| Hold it | `mlsweep pause EXP`, `mlsweep unpause EXP` | While paused, no new runs start and no new trials are chosen. Running runs finish. |
+| Drop one trial | `mlsweep cancel EXP RUN` | The run stops, it doesn't use budget, and the manager chooses another trial. |
+| End it now | `mlsweep stop EXP --yes` | Every unfinished run is cancelled. `mlsweep resume EXP` starts it choosing trials again. |
 
 ## Logger
 

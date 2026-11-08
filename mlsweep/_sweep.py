@@ -13,7 +13,7 @@ from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from typing import Any
 
-from mlsweep._shared import _val_sort_key
+from mlsweep._shared import _val_sort_key, validate_artifact_id, validate_run_id
 
 # Metadata keys in a dimension spec (no dot prefix). Dot-prefixed keys are subdimensions.
 _METADATA_KEYS = {"values", "flags", "name", "singular", "monotonic",
@@ -90,13 +90,7 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         if method not in ("grid", "bayes"):
             raise ValueError(f"{path}: OPTIMIZE method must be 'grid' or 'bayes'")
         if method == "bayes":
-            for req in ("metric", "goal", "budget"):
-                if req not in optimize:
-                    raise ValueError(f"{path}: OPTIMIZE requires '{req}' when method='bayes'")
-            if optimize["goal"] not in _GOALS:
-                raise ValueError(f"{path}: OPTIMIZE goal must be 'minimize' or 'maximize'")
-            if not isinstance(optimize["budget"], int) or optimize["budget"] < 1:
-                raise ValueError(f"{path}: OPTIMIZE budget must be a positive int")
+            validate_optimize_config(optimize, str(path))
         # OPTIMIZE wins over the top-level METRIC/GOAL when both are present.
         metric = optimize.get("metric", metric)
         goal = optimize.get("goal", goal)
@@ -121,6 +115,25 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "goal": goal,
         "setup_command": setup_command,
     }
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def validate_optimize_config(optimize: dict[str, Any], where: str = "OPTIMIZE") -> None:
+    """Check the fields a Bayesian ``OPTIMIZE`` dict declares.  Raises ValueError."""
+    for req in ("metric", "goal", "budget"):
+        if req not in optimize:
+            raise ValueError(f"{where}: OPTIMIZE requires '{req}' when method='bayes'")
+    if not isinstance(optimize["metric"], str) or not optimize["metric"]:
+        raise ValueError(f"{where}: OPTIMIZE metric must be a non-empty str")
+    if optimize["goal"] not in _GOALS:
+        raise ValueError(f"{where}: OPTIMIZE goal must be 'minimize' or 'maximize'")
+    for field in ("budget", "n_initial", "max_failures"):
+        value = optimize.get(field)
+        if (field == "budget" or value is not None) and not _positive_int(value):
+            raise ValueError(f"{where}: OPTIMIZE {field} must be a positive int")
 
 
 def _sample_distribution(dist: str, lo: float, hi: float, n: int) -> list[Any]:
@@ -614,3 +627,231 @@ def _write_manifest(exp_dir: str, experiment: str, variations: list[dict[str, An
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=2)
     os.replace(tmp, path)
+
+
+# ── Bayesian sweep specs ───────────────────────────────────────────────────────
+#
+# The manager runs a Bayesian sweep on its own, so it stores everything needed
+# to make more runs: an ``optimize`` spec on the experiment.  The spec is JSON.
+# The fields set when the sweep is submitted:
+#
+#   metric, goal, budget, n_initial, max_failures   what to optimize, how far
+#   sweep_name, options, extra_flags                what a trial looks like
+#   job                                             build_job_payloads' arguments
+#
+# The manager also keeps these in it:
+#
+#   finishing            start no new trials, complete once the running ones end
+#   failures_cleared_at  failures before this time don't count as a failure streak
+#   note                 why the manager paused or completed the sweep
+
+
+def options_to_wire(options: dict[str, Any]) -> dict[str, Any]:
+    """OPTIONS as JSON values, without the fields ``validate_options`` synthesizes.
+
+    A dict of flags may have keys JSON can't (64, True), so it goes as pairs.
+    Raises ValueError if anything else in OPTIONS would not survive JSON.
+    """
+    def encode(opts: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, opt in opts.items():
+            spec: dict[str, Any] = {}
+            for k, v in opt.items():
+                if k.startswith("."):
+                    spec.update(encode({k: v}))
+                elif k == "flags" and isinstance(v, dict):
+                    spec[k] = {"pairs": [[fk, list(tokens)] for fk, tokens in v.items()]}
+                elif k == "values":
+                    spec[k] = list(v)
+                elif not k.startswith("_"):
+                    spec[k] = v
+            out[key] = spec
+        return out
+
+    wire = encode(options)
+    try:
+        same = json.loads(json.dumps(wire, allow_nan=False)) == wire
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        raise ValueError("a Bayesian sweep's OPTIONS must hold only plain JSON values "
+                         "(str, number, bool, None, list, dict), since the manager keeps them")
+    return wire
+
+
+def options_from_wire(wire: dict[str, Any]) -> dict[str, Any]:
+    """Invert ``options_to_wire``.  The result still needs ``validate_options``."""
+    out: dict[str, Any] = {}
+    for key, spec in wire.items():
+        opt = dict(spec)
+        for k, v in spec.items():
+            if k.startswith("."):
+                opt[k] = options_from_wire({k: v})[k]
+            elif k == "flags" and isinstance(v, dict):
+                opt[k] = {fk: tokens for fk, tokens in v["pairs"]}
+        out[key] = opt
+    return out
+
+
+def singular_dims(options: dict[str, Any]) -> list[str]:
+    """Names of the top-level singular dims of validated *options*."""
+    return [k[1:] for k, v in options.items() if v.get("singular")]
+
+
+def lex_key(combo: dict[str, Any], singular: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """What identifies a Bayesian trial: *combo* without its singular dims."""
+    return tuple((k, str(combo[k])) for k in sorted(combo) if k not in singular)
+
+
+def _default_n_initial(options: dict[str, Any]) -> int:
+    n_dims = sum(1 for v in options.values() if not v.get("singular") and v.get("_values") != [None])
+    return max(8, 2 * n_dims)
+
+
+def _check_job_template(job: Any) -> dict[str, Any]:
+    if not isinstance(job, dict):
+        raise ValueError("optimize.job must be an object")
+    command = job.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
+        raise ValueError("optimize.job.command must be a non-empty list of strings")
+    overrides = job.get("cli_overrides", [])
+    if not isinstance(overrides, list) or not all(isinstance(c, str) for c in overrides):
+        raise ValueError("optimize.job.cli_overrides must be a list of strings")
+    numbers = {"gpus_per_run": (1, 0), "nodes_per_run": (1, 1), "priority": (0, None), "max_retries": (2, 0)}
+    out: dict[str, Any] = {"command": command, "cli_overrides": overrides}
+    for field, (default, low) in numbers.items():
+        value = job.get(field, default)
+        if not isinstance(value, int) or isinstance(value, bool) or (low is not None and value < low):
+            raise ValueError(f"optimize.job.{field} must be an int" + (f" >= {low}" if low is not None else ""))
+        out[field] = value
+    for field in ("artifact_id", "run_from", "setup_command"):
+        value = job.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"optimize.job.{field} must be a string")
+        out[field] = value
+    if out["artifact_id"] is not None:
+        validate_artifact_id(out["artifact_id"])
+    if not isinstance(job.get("set_dist_env", False), bool):
+        raise ValueError("optimize.job.set_dist_env must be a bool")
+    out["set_dist_env"] = job.get("set_dist_env", False)
+    return out
+
+
+def validate_optimize_spec(raw: Any) -> dict[str, Any]:
+    """Check a submitted ``optimize`` spec.  Returns it with defaults filled in.
+
+    Only the fields a sweep declares are kept.  Raises ValueError.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("'optimize' must be an object")
+    if raw.get("method", "bayes") != "bayes":
+        raise ValueError("optimize.method must be 'bayes'")
+    validate_optimize_config(raw, "optimize")
+    name = raw.get("sweep_name")
+    if not isinstance(name, str):
+        raise ValueError("optimize.sweep_name must be a string")
+    validate_run_id(f"{name}_bayes_0001")
+    extra_flags = raw.get("extra_flags", [])
+    if not isinstance(extra_flags, list) or not all(isinstance(f, str) for f in extra_flags):
+        raise ValueError("optimize.extra_flags must be a list of strings")
+    wire = raw.get("options")
+    if not isinstance(wire, dict):
+        raise ValueError("optimize.options must be an object")
+    try:
+        options = options_from_wire(wire)
+        validate_options(options, method="bayes")
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError(f"optimize.options is malformed: {exc!r}") from exc
+    for key, opt in options.items():
+        if opt.get("singular") and opt.get("_type") == "continuous":
+            raise ValueError(f"Dimension {key!r}: a singular dim needs a list of 'values', not a distribution")
+    n_initial = raw.get("n_initial") or _default_n_initial(options)
+    return {
+        "method": "bayes",
+        "metric": raw["metric"],
+        "goal": raw["goal"],
+        "budget": raw["budget"],
+        "n_initial": n_initial,
+        "max_failures": raw.get("max_failures") or max(3, n_initial),
+        "sweep_name": name,
+        "options": wire,
+        "extra_flags": extra_flags,
+        "job": _check_job_template(raw.get("job")),
+    }
+
+
+def spec_singular_dims(spec: dict[str, Any]) -> list[str]:
+    """The singular dims of a stored ``optimize`` spec."""
+    return [k[1:] for k, v in spec["options"].items() if v.get("singular")]
+
+
+# ── Job payloads and results ───────────────────────────────────────────────────
+
+
+def build_job_payloads(
+    variations: list[dict[str, Any]],
+    experiment_id: str,
+    artifact_id: str | None,
+    command: list[str],
+    cli_overrides: list[str],
+    gpus_per_run: int,
+    nodes_per_run: int,
+    set_dist_env: bool,
+    run_from: str | None,
+    priority: int,
+    max_retries: int,
+    setup_command: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convert sweep variations into job payloads for the manager API.
+
+    Each payload is a dict with keys matching the JobRecord fields expected
+    by POST /api/jobs/bulk.  A run's command is ``COMMAND + EXTRA_FLAGS +
+    OPTIONS flags + -- overrides``; each variation's ``overrides`` already
+    starts with EXTRA_FLAGS.
+    """
+    jobs = []
+    for var in variations:
+        full_command = list(command) + var["overrides"] + list(cli_overrides)
+        env_dict: dict[str, str] = {}
+        tag_parts = [f"{k}={v}" for k, v in var["combo"].items() if v is not None]
+        if tag_parts:
+            env_dict["EXP_TAGS"] = ",".join(tag_parts)
+
+        job = {
+            "run_id": var["name"],
+            "experiment_id": experiment_id,
+            "priority": priority,
+            "command": full_command,
+            "combo": var["combo"],
+            "env": env_dict,
+            "status": "pending",
+            "gpus_per_run": gpus_per_run,
+            "nodes_per_run": nodes_per_run,
+            "set_dist_env": set_dist_env,
+            "run_from": run_from,
+            "artifact_id": artifact_id,
+            "max_retries": max_retries,
+            "return_files": [],  # could configure via sweep file
+        }
+        if setup_command:
+            job["setup_command"] = setup_command
+        jobs.append(job)
+    return jobs
+
+
+def metric_values(metrics: list[dict[str, Any]] | None, metric: str) -> list[float]:
+    """Finite values of *metric* across metric rows, in step order."""
+    return [
+        float(r[metric])
+        for r in (metrics or [])
+        if isinstance(r, dict) and isinstance(r.get(metric), (int, float))
+        and math.isfinite(float(r[metric]))
+    ]
+
+
+def best_metric(metrics: list[dict[str, Any]] | None, metric: str, goal: str) -> float | None:
+    """Best finite value of *metric* under *goal*, or None if it was never logged."""
+    vals = metric_values(metrics, metric)
+    if not vals:
+        return None
+    return min(vals) if goal == "minimize" else max(vals)

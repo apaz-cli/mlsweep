@@ -169,6 +169,23 @@ def test_bayes_end_to_end(manager_with_worker, tmp_path):
     assert all(j["exit_code"] != 0 for j in xfailed)
 
 
+def test_bayes_stream_only_watches_and_ends_when_the_manager_completes(manager_with_worker, tmp_path):
+    """`--stream` exits on its own once the manager finishes the sweep."""
+    server, url = manager_with_worker
+    result = _run("tests/sweeps/bayes_sweep.py", tmp_path, "--stream", manager_url=url)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Experiment complete!" in result.stdout
+    assert _api_get(url, server.token, f"/api/experiments/{EXP}")["status"] == "completed"
+    view = _api_get(url, server.token, f"/api/experiments/{EXP}/optimize")
+    assert view["told"] == view["budget"] == 12
+
+
+def test_bayes_dry_run_previews_without_a_manager(tmp_path):
+    result = _run("tests/sweeps/bayes_sweep.py", tmp_path, "--dry-run", manager_url="http://127.0.0.1:1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "bayes_sweep_bayes_0001" in result.stdout and "DRY RUN" in result.stdout
+
+
 def test_experiment_created(manager_with_worker, tmp_path):
     """Verify the manager records the experiment metadata."""
     server, url = manager_with_worker

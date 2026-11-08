@@ -6,8 +6,9 @@ usual: pull, commit, merge, push. The dashboard's Notes tab browses and edits
 the same repository.
 
 Nothing about the files is required: no frontmatter, no folder layout, no
-special syntax. If you use them, `[[wikilinks]]`, embeds, math and callouts render, and
-experiment IDs written anywhere link to their results. See [Markdown](#markdown).
+special syntax. If you use them, `[[wikilinks]]`, embeds, math, callouts, charts,
+tables and evidence links render, and experiment IDs written anywhere link to
+their results. See [Markdown](#markdown).
 
 mlsweep does not run agents and does not decide what goes in the notes. It
 provides the remote, the lint, and the tab.
@@ -108,8 +109,9 @@ saves now, and hover the bottom one for the clone URL and current commit.
 - A lock marks folders of originals. A dot marks a file another machine changed in
   the last 15 minutes.
 
-What opens how: markdown in Live; text and code in an editor with line numbers;
-images and PDFs in place; anything else, or a file over 8 MB, as a download card.
+What opens how: markdown in Live, with Live, Source and Split in the toolbar; text
+and code in an editor with line numbers (no mode switch); images and PDFs in place;
+anything else, or a file over 8 MB, as a download card.
 
 ### Tabs and the toolbar
 
@@ -143,15 +145,20 @@ Ctrl+Z / Ctrl+Shift+Z to undo.
 
 A block is: a run of lines up to a blank line; a whole list; a fenced code block; a
 `$$` math block; a `:::` or `<div>` container; or the frontmatter. Each renders on its
-own, which is the one difference from Split (see [Markdown](#markdown)).
+own, which is the one difference from Split (see [Markdown](#markdown)). A chart or
+table block is a block too: click its header to edit the spec, click the chart itself
+to zoom or hover, and use the header's `↻` to refetch.
 
 ### Source and Split views
 
-Source is the whole file in one editor with markdown colored by syntax. Enter continues
-lists, brackets close themselves, `[[` or Ctrl+Space completes links, Ctrl+B and Ctrl+I
-format. `E` switches Live and Source; Esc returns to Live (in a text file, it just
-leaves the editor). `S` shows source beside a rendered preview that follows as you
-type and scroll; click an image there to enlarge it.
+Source is the whole file in the same editor used for text and code files: monospace,
+line numbers, markdown colored by syntax. Frontmatter, links and embeds, callouts,
+footnotes, evidence links, tags and tables are colored too. Enter continues lists, brackets close
+themselves, `[[` or Ctrl+Space completes links, Ctrl+B and Ctrl+I format. `E` switches
+Live and Source; Esc returns to Live (in a text file, it just leaves the editor). `S`
+shows source beside a rendered preview that follows as you type and scroll; click an
+image there to enlarge it. These views are for notes; other text and code files always
+use this editor.
 
 ### Saving and conflicts
 
@@ -220,8 +227,8 @@ shows this list in the tab.
 | `X` | close tab |
 | `{` `}` | previous, next tab |
 | `[` `]` | back, forward |
-| `E` | Live or Source |
-| `S` | Split |
+| `E` | notes: Live or Source |
+| `S` | notes: Split |
 | `/` | search |
 | `G`, `Shift+G` | graph, this note's graph |
 | `F2` | rename |
@@ -238,13 +245,17 @@ The browser keeps Ctrl+W for itself, so that key closes the browser tab and can'
 Rendered markdown is sanitized. HTML files are served as text, SVGs sandboxed, and
 anything else not an image or PDF as a download, so a file in the notes can't run script
 in the dashboard. Paths can't leave the folder or reach `.git`, and symlinks leading
-out are not followed.
+out are not followed. Charts and tables are drawn from the manager's read-only
+metrics; a note can choose what to plot but cannot make the page run code or
+change a run.
 
 ## Markdown
 
 The tab renders GitHub-flavored Markdown (marked 15) with the additions below. Agents
 writing with their file tools use the same syntax. Files stay plain markdown, and the
-wikilinks, embeds and callouts also work in Obsidian.
+wikilinks, embeds, callouts, footnotes and captions also work in Obsidian. The chart
+and table blocks and `mlsweep:` evidence links are dashboard additions: elsewhere
+they read as a code block and an ordinary link.
 
 ### Base
 
@@ -281,10 +292,124 @@ lint reports it. A link to a missing note is dashed, and clicking it creates the
 | `![[Note]]`, `![[Note#Heading]]` | another note or one section, two levels deep at most |
 | `![[data.csv]]` | any other file, as a link |
 
+### Charts
+
+A `mlsweep-chart` fence is a query, drawn in the page from the manager's metrics.
+It reflects the latest logged data, so don't paste screenshots into a note.
+
+````
+```mlsweep-chart
+experiments: baseline, warmup
+metric: val_loss
+split_by: lr
+band: minmax
+caption: Validation loss by learning rate. {#fig-loss}
+```
+````
+
+The body is one `key: value` per line; JSON is accepted too. Only `metric` and one
+of `experiments`/`runs` are required. Everything else is optional:
+
+| Key | |
+|---|---|
+| `experiments` | one or more experiment IDs; all their runs are included |
+| `runs` | specific runs, `experiment/run` (or a run ID, with `experiments` naming which experiment) |
+| `metric` | the logged metric to plot |
+| `x` | the x-axis value (default `step`; any numeric logged key works) |
+| `split_by` | color by a hyperparameter, or `_run`, `_status`, `_experiment`; runs with the same value are grouped |
+| `band` | with `split_by`, the spread across runs: `minmax` (default) or `std`; `none` hides it |
+| `agg` | `mean` (default) or `median` within a group |
+| `smooth` | EMA weight, 0–0.99; 0 (default) is raw |
+| `log_x`, `log_y` | logarithmic axes |
+| `x_min`, `x_max` | plot only this x range |
+| `where` | keep runs whose hyperparameters match, e.g. `lr=0.001, optimizer=muon` |
+| `points` | most points per line (default 400); the manager downsamples |
+| `limit` | most runs to read (default 60) |
+| `caption`, `title` | caption below the figure, and an explicit header; without `title` the header gives the metric and grouping, plus the experiments unless the legend already names them |
+
+The header gives the metric and grouping; the legend above the plot names the
+individual series, so names are not repeated in both. Names are the experiment's
+display name and the run's short name (its ID without the experiment prefix); hover
+a legend entry for the full IDs. The header's `↻` refetches and `⤓` downloads the
+chart as a PNG. Hover a legend name to dim the others, and click it to hide or show
+that line. Drag on the plot to zoom and double-click to reset. Charts read the
+manager, so they need it reachable; a block whose experiment or metric is missing
+shows the reason in place. Naming experiment IDs in the block also counts as citing
+them.
+
+### Tables
+
+A `mlsweep-table` fence is a leaderboard, one row per run, fetched the same way.
+
+````
+```mlsweep-table
+experiments: baseline
+metrics: [val_loss, acc]
+columns: [lr, batch_size]
+sort: val_loss
+order: asc
+```
+````
+
+It takes `experiments`/`runs`, `where`, `limit` and `caption` from the chart
+keys, plus `metrics` (the metric columns; default: the experiment's metric, else the
+numeric keys the runs logged), `columns`
+(hyperparameter columns; default all), `agg` (`final` by default, or `min`,
+`max`, `mean`), `sort` (`metrics` sort on the summary `agg`), and `order`.
+`limit` defaults to 300 runs here. List `metrics`, or leave it out to infer them
+from the runs. Click a column header to sort by it; the arrow shows the current
+order. Run labels are short too (the full ID is in the link tooltip), and they link
+to Results (Shift+click for Logs). If you list `columns` and the run names are just
+one of those values, the run column is dropped and that parameter cell links to the
+run instead, so the same name is not shown twice. Each metric cell's tooltip has
+final/min/max/mean, and `⧉` copies the table as markdown in the order shown.
+
+### Evidence links
+
+Tie a number in prose to the metric it came from:
+
+```md
+Final validation loss was [0.412](mlsweep:baseline/seed0/val_loss@20000), 8% lower.
+```
+
+The note says `baseline/seed0/val_loss@20000`; the tab looks the value up and shows
+✓ when it matches (within 0.5%) and ⚠ when it does not, with the logged value in
+the tooltip. Click opens the experiment's Results. `@` takes a step (the nearest logged
+step at or below it is used), or `final`, `min`, `max`, `mean`, or a percentile
+such as `@50%`. A metric name may contain `/` (`train/loss`); the first two
+segments are the experiment and run. Use it for every number about a run: it is one click of checking
+for the reader. Lint reports references to experiments or runs that do not exist,
+and numbers that do not match the logged value. Elsewhere the link is just a link.
+
+### Footnotes
+
+```md
+One seed is one seed.[^seed]
+
+[^seed]: Repeat with at least three and report the spread.
+  Continuation lines are indented.
+```
+
+Footnotes render at the end of the block that defines them, with a backlink.
+Numbers are counted across the whole note in Live, so a reference and its
+definition can be in different blocks.
+
+### Figures and cross-references
+
+A `Figure:`, `Table:` or `Chart:` line on the line directly below an image or a
+table becomes a caption; a chart or table block's `caption:` does the same.
+Figures and tables are numbered separately, in document order. End a caption with
+`{#fig-name}` to fix its anchor, then link to it from prose as
+`[Figure 2](#fig-name)`.
+
+A heading can fix its own anchor too: `## Results {#results}`, linked as
+`[the results](#results)`.
+
 ### Experiment IDs
 
 Any word that's an experiment ID on this manager becomes a chip with a status dot,
-linking to Results, in text or `inline code`. Inside a fenced block it stays plain but
+linking to Results, in text or `inline code`. The chip shows the experiment's
+display name; hover it for the full ID. Inside a fenced block it stays plain but
 still counts as a citation for backlinks, the citation counts and lint.
 
 ### Run IDs
@@ -324,8 +449,8 @@ line. Nothing reads the values; add them or not.
 ### Code
 
 Fences highlight `python`, `sh`/`bash`/`zsh`/`shell`/`console`, `js`, `ts`, `json`, `yaml`,
-`toml`, `diff`/`patch`, `c`, `cpp`, `cu`/`cuda`, `java` and `md`. Other languages, including
-Rust and Go, show as plain text with their name in the corner.
+`toml`, `diff`/`patch`, `c`, `cpp`, `cu`/`cuda`, `java`, `rs`/`rust`, `go` and `md`. Other
+languages show as plain text with their name in the corner.
 
 ### HTML
 
@@ -339,9 +464,8 @@ that doesn't render.
 
 | Syntax | What happens |
 |---|---|
-| Footnotes, `x[^1]` | not rendered as footnotes; `[^1]: text` is read as a link definition, so `[^1]` becomes a stray link |
 | Pandoc divs, `::: {.cls}` | shown as literal text |
-| Attributes, `# Title {#id .c}` | shown as literal text |
+| Other attributes, `# Title {.c}` | literal text; `{#id}` on a heading or caption is the one exception |
 | Definition lists, citations `[@key]` | literal text |
 | `x^2^` | literal text; use `<sup>` or math |
 | `H~2~O` | single tildes are strikethrough; use `<sub>` or math |
@@ -365,21 +489,27 @@ Three tiers:
    one file is pointed at that file. Nothing else is ever changed for you.
 2. Reports (suspects, for a person or an agent to judge):
    - broken and ambiguous links;
-   - experiment IDs the manager does not know;
+   - experiment IDs the manager does not know, including those in chart/table
+     blocks and `mlsweep:` evidence links, and run IDs it does not know;
+   - malformed chart/table specs and unknown keys;
+   - evidence links whose number does not match the logged metric;
    - leftover conflict markers and empty files.
-3. Judgment is not automated, and that includes numbers. Lint doesn't compare
-   them with logged metrics, so whoever writes a note checks each one with
-   `mlsweep metrics`. `mlsweep notes lint --review-prompt` (or *Copy
-   review prompt* in the tab) prints a brief for a fresh agent: check the notes'
-   claims against the logged metrics and sources, look for contradictions and
-   over-broad conclusions, and write findings to a new file under `reviews/`
-   without editing anything. Give it to an agent that did not write the notes.
+3. Judgment is not automated. Lint checks that an evidence link's experiment and
+   run exist and that the number beside it matches the logged value; it does not
+   decide whether that is the right number to cite, or whether a claim follows
+   from it. Whoever writes a note still reads the curve. `mlsweep notes lint
+   --review-prompt` (or *Copy review prompt* in the tab) prints a brief for a
+   fresh agent: check the notes' claims against the logged metrics and sources,
+   look for contradictions and over-broad conclusions, and write findings to a
+   new file under `reviews/` without editing anything. Give it to an agent that
+   did not write the notes.
 
 Files under `sources/` are originals and are not linted.
 
-The experiment ID check needs the manager (`--manager`, `MLSWEEP_MANAGER`, default
-`http://localhost:7891`, and its token as usual); without it, lint still runs the
-other checks.
+The experiment/run ID and evidence-number checks need the manager (`--manager`,
+`MLSWEEP_MANAGER`, default `http://localhost:7891`, and its token as usual).
+Without it, lint still parses the chart/table specs, checks links and reports
+merge leftovers; it leaves the numbers unchecked.
 
 ## Rules for agents
 
@@ -393,8 +523,9 @@ instructions if you like:
   line or a new note that links to it.
 - `sources/` is read-only except for adding files.
 - Every number about an experiment comes from its logged metrics, and the note
-  names the experiment ID. Check each one with `mlsweep metrics`, and state the
-  conditions (steps, seeds, size).
+  names the experiment and run. Write it as an evidence link so a reader can check
+  it; lint reports a number that disagrees. Plot with a chart block instead of a
+  screenshot, and state the conditions (steps, seeds, size).
 - Record dead ends, with the reason.
 - Keep `STATUS.md` short and readable by someone with no context: what is running, with
   experiment IDs, and what comes next. Read it when you start, and update it before you stop.

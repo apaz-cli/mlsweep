@@ -141,6 +141,7 @@ _ipc_cond = threading.Condition(_lock)
 _ipc_unclaimed = 0
 # How long a finished run's result waits for its loggers' last messages.
 _IPC_DRAIN_TIMEOUT = 10.0
+_IPC_BARRIER = "barrier"  # not a logger message: see _drain_ipc
 
 # Set by main() from CLI args
 _scratch_dir: str = DEFAULT_SCRATCH_DIR
@@ -308,6 +309,16 @@ def _write_thread(conn: ConnState) -> None:
 # ── Read thread (one per connection) ──────────────────────────────────────────
 
 
+def _refuse_connection(conn: ConnState, reason: str) -> None:
+    """Close a connection that failed the hello, and say why on stderr, which the manager relays."""
+    try:
+        peer = conn.sock.getpeername()[0]
+    except OSError:
+        peer = "unknown address"
+    print(f"Refused a connection from {peer}: {reason}", file=sys.stderr, flush=True)
+    conn.send_queue.put(None)
+
+
 def _read_thread(conn: ConnState) -> None:
     """Read protocol messages from a controller connection and dispatch them."""
     # First message must be MsgHello.  Nothing has authenticated yet, so it gets
@@ -324,13 +335,13 @@ def _read_thread(conn: ConnState) -> None:
     try:
         msg = decode(payload)
     except (ValueError, json.JSONDecodeError, TypeError):
-        conn.send_queue.put(None)
+        _refuse_connection(conn, "its first message could not be read")
         return
     if not isinstance(msg, MsgHello):
-        conn.send_queue.put(None)
+        _refuse_connection(conn, "its first message was not a hello")
         return
     if _token and not hmac.compare_digest(str(msg.token).encode(), _token.encode()):
-        conn.send_queue.put(None)
+        _refuse_connection(conn, "its token does not match this worker's --token")
         return
     try:
         conn.sock.settimeout(None)
@@ -802,9 +813,7 @@ def _run_thread(
     )
     # The processes are gone, but their loggers' last metrics may still be unread
     # in the IPC sockets.  Record them before the result, which ends the run.
-    with _ipc_cond:
-        _ipc_cond.wait_for(lambda: state.ipc_conns == 0 and _ipc_unclaimed == 0,
-                           timeout=_IPC_DRAIN_TIMEOUT)
+    _drain_ipc(state)
 
     # Free the workspace (large extracted artifact copy); keep logs and output
     # artifacts.  Done while the run is still in flight, so a newer attempt
@@ -997,6 +1006,7 @@ def _ipc_socket_path(port: int) -> str:
 
 def _ipc_thread(sock_path: str) -> None:
     """Accept connections from training scripts and route metric/sync messages."""
+    global _ipc_unclaimed
     try:
         os.unlink(sock_path)
     except OSError:
@@ -1019,6 +1029,9 @@ def _ipc_thread(sock_path: str) -> None:
                 continue
             except OSError:
                 break
+            # Counted here, not in its thread, so that _drain_ipc's barrier covers it.
+            with _lock:
+                _ipc_unclaimed += 1
             t = threading.Thread(
                 target=_ipc_conn_thread, args=(client,), daemon=True
             )
@@ -1038,8 +1051,6 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
     until it closes, so the run's result is only sent once it has drained.
     """
     global _ipc_unclaimed
-    with _lock:
-        _ipc_unclaimed += 1
     claimed = False
     rs: RunState | None = None
     buf = b""
@@ -1057,6 +1068,9 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
                 try:
                     msg: dict[str, Any] = json.loads(line_bytes)
                 except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == _IPC_BARRIER:
+                    sock.sendall(b"\n")
                     continue
                 if not claimed:
                     with _ipc_cond:
@@ -1080,6 +1094,29 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
             elif rs is not None:
                 rs.ipc_conns -= 1
             _ipc_cond.notify_all()
+
+
+def _drain_ipc(state: RunState) -> None:
+    """Wait until every logger message of this exited run has been handled.
+
+    A logger's connection can still be in the listen backlog after its process
+    exits, with its last metrics in it.  Connections are accepted in order, so
+    once one made now has been answered, all the earlier ones are counted.
+    """
+    deadline = time.monotonic() + _IPC_DRAIN_TIMEOUT
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as barrier:
+            barrier.settimeout(_IPC_DRAIN_TIMEOUT)
+            barrier.connect(_ipc_sock_path)
+            barrier.sendall(json.dumps({"type": _IPC_BARRIER}).encode() + b"\n")
+            barrier.recv(1)
+    except OSError:
+        pass  # not listening, so there's nothing to wait for
+    with _ipc_cond:
+        _ipc_cond.wait_for(
+            lambda: state.ipc_conns == 0 and _ipc_unclaimed == 0,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
 
 
 def _ipc_run_state_locked(msg: dict[str, Any]) -> RunState | None:

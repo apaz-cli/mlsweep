@@ -16,12 +16,13 @@ Three tiers, after the karpathy-llm-wiki pattern:
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from mlsweep import _notes
+from mlsweep import _notes, _notes_blocks
 from mlsweep._notes_git import read_config
 from mlsweep._notes_rules import is_protected
 
@@ -44,11 +45,18 @@ KIND_TITLES = {
     "broken-link": "Broken links",
     "ambiguous-link": "Ambiguous links",
     "unknown-experiment": "Unknown experiment IDs",
+    "unknown-run": "Unknown run IDs",
+    "block-spec": "Chart and table specs",
+    "evidence-ref": "Evidence links",
+    "stale-evidence": "Evidence numbers that do not match",
     "conflict-marker": "Leftover conflict markers",
     "empty-file": "Empty files",
 }
 
 _CONFLICT_RE = re.compile(r"^(<{7}|={7}|>{7})( |$)")
+_FENCE_OPEN_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`]*)")
+_EVIDENCE_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(\s*<?mlsweep:([^()\s<>]+)>?\s*\)")
+_CLAIM_NUM_CLEAN = re.compile(r"[^0-9eE+.\-]")
 
 
 def _check_conflict_markers(path: str, text: str, findings: list[Finding]) -> None:
@@ -60,11 +68,166 @@ def _check_conflict_markers(path: str, text: str, findings: list[Finding]) -> No
                                     "leftover merge conflict marker"))
 
 
+def _fences(text: str) -> list[tuple[str, str, int]]:
+    """``(language, body, 1-based line)`` for every fenced block in *text*."""
+    out: list[tuple[str, str, int]] = []
+    lines = text.split("\n")
+    fence: str | None = None
+    lang, start = "", 0
+    body: list[str] = []
+    for i, line in enumerate(lines):
+        if fence is not None:
+            stripped = line.strip()
+            if stripped.startswith(fence) and stripped.replace(fence[0], "") == "":
+                out.append((lang, "\n".join(body), start + 1))
+                fence, body = None, []
+            else:
+                body.append(line)
+            continue
+        m = _FENCE_OPEN_RE.match(line)
+        if m:
+            fence, lang, start, body = m.group(1), m.group(2).lower(), i, []
+    return out
+
+
+def _claimed_number(text: str) -> float | None:
+    """The number a link displays, read the same way the Notes tab reads it."""
+    cleaned = _CLAIM_NUM_CLEAN.sub("", text.replace(",", ""))
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _check_blocks(
+    path: str, text: str, known_experiments: set[str] | None,
+    known_runs: dict[str, list[str]] | None,
+    evidence: dict[str, dict[str, Any]] | None,
+    findings: list[Finding],
+) -> int:
+    """Check chart/table specs and ``mlsweep:`` evidence links.  Returns the block count."""
+    count = 0
+    for lang, body, line_no in _fences(text):
+        kind = {"mlsweep-chart": "chart", "mlsweep-table": "table"}.get(lang)
+        if kind is None:
+            continue
+        count += 1
+        try:
+            spec, warnings = _notes_blocks.normalize_spec(body, kind)
+        except _notes_blocks.SpecError as exc:
+            findings.append(Finding("report", "block-spec", path, line_no, f"{lang}: {exc}"))
+            continue
+        for warning in warnings:
+            findings.append(Finding("report", "block-spec", path, line_no, f"{lang}: {warning}"))
+        if known_experiments is None:
+            continue
+        for exp in spec.get("experiments") or []:
+            if exp not in known_experiments and not _notes.GENERATED_EXP_ID_RE.fullmatch(exp):
+                findings.append(Finding(
+                    "report", "unknown-experiment", path, line_no,
+                    f"`{exp}` in a {kind} block is not an experiment on this manager",
+                    {"id": exp, "block": kind}))
+        for ref in spec.get("runs") or []:
+            exp, run = ref.split("/", 1) if "/" in ref else (None, ref)
+            if (exp is not None and exp not in known_experiments
+                    and not _notes.GENERATED_EXP_ID_RE.fullmatch(exp)):
+                findings.append(Finding(
+                    "report", "unknown-experiment", path, line_no,
+                    f"`{exp}` in a {kind} block is not an experiment on this manager",
+                    {"id": exp, "block": kind}))
+            if known_runs is None:
+                continue
+            owners = known_runs.get(run)
+            if not owners:
+                findings.append(Finding("report", "unknown-run", path, line_no,
+                                        f"`{ref}` names no run on this manager", {"id": ref}))
+            elif exp is not None and exp not in owners:
+                findings.append(Finding(
+                    "report", "unknown-run", path, line_no,
+                    f"run `{run}` belongs to {', '.join(owners)}, not `{exp}`",
+                    {"id": run, "experiments": owners}))
+
+    mask = _notes.code_mask(text)
+    for i, raw_line in enumerate(text.split("\n")):
+        if mask[i]:
+            continue
+        line = _notes.strip_inline_code(raw_line)
+        for m in _EVIDENCE_LINK_RE.finditer(line):
+            link_text, raw = m.group(1), m.group(2)
+            try:
+                exp, run, _metric, _at = _notes_blocks.parse_evidence_ref(raw)
+            except _notes_blocks.SpecError as exc:
+                findings.append(Finding("report", "evidence-ref", path, i + 1,
+                                        f"mlsweep:{raw}: {exc}", {"ref": raw}))
+                continue
+            if known_experiments is not None and exp not in known_experiments:
+                findings.append(Finding(
+                    "report", "unknown-experiment", path, i + 1,
+                    f"evidence link names `{exp}`, which is not on this manager",
+                    {"id": exp}))
+                continue
+            if evidence is not None:
+                hit = evidence.get(raw)
+                got = hit.get("value") if hit and hit.get("ok") else None
+                claimed = _claimed_number(link_text)
+                if (isinstance(got, (int, float)) and not isinstance(got, bool)
+                        and claimed is not None):
+                    tolerance = max(abs(float(got)) * 0.005, 0.005)
+                    if abs(float(got) - claimed) > tolerance:
+                        findings.append(Finding(
+                            "report", "stale-evidence", path, i + 1,
+                            f"note says {link_text.strip()} but this run logged {float(got):.6g}",
+                            {"ref": raw, "claimed": claimed, "value": float(got),
+                             "step": hit.get("step") if hit else None}))
+            if known_runs is None:
+                continue
+            owners = known_runs.get(run)
+            if not owners:
+                findings.append(Finding("report", "evidence-ref", path, i + 1,
+                                        f"evidence link names run `{run}`, which does not exist",
+                                        {"ref": raw}))
+            elif exp not in owners:
+                findings.append(Finding(
+                    "report", "evidence-ref", path, i + 1,
+                    f"run `{run}` belongs to {', '.join(owners)}, not `{exp}`",
+                    {"ref": raw, "experiments": owners}))
+    return count
+
+
+def evidence_refs(index: _notes.Index, root: str | Path) -> list[str]:
+    """Every ``mlsweep:`` reference in the notes, in order, without duplicates.
+
+    Callers resolve these (the manager's metrics, or ``/api/notes/evidence``)
+    and pass the result back so lint can check the numbers themselves.
+    """
+    protected = read_config(Path(root).resolve())["protected"]
+    refs: list[str] = []
+    for path, text in index.texts.items():
+        if is_protected(path, protected):
+            continue
+        mask = _notes.code_mask(text)
+        for i, raw_line in enumerate(text.split("\n")):
+            if mask[i]:
+                continue
+            for m in _EVIDENCE_LINK_RE.finditer(_notes.strip_inline_code(raw_line)):
+                ref = m.group(2)
+                if ref not in refs:
+                    refs.append(ref)
+    return refs
+
+
 def lint(root: str | Path, *, known_experiments: set[str] | None = None,
+         known_runs: dict[str, list[str]] | None = None,
+         evidence: dict[str, dict[str, Any]] | None = None,
          index: _notes.Index | None = None) -> dict[str, Any]:
     """Run tiers 1 and 2 over *root*.  Returns ``{"findings": [...], "stats": {...}}``.
 
-    *known_experiments* enables the unknown-ID check.
+    *known_experiments* enables the unknown-ID check; *known_runs* (run ID ->
+    experiments) also checks run IDs and chart/table blocks.  *evidence* maps
+    resolved references to values, enabling the stale-number check.
     """
     root = Path(root).resolve()
     known = known_experiments or set()
@@ -125,6 +288,13 @@ def lint(root: str | Path, *, known_experiments: set[str] | None = None,
                                             f"{m.group(0)} is not an experiment on this manager",
                                             {"id": m.group(0)}))
 
+    # ── chart/table blocks and evidence links ──
+    blocks = 0
+    for path, text in index.texts.items():
+        if not skip(path):
+            blocks += _check_blocks(path, text, known_experiments, known_runs,
+                                    evidence, findings)
+
     # ── merge leftovers ──
     for path, text in index.texts.items():
         if not skip(path):
@@ -137,7 +307,11 @@ def lint(root: str | Path, *, known_experiments: set[str] | None = None,
     stats = {"files": len(index.files), "notes": len(index.texts),
              "links": sum(len(v) for v in index.links.values()),
              "experiments_cited": len(index.cited()),
-             "experiments_checked": known_experiments is not None}
+             "data_blocks": blocks,
+             "experiments_checked": known_experiments is not None,
+             "runs_checked": known_runs is not None,
+             "evidence_checked": evidence is not None,
+             "evidence_refs": len(evidence or {})}
     return {"findings": [f.as_dict() for f in findings], "stats": stats,
             "kinds": KIND_TITLES}
 
@@ -206,6 +380,11 @@ change. Say plainly when something checked out. Then stop.
 
 Mechanical lint report:
 {report}
+
+Chart/table blocks and evidence links (`[0.42](mlsweep:EXP/RUN/metric@step)`)
+were checked for unknown experiments and runs, and each evidence number was
+compared with the logged metric. A stale-evidence finding means they disagree;
+still judge whether the number is the right one to cite.
 """
 
 
@@ -228,7 +407,8 @@ def format_report(result: dict[str, Any]) -> str:
     s = result.get("stats", {})
     out.append(f"{s.get('notes', 0)} notes, {s.get('links', 0)} links, "
                f"{s.get('experiments_cited', 0)} experiments cited"
-               + ("" if s.get("experiments_checked") else "; experiment IDs not checked (no manager)"))
+               + (f", {s['data_blocks']} chart/table blocks" if s.get("data_blocks") else "")
+               + ("" if s.get("experiments_checked") else "; experiment and run IDs not checked (no manager)"))
     return "\n".join(out)
 
 

@@ -37,7 +37,7 @@ from typing import Any
 
 from aiohttp import BodyPartReader, web
 
-from mlsweep import _notes, _notes_git, _notes_lint, _notes_rules
+from mlsweep import _notes, _notes_blocks, _notes_git, _notes_lint, _notes_rules
 from mlsweep._manager_db import list_experiment_meta, list_run_ids
 from mlsweep._manager_http import (
     DB_KEY,
@@ -492,6 +492,8 @@ async def notes_upload(request: web.Request) -> web.Response:
         return _error_response(str(exc))
     cfg = await asyncio.to_thread(_notes_git.read_config, svc.root)
     limit = min(_notes.MAX_UPLOAD_BYTES, int(cfg["max_file_mb"] * 1024 * 1024))
+    if not request.content_type.startswith("multipart/"):
+        return _error_response("expected a multipart upload with a 'file' field")
     reader = await request.multipart()
     saved: list[str] = []
     while True:
@@ -668,8 +670,14 @@ async def notes_commit(request: web.Request) -> web.Response:
 
 async def _run_lint(request: web.Request, svc: NotesService) -> dict[str, Any]:
     known = set(await _known_experiments(request))
+    runs = await _known_runs(request)
     idx = await svc.index(known)
-    return await asyncio.to_thread(_notes_lint.lint, svc.root, known_experiments=known, index=idx)
+    # Resolve evidence links first, in this event loop, so the thread that walks
+    # the folder can compare each claimed number with the logged metric.
+    refs = await asyncio.to_thread(_notes_lint.evidence_refs, idx, svc.root)
+    evidence = await _notes_blocks.resolve_evidence_many(request.config_dict[DB_KEY], refs)
+    return await asyncio.to_thread(_notes_lint.lint, svc.root, known_experiments=known,
+                                   known_runs=runs, evidence=evidence, index=idx)
 
 
 @notes_routes.get("/api/notes/lint")
@@ -706,6 +714,55 @@ async def notes_review_prompt(request: web.Request) -> web.Response:
 async def notes_experiment_ids(request: web.Request) -> web.Response:
     """Every experiment ID, for ``mlsweep notes`` commands on other machines."""
     return _json_response({"known": sorted(await _known_experiments(request))})
+
+
+@notes_routes.get("/api/notes/run-ids")
+async def notes_run_ids(request: web.Request) -> web.Response:
+    """Every run ID and the experiments that use it, for ``mlsweep notes lint``."""
+    return _json_response({"runs": await _known_runs(request)})
+
+
+# ── data-backed markdown blocks ───────────────────────────────────────────────
+
+
+@notes_routes.post("/api/notes/block")
+async def notes_block(request: web.Request) -> web.Response:
+    """Evaluate a ``mlsweep-chart`` or ``mlsweep-table`` block against the metrics.
+
+    The note sends the block's spec exactly as it is written, so the dashboard
+    and ``mlsweep notes lint`` share this parser.
+    """
+    _service(request)
+    body = await _json_body(request)
+    kind = body.get("kind")
+    raw = body.get("spec")
+    if kind not in ("chart", "table"):
+        raise _bad_request("kind must be 'chart' or 'table'")
+    if not isinstance(raw, str):
+        raise _bad_request("spec must be the block's text")
+    if len(raw.encode("utf-8", "replace")) > _notes_blocks.MAX_SPEC_BYTES:
+        raise _bad_request("spec is too large")
+    db = request.config_dict[DB_KEY]
+    try:
+        result = (await _notes_blocks.build_chart(db, raw) if kind == "chart"
+                  else await _notes_blocks.build_table(db, raw))
+    except _notes_blocks.SpecError as exc:
+        raise _bad_request(str(exc)) from None
+    return _json_response(result)
+
+
+@notes_routes.post("/api/notes/evidence")
+async def notes_evidence(request: web.Request) -> web.Response:
+    """Resolve ``[number](mlsweep:EXP/RUN/METRIC@STEP)`` links for a note."""
+    _service(request)
+    body = await _json_body(request)
+    refs = body.get("refs")
+    if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+        raise _bad_request("refs must be a list of strings")
+    if len(refs) > _notes_blocks.MAX_EVIDENCE_REFS:
+        raise _bad_request(f"at most {_notes_blocks.MAX_EVIDENCE_REFS} references at once")
+    results = await _notes_blocks.resolve_evidence_many(request.config_dict[DB_KEY], refs)
+    return _json_response({"results": results})
 
 
 # ── the git remote ─────────────────────────────────────────────────────────────

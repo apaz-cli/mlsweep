@@ -400,7 +400,7 @@ Use `"decreasing"` when your values are naturally written largest-first and you 
 
 Both examples above produce identical behavior. The choice is purely about which order is more natural to write.
 
-The manager applies both rules whenever a run finishes. Jobs still pending that a rule makes unnecessary are marked `xfailed` and never run. Jobs already running are left to finish, so the fewer that run at once (`--max-concurrent`, or fewer GPUs), the more skipping saves. Skipping applies to grid sweeps; Bayesian sweeps handle `singular` themselves.
+The manager applies both rules whenever a run finishes. Jobs still pending that a rule makes unnecessary are marked `xfailed` and never run. Jobs already running are left to finish, so the fewer that run at once (`--max-concurrent`, or fewer GPUs), the more skipping saves. Skipping applies to grid sweeps. See [Singular dims in bayes mode](#singular-dims-in-bayes-mode) for Bayesian sweeps.
 
 ## Singular Skipping (Skip on Success)
 
@@ -434,8 +434,8 @@ OPTIMIZE = {
     "method": "bayes",       # "grid" (default) or "bayes"
     "metric": "val_loss",    # metric name logged via MLSweepLogger
     "goal": "minimize",      # "minimize" or "maximize"
-    "budget": 50,            # number of successful lex evaluations to run
-    "n_initial": 5,          # random combos before TPE takes over (default: max(8, n_params*2))
+    "budget": 50,            # how many trials need results
+    "n_initial": 5,          # random trials before TPE takes over (default: max(8, n_params*2))
 }
 ```
 
@@ -446,10 +446,37 @@ OPTIMIZE = {
 | `method` | no | `"grid"` (default) or `"bayes"` |
 | `metric` | yes (bayes) | Metric name to optimize (must be logged via `MLSweepLogger`) |
 | `goal` | yes (bayes) | `"minimize"` or `"maximize"` |
-| `budget` | yes (bayes) | Number of successful lex evaluations to run |
-| `n_initial` | no | Number of random combos before TPE starts using results. Default: `max(8, n_params * 2)`. These runs count toward `budget`. |
+| `budget` | yes (bayes) | How many trials need results. A trial is one combo of the non-singular dims. Failed trials don't count. |
+| `n_initial` | no | Number of random trials before TPE starts using results. Default: `max(8, n_params * 2)`. These count toward `budget`. Also how many trials run at once, unless `--max-concurrent` is set. |
+| `max_failures` | no | Failed trials in a row before the manager pauses the sweep. Default: `max(3, n_initial)`. |
 
-Submit with `--stream` for adaptive sampling. That process chooses each run from the results so far and submits them one at a time, so it has to stay alive. Without `--stream`, the whole budget is submitted up front with no results to learn from. If the process dies, running runs finish but no new ones start. `mlsweep resume EXP --sweep FILE --stream` restores the earlier results, counts runs still active, and continues.
+### How a Bayesian sweep runs
+
+The manager runs the sweep, so `mlsweep run` submits it and exits. The sweep keeps going if your terminal closes or the manager restarts. `--stream` only watches.
+
+The sweep's options and job settings are stored with the experiment. Each time a result comes in, the manager chooses new trials from all the results so far and queues their runs. It keeps up to `--max-concurrent` trials going, or `n_initial` if that isn't set. Fewer at once means each trial learns from more results. So `--max-concurrent 1` is fully sequential, and a high value is closer to random search.
+
+The sweep completes when `budget` trials have results and no runs are left, or when a small discrete search space has no untried combos left.
+
+A trial fails if its runs all fail, or if they finish without logging `metric`. Its value is the best value of `metric` the run logged. After `max_failures` failed trials in a row, the manager pauses the sweep and cancels its queued runs, so a broken script or a misspelled metric can't use the cluster forever. `mlsweep optimize EXP` shows the reason. Fix what you can and `mlsweep unpause EXP` to try again. To run changed code, submit a new sweep.
+
+OPTIONS values must be plain JSON (strings, numbers, booleans, `None`, lists and dicts), since the manager stores them. `EXCLUDE` is a Python function, so it does not apply to Bayesian sweeps. `--append` is refused for them.
+
+### Controlling a Bayesian sweep
+
+| Do this | With | What happens |
+|---------|------|--------------|
+| See where it stands | `mlsweep optimize EXP` | Budget used, trials running and failed, the best run. `--json` for scripts. |
+| Change the budget | `mlsweep optimize EXP --budget N` or `+N` | Takes effect on the next trial. A completed sweep with budget left runs again. Lowering it leaves existing runs alone. |
+| End it gently | `mlsweep optimize EXP --finish` | No new trials. Runs already queued or running end, then the sweep completes. `--budget` undoes this. |
+| Change how many run at once | `mlsweep optimize EXP --max-concurrent K` | Raising it starts more trials now. Lowering it lets running runs finish. |
+| Hold it | `mlsweep pause EXP`, `mlsweep unpause EXP` | While paused, no new runs start and no new trials are chosen. Running runs finish. |
+| Drop one trial | `mlsweep cancel EXP RUN` | The run stops, it doesn't use budget, and the manager chooses another trial. |
+| End it now | `mlsweep stop EXP --yes` | Every unfinished run is cancelled. `mlsweep resume EXP` starts it choosing trials again. |
+
+`mlsweep retry EXP RUN` works as usual. The rerun's result replaces the old one when it finishes. Purging or moving a run takes its trial out of the count, so a completed sweep needs `--budget` to replace it.
+
+`mlsweep wait` and `mlsweep fetch --wait` wait until the manager completes, pauses or stops the sweep. The same controls are available over HTTP as `GET` and `PATCH /api/experiments/{id}/optimize`.
 
 ### Continuous dimensions
 
@@ -523,7 +550,7 @@ Subdims become conditional optuna parameters — when `muon` is selected, `lr_sc
 
 ### Singular dims in bayes mode
 
-Singular dims (hardware constraints like batch size) work identically in bayes mode. The optimizer only sees non-singular dim values; for each optimizer suggestion, the full singular probe sequence is generated into `pending`. The existing singular locking and deferral logic runs completely unchanged.
+Singular dims (hardware constraints like batch size) must list their `values`. The optimizer sees only the other dims. Each trial queues one run per singular value, all at once, and they may run together. A trial's result comes from the first run to log the metric, and the runs that failed are marked `xfailed`. Unlike in a grid sweep, the other probes of a trial are not skipped once one succeeds, so a trial can use up to one run per singular value.
 
 ```python
 OPTIMIZE = {"method": "bayes", "metric": "val_loss", "goal": "minimize", "budget": 30}
@@ -541,7 +568,7 @@ OPTIONS = {
 
 ### Run naming in bayes mode
 
-Bayes runs are named `{sweep_name}_bayes_{N:04d}` — globally sequential across all dispatched runs including singular probes. Combo values are stored in `sweep_status.json` and `sweep_manifest.json` as usual.
+Bayes runs are named `{sweep_name}_bayes_{N:04d}`, numbered in order across all the experiment's runs, singular probes included. Each run's combo is stored with its job, and `mlsweep ls EXP` shows it.
 
 ### Full example
 
@@ -696,7 +723,7 @@ mlsweep wait EXP --until stalled --stalled-after 900
 | `5` | No failures, but some runs were cancelled or the sweep was stopped, so the results are partial. |
 
 `--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs
-stuck in `pending`. A Bayesian sweep with budget left is not settled, even with no active runs.
+stuck in `pending`. A running Bayesian sweep is not settled, even with no active runs, because the manager is about to add more.
 
 `--interval` controls the poll period (default `10` seconds). `mlsweep fetch
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
@@ -802,7 +829,8 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `metrics` | Print runs' logged metrics as tables, fetched on demand. `--keys REGEX` selects keys; `--pivot` turns keys into rows using the regex's capture group (e.g. `val/nll@r(\d+)` becomes value vs. r, one column per run); `--step`, `--tail` (table view only), `--json`, `--csv`. |
 | `cancel <exp_id>` | Cancel runs (`--running` / `--pending` / run IDs / `--all`). |
 | `retry <exp_id>` | Re-queue finished runs (`--failed` / `--cancelled` / run IDs) with the code submitted with the experiment. Each gets a fresh `--max-retries` budget. |
-| `resume <exp_id>` | Re-queue failed and cancelled runs, with the same code. With `--sweep FILE`, continue a Bayesian sweep (add `--stream` to stay adaptive). It does not undo `pause`. |
+| `resume <exp_id>` | Re-queue failed and cancelled runs, with the same code. A Bayesian sweep instead goes back to running, and the manager chooses new trials. It does not undo `pause`. |
+| `optimize <exp_id>` | Show or adjust a Bayesian sweep (`--budget N`, `--budget +N`, `--finish`, `--max-concurrent K`, `--max-failures N`, `--json`). See [Controlling a Bayesian sweep](#controlling-a-bayesian-sweep). |
 | `stop <exp_id>` | Abort a sweep (requires `--yes`). Every unfinished run is cancelled. |
 | `pause <exp_id>` | Stop dispatching new jobs. |
 | `unpause <exp_id>` | Resume dispatching. |
@@ -845,11 +873,10 @@ Every subcommand that talks to the manager takes `--campaign NAME` and
 | `--output-dir <dir>` | Directory for local submit-side artifacts (submit log + manifest). Default: `~/.mlsweep/submissions`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. A name already in use is refused unless you pass `--append`. |
 | `--append` | Add this sweep's runs to the existing experiment named by `--experiment`. Run names must not clash with its runs. |
-| `--resume <id>` | Resume a Bayesian sweep experiment by ID. |
 | `--campaign <name>` | Campaign to submit under (env: `MLSWEEP_CAMPAIGN`, default: `default`). |
-| `--all-campaigns` | With `--resume`, find the experiment in any campaign. Refused for a new sweep. |
+| `--all-campaigns` | Refused for a new sweep. |
 | `--priority N` | Job priority — higher values run sooner (default: 0). |
-| `--stream` | Subscribe to the manager's WebSocket event stream for live terminal status. |
+| `--stream` | Watch live status in the terminal over the manager's WebSocket event stream. The sweep doesn't depend on it. |
 | `--fetch` | Fetch and display results after submission (when `--stream` is not used). |
 | `--dry-run` | Print the commands that would be executed without running them. |
 | `--validate` | Validate sweep config, print all combinations, and exit (no jobs submitted). |

@@ -1,16 +1,48 @@
-"""Bayesian optimization backend (optuna TPE) for mlsweep."""
+"""Choosing Bayesian trials with optuna TPE.
+
+``suggest`` keeps nothing between calls.  It rebuilds a study from the trials so
+far, which the manager reads from its jobs table.  So a restart, a retried run or
+a purged run can't leave an optimizer out of step with the database.  Rebuilding
+is cheap: 500 past trials take about 15 ms to add and 7 ms to ask from.
+"""
 
 import itertools
-import re
 import warnings
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import optuna
 import optuna.exceptions
 from optuna.samplers import TPESampler
+from optuna.trial import FixedTrial, TrialState, create_trial
+
+from mlsweep._sweep import lex_key, options_from_wire, singular_dims, validate_options
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+
+# How many samples to draw looking for one new combo, before calling a discrete
+# search space used up.  A continuous dim never repeats, so this is only ever
+# reached when few combos are left.
+_MAX_DRAWS_PER_TRIAL = 50
+
+TrialOutcome = Literal["complete", "failed", "running", "abandoned"]
+
+_OPTUNA_STATE: dict[TrialOutcome, TrialState] = {
+    "complete": TrialState.COMPLETE,
+    "failed": TrialState.FAIL,
+    "abandoned": TrialState.FAIL,
+    "running": TrialState.RUNNING,
+}
+
+
+@dataclass
+class PastTrial:
+    """A trial the study should know about.  *value* is set only if complete."""
+
+    combo: dict[str, Any]
+    outcome: TrialOutcome
+    value: float | None = None
 
 
 def _build_lex_combo(
@@ -154,117 +186,61 @@ def _expand_singular_probes(
     return variations, counter
 
 
-class BayesianOptimizer:
-    """TPE-based Bayesian optimizer for mlsweep sweeps.
+def suggest(
+    spec: dict[str, Any],
+    history: list[PastTrial],
+    n: int,
+    next_number: int = 1,
+) -> list[dict[str, Any]]:
+    """Choose up to *n* new trials given *history*, and return their runs.
 
-    Manages an optuna study, mapping lex combo suggestions to variations
-    (including singular probe expansion) and recording results back to optuna.
+    *spec* is the sweep's ``optimize`` spec.  A trial becomes one run, or one per
+    singular probe, numbered from *next_number*.  Combos already tried are not
+    tried again, except abandoned ones.  So this returns fewer than *n* trials
+    when a discrete search space is nearly used up.
     """
+    options = options_from_wire(spec["options"])
+    validate_options(options, method="bayes")
+    singular = singular_dims(options)
+    lex_options = {k: v for k, v in options.items() if not v.get("singular")}
+    singular_options = {k: v for k, v in options.items() if v.get("singular")}
 
-    def __init__(
-        self,
-        sweep_name: str,
-        options: dict[str, Any],
-        optimize_cfg: dict[str, Any],
-        extra_flags: list[str] | None = None,
-    ) -> None:
-        self._optuna = optuna
-        self._sweep_name = sweep_name
-        self._budget: int = optimize_cfg["budget"]
-        self._goal: str = optimize_cfg["goal"]
-        self._options = options
-        self._extra_flags: list[str] = list(extra_flags or [])
-        self._lex_options = {k: v for k, v in options.items() if not v.get("singular")}
-        self._singular_options = {k: v for k, v in options.items() if v.get("singular")}
-        n_lex_dims = sum(
-            1 for v in self._lex_options.values()
-            if v.get("_values") != [None]
-        )
-        n_initial = optimize_cfg.get("n_initial") or max(8, 2 * n_lex_dims)
-        self.n_initial: int = min(n_initial, self._budget)
-        direction = "minimize" if self._goal == "minimize" else "maximize"
-        self._study: Any = optuna.create_study(
-            direction=direction,
-            sampler=TPESampler(multivariate=True, group=True, n_startup_trials=self.n_initial),
-        )
-        self._lex_key_to_trial: dict[tuple[Any, ...], Any] = {}
-        self._told: int = 0
-        self._run_counter: int = 1  # 1-based so names start at _bayes_0001
+    # constant_liar keeps trials asked at the same time from landing on one spot.
+    study = optuna.create_study(
+        direction="minimize" if spec["goal"] == "minimize" else "maximize",
+        sampler=TPESampler(multivariate=True, group=True, constant_liar=True,
+                           n_startup_trials=min(spec["n_initial"], spec["budget"])),
+    )
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for past in history:
+        fixed = FixedTrial({k: v for k, v in past.combo.items() if k not in singular and v is not None})
+        try:
+            _build_lex_combo(fixed, lex_options)
+        except ValueError:
+            continue  # a run that isn't one of these trials, added to the experiment by hand
+        study.add_trial(create_trial(
+            params=fixed.params, distributions=fixed.distributions,
+            state=_OPTUNA_STATE[past.outcome], value=past.value,
+        ))
+        if past.outcome != "abandoned":
+            seen.add(lex_key(past.combo, singular))
 
-    def suggest(self, n: int = 1) -> list[dict[str, Any]]:
-        """Ask optuna for n lex combos and expand each into singular probe variations."""
-        all_vars: list[dict[str, Any]] = []
-        for _ in range(n):
-            if self.exhausted:
+    variations: list[dict[str, Any]] = []
+    counter = next_number
+    for _ in range(n):
+        for _ in range(_MAX_DRAWS_PER_TRIAL):
+            trial = study.ask()
+            lex_combo, lex_flags = _build_lex_combo(trial, lex_options)
+            key = lex_key(lex_combo, singular)
+            if key not in seen:
                 break
-            trial = self._study.ask()
-            lex_combo, lex_flags = _build_lex_combo(trial, self._lex_options)
-            lex_key = tuple(lex_combo[k] for k in sorted(lex_combo))
-            self._lex_key_to_trial[lex_key] = trial
-            probe_vars, self._run_counter = _expand_singular_probes(
-                self._sweep_name, lex_combo, lex_flags,
-                self._singular_options, self._options,
-                self._extra_flags, self._run_counter,
-            )
-            all_vars.extend(probe_vars)
-        return all_vars
-
-    def tell(self, combo: dict[str, Any], metric_value: float | None) -> None:
-        """Report a result back to optuna. metric_value=None counts as a failure."""
-        singular_names = {k[1:] for k in self._singular_options}
-        lex_key = tuple(combo[k] for k in sorted(combo) if k not in singular_names)
-        trial = self._lex_key_to_trial.pop(lex_key, None)
-        if trial is None:
-            return
-        if metric_value is None:
-            self._study.tell(trial, state=self._optuna.trial.TrialState.FAIL)
+            study.tell(trial, state=TrialState.FAIL)  # a repeat: never run, so nothing learned
         else:
-            self._study.tell(trial, metric_value)
-            self._told += 1
-
-    def _adopt(self, combo: dict[str, Any]) -> None:
-        """Make a trial for a combo submitted before this process started, so tell() can count it."""
-        singular_names = {k[1:] for k in self._singular_options}
-        self._study.enqueue_trial({k: v for k, v in combo.items()
-                                   if k not in singular_names and v is not None})
-        trial = self._study.ask()
-        lex_combo, _ = _build_lex_combo(trial, self._lex_options)
-        self._lex_key_to_trial[tuple(lex_combo[k] for k in sorted(lex_combo))] = trial
-
-    def restore(
-        self,
-        finished: list[tuple[dict[str, Any], float | None]],
-        active: list[dict[str, Any]],
-        run_ids: list[str],
-    ) -> int:
-        """Rebuild state from an experiment's earlier runs, for resuming a sweep.
-
-        *finished* holds each finished run's (combo, best metric or None), *active* the combos
-        still queued or running, *run_ids* every run ID it has, so new names don't collide.
-        Sibling singular probes count once, as they do live.  Returns how many lex combos are
-        still active.
-        """
-        singular_names = {k[1:] for k in self._singular_options}
-
-        def key(combo: dict[str, Any]) -> tuple[Any, ...]:
-            return tuple(str(combo[k]) for k in sorted(combo) if k not in singular_names)
-
-        results: dict[tuple[Any, ...], tuple[dict[str, Any], float | None]] = {}
-        for combo, value in finished:
-            if key(combo) not in results or results[key(combo)][1] is None:
-                results[key(combo)] = (combo, value)
-        for combo, value in results.values():
-            self._adopt(combo)
-            self.tell(combo, value)
-        waiting = {key(c): c for c in active if key(c) not in results}
-        for combo in waiting.values():
-            self._adopt(combo)
-        for run_id in run_ids:
-            m = re.search(r"_bayes_(\d+)$", run_id)
-            if m:
-                self._run_counter = max(self._run_counter, int(m.group(1)) + 1)
-        return len(waiting)
-
-    @property
-    def exhausted(self) -> bool:
-        return self._told >= self._budget
+            return variations
+        seen.add(key)
+        probes, counter = _expand_singular_probes(
+            spec["sweep_name"], lex_combo, lex_flags, singular_options, options,
+            spec["extra_flags"], counter,
+        )
+        variations.extend(probes)
+    return variations

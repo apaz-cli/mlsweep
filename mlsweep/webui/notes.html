@@ -16,6 +16,7 @@
   --ok: #2ca02c; --warn: #e07b00; --bad: #d62728;
   --add-bg: #2ca02c1c; --add-fg: #1f7a1f; --del-bg: #d627281c; --del-fg: #b02020;
   --tok-kw: #8a3fbf; --tok-str: #2a7a2a; --tok-num: #b35c00; --tok-com: #999; --tok-def: #1a56c4; --tok-head: #222; --tok-link: #1a56c4;
+  --tok-foot: #8a6d00; --tok-tag: #0f766e; --tok-evidence: #2a7a2a; --tok-table: #8a8a8a;
 }
 [data-theme=dark] {
   --accent: #82b4f0; --accent-soft: #4c9be81f;
@@ -23,6 +24,7 @@
   --ok: #5cd65c; --warn: #f0a030; --bad: #ff6b6b;
   --add-bg: #5cd65c18; --add-fg: #7ee07e; --del-bg: #ff6b6b18; --del-fg: #ff8a8a;
   --tok-kw: #c792ea; --tok-str: #a5d6a7; --tok-num: #f7b267; --tok-com: #6b6b6b; --tok-def: #82b4f0; --tok-head: #e8e8e8; --tok-link: #82b4f0;
+  --tok-foot: #e5c07b; --tok-tag: #56d4c4; --tok-evidence: #7ee07e; --tok-table: #8a8a8a;
 }
 
 body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -46,14 +48,14 @@ body.right-collapsed #right, body.right-collapsed #resize-right { display: none;
 #center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--doc-bg); }
 
 /* ── Left: header, tabs, panes ───────────────────────────────────────────── */
-#left-head { display: flex; align-items: center; gap: 6px; padding: 8px 10px 6px 12px; flex-shrink: 0; }
+#left-head { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px 0 12px; flex-shrink: 0; }
 #vault-name { font-size: 12px; font-weight: 700; color: var(--text-strong); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #vault-name .branch { font-weight: 500; color: var(--text-muted); font-size: 10px; margin-left: 4px; font-family: ui-monospace, monospace; }
 .icon-btn { flex-shrink: 0; width: 26px; height: 26px; background: transparent; border: 1px solid transparent; border-radius: 4px; cursor: pointer; color: var(--text-dim); display: inline-flex; align-items: center; justify-content: center; }
 .icon-btn:hover { background: var(--btn-hover); color: var(--text); }
 .icon-btn.on { background: var(--radio-checked-bg); color: var(--radio-checked-color); border-color: var(--radio-checked-border); }
 .icon-btn svg { width: 15px; height: 15px; display: block; }
-#left-tabs { display: flex; gap: 2px; padding: 0 8px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+#left-tabs { display: flex; align-items: center; gap: 2px; height: 36px; padding: 0 8px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .ltab { flex: 1; font-size: 11px; padding: 4px 0; border: 1px solid transparent; border-radius: 4px; background: none; color: var(--btn-text); cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 4px; }
 .ltab:hover { background: var(--btn-hover); }
 .ltab.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
@@ -241,6 +243,60 @@ body.wide-doc .doc { max-width: none; }
 .doc .callout.c-example { --c-border: #7f6fd055; --c-bg: #7f6fd012; --c-fg: #9d8ff0; }
 .doc .callout.c-todo, .doc .callout.c-idea, .doc .callout.c-hint, .doc .callout.c-tip { --c-border: #17becf55; --c-bg: #17becf10; --c-fg: #17becf; }
 
+/* Figures, footnotes, data blocks */
+.doc figure.note-fig { margin: 1.4em 0; }
+.doc figure.note-fig > img, .doc figure.note-fig > .table-wrap { margin: 0; }
+.doc figcaption { font-size: .87em; color: var(--text-label); margin-top: 6px; line-height: 1.45; }
+.doc figcaption .fig-kind { font-weight: 700; color: var(--text-strong); margin-right: 2px; }
+.doc .footnotes { margin-top: 2.2em; font-size: .9em; color: var(--text-label); }
+.doc .footnotes hr { margin: 1.4em 0 .8em; }
+.doc .fn-list { padding-left: 1.6em; }
+.doc .fn-list li { margin: .35em 0; }
+.doc .fn-list li:target { background: var(--accent-soft); border-radius: 3px; }
+.doc .fn-back { margin-left: .5em; text-decoration: none; opacity: .6; }
+.doc .fn-back:hover { opacity: 1; }
+.doc sup.fn-ref a { text-decoration: none; padding: 0 1px; color: var(--accent); font-size: .78em; }
+.doc a.metric-ev { text-decoration: none; border-bottom: 1px dashed var(--border-input); font-variant-numeric: tabular-nums; cursor: pointer; }
+.doc a.metric-ev:hover { border-bottom-style: solid; }
+.doc a.metric-ev .ev-mark { font-size: .78em; margin-left: 1px; }
+.doc a.metric-ev.ev-ok .ev-mark { color: var(--ok); }
+.doc a.metric-ev.ev-bad { color: var(--bad); border-bottom-color: var(--bad); }
+.doc a.metric-ev.ev-bad .ev-mark { color: var(--bad); }
+.doc a.metric-ev.ev-unknown .ev-mark { color: var(--text-muted); }
+
+.doc .nb-block { border: 1px solid var(--border); border-radius: 6px; margin: 1.2em 0; background: var(--surface); overflow: hidden; }
+.doc figure.note-fig > .nb-block { margin: 0; }
+.doc .nb-head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 10px; color: var(--text-muted); border-bottom: 1px solid var(--border); background: var(--code-bg); }
+.doc .nb-title { font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-label); font-family: ui-monospace, monospace; }
+.doc .nb-refresh { background: none; border: 1px solid transparent; border-radius: 3px; color: var(--text-muted); cursor: pointer; font-size: 12px; line-height: 1; padding: 1px 5px; }
+.doc .nb-refresh:hover { background: var(--btn-hover); color: var(--text); }
+.doc .nb-body { padding: 8px 10px; }
+.doc .nb-plot { width: 100%; height: 320px; }
+.doc .nb-legend { display: flex; flex-wrap: wrap; gap: 3px 14px; padding: 1px 2px 9px; font-size: 11px; color: var(--text-label); }
+.doc .nb-legend-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; cursor: pointer; }
+.doc .nb-legend-item:hover { color: var(--text-strong); }
+.doc .nb-legend-item.off { opacity: .4; }
+.doc .nb-legend-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc .nb-legend-band { color: var(--text-muted); }
+.doc .nb-swatch { width: 11px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+.doc .nb-swatch.nb-band { height: 9px; border-radius: 2px; background: var(--text-muted); opacity: .45; }
+.doc .nb-loading, .doc .nb-empty { font-size: 12px; color: var(--text-muted); padding: 18px 4px; text-align: center; }
+.doc .nb-error { font-size: 12px; color: var(--bad); padding: 10px 4px; display: flex; gap: 7px; align-items: baseline; }
+.doc .nb-error-icon { display: inline-flex; width: 15px; height: 15px; border-radius: 50%; background: var(--bad); color: white; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; flex-shrink: 0; }
+.doc .nb-warn { font-size: 11px; color: var(--warn); padding: 2px 4px 6px; }
+.doc .nb-table-wrap { overflow-x: auto; }
+.doc .nb-table { border-collapse: collapse; font-size: .86em; width: auto; min-width: 50%; }
+.doc .nb-table th { position: sticky; top: 0; }
+.doc .nb-table td.nb-num, .doc .nb-table th.nb-num { text-align: right; font-variant-numeric: tabular-nums; }
+.doc .nb-table td.nb-param { color: var(--text-muted); font-family: ui-monospace, monospace; font-size: .92em; }
+.doc .nb-table td.nb-missing { color: var(--text-muted); }
+.doc .nb-table th.nb-sortable { cursor: pointer; user-select: none; }
+.doc .nb-table th.nb-sortable:hover { background: var(--accent-soft); }
+.doc .nb-table th.nb-sorted { color: var(--text-strong); }
+.doc .nb-sort { font-size: 8px; margin-left: 4px; color: var(--accent); }
+.doc .nb-run { color: var(--accent); font-family: ui-monospace, monospace; font-size: .95em; display: inline-block; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.doc .nb-table tr:hover td { background: var(--accent-soft); }
+
 /* Live mode (click a block to edit its markdown) */
 .lv-doc .lv-block { position: relative; border-radius: 4px; cursor: text; min-height: 1em; margin: 0 -10px; padding: 0 10px; outline: 1px dashed transparent; outline-offset: 2px; transition: outline-color .1s; }
 .lv-doc .lv-block > :first-child { margin-top: .4em; }
@@ -383,15 +439,16 @@ kbd { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 1px 6px;
 .merge-dialog { width: min(1100px, 94vw) !important; max-height: 88vh; }
 
 /* ── CodeMirror theme ────────────────────────────────────────────────────── */
-.md-editor .CodeMirror { font-family: system-ui, -apple-system, sans-serif; font-size: 15px; line-height: 1.7; }
-.md-editor .cm-comment, .md-editor .CodeMirror .cm-formatting-code-block, .md-editor .cm-tab { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-.md-editor .cm-comment { background: var(--code-bg); border-radius: 3px; }
 .CodeMirror { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; line-height: 1.6; background: var(--doc-bg); color: var(--text); height: 100%; }
 .CodeMirror-lines { padding: 28px 0 120px; }
 .CodeMirror pre.CodeMirror-line, .CodeMirror pre.CodeMirror-line-like { padding: 0 max(28px, calc((100% - var(--doc-w, 780px)) / 2)); }
 body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
-#editor-wrap:not(.md-editor) .CodeMirror pre.CodeMirror-line { padding: 0 16px; }
-#editor-wrap:not(.md-editor) .CodeMirror-lines { padding-top: 12px; }
+/* No left inset: CodeMirror starts the selection at the line box, so padding-left
+   made the blue highlight start to the right of the line.  The line-like element
+   is CodeMirror's padding measuring stick, so it needs the same rule. */
+#editor-wrap .CodeMirror pre.CodeMirror-line,
+#editor-wrap .CodeMirror pre.CodeMirror-line-like { padding: 0 16px 0 0; }
+#editor-wrap .CodeMirror-lines { padding-top: 12px; }
 .CodeMirror-cursor { border-left: 2px solid var(--radio-checked-border); }
 .CodeMirror-gutters { background: var(--doc-bg); border-right: 1px solid var(--border); }
 .CodeMirror-linenumber { color: var(--text-muted); padding: 0 10px 0 8px; }
@@ -400,13 +457,15 @@ body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
 .CodeMirror-focused .CodeMirror-selected { background: #4c9be844 !important; }
 .CodeMirror-activeline-background { background: color-mix(in srgb, var(--btn-hover) 55%, transparent); }
 .CodeMirror-placeholder { color: var(--text-muted) !important; }
-.cm-header { color: var(--tok-head); font-weight: 700; }
-.cm-header-1 { font-size: 1.45em; } .cm-header-2 { font-size: 1.25em; } .cm-header-3 { font-size: 1.1em; }
-.cm-strong { font-weight: 700; color: var(--text-strong); } .cm-em { font-style: italic; }
-.cm-link, .cm-url { color: var(--tok-link); } .cm-url { opacity: .75; }
+.cm-header { color: var(--tok-kw); font-weight: 700; }
+.cm-strong { font-weight: 700; color: var(--tok-num); } .cm-em { font-style: italic; color: var(--tok-def); }
+#editor-wrap.md-source .cm-link { color: var(--tok-link); text-decoration: underline; text-underline-offset: 2px; }
+#editor-wrap.md-source .cm-url { color: var(--tok-link); opacity: .65; text-decoration: none; }
 .cm-quote { color: var(--text-label); font-style: italic; }
 .cm-comment { color: var(--tok-str); } /* markdown code spans */
 .cm-formatting { color: var(--text-muted) !important; font-weight: 400; }
+/* A heading's leading # is part of the heading, not punctuation to grey out. */
+.cm-formatting-header { color: var(--tok-kw) !important; font-weight: 700 !important; }
 .cm-hr { color: var(--text-muted); }
 .cm-variable-2, .cm-variable-3 { color: var(--text); }
 .cm-keyword { color: var(--tok-kw); } .cm-string, .cm-string-2 { color: var(--tok-str); } .cm-number { color: var(--tok-num); }
@@ -420,6 +479,48 @@ body.wide-doc .CodeMirror pre.CodeMirror-line { padding: 0 28px; }
 .cm-wikilink { color: var(--tok-link); background: var(--accent-soft); border-radius: 2px; }
 .cm-expid { color: var(--tok-num); border-bottom: 1px dotted var(--tok-num); }
 .cm-strikethrough { text-decoration: line-through; }
+
+/* Note-specific tokens, only in the markdown source/split editor. */
+#editor-wrap.md-source .cm-wikilink { color: var(--tok-link); }
+#editor-wrap.md-source .cm-wikilink-embed {
+  color: var(--tok-tag);
+  background: color-mix(in srgb, var(--tok-tag) 14%, transparent);
+  border-radius: 2px;
+}
+#editor-wrap.md-source .cm-formatting.cm-wikilink { color: var(--tok-link) !important; }
+#editor-wrap.md-source .cm-formatting.cm-wikilink-embed { color: var(--tok-tag) !important; }
+#editor-wrap.md-source .cm-footnote-ref { color: var(--tok-foot); }
+#editor-wrap.md-source .cm-footnote-def { color: var(--tok-foot); font-weight: 600; }
+#editor-wrap.md-source .cm-evidence { color: var(--tok-evidence); border-bottom: 1px dotted var(--tok-evidence); }
+#editor-wrap.md-source .cm-tag { color: var(--tok-tag); }
+#editor-wrap.md-source .cm-blockid { color: var(--tok-foot); opacity: .85; }
+#editor-wrap.md-source .cm-caption { color: var(--tok-kw); font-weight: 700; }
+#editor-wrap.md-source .cm-callout { font-weight: 700; font-style: normal; }
+#editor-wrap.md-source .cm-callout-warning, #editor-wrap.md-source .cm-callout-caution,
+#editor-wrap.md-source .cm-callout-attention { color: var(--warn); }
+#editor-wrap.md-source .cm-callout-danger, #editor-wrap.md-source .cm-callout-error,
+#editor-wrap.md-source .cm-callout-bug, #editor-wrap.md-source .cm-callout-failure,
+#editor-wrap.md-source .cm-callout-fail { color: var(--bad); }
+#editor-wrap.md-source .cm-callout-success, #editor-wrap.md-source .cm-callout-check,
+#editor-wrap.md-source .cm-callout-done, #editor-wrap.md-source .cm-callout-tip,
+#editor-wrap.md-source .cm-callout-hint { color: var(--ok); }
+#editor-wrap.md-source .cm-callout-note, #editor-wrap.md-source .cm-callout-info,
+#editor-wrap.md-source .cm-callout-important, #editor-wrap.md-source .cm-callout-example,
+#editor-wrap.md-source .cm-callout-quote, #editor-wrap.md-source .cm-callout-abstract,
+#editor-wrap.md-source .cm-callout-summary, #editor-wrap.md-source .cm-callout-todo,
+#editor-wrap.md-source .cm-callout-idea { color: var(--accent); }
+#editor-wrap.md-source .cm-frontmatter-key { color: var(--tok-def); font-weight: 400; }
+#editor-wrap.md-source .cm-frontmatter-value { color: var(--tok-str); font-weight: 400; }
+#editor-wrap.md-source .cm-frontmatter-mark { color: var(--text-muted); }
+#editor-wrap.md-source .cm-table-pipe { color: var(--tok-table); }
+#editor-wrap.md-source .cm-formatting-list { color: var(--tok-num) !important; }
+#editor-wrap.md-source .cm-strikethrough { color: var(--text-muted); }
+/* Inline code is a colour, not a little code block. */
+#editor-wrap.md-source .cm-formatting-code + .cm-comment {
+  color: var(--tok-str);
+  background: none; border: 0; padding: 0;
+}
+#editor-wrap.md-source .cm-table-header-text { font-weight: 700; color: var(--text-strong); }
 .doc pre code .cm-comment { color: var(--tok-com); font-style: italic; }
 .CodeMirror-hints { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 26px #0005; font-family: system-ui, sans-serif; font-size: 12.5px; padding: 3px 0; max-height: 16em; z-index: 600; }
 .CodeMirror-hint { color: var(--text); padding: 3px 12px; }
@@ -430,6 +531,9 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
 <script src="dialog.js"></script>
 <script src="campaign.js"></script>
 <script src="vendor-notes.js"></script>
+<script src="cm-simple.js"></script>
+<script src="cm-rust.js"></script>
+<script src="cm-go.js"></script>
 <script src="katex/katex.min.js"></script>
 </head>
 <body>
@@ -454,7 +558,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
       <button class="ltab active" data-pane="files" title="Files">Files</button>
       <button class="ltab" data-pane="search" title="Search (/)">Search</button>
       <button class="ltab" data-pane="changes" title="Recent changes from every machine">Changes</button>
-      <button class="ltab" data-pane="lint" title="Lint: links, experiment IDs, merge leftovers">Lint <span class="count zero" id="lint-count">0</span></button>
+      <button class="ltab" data-pane="lint" title="Lint: links, experiment and run IDs, chart specs, evidence numbers, merge leftovers">Lint <span class="count zero" id="lint-count">0</span></button>
     </div>
     <div id="left-body">
       <div class="lpane active" id="pane-files"><div id="tree"></div></div>
@@ -473,7 +577,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
             <button class="mini-btn" id="lint-fix" disabled>Apply safe fixes</button>
             <button class="mini-btn" id="lint-review" title="Copy a brief for an independent reviewing agent">Copy review prompt</button>
           </div>
-          <div class="lint-summary" id="lint-summary">Checks links, experiment IDs and merge leftovers.</div>
+          <div class="lint-summary" id="lint-summary">Checks links, experiment and run IDs, chart/table specs, evidence numbers and merge leftovers.</div>
         </div>
         <div id="lint-body"></div>
       </div>
@@ -517,6 +621,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
 
 <script src="notes.js"></script>
 <script src="notes-view.js"></script>
+<script src="notes-blocks.js"></script>
 <script src="notes-live.js"></script>
 <script src="notes-panels.js"></script>
 </body>

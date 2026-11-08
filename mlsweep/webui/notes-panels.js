@@ -268,7 +268,7 @@ async function showVersion(path, rev, c) {
     const note = el("div", "callout c-quote"); note.append(el("div", "callout-title", `Version of ${path} from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : rev.slice(0, 10)} — read only`));
     doc.append(note);
     const inner = el("div"); doc.append(inner);
-    if (isMd(path)) renderMarkdown(r.content, path, inner, { depth: 1 }); else { const pre = el("pre"); pre.append(el("code", "", r.content)); inner.append(pre); }
+    if (isMd(path)) renderMarkdown(r.content, path, inner, { depth: 1, footnotePrefix: "p" + hashStr(path) + "-" }); else { const pre = el("pre"); pre.append(el("code", "", r.content)); inner.append(pre); }
     pane.append(doc); view.append(pane);
   } catch (e) { toast(e.message, "err"); }
 }
@@ -431,9 +431,10 @@ function expRow(id, note, onclick) {
   const m = S.experiments.get(id) || {};
   const a = el("a", "exp-row");
   a.href = pageHref("results.html", { experiment: id });
-  a.append(el("span", "badge badge-" + (m.status || "unknown"), m.status || "?"), el("span", "id", id));
+  a.append(el("span", "badge badge-" + (m.status || "unknown"), m.status || "?"),
+           el("span", "id", m.name || id));
   if (note) a.append(el("span", "commit-time", note));
-  a.title = `${m.name || id}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? `\n${m.jobs.done || 0}/${m.jobs.total || 0} runs done, ${m.jobs.failed || 0} failed` : ""}`;
+  a.title = `${id}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? `\n${m.jobs.done || 0}/${m.jobs.total || 0} runs done, ${m.jobs.failed || 0} failed` : ""}`;
   if (onclick) a.onclick = e => { e.preventDefault(); onclick(); };
   return a;
 }
@@ -447,11 +448,12 @@ function refreshOutline(t) {
     const m = HEADING_RE.exec(line);
     if (!m) return;
     n++;
-    const it = el("div", "outline-item", m[2]);
+    const title = m[2].replace(/\s*\{#[^}]+\}\s*$/, "");
+    const it = el("div", "outline-item", title);
     it.style.paddingLeft = (12 + (m[1].length - 1) * 12) + "px";
     it.onclick = () => {
       const reader = $("view").querySelector(".vpane.reader");
-      if (t.mode !== "source" && reader) scrollToHeading(reader, m[2]);
+      if (t.mode !== "source" && reader) scrollToHeading(reader, title);
       if (t.mode !== "live" && Editor.cm) { Editor.cm.setCursor({ line: i, ch: 0 }); Editor.cm.scrollIntoView({ line: i, ch: 0 }, 80); Editor.cm.focus(); }
     };
     ob.append(it);
@@ -489,7 +491,7 @@ async function runLint() {
   if (linting) return;
   linting = true;
   $("lint-run").disabled = true; $("lint-run").textContent = "Running…";
-  $("lint-summary").textContent = "Checking links, experiment IDs and merge leftovers…";
+  $("lint-summary").textContent = "Checking links, experiment and run IDs, chart specs, evidence numbers and merge leftovers…";
   try {
     S.lint = await api("/api/notes/lint");
     renderLint();
@@ -502,9 +504,12 @@ function renderLint() {
   const fixes = L.findings.filter(f => f.tier === "fix");
   const reports = L.findings.filter(f => f.tier === "report");
   const st = L.stats;
-  $("lint-summary").textContent = `${st.notes} notes, ${st.links} links, ${st.experiments_cited} experiments cited. ` +
+  $("lint-summary").textContent = `${st.notes} notes, ${st.links} links, ${st.experiments_cited} experiments cited` +
+    (st.data_blocks ? `, ${st.data_blocks} chart/table block${st.data_blocks === 1 ? "" : "s"}` : "") +
+    (st.evidence_refs ? `, ${st.evidence_refs} evidence link${st.evidence_refs === 1 ? "" : "s"}` : "") + ". " +
     (L.findings.length ? `${fixes.length} safe fix${fixes.length === 1 ? "" : "es"}, ${reports.length} report${reports.length === 1 ? "" : "s"}.` : "") +
-    (st.experiments_checked ? "" : " Experiment IDs not checked.");
+    (st.experiments_checked ? (st.runs_checked ? "" : " Run IDs not checked.") : " Experiment and run IDs not checked.") +
+    (st.evidence_checked ? "" : " Evidence numbers not checked.");
   const count = $("lint-count");
   const real = reports.filter(f => !(f.detail && f.detail.missing_note)).length + fixes.length;
   count.textContent = real; count.className = "count" + (real ? (reports.some(f => f.kind === "conflict-marker") ? "" : " warn") : " zero");
@@ -646,7 +651,7 @@ const Graph = {
     if (this.opts.exps) {
       for (const [exp, srcs] of Object.entries(idx.mentions)) {
         if (!S.experiments.has(exp)) continue;
-        add("exp:" + exp, "exp", exp);
+        add("exp:" + exp, "exp", shortExp(exp));
         for (const s of srcs) if (nodes.has(s)) edges.push([s, "exp:" + exp]);
       }
     }
@@ -846,8 +851,8 @@ const KEYS = [
     ["X", "close tab"],
     ["{ / }", "previous / next tab"],
     ["/", "search"],
-    ["E", "Live ↔ Source"],
-    ["S", "split view"],
+    ["E", "notes: Live ↔ Source"],
+    ["S", "notes: split view"],
     ["G", "graph (Shift+G: this note's graph)"],
     ["[ / ]", "back / forward"],
     ["Ctrl+Z / Ctrl+Shift+Z", "undo / redo in Live"],

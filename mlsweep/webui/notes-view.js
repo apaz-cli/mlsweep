@@ -215,7 +215,7 @@ function renderActive({ keepEditor = false } = {}) {
   if (!t.meta) { view.append(el("div", "placeholder", "Loading…")); return; }
   const k = t.kind;
   if ((k === "md" || k === "text") && t.doc) {
-    if (k === "text" && t.mode === "live") t.mode = "source";
+    if (k === "text" && t.mode !== "source") t.mode = "source";
     if (t.mode === "live") view.append(livePane(t));
     else if (t.mode === "source") view.append(Editor.attach(t));
     else { const ed = Editor.attach(t); view.append(ed, el("div", "split-divider"), readerPane(t)); }
@@ -259,12 +259,14 @@ function renderCrumbs(t) {
   if (t.meta && t.meta.protected) { const b = el("span", "lockbadge", "🔒 protected"); b.title = "An original: by convention, files here are added and not changed."; c.append(b); }
 }
 function renderModeSeg(t) {
-  const editable = (t.kind === "md" || t.kind === "text") && t.doc;
+  // Live, Source and Split are ways to read a note.  Other files are simply
+  // themselves: text/code in the editor, images and PDFs in place.
+  const note = t.kind === "md" && !!t.doc;
   document.querySelectorAll("#mode-seg button").forEach(b => {
     b.classList.toggle("on", b.dataset.mode === t.mode);
-    b.disabled = !editable || (t.kind === "text" && b.dataset.mode !== "source");
+    b.disabled = false;
   });
-  $("mode-seg").style.display = editable ? "" : "none";
+  $("mode-seg").style.display = note ? "" : "none";
 }
 document.querySelectorAll("#mode-seg button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
 function setMode(mode) {
@@ -415,6 +417,23 @@ MD.use({
       if (t.embed) return `<span class="wl-embed" data-wl="${esc(t.target)}" data-heading="${esc(t.heading)}" data-alias="${esc(t.alias)}"></span>`;
       return `<a class="wikilink" data-wl="${esc(t.target)}" data-heading="${esc(t.heading)}">${esc(label || t.target)}</a>`;
     },
+  }, {
+    name: "footnoteRef", level: "inline",
+    start(src) { const i = src.indexOf("[^"); return i < 0 ? undefined : i; },
+    tokenizer(src) {
+      const m = /^\[\^([^\]\s]+)\]/.exec(src);
+      if (m) return { type: "footnoteRef", raw: m[0], id: m[1] };
+    },
+    renderer(t) {
+      if (!FN || !FN.defs.has(t.id)) return esc(t.raw);
+      let n = FN.numbers.get(t.id);
+      if (!n) { n = FN.next++; FN.numbers.set(t.id, n); }
+      const base = "fn-" + FN.prefix + n;
+      const refId = "fnref-" + FN.prefix + n + "-" + (++FN.refs);
+      if (!FN.firstRef.has(t.id)) FN.firstRef.set(t.id, refId);
+      if (!FN_FIRST_REF.has(FN.src + "\u0000" + n)) FN_FIRST_REF.set(FN.src + "\u0000" + n, refId);
+      return `<sup class="fn-ref"><a href="#${base}" id="${refId}" data-fn="${esc(t.id)}">${n}</a></sup>`;
+    },
   }],
   renderer: {
     code(tok) {
@@ -425,7 +444,10 @@ MD.use({
   },
 });
 const PURIFY = {
-  ADD_ATTR: ["data-wl", "data-heading", "data-alias", "data-lang", "data-tex", "target"],
+  // DOMPurify's default URI allow-list plus mlsweep:, which links a number to
+  // the logged metric (the tab turns it into a normal link after sanitizing).
+  ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|mlsweep):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+  ADD_ATTR: ["data-wl", "data-heading", "data-alias", "data-lang", "data-tex", "data-fn", "target"],
   FORBID_TAGS: ["style", "form", "button", "textarea", "select", "iframe", "object", "embed", "link", "meta", "base"],
   FORBID_ATTR: ["style"],
   ALLOW_UNKNOWN_PROTOCOLS: false,
@@ -440,24 +462,255 @@ function slugify(s) { return s.toLowerCase().trim().replace(/[^\w\- ]+/g, "").re
 
 const CALLOUT_ICONS = { note: "✎", info: "ℹ", tip: "💡", hint: "💡", important: "❗", warning: "⚠", caution: "⚠", attention: "⚠", danger: "⛔", error: "⛔", bug: "🐞", failure: "✗", fail: "✗", success: "✓", check: "✓", done: "✓", question: "?", help: "?", faq: "?", example: "▸", quote: "❝", cite: "❝", abstract: "≡", summary: "≡", tldr: "≡", todo: "☐", idea: "💡" };
 
-function renderMarkdown(text, srcPath, container, { depth = 0 } = {}) {
-  const [fm, body] = splitFrontmatter(text);
-  const html = DOMPurify.sanitize(MD.parse(body), PURIFY);
+// ── Footnotes and figures ─────────────────────────────────────────────────────
+// State for the one synchronous MD.parse() call: a marked renderer cannot take
+// arguments, so the renderer reads this.  Cleared again as soon as parsing ends.
+let FN = null;
+const FN_FIRST_REF = new Map();  // note + number -> the first backlink id
+let FN_EMBED_SEQ = 0;            // keeps two embeds of one note from sharing ids
+
+// A definition line is `[^id]: text`, plus any indented continuation lines.
+// Fenced blocks and display math are left alone, so code can show the syntax.
+function collectFootnotes(text) {
+  const lines = text.split("\n");
+  const out = [];
+  const defs = new Map();
+  let fence = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const was = fence;
+    fence = lvNextFence(fence, line);
+    if (was || fence) { out.push(line); continue; }
+    const m = /^\[\^([^\]\s]+)\]:[ \t]*(.*)$/.exec(line);
+    if (!m) { out.push(line); continue; }
+    let body = m[2];
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (/^(?: {2,}|\t)/.test(next)) { body += "\n" + lines[++i].replace(/^(?: {2,4}|\t)/, ""); continue; }
+      if (/^\s*$/.test(next) && i + 2 < lines.length && /^(?: {2,}|\t)/.test(lines[i + 2])) {
+        body += "\n\n" + lines[i + 2].replace(/^(?: {2,4}|\t)/, "");
+        i += 2;
+        continue;
+      }
+      break;
+    }
+    if (!defs.has(m[1])) defs.set(m[1], body);
+  }
+  return { body: out.join("\n"), defs };
+}
+
+// Footnote numbers follow the order of first reference in the note.
+function footnoteNumbers(body, defs) {
+  const numbers = new Map();
+  let next = 1, fence = null;
+  for (const line of body.split("\n")) {
+    const was = fence;
+    fence = lvNextFence(fence, line);
+    if (was || fence) continue;
+    const re = /\[\^([^\]\s]+)\]/g;
+    let m;
+    while ((m = re.exec(line))) {
+      if (!defs.has(m[1]) || numbers.has(m[1])) continue;
+      numbers.set(m[1], next++);
+    }
+  }
+  for (const id of defs.keys()) if (!numbers.has(id)) numbers.set(id, next++);
+  return numbers;
+}
+
+function fnNext(numbers) {
+  let n = 1;
+  for (const v of numbers.values()) if (v >= n) n = v + 1;
+  return n;
+}
+
+// The figures in a whole note, in order, so Live mode can number across blocks.
+// A figure is a chart/table block with a `caption:`, or a caption line directly
+// under an image or a table row.
+const NB_CAP_RE = /^\s*(Figure|Table|Chart|Fig\.)\s*[:.]?\s+\S/i;
+const NB_IMG_LINE_RE = /^\s*(?:!\[\[[^\]]+\]\]|!\[[^\]]*\]\([^)]+\))\s*$/;
+function countFigures(text) {
+  let fig = 0, table = 0, fence = null, lang = "", hasCaption = false, prev = "";
+  for (const line of text.split("\n")) {
+    if (fence) {
+      if (line.trim().startsWith(fence) && line.trim().replace(/[`~]/g, "") === "") {
+        if (/^mlsweep-(chart|table)$/.test(lang) && hasCaption) {
+          if (lang === "mlsweep-table") table++; else fig++;
+        }
+        fence = null; lang = ""; hasCaption = false;
+      } else if (/^\s*caption\s*:/i.test(line) || /"caption"\s*:/.test(line)) {
+        hasCaption = true;
+      }
+      prev = line;
+      continue;
+    }
+    const m = LV_FENCE.exec(line);
+    if (m) {
+      fence = m[1];
+      lang = line.trim().slice(m[1].length).trim().split(/\s+/)[0].toLowerCase();
+      hasCaption = false;
+      prev = line;
+      continue;
+    }
+    if (NB_CAP_RE.test(line) && (NB_IMG_LINE_RE.test(prev) || /\|/.test(prev))) {
+      if (/^\s*Table\b/i.test(line)) table++; else fig++;
+    }
+    prev = line;
+  }
+  return { fig, table };
+}
+
+function appendFootnotes(container, defs, state, srcPath, depth) {
+  if (!defs.size) return;
+  const items = [...defs.keys()]
+    .map(id => ({ id, n: state.numbers.get(id) || 0 }))
+    .sort((a, b) => a.n - b.n);
+  const sec = el("section", "footnotes");
+  sec.append(el("hr"));
+  const ol = el("ol", "fn-list");
+  for (const { id, n } of items) {
+    const li = el("li");
+    li.id = "fn-" + state.prefix + n;
+    li.dataset.fn = id;
+    const body = el("div", "fn-body");
+    li.append(body);
+    renderMarkdown(defs.get(id), srcPath, body, { depth: depth + 1, footnote: false, frontmatter: false });
+    const back = state.firstRef.get(id) || FN_FIRST_REF.get(srcPath + "\u0000" + n);
+    if (back) {
+      const a = el("a", "fn-back", "↩");
+      a.href = "#" + back;
+      a.title = "Back to the reference";
+      li.append(a);
+    }
+    ol.append(li);
+  }
+  sec.append(ol);
+  container.append(sec);
+}
+
+function renderMarkdown(text, srcPath, container, opts = {}) {
+  const { depth = 0, footnote = true, frontmatter = true, footnotePrefix = "" } = opts;
+  const figBase = typeof opts.figBase === "number"
+    ? { fig: opts.figBase, table: 0 }
+    : (opts.figBase || { fig: 0, table: 0 });
+  const [fm, body] = frontmatter ? splitFrontmatter(text) : [null, text];
+  const local = footnote ? collectFootnotes(body) : { body, defs: new Map() };
+  const defs = new Map(opts.fnDefs || []);
+  for (const [id, def] of local.defs) defs.set(id, def);
+  const numbers = opts.fnNumbers || footnoteNumbers(local.body, defs);
+  const state = { defs, numbers, next: fnNext(numbers), firstRef: new Map(), refs: 0,
+                  src: srcPath, prefix: footnotePrefix };
+  const prev = FN;
+  FN = footnote ? state : null;
+  let html;
+  try {
+    html = DOMPurify.sanitize(MD.parse(splitFigureCaptions(local.body)), PURIFY);
+  } finally {
+    FN = prev;
+  }
   container.innerHTML = html;
   if (fm) {
     const props = propsEl(fm.split("\n"));
     if (props.childNodes.length) container.prepend(props);
   }
-  postProcess(container, srcPath, depth);
+  postProcess(container, srcPath, depth, { figBase, footnote: footnote ? state : null });
+  if (footnote) appendFootnotes(container, local.defs, state, srcPath, depth);
 }
 
-function postProcess(root, srcPath, depth) {
-  // Headings get ids for the outline.
+// A caption line directly under an image merges into one paragraph in
+// CommonMark.  A blank line before it keeps the image and its caption separate
+// for decorateFigures, without changing the note on disk.
+function splitFigureCaptions(text) {
+  const out = [];
+  let fence = null;
+  for (const line of text.split("\n")) {
+    const was = fence;
+    fence = lvNextFence(fence, line);
+    if (!was && !fence && NB_CAP_RE.test(line) && out.length && NB_IMG_LINE_RE.test(out[out.length - 1])) {
+      out.push("");
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+function nbCaptionParts(p) {
+  const text = p.textContent.trim();
+  const m = NB_CAP_RE.exec(text);
+  if (!m) return null;
+  let inner = p.innerHTML.replace(/^\s*(?:Figure|Table|Chart|Fig\.)\s*[:.]?\s+/i, "");
+  const idm = /\s*\{#([A-Za-z][\w:.\-]*)\}\s*$/.exec(text);
+  let id = "";
+  if (idm) {
+    id = idm[1];
+    inner = inner.replace(/\s*\{#[^}]+\}\s*$/, "");
+  }
+  const kind = /^fig/i.test(m[1]) ? "Figure" : m[1];
+  return { kind, html: inner, id };
+}
+
+// Turn caption lines into <figcaption>, and chart/table blocks into rendered
+// cards, in one document-order pass so `Figure 1, 2, …` follows the note.
+function decorateFigures(root, figState) {
+  if (typeof nbBlock !== "function") return;  // an old cached page without notes-blocks.js
+  const state = {
+    fig: (figState && figState.fig) || 0,
+    table: (figState && figState.table) || 0,
+  };
+  const nodes = [...root.querySelectorAll("pre, p")];
+  for (const node of nodes) {
+    // parentNode, not isConnected: Live builds a block detached, then appends it.
+    if (!node.parentNode) continue;
+    if (node.tagName === "PRE") {
+      const code = node.firstElementChild;
+      if (!code || code.tagName !== "CODE") continue;
+      const lang = (code.dataset.lang || "").toLowerCase();
+      if (lang !== "mlsweep-chart" && lang !== "mlsweep-table") continue;
+      nbBlock(node, lang === "mlsweep-table" ? "table" : "chart", code.textContent, state);
+      continue;
+    }
+    const parts = nbCaptionParts(node);
+    if (!parts) continue;
+    const prev = node.previousElementSibling;
+    if (!prev || !prev.matches) continue;
+    // An image on its own line is wrapped in a paragraph, so look inside it.
+    let target = prev;
+    if (prev.tagName === "P" && prev.childElementCount === 1) {
+      const only = prev.firstElementChild;
+      if (only && only.matches("img, table, .table-wrap, .nb-block")) target = only;
+    }
+    const bare = target.matches("figure.note-fig.nb-bare") ? target : null;
+    const eligible = bare || target.matches("img, table, .table-wrap, .nb-block");
+    if (!eligible) continue;
+    const counter = /^table$/i.test(parts.kind) ? "table" : "fig";
+    const n = ++state[counter];
+    const fig = bare || el("figure", "note-fig");
+    if (bare) bare.classList.remove("nb-bare");
+    else {
+      prev.replaceWith(fig);
+      fig.append(target);
+      if (target !== prev) prev.remove();
+    }
+    fig.id = parts.id || ((counter === "table" ? "tbl-" : "fig-") + n);
+    const cap = el("figcaption");
+    cap.innerHTML = `<span class="fig-kind">${esc(parts.kind)} ${n}.</span> ` + parts.html;
+    fig.append(cap);
+    node.remove();
+  }
+}
+
+function postProcess(root, srcPath, depth, opts = {}) {
+  // Headings get ids for the outline; `## Title {#id}` fixes one for links.
   const used = new Map();
   root.querySelectorAll("h1,h2,h3,h4,h5,h6").forEach(h => {
-    let id = slugify(h.textContent); const n = used.get(id) || 0; used.set(id, n + 1);
+    let explicit = null;
+    const m = /\s*\{#([A-Za-z][\w:.\-]*)\}\s*$/.exec(h.textContent);
+    if (m) { explicit = m[1]; h.textContent = h.textContent.slice(0, m.index).trim(); }
+    let id = explicit || "h-" + slugify(h.textContent);
+    const n = used.get(id) || 0;
+    used.set(id, n + 1);
     if (n) id += "-" + n;
-    h.id = "h-" + id;
+    h.id = id;
   });
   // Callouts: > [!type] Title
   root.querySelectorAll("blockquote").forEach(bq => {
@@ -522,7 +775,7 @@ function postProcess(root, srcPath, depth) {
       api(`/api/notes/file?path=${q(hit)}&history=0`).then(m => {
         let text = m.content || "";
         if (sp.dataset.heading) text = sectionOf(text, sp.dataset.heading) ?? text;
-        renderMarkdown(text, hit, inner, { depth: depth + 1 });
+        renderMarkdown(text, hit, inner, { depth: depth + 1, footnotePrefix: "e" + hashStr(hit) + (++FN_EMBED_SEQ) + "-" });
       }).catch(() => { inner.textContent = "(could not load)"; });
     } else {
       const a = el("a", "embed-file"); a.innerHTML = iconFor(hit); a.append(" " + basename(hit)); a.dataset.path = hit; a.href = "#"; sp.replaceWith(a);
@@ -532,6 +785,13 @@ function postProcess(root, srcPath, depth) {
   root.querySelectorAll("a[href]").forEach(a => {
     if (a.classList.contains("wikilink") || a.dataset.path) return;
     const href = a.getAttribute("href");
+    if (/^mlsweep:/i.test(href) && typeof annotateEvidence === "function") {
+      a.dataset.evRef = href.slice("mlsweep:".length);
+      a.classList.add("metric-ev");
+      a.removeAttribute("href");
+      a.title = "Checking against the logged metric…";
+      return;
+    }
     if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//")) {
       if (/^(https?|mailto):/i.test(href)) { a.target = "_blank"; a.rel = "noopener noreferrer"; a.classList.add("ext"); }
       else { a.removeAttribute("href"); }
@@ -551,7 +811,11 @@ function postProcess(root, srcPath, depth) {
     const hit = Resolver.relative(srcPath, src) || Resolver.wiki(srcPath, basename(src.split("?")[0]));
     if (hit) img.src = rawURL(hit); else { img.alt = "Missing image: " + src; img.removeAttribute("src"); }
   });
+  // Charts, tables and figure captions, in document order so numbering follows
+  // the note.  After embeds, because a caption pairs with the resolved image.
+  decorateFigures(root, opts.figBase);
   linkExperiments(root);
+  if (typeof annotateEvidence === "function") annotateEvidence(root);
   renderMath(root);
 }
 
@@ -576,7 +840,8 @@ function sectionOf(text, heading) {
   for (let i = 0; i < lines.length; i++) {
     const m = HEADING_RE.exec(lines[i]);
     if (!m) continue;
-    if (start < 0 && m[2].toLowerCase() === want) { start = i; level = m[1].length; continue; }
+    const title = m[2].replace(/\s*\{#[^}]+\}\s*$/, "");
+    if (start < 0 && title.toLowerCase() === want) { start = i; level = m[1].length; continue; }
     if (start >= 0 && m[1].length <= level) return lines.slice(start, i).join("\n");
   }
   return start >= 0 ? lines.slice(start).join("\n") : null;
@@ -588,9 +853,9 @@ function expChip(id) {
   const m = S.experiments.get(id) || {};
   const a = el("a", "exp-chip s-" + (m.status || "unknown"));
   a.href = pageHref("results.html", { experiment: id });
-  a.title = `${m.name || id} · ${m.status || "?"}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? ` · ${m.jobs.done || 0}/${m.jobs.total || 0} runs done` : ""}\nOpen in Results (Shift+click: Logs)`;
+  a.title = `${id} · ${m.status || "?"}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? ` · ${m.jobs.done || 0}/${m.jobs.total || 0} runs done` : ""}\nOpen in Results (Shift+click: Logs)`;
   a.dataset.exp = id;
-  a.append(el("span", "d"), document.createTextNode(id));
+  a.append(el("span", "d"), document.createTextNode(m.name || id));
   return a;
 }
 function linkExperiments(root) {
@@ -645,7 +910,10 @@ function readerPane(t) {
 }
 function scrollToHeading(pane, heading) {
   const want = heading.toLowerCase();
-  const h = [...pane.querySelectorAll("h1,h2,h3,h4,h5,h6")].find(x => x.textContent.toLowerCase().trim() === want) ||
+  const heads = [...pane.querySelectorAll("h1,h2,h3,h4,h5,h6")];
+  const h = pane.querySelector("#" + CSS.escape(heading)) ||
+    heads.find(x => x.textContent.toLowerCase().trim() === want) ||
+    heads.find(x => x.textContent.toLowerCase().trim() === want.replace(/-/g, " ")) ||
     pane.querySelector("#h-" + CSS.escape(slugify(heading)));
   if (h) { h.scrollIntoView({ block: "start" }); h.animate([{ background: "var(--accent-soft)" }, { background: "transparent" }], { duration: 1400 }); }
 }
@@ -660,7 +928,7 @@ function onDocClick(e, t) {
   }
   const a = e.target.closest("a");
   if (!a) return;
-  if (a.dataset.anchor != null) { e.preventDefault(); scrollToHeading(e.currentTarget.parentElement, a.dataset.anchor.replace(/-/g, " ")); return; }
+  if (a.dataset.anchor != null) { e.preventDefault(); scrollToHeading(e.currentTarget.parentElement, decodeURIComponent(a.dataset.anchor)); return; }
   if (a.classList.contains("ext")) return;
   if (a.dataset.path !== undefined || a.classList.contains("wikilink")) {
     e.preventDefault();
@@ -689,14 +957,16 @@ function modeForLang(lang) {
   const map = { py: "python", python: "python", sh: "shell", bash: "shell", shell: "shell", zsh: "shell", console: "shell",
     js: "javascript", javascript: "javascript", ts: "text/typescript", typescript: "text/typescript", json: "application/json",
     yaml: "yaml", yml: "yaml", toml: "toml", diff: "diff", patch: "diff", c: "text/x-csrc", cpp: "text/x-c++src", "c++": "text/x-c++src",
-    cuda: "text/x-c++src", cu: "text/x-c++src", java: "text/x-java", md: "markdown", markdown: "markdown" };
+    cuda: "text/x-c++src", cu: "text/x-c++src", java: "text/x-java", md: "markdown", markdown: "markdown",
+    rs: "text/x-rustsrc", rust: "text/x-rustsrc", go: "text/x-go", golang: "text/x-go" };
   return map[l] || null;
 }
 function modeForPath(p) {
   const e = extOf(p);
   const map = { py: "python", sh: "shell", bash: "shell", zsh: "shell", js: "javascript", ts: "text/typescript", json: "application/json",
     jsonl: "application/json", yaml: "yaml", yml: "yaml", toml: "toml", diff: "diff", patch: "diff", c: "text/x-csrc", h: "text/x-csrc",
-    cc: "text/x-c++src", cpp: "text/x-c++src", hpp: "text/x-c++src", cu: "text/x-c++src", java: "text/x-java", html: "xml", xml: "xml", svg: "xml" };
+    cc: "text/x-c++src", cpp: "text/x-c++src", hpp: "text/x-c++src", cu: "text/x-c++src", java: "text/x-java", html: "xml", xml: "xml", svg: "xml",
+    rs: "text/x-rustsrc", go: "text/x-go" };
   return map[e] || null;
 }
 
@@ -719,18 +989,55 @@ const Editor = {
         "Esc": cm => { if (cm.state.completionActive) return CodeMirror.Pass; const t = activeTab(); if (t && t.kind === "md") setMode("live"); else cm.getInputField().blur(); },
       },
     });
-    this.cm.addOverlay({
+    this.overlay = {
+      // CodeMirror overlays cannot be stateful.  Frontmatter and fence ranges
+      // are precomputed by decorateBlocks and read through Editor.mdInfo.
       token(stream) {
-        if (stream.match(/^!?\[\[[^\]\n]*\]\]/)) return "wikilink";
+        const info = Editor.mdInfo;
+        const lineNo = stream.lineOracle
+          ? (stream.lineOracle.lineNo != null ? stream.lineOracle.lineNo : stream.lineOracle.line)
+          : null;
+        if (info && lineNo != null) {
+          if (info.frontmatter && lineNo >= info.frontmatter.start && lineNo <= info.frontmatter.end) {
+            if (lineNo === info.frontmatter.start || lineNo === info.frontmatter.end) {
+              stream.skipToEnd(); return "frontmatter-mark";
+            }
+            const colon = stream.string.indexOf(":");
+            if (colon > 0 && stream.pos <= colon) {
+              stream.match(/^[^:\n]+:/);
+              return "frontmatter-key";
+            }
+            stream.skipToEnd(); return "frontmatter-value";
+          }
+          if (info.fenced.has(lineNo)) { stream.skipToEnd(); return null; }
+        }
+        if (stream.sol()) {
+          const callout = /^>\s*\[!([\w-]+)\]/.exec(stream.string);
+          if (callout) {
+            stream.match(callout[0]);
+            return "callout callout-" + callout[1].toLowerCase();
+          }
+          if (stream.match(/^(Figure|Table|Chart):/)) return "caption";
+        }
+        if (stream.match(/^\[\^[^\]\s]+\]:/)) return "footnote-def";
+        if (stream.match(/^\[\^[^\]\s]+\]/)) return "footnote-ref";
+        if (stream.match(/^!\[\[[^\]\n]*\]\]/)) return "wikilink wikilink-embed";
+        if (stream.match(/^\[\[[^\]\n]*\]\]/)) return "wikilink";
+        if (stream.match(/^mlsweep:[^\s)<>]+/)) return "evidence";
+        if (stream.match(/^\^[A-Za-z0-9-]+(?=\s*$)/)) return "blockid";
+        if (stream.match(/^#[A-Za-z][\w/-]*/)) return "tag";
+        if (stream.match(/^\|/)) return "table-pipe";
         if (stream.match(/^\$\$[^$]+\$\$/) || stream.match(INLINE_MATH)) return "math";
         if (stream.match(/^[A-Za-z0-9][A-Za-z0-9_\-]{2,127}/)) {
           return S.experiments.has(stream.current()) ? "expid" : null;
         }
         stream.next();
-        while (!stream.eol() && !/[A-Za-z0-9!\[$]/.test(stream.peek())) stream.next();
+        while (!stream.eol() && !/[A-Za-z0-9!\[$#>^m|]/.test(stream.peek())) stream.next();
         return null;
       },
-    });
+    };
+    this.overlayAdded = false;
+    this.cm.on("changes", debounce(() => this.decorateBlocks(this.tab), 200));
     // Typing "[[" opens link completion (autoCloseBrackets inserts brackets
     // itself, so this listens for changes rather than inputRead).
     this.cm.on("change", (cm, ch) => {
@@ -757,10 +1064,68 @@ const Editor = {
       this.tab = t;
       const mode = t.kind === "md" ? { name: "gfm", highlightFormatting: true, fencedCodeBlockHighlighting: true } : modeForPath(t.path);
       this.cm.setOption("mode", mode);
-      this.cm.setOption("lineNumbers", t.kind !== "md");
-      this.host.classList.toggle("md-editor", t.kind === "md");
+      this.cm.setOption("lineNumbers", true);
     }
+    this.host.classList.toggle("md-source", t.kind === "md");
+    this.setOverlay(t.kind === "md");
+    if (t.kind !== "md") { this.mdInfo = null; this.mdSig = null; }
+    this.decorateBlocks(t);
     return this.host;
+  },
+  setOverlay(on) {
+    if (!this.cm || !this.overlay) return;
+    if (this.overlayAdded) {
+      this.cm.removeOverlay(this.overlay);
+      this.overlayAdded = false;
+    }
+    if (on) {
+      this.cm.addOverlay(this.overlay);
+      this.overlayAdded = true;
+    }
+  },
+  decorateBlocks(t) {
+    if (!this.cm || !t || t.kind !== "md") { this.mdInfo = null; return; }
+    const cm = this.cm;
+    const info = { frontmatter: null, fenced: new Set() };
+    this.mdInfo = info;
+    cm.operation(() => {
+      cm.eachLine(line => cm.removeLineClass(line, "text", "cm-table-header-text"));
+      const n = cm.lineCount();
+      const lines = [];
+      for (let i = 0; i < n; i++) lines.push(cm.getLine(i));
+      if (lines[0] === "---") {
+        const close = lines.indexOf("---", 1);
+        if (close > 0) info.frontmatter = { start: 0, end: close };
+      }
+      let fence = null;
+      const first = info.frontmatter ? info.frontmatter.end + 1 : 0;
+      for (let i = first; i < n; i++) {
+        const line = lines[i];
+        if (fence) {
+          info.fenced.add(i);
+          const trim = line.trim();
+          if (trim.startsWith(fence) && trim.replace(/[`~]/g, "") === "") fence = null;
+          continue;
+        }
+        const open = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+        if (open) {
+          fence = open[1];
+          info.fenced.add(i);
+          continue;
+        }
+        const next = lines[i + 1] || "";
+        const delim = /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(next) && next.includes("-");
+        if (line.includes("|") && delim) {
+          cm.addLineClass(i, "text", "cm-table-header-text");
+        }
+      }
+    });
+    const sig = (info.frontmatter ? `${info.frontmatter.start}:${info.frontmatter.end}` : "-") +
+      "|" + [...info.fenced].join(",");
+    if (sig !== this.mdSig) {
+      this.mdSig = sig;
+      this.cm.refresh();
+    }
   },
   refresh(t) {
     requestAnimationFrame(() => {

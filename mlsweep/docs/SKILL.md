@@ -75,9 +75,10 @@ with MLSweepLogger() as logger:
 
 These declare `OPTIMIZE = {"method": "bayes", "metric": ..., "goal": ..., "budget": N}`, which wins over `METRIC`/`GOAL`.
 
-- Submit with `--stream` and run it in the background. The adaptive loop lives in that process, and it submits one run at a time, each chosen from the results so far.
-- Without `--stream`, the whole budget goes in up front with no results to learn from.
-- If the process dies, running runs finish but no new ones start. `wait` then exits 2 and names the fix, `mlsweep resume <id> --sweep FILE --stream`, which restores earlier results and continues.
+- The manager runs the sweep, so submit it like any other and use `wait`. No process has to stay attached. It chooses new trials from the results so far as each one comes in.
+- `mlsweep optimize <id>` shows the budget, the failures and the best run. `--budget N`, `--budget +N`, `--finish` and `--max-concurrent K` adjust it. Fewer at once means each trial learns from more results.
+- After `max_failures` failed trials in a row the manager pauses the sweep, and `wait` returns. `optimize` shows why. If the metric name or the code was wrong, stop it and submit again. Otherwise use `mlsweep unpause <id>`.
+- `mlsweep cancel` on one of its runs gets the trial replaced. To end the sweep, use `mlsweep stop <id> --yes`, or `mlsweep optimize <id> --finish` to let running runs end.
 
 ## Quick reference
 
@@ -150,10 +151,39 @@ mlsweep scheduler                               # show or set GPU placement (--p
 - Notes commands run outside the clone need its path, or `MLSWEEP_NOTES=~/notes` inline. Without one they read the manager's own folder, and they refuse to change it.
 - `mlsweep notes search WORDS` searches like the Notes tab. `mlsweep notes links PATH` shows backlinks, `mlsweep notes mentions EXP` finds notes about an experiment, and `mlsweep notes history` shows who changed what. `mlsweep notes status` shows unpushed commits. Rename or move notes with `mlsweep notes mv SRC DST`, because plain `mv` breaks links to them.
 - Write experiment IDs in full (`rzo_e1_zo_20261001_0309_c37e`) so the dashboard links them.
-- The first column of `best` is the run's best step, and `final=` is its last. `mlsweep metrics --experiment <id> --last` gives only the last, so use `--keys` without `--last` to check a best-step value. Lint does not check numbers, so check each one you write.
+- The first column of `best` is the run's best step, and `final=` is its last. `mlsweep metrics --experiment <id> --last` gives only the last, so use `--keys` without `--last` to check a best-step value. Lint checks the number behind an evidence link, not whether it is the right claim to make, so still read the curve.
 - `best` ranks only runs that finished and logged the metric, and its header counts the rest. A failed arm is a result, so report it.
 - Keep `STATUS.md` at the top of the notes short and readable by someone with none of your context: what is running, with experiment IDs, and what comes next.
-- `mlsweep notes lint` checks links and experiment IDs, and reports leftover conflict markers and empty files. It always exits 0, so read the report. It needs the manager for the IDs (`--manager`, or `--no-manager` to skip them). `--fix` applies safe link-path fixes, and `--review-prompt` prints a brief for an independent reviewing agent.
+- `mlsweep notes lint` checks links, experiment and run IDs, chart/table specs, and the numbers behind evidence links, and reports leftover conflict markers and empty files. It always exits 0, so read the report. It needs the manager for the IDs (`--manager`, or `--no-manager` to skip them). `--fix` applies safe link-path fixes, and `--review-prompt` prints a brief for an independent reviewing agent.
+
+### Recording results
+
+Put the evidence in the note, not in a screenshot. These blocks are fetched from
+the manager when the note is opened, so they stay current and count as citations.
+
+````
+```mlsweep-chart
+experiments: <experiment_id>
+metric: val_loss
+split_by: lr          # color by a hyperparameter; band: minmax shows seed spread
+caption: Validation loss by learning rate. {#fig-loss}
+```
+````
+
+````
+```mlsweep-table
+experiments: <experiment_id>
+metrics: [val_loss, acc]
+sort: val_loss
+order: asc
+```
+````
+
+- Chart keys: `experiments` or `runs` (`exp/run`), `metric`, then optional `split_by`, `band`, `smooth`, `log_y`, `x_max`, `where` (`lr=0.001`), `points`, `limit`, `caption`. Table keys add `metrics`, `columns`, `agg` (`final`/`min`/`max`/`mean`), `sort`, `order`.
+- Tie every number in prose to its source: `[0.412](mlsweep:<experiment>/<run>/val_loss@20000)`. The tab marks it ✓ when it matches (⚠ when it does not) and links to the run. `@final`, `@min`, `@max`, `@mean` and `@50%` also work. Lint reports unknown experiments/runs and numbers that disagree with the logged metric; it does not judge the claim.
+- Footnotes: `text[^1]` and `[^1]: the note`, continuation lines indented.
+- Captions: a `Figure: text` line directly under an image or table. Add `{#fig-name}` to fix the anchor and link to it as `[Figure 1](#fig-name)`. Headings take `{#id}` too.
+- Full reference: `mlsweep docs notes`.
 
 ## Reading more
 

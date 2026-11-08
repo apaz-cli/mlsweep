@@ -1,4 +1,5 @@
-Third-party code bundled in vendor-notes.js and vendor-notes.css
+Third-party code bundled in vendor-notes.js, vendor-notes.css, cm-simple.js,
+cm-rust.js, cm-go.js, and the vendored plotly/katex files
 
 === marked 15.0.12 ===
 # License information
@@ -80,6 +81,9 @@ This software is provided by the copyright holders and contributors “as is” 
 (full text: https://github.com/cure53/DOMPurify/blob/3.4.17/LICENSE)
 
 === CodeMirror 5.65.21 ===
+(cm-simple.js, cm-rust.js and cm-go.js are CodeMirror 5.56.0 mode/addon files,
+under the same MIT license.)
+
 MIT License
 
 Copyright (C) 2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others

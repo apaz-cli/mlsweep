@@ -40,6 +40,7 @@ from mlsweep.run_sweep import (
     _parse_combo,
     _resolve_campaign,
     _wait_until_settled,
+    _get_experiment,
     build_leaderboard,
     manager_cancel_job,
     manager_get_experiment_summary,
@@ -73,6 +74,14 @@ def _select_jobs(
         j for j in jobs
         if (ids and j.get("run_id") in ids) or (statuses and j.get("status") in statuses)
     ]
+
+
+def _jobs_or_exit(manager: str, token: str, experiment: str, campaign: str | None) -> list[dict[str, Any]]:
+    """The experiment's jobs.  A failed listing has been reported; do not mistake it for no jobs."""
+    jobs = manager_list_experiment_jobs(manager, token, experiment, campaign=campaign)
+    if jobs is None:
+        sys.exit(1)
+    return jobs
 
 
 def _report(ok: object, msg: str) -> None:
@@ -467,7 +476,6 @@ def ls_cmd(argv: list[str]) -> None:
     status_filter = "completed" if args.status == "done" else args.status
     exps = manager_list_experiments(manager, token, status_filter=status_filter, campaign=campaign)
     if exps is None:
-        sweep_print(f"{_RED}FAIL{_RESET}  list experiments")
         sys.exit(1)
     if args.json:
         print(json.dumps(exps, indent=2))
@@ -652,7 +660,7 @@ def metrics_cmd(argv: list[str]) -> None:
 
     jobs: list[dict[str, Any]] = []
     if not args.runs or args.with_dims:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
+        jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
     dims, combo_by_run = _dim_columns(jobs)
     if not args.with_dims:
         dims = []  # so every dim column below comes out empty
@@ -782,7 +790,7 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
-    jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
+    jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
     statuses = [s for s in _SELECTABLE_STATUSES if getattr(args, s)]
     targets = jobs if args.all else _select_jobs(jobs, args.runs, statuses)
 
@@ -801,6 +809,10 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
     else:
         failures = _apply(targets, manager_cancel_job, verb, manager, token, args.experiment,
                           args.dry_run, campaign)
+        if awaits_more_runs(manager, token, args.experiment, campaign):
+            sweep_print(f"  If this is a Bayesian sweep, the manager will choose new trials to replace "
+                        f"these. To end it, use `mlsweep stop {args.experiment}`, or `mlsweep optimize "
+                        f"{args.experiment} --finish` to let running runs end.")
     if failures:
         sys.exit(1)
 
@@ -886,6 +898,85 @@ def pause_cmd(argv: list[str]) -> None:
 
 def unpause_cmd(argv: list[str]) -> None:
     _set_status_cmd(argv, "unpause", "Resume dispatching a paused experiment.", "running", "resumed")
+
+
+# ── optimize ───────────────────────────────────────────────────────────────────
+
+
+def _print_optimizer(view: dict[str, Any]) -> None:
+    told, budget = view.get("told"), view.get("budget")
+    sweep_print(f"  {_BOLD}{view.get('experiment_id')}{_RESET}: {view.get('status')}"
+                + (", finishing (no new trials)" if view.get("finishing") else ""))
+    sweep_print(f"  metric:     {view.get('metric')} ({view.get('goal')})")
+    sweep_print(f"  budget:     {told} of {budget} trials have results")
+    sweep_print(f"  trials:     {view.get('running')} running, {view.get('failed')} failed, "
+                f"{view.get('abandoned')} cancelled")
+    sweep_print(f"  at once:    {view.get('parallel')} (set with --max-concurrent)")
+    sweep_print(f"  failures:   {view.get('failure_streak')} in a row, pauses at {view.get('max_failures')}")
+    best = view.get("best")
+    if isinstance(best, dict):
+        sweep_print(f"  best:       {best.get('value')} {_GREEN}{best.get('run_id')}{_RESET}  "
+                    f"{_combo_str(best.get('combo'))}")
+    if view.get("note"):
+        sweep_print(f"  {_YELLOW}note:{_RESET}       {view.get('note')}")
+
+
+def optimize_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep optimize",
+        "Show or adjust a Bayesian sweep. The manager chooses its runs. Use pause, unpause and stop "
+        "to control it, and cancel to drop one trial, which the manager replaces.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("--budget", default=None, metavar="N|+N",
+                        help="How many trials need results, or +N for that many more. "
+                             "Undoes --finish, and a completed sweep with budget left runs again.")
+    parser.add_argument("--finish", action="store_true",
+                        help="Start no new trials, and complete once the running ones end")
+    parser.add_argument("--max-concurrent", type=int, default=None, metavar="K",
+                        help="How many trials and jobs run at once (0 = the default, n_initial)")
+    parser.add_argument("--max-failures", type=int, default=None, metavar="N",
+                        help="Failed trials in a row before the sweep pauses")
+    parser.add_argument("--json", action="store_true", help="Print the status as JSON")
+    args = parser.parse_args(argv)
+    manager, token, campaign = _connect(args, args.experiment)
+    url = _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/optimize", campaign))
+
+    status, view = _http_request("GET", url, token)
+    if status != 200 or not isinstance(view, dict):
+        _fail("optimize", status, view)
+
+    body: dict[str, Any] = {}
+    if args.budget is not None:
+        try:
+            body["budget"] = int(args.budget) + (int(view["budget"]) if args.budget.startswith("+") else 0)
+        except ValueError:
+            parser.error(f"--budget must be N or +N, not {args.budget!r}")
+    if args.finish:
+        if args.budget is not None:
+            parser.error("--budget undoes --finish, so use one of them")
+        body["finish"] = True
+    if args.max_failures is not None:
+        body["max_failures"] = args.max_failures
+    if args.max_concurrent is not None:
+        cap_url = _with_campaign(f"/api/experiments/{args.experiment}/max_concurrent", campaign)
+        status, resp = _http_request("PUT", _manager_url(manager, cap_url), token,
+                                     json_data={"max_concurrent": args.max_concurrent})
+        if status != 200:
+            _fail("optimize", status, resp)
+    if body:
+        status, view = _http_request("PATCH", url, token, json_data=body)
+        if status != 200 or not isinstance(view, dict):
+            _fail("optimize", status, view)
+    elif args.max_concurrent is not None:
+        status, view = _http_request("GET", url, token)
+        if status != 200 or not isinstance(view, dict):
+            _fail("optimize", status, view)
+
+    if args.json:
+        print(json.dumps(view, indent=2))
+    else:
+        _print_optimizer(view)
 
 
 # ── wait ───────────────────────────────────────────────────────────────────────
@@ -1001,6 +1092,15 @@ def wait_cmd(argv: list[str]) -> None:
             sys.exit(WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED)
 
         if not active:
+            # A Bayesian sweep adds runs as results come in, so a gap isn't the end.
+            if awaits_more_runs(manager, token, args.experiment, campaign):
+                if args.timeout and time.monotonic() - start >= args.timeout:
+                    sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
+                                f"but the manager still expects more. `mlsweep optimize "
+                                f"{args.experiment}` shows where a Bayesian sweep stands.")
+                    sys.exit(WAIT_EXIT_TIMEOUT)
+                time.sleep(args.interval)
+                continue
             # Settled: nothing pending/dispatched/running.
             if failed:
                 names = ", ".join(j.get("run_id", "?") for j in failed)
@@ -1012,18 +1112,8 @@ def wait_cmd(argv: list[str]) -> None:
                 sweep_print(f"{_YELLOW}CANCELLED{_RESET}  {args.experiment} settled with "
                             f"{cancelled} of {len(jobs)} run(s) cancelled.")
                 sys.exit(WAIT_EXIT_CANCELLED)
-            # A Bayesian sweep's submitter adds runs one at a time, so a gap isn't the end.
-            awaiting = awaits_more_runs(manager, token, args.experiment, campaign)
-            if not awaiting:
-                sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
-                sys.exit(WAIT_EXIT_SETTLED)
-            if args.timeout and time.monotonic() - start >= args.timeout:
-                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs, but its "
-                            f"Bayesian budget is not used up. If its submitter is gone, continue with "
-                            f"`mlsweep resume {args.experiment} --sweep FILE --stream`.")
-                sys.exit(WAIT_EXIT_TIMEOUT)
-            time.sleep(args.interval)
-            continue
+            sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
+            sys.exit(WAIT_EXIT_SETTLED)
 
         if args.until == "stalled":
             stalled = _wait_stalled(jobs, args.stalled_after)
@@ -1047,32 +1137,24 @@ def wait_cmd(argv: list[str]) -> None:
 def resume_cmd(argv: list[str]) -> None:
     parser = _common_parser(
         "mlsweep resume",
-        "Re-queue an experiment's failed and cancelled runs, or continue a Bayesian sweep with "
-        "--sweep. It does not undo `pause`; use `unpause` for that.")
+        "Re-queue an experiment's failed and cancelled runs. A Bayesian sweep instead goes back "
+        "to running and the manager chooses new trials. It does not undo `pause`; use `unpause` for that.")
     parser.add_argument("experiment", help="Experiment ID")
-    parser.add_argument("--sweep", default=None, help="Sweep file (required to continue a Bayesian sweep)")
-    parser.add_argument("--stream", action="store_true",
-                        help="With a Bayesian --sweep: stay attached and choose each run from the last result")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
-    if args.sweep:
-        from mlsweep._sweep import load_sweep_file
-        info = load_sweep_file(args.sweep)
-        if info.get("method") == "bayes":
-            # Reuse the submitter's bayes resume path.
-            from mlsweep.cli import _forward
-            from mlsweep.run_sweep import main as _run_main
-            fwd = [args.sweep, "--resume", args.experiment, "--manager", manager,
-                   *_campaign_argv(campaign), *(["--stream"] if args.stream else [])]
-            if args.token:
-                fwd += ["--token", args.token]
-            _forward("mlsweep run", _run_main, fwd)
+    if _get_experiment(manager, token, args.experiment, campaign).get("optimize"):
+        if args.dry_run:
+            sweep_print(f"  Would set {args.experiment} running, so the manager chooses new trials.")
             return
+        r = manager_set_experiment_status(manager, token, args.experiment, "running", campaign=campaign)
+        _report(r, f"resumed {args.experiment}; the manager chooses new trials")
+        if not r:
+            sys.exit(1)
+        return
 
-    # Grid (or no sweep file): re-queue failed / cancelled runs.
-    jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign) or []
+    jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
     targets = [j for j in jobs if j.get("status") in ("failed", "cancelled")]
     if not targets:
         sweep_print("  Nothing to resume, no failed or cancelled jobs.")

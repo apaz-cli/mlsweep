@@ -76,16 +76,21 @@ function lvSerialize(d) {
 const lvSrc = b => b.lines.join("\n");
 
 // ── Rendering one block ────────────────────────────────────────────────────────
-function lvRenderBlock(el, b, path) {
+function lvRenderBlock(el, b, path, ctx) {
   el.innerHTML = "";
   if (b.fm) {
     const props = propsEl(b.lines.slice(1, -1));
     if (props.children.length) el.append(props); else lvGhost(el, b);
     return;
   }
-  el.innerHTML = DOMPurify.sanitize(MD.parse(lvSrc(b)), PURIFY);
-  postProcess(el, path, 0);
-  const visible = el.textContent.trim() !== "" || el.querySelector("img,hr,iframe,svg,table,canvas,.katex,.embed-note,input");
+  renderMarkdown(lvSrc(b), path, el, {
+    frontmatter: false,
+    figBase: b.figBase || 0,
+    fnDefs: ctx && ctx.defs,
+    fnNumbers: ctx && ctx.numbers,
+  });
+  const visible = el.textContent.trim() !== "" ||
+    el.querySelector("img,hr,iframe,svg,table,canvas,.katex,.embed-note,.nb-block,.footnotes,input");
   if (!visible) lvGhost(el, b);
 }
 // Blocks that render to nothing (comments, link definitions) show their source, greyed.
@@ -122,8 +127,28 @@ function livePane(t) {
   return pane;
 }
 
+// Footnote numbers and figure numbers are counted over the whole note, so each
+// block's rendering agrees with the others.  lvNumbering also returns a cheap
+// signature; when an edit changes it, every block has to be drawn again.
+function lvNumbering(L) {
+  const whole = L.t.doc.getValue();
+  const fn = collectFootnotes(whole);
+  const numbers = footnoteNumbers(fn.body, fn.defs);
+  const figBase = { fig: 0, table: 0 };
+  for (const b of L.doc.blocks) {
+    b.figBase = { ...figBase };
+    const n = b.fm ? { fig: 0, table: 0 } : countFigures(b.lines.join("\n"));
+    figBase.fig += n.fig;
+    figBase.table += n.table;
+  }
+  L.fn = { defs: fn.defs, numbers };
+  L.fnSig = figBase.fig + "/" + figBase.table + ":" +
+    [...numbers].map(([id, n]) => id + "=" + n).join(",");
+}
+
 function lvDraw(L) {
   L.doc = lvParse(L.t.doc.getValue());
+  lvNumbering(L);
   L.editing = -1; L.ta = null;
   L.art.innerHTML = "";
   for (const b of L.doc.blocks) L.art.append(lvBlockEl(L, b));
@@ -133,7 +158,7 @@ function lvDraw(L) {
 }
 function lvBlockEl(L, b) {
   const d = el("div", "lv-block");
-  lvRenderBlock(d, b, L.t.path);
+  lvRenderBlock(d, b, L.t.path, L.fn);
   return d;
 }
 const lvIndex = (L, node) => [...L.art.children].indexOf(node);
@@ -241,6 +266,15 @@ function lvAfterChange(L) {
   renderTabs(); updateSaveState(t);
   clearTimeout(autosave.get(t.id));
   if (t.dirty) autosave.set(t.id, setTimeout(() => saveTab(t), 600));
+  const before = L.fnSig;
+  lvNumbering(L);
+  if (L.fnSig !== before) {
+    // A new figure or footnote can renumber the rest of the note.
+    const top = L.pane.scrollTop;
+    lvDraw(L);
+    L.pane.scrollTop = top;
+    return;
+  }
   refreshOutline(t);
 }
 
@@ -287,8 +321,9 @@ function lvKey(L, e) {
 function lvMouseDown(L, e) {
   if (e.button !== 0) return;
   if (e.target.closest("textarea")) return;
-  // Links, experiment chips and checkboxes act; everything else edits.
-  if (e.target.closest("a, input, .embed-note .embed-title")) return;
+  // Links, experiment chips, checkboxes and the chart itself act; the rest
+  // edits.  A chart's header is still inside the block, so clicking it edits.
+  if (e.target.closest("a, input, button, .nb-legend, .nb-table, .embed-note .embed-title, .nb-chart")) return;
   const blk = e.target.closest(".lv-block");
   if (blk) {
     e.preventDefault();

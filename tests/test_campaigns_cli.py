@@ -517,12 +517,11 @@ def test_run_refuses_existing_experiment_in_other_campaign(mgr, tmp_path):
     assert sorted(j["run_id"] for j in ok(mgr, "GET", f"/api/experiments/{eid}/jobs")) == ["r1", "r2"]
 
 
-def test_resume_refuses_experiment_in_other_campaign(mgr, tmp_path):
+def test_resume_refuses_experiment_in_other_campaign(mgr, capsys):
     eid = seed(mgr, "alpha")
-    proc = _submit(["tests/sweeps/bayes_sweep.py", "--output-dir", str(tmp_path),
-                    "--manager", mgr.url, "--token", TOKEN, "--resume", eid])
-    assert proc.returncode == 1
-    assert f"experiment {eid} is in campaign 'alpha', not 'default'" in proc.stdout
+    code, out = _run_cli(["resume", eid, "--manager", mgr.url, "--token", TOKEN], capsys)
+    assert code == 1
+    assert f"experiment {eid} is in campaign 'alpha', not 'default'" in out
 
 
 # ── End to end, with a worker ───────────────────────────────────────────────────

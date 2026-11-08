@@ -222,3 +222,70 @@ def test_reads_say_when_they_fall_back_and_fail_with_no_notes(tmp_path: Path) ->
     (tmp_path / "state" / "notes" / "a.md").write_text("alpha\n")
     done = _outside_a_clone(tmp_path, "search", "alpha")
     assert done.returncode == 0 and "a.md" in done.stdout and "manager's folder" in done.stderr
+
+
+def test_chart_blocks_and_evidence_links(tmp_path: Path) -> None:
+    _write(tmp_path, {"n.md": (
+        "# Results\n\n"
+        "```mlsweep-chart\n"
+        "experiments: [real, ghost]\n"
+        "metric: val_loss\n"
+        "runs: [real/run_a, real/run_missing]\n"
+        "```\n\n"
+        "The loss was [0.42](mlsweep:real/run_a/val_loss@20000).\n"
+        "Bad: [x](mlsweep:real/run_a) and [y](mlsweep:real/run_b/loss).\n"
+        "Code is ignored: `[z](mlsweep:real/run_a/loss@1)`.\n"
+        "\n```mlsweep-table\nnot a key value line\n```\n"
+    )})
+    res = _notes_lint.lint(tmp_path, known_experiments={"real"},
+                           known_runs={"run_a": ["real"]})
+    by_kind = {}
+    for f in res["findings"]:
+        by_kind.setdefault(f["kind"], []).append(f)
+    assert res["stats"]["data_blocks"] == 2
+    assert [f["detail"]["id"] for f in by_kind["unknown-experiment"]] == ["ghost"]
+    assert {f["detail"]["id"] for f in by_kind["unknown-run"]} == {"real/run_missing"}
+    assert len(by_kind["evidence-ref"]) == 2
+    assert len(by_kind["block-spec"]) == 1
+    assert any("key: value" in f["message"] for f in by_kind["block-spec"])
+
+    # Without a manager, specs are still parsed and only structural problems show.
+    res = _notes_lint.lint(tmp_path)
+    kinds = {f["kind"] for f in res["findings"]}
+    assert "unknown-experiment" not in kinds and "unknown-run" not in kinds
+    assert "block-spec" in kinds
+
+
+def test_caption_lines_without_a_figure_are_not_findings(tmp_path: Path) -> None:
+    _write(tmp_path, {"n.md": "Figure: this is just a sentence.\n"})
+    assert _notes_lint.lint(tmp_path)["findings"] == []
+
+
+def test_stale_evidence_numbers(tmp_path: Path) -> None:
+    _write(tmp_path, {"n.md": (
+        "Matches [1.0](mlsweep:real/run_a/loss@2) and "
+        "does not [9.0](mlsweep:real/run_a/loss@2).\n")})
+    evidence = {"real/run_a/loss@2": {"ok": True, "ref": "real/run_a/loss@2",
+                                      "value": 1.001, "step": 2}}
+    res = _notes_lint.lint(tmp_path, known_experiments={"real"},
+                           known_runs={"run_a": ["real"]}, evidence=evidence)
+    stale = [f for f in res["findings"] if f["kind"] == "stale-evidence"]
+    assert len(stale) == 1
+    assert "9" in stale[0]["message"] and stale[0]["detail"]["value"] == 1.001
+    assert res["stats"]["evidence_checked"] is True
+
+    # Without resolved values the number check is skipped, not guessed.
+    res = _notes_lint.lint(tmp_path, known_experiments={"real"},
+                           known_runs={"run_a": ["real"]})
+    assert not [f for f in res["findings"] if f["kind"] == "stale-evidence"]
+    assert res["stats"]["evidence_checked"] is False
+
+
+def test_evidence_refs_skips_code_and_sources(tmp_path: Path) -> None:
+    _write(tmp_path, {
+        "n.md": ("[a](mlsweep:e/r/loss@1) `[b](mlsweep:e/r/loss@2)`\n"
+                 "```\n[c](mlsweep:e/r/loss@3)\n```\n"),
+        "sources/paper.md": "[d](mlsweep:e/r/loss@4)\n",
+    })
+    index = _notes.build_index(tmp_path, set())
+    assert _notes_lint.evidence_refs(index, tmp_path) == ["e/r/loss@1"]

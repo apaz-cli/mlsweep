@@ -34,6 +34,7 @@ from typing import Any, Callable, Sequence
 
 import aiosqlite
 
+from mlsweep._manager_optimizer import advance_optimizers_locked
 from mlsweep._manager_db import (
     JobRecord,
     SchedulableJob,
@@ -723,8 +724,13 @@ async def _worker_read_task(
             print(f"  {_YELLOW}WARN{_RESET}  Worker {wc.host} sent {type(hello).__name__} "
                   "before its hello; dropping the connection")
             hello = None
+    except asyncio.IncompleteReadError:
+        if wc.conn_gen == gen and not state.shutdown_event.is_set():
+            print(f"  {_YELLOW}WARN{_RESET}  Worker {wc.host} closed the connection before its hello; "
+                  "if this repeats, its --token may not match the manager's")
+        hello = None
     except Exception as e:
-        if not isinstance(e, (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError, ValueError)):
+        if not isinstance(e, (asyncio.TimeoutError, OSError, ValueError)):
             print(f"  {_RED}ERROR{_RESET} handling hello from {wc.host}: {e!r}")
             traceback.print_exc()
         hello = None
@@ -1274,6 +1280,8 @@ async def _check_experiments_complete_locked(
         exp = await get_experiment(db, eid)
         if exp is None or exp.status != "running":
             continue
+        if exp.optimize is not None:
+            continue  # it decides when it's done; see _manager_optimizer
         counts = await count_jobs_by_status(db, eid)
         if not counts:
             # No jobs yet (e.g. a freshly created or un-paused experiment):
@@ -1512,6 +1520,7 @@ async def scheduler_loop(db: aiosqlite.Connection, state: ManagerState) -> None:
         state.schedule_event.clear()
         try:
             async with state.lock:
+                await advance_optimizers_locked(db, state)
                 await _schedule_pass_locked(db, state)
         except Exception as e:
             print(f"  {_RED}ERROR{_RESET} scheduling pass failed: {e!r}")

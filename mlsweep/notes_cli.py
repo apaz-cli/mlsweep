@@ -31,7 +31,8 @@ _USAGE = f"""\
 {_BOLD}{_CYAN}Use:{_RESET}
   clone DIR                      clone the notes from the manager (--manager URL), then use git as usual
   status [DIR]                   remote, unpushed commits, recent changes
-  lint [DIR]                     check links, experiment IDs and conflict markers (--fix, --json)
+  lint [DIR]                     check links, experiment/run IDs, chart specs, evidence
+                                 numbers and conflict markers (--fix, --json)
   lint [DIR] --review-prompt     print a brief for an independent reviewing agent
 
 {_BOLD}{_CYAN}Read and reorganize{_RESET} (add --dir DIR, --json):
@@ -165,6 +166,27 @@ def _fetch_known(manager: str, token: str) -> set[str]:
     return set(data.get("known", []))
 
 
+def _fetch_run_map(manager: str, token: str) -> dict[str, list[str]]:
+    """Run IDs and the experiments that use them; OSError if the manager won't say."""
+    path = "/api/notes/run-ids"
+    status, data = _http_request("GET", _manager_url(manager, path), token, timeout=60, quiet=True)
+    if status != 200 or not isinstance(data, dict):
+        raise OSError(f"HTTP {status}" if status else "no response")
+    runs = data.get("runs")
+    return runs if isinstance(runs, dict) else {}
+
+
+def _fetch_evidence(manager: str, token: str, refs: list[str]) -> dict[str, dict[str, Any]]:
+    """Resolve evidence links to logged values; OSError if the manager won't say."""
+    path = "/api/notes/evidence"
+    status, data = _http_request("POST", _manager_url(manager, path), token,
+                                 json_data={"refs": refs}, timeout=60, quiet=True)
+    if status != 200 or not isinstance(data, dict):
+        raise OSError(f"HTTP {status}" if status else "no response")
+    results = data.get("results")
+    return results if isinstance(results, dict) else {}
+
+
 def _fetch_run_ids(manager: str, token: str, experiment: str) -> set[str]:
     """Run IDs of *experiment*; OSError if the manager won't say."""
     path = f"/api/experiments/{quote(experiment, safe='')}/jobs"
@@ -177,9 +199,9 @@ def _fetch_run_ids(manager: str, token: str, experiment: str) -> set[str]:
 def _lint(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(
         prog="mlsweep notes lint",
-        description="Check the notes: links, experiment IDs (via the manager) and merge "
-                    "leftovers. Numbers are not checked; compare them with `mlsweep metrics`. "
-                    "Reports only; --fix applies the safe link-path fixes.")
+        description="Check the notes: links, experiment and run IDs, chart/table specs, "
+                    "and the numbers behind mlsweep: evidence links (via the manager), "
+                    "plus merge leftovers. Reports only; --fix applies the safe link-path fixes.")
     ap.add_argument("dir", nargs="?")
     ap.add_argument("--fix", action="store_true", help="apply safe fixes (link paths) and report the rest")
     ap.add_argument("--json", action="store_true")
@@ -194,20 +216,42 @@ def _lint(argv: list[str]) -> None:
         sys.exit(2)
 
     known: set[str] | None = None
+    known_runs: dict[str, list[str]] | None = None
+    evidence: dict[str, dict[str, Any]] | None = None
+    index: _notes.Index | None = None
+    token = ""
     note = ""
     if not args.no_manager:
         token = _resolve_token(args.token)
         try:
             known = _fetch_known(args.manager, token)
         except OSError as exc:
-            note = f"experiment IDs not checked: manager {args.manager} unreachable ({exc})"
+            note = f"experiment and run IDs not checked: manager {args.manager} unreachable ({exc})"
+        else:
+            try:
+                known_runs = _fetch_run_map(args.manager, token)
+            except OSError:
+                note = "run IDs not checked: this manager does not report them"
 
-    result = _notes_lint.lint(root, known_experiments=known)
+    if known is not None:
+        index = _notes.build_index(root, known)
+        refs = _notes_lint.evidence_refs(index, root)
+        if refs:
+            try:
+                evidence = _fetch_evidence(args.manager, token, refs)
+            except OSError:
+                msg = "evidence numbers not checked: this manager does not report them"
+                note = f"{note} {msg}".strip() if note else msg
+
+    result = _notes_lint.lint(root, known_experiments=known, known_runs=known_runs,
+                              evidence=evidence, index=index)
     if args.fix:
         changed = _notes_lint.apply_fixes(root, result["findings"])
         if changed and not args.json:
             print(f"{_GREEN}fixed links in {len(changed)} file(s):{_RESET} " + ", ".join(changed))
-        result = _notes_lint.lint(root, known_experiments=known)
+        index = _notes.build_index(root, known or set())
+        result = _notes_lint.lint(root, known_experiments=known, known_runs=known_runs,
+                                  evidence=evidence, index=index)
     if args.json:
         print(json.dumps(result, indent=1))
         return

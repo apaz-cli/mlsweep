@@ -42,7 +42,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncContextManager, Callable, Awaitable
+from typing import Any, AsyncContextManager, Callable, Awaitable, TypeGuard
 
 import aiosqlite
 from aiohttp import WSMsgType, web
@@ -60,6 +60,7 @@ from mlsweep._export import (
 from mlsweep._manager_db import (
     ACTIVE_JOB_STATUSES,
     FINISHED_JOB_STATUSES,
+    JOB_STATUSES,
     WorkerRecord,
     count_pending_jobs,
     experiment_summary,
@@ -79,6 +80,13 @@ from mlsweep._manager_db import (
     list_pending_jobs,
     list_workers,
 )
+from mlsweep._manager_optimizer import (
+    advance_optimizer_locked,
+    check_submitted_spec,
+    cleared_for_running,
+    read_progress,
+    status_view,
+)
 from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState
 from mlsweep._manager_workers import (
     _check_experiments_complete_locked,
@@ -90,6 +98,7 @@ from mlsweep._manager_workers import (
     validate_worker_host,
     worker_id_for,
 )
+from mlsweep._sweep import spec_singular_dims
 from mlsweep._shared import (
     DEFAULT_CAMPAIGN,
     _dir_size,
@@ -265,7 +274,7 @@ def _sanitize_experiment_id(experiment_id: str) -> str:
 
     Returns *experiment_id* unchanged if valid; raises ``ValueError`` otherwise.
     """
-    if not _EXPERIMENT_ID_RE.match(experiment_id):
+    if not isinstance(experiment_id, str) or not _EXPERIMENT_ID_RE.match(experiment_id):
         raise ValueError(
             "experiment_id must be 1-128 chars of [a-zA-Z0-9_\\-]"
         )
@@ -349,6 +358,42 @@ class _AuthThrottle:
             if len(self._seen) >= _MAX_TRACKED_ADDRESSES:
                 return
         self._seen[str(address)] = (count, start, now + _AUTH_BLOCK_SECS if count >= _MAX_AUTH_FAILURES else 0.0)
+
+
+def _job_insert_refused(exc: sqlite3.IntegrityError) -> web.Response:
+    """What a constraint failure on inserting jobs means to the client."""
+    if "FOREIGN KEY" in str(exc):
+        return _not_found("experiment")
+    return _error_response(
+        "duplicate run_id in this experiment (run names must be unique per experiment); nothing was created",
+        status=409,
+    )
+
+
+def _is_number(value: Any) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _limit_param(request: web.Request) -> int | None:
+    """The ``?limit=`` query parameter, or None without one; a 400 if it is not a count."""
+    raw = request.query.get("limit")
+    if not raw:
+        return None
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise _bad_request("limit must be a non-negative integer") from None
+    if limit < 0:
+        raise _bad_request("limit must be a non-negative integer")
+    return limit
+
+
+def _status_param(request: web.Request, default: str | None = None) -> str | None:
+    """The ``?status=`` query parameter; a 400 if no job can have it."""
+    status = request.query.get("status", default)
+    if status is not None and status not in JOB_STATUSES:
+        raise _bad_request(f"status must be one of {list(JOB_STATUSES)}")
+    return status
 
 
 def _is_static(request: web.Request) -> bool:
@@ -647,10 +692,7 @@ async def handle_update_experiment_campaign(request: web.Request) -> web.Respons
     """
     state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     target = body.get("campaign") if isinstance(body, dict) else None
     if not target:
         return _error_response("'campaign' is required")
@@ -706,6 +748,20 @@ async def _experiment_fields(
     existing = await get_experiment(db, experiment_id)
     if existing is not None and existing.campaign != campaign:
         return _wrong_campaign(experiment_id, existing.campaign, campaign, status=409)
+    optimizer: dict[str, Any] = {}
+    if body.get("optimize") is not None:
+        if existing is not None:
+            return _error_response(f"experiment {experiment_id} already exists; "
+                                   "a Bayesian sweep needs a new one", status=409)
+        try:
+            spec = await asyncio.to_thread(check_submitted_spec, body["optimize"])
+        except Exception as exc:
+            return _error_response(f"bad Bayesian sweep: {exc}")
+        # The spec decides these, so they can't disagree with it.
+        optimizer = {
+            "optimize": spec, "metric": spec["metric"], "goal": spec["goal"], "expected_jobs": 0,
+            "singular_dims": spec_singular_dims(spec), "skip_rules": {},
+        }
     return {
         "experiment_id": experiment_id,
         "name": body.get("name") or experiment_id,
@@ -719,6 +775,7 @@ async def _experiment_fields(
         "skip_rules": body.get("skip_rules") or {},
         "metric": body.get("metric"),
         "goal": goal,
+        **optimizer,
     }
 
 
@@ -732,10 +789,7 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     experiment_id = body.get("experiment_id") or body.get("id")
     if not experiment_id:
@@ -750,8 +804,14 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     fields = await _experiment_fields(request, db, body, experiment_id)
     if isinstance(fields, web.Response):
         return fields
-    exp = await state.db_writer.create_experiment(**fields)
+    if fields.get("optimize") is None:
+        return _json_response(await state.db_writer.create_experiment(**fields), status=201)
 
+    # The first trials exist by the time this returns, so a client never sees a sweep with no runs.
+    async with state.lock:
+        exp = await state.db_writer.create_experiment(**fields)
+        await advance_optimizer_locked(db, state, exp)
+    state.request_schedule()
     return _json_response(exp, status=201)
 
 
@@ -781,10 +841,7 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     status = body.get("status")
     if not status:
         return _error_response("'status' is required")
@@ -796,6 +853,9 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
         exp = await state.db_writer.update_experiment_status(experiment_id, status)
         if exp is None:
             return _not_found("experiment")
+        if status == "running" and exp.optimize is not None:
+            await state.db_writer.update_experiment_optimize(
+                experiment_id, cleared_for_running(json.loads(exp.optimize)))
         # Aborting stops the sweep for good, so cancel everything unfinished.
         if status == "aborted":
             pending = await list_jobs_by_experiment(db, experiment_id, status="pending")
@@ -809,15 +869,84 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     return _json_response(exp)
 
 
+async def _optimizer_status(
+    db: aiosqlite.Connection, state: ManagerState, experiment_id: str,
+) -> dict[str, Any] | web.Response:
+    exp = await get_experiment(db, experiment_id)
+    if exp is None:
+        return _not_found("experiment")
+    if exp.optimize is None:
+        return _error_response(f"{experiment_id} is not a Bayesian sweep", status=404)
+    spec = json.loads(exp.optimize)
+    return status_view(exp, spec, await read_progress(db, state, experiment_id, spec))
+
+
+@routes.get("/api/experiments/{experiment_id}/optimize")
+async def handle_get_optimizer(request: web.Request) -> web.Response:
+    """A Bayesian sweep's progress: budget, trials with results, running, failed, best so far."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    async with state.lock:
+        view = await _optimizer_status(db, state, request.match_info["experiment_id"])
+    return view if isinstance(view, web.Response) else _json_response(view)
+
+
+@routes.patch("/api/experiments/{experiment_id}/optimize")
+async def handle_patch_optimizer(request: web.Request) -> web.Response:
+    """Change a Bayesian sweep while it runs.
+
+    Body fields, all optional:
+
+    * ``budget`` (int >= 1): how many trials need results.  Setting it also undoes
+      ``finish``, and a completed sweep with budget left runs again.
+    * ``max_failures`` (int >= 1): failed trials in a row before the sweep pauses.
+    * ``finish`` (bool): start no new trials, and complete once the running ones end.
+
+    Runs that already exist are never touched.  To stop them, use ``cancel`` or ``stop``.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    experiment_id = request.match_info["experiment_id"]
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return _error_response("body must be an object")
+    for field in ("budget", "max_failures"):
+        value = body.get(field)
+        if field in body and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            return _error_response(f"'{field}' must be a positive int")
+    if "finish" in body and not isinstance(body["finish"], bool):
+        return _error_response("'finish' must be a bool")
+
+    async with state.lock:
+        exp = await get_experiment(db, experiment_id)
+        if exp is None:
+            return _not_found("experiment")
+        if exp.optimize is None:
+            return _error_response(f"{experiment_id} is not a Bayesian sweep", status=404)
+        spec = json.loads(exp.optimize)
+        if "max_failures" in body:
+            spec["max_failures"] = body["max_failures"]
+        if "budget" in body:
+            spec["budget"] = body["budget"]
+            spec["finishing"] = False
+        if "finish" in body:
+            spec["finishing"] = body["finish"]
+        await state.db_writer.update_experiment_optimize(experiment_id, spec)
+        if exp.status == "completed" and "budget" in body:
+            # Completes again on the next pass if there is still nothing to do.
+            await state.db_writer.update_experiment_status(experiment_id, "running")
+            await state.db_writer.update_experiment_optimize(experiment_id, cleared_for_running(spec))
+        view = await _optimizer_status(db, state, experiment_id)
+    state.request_schedule()
+    return view if isinstance(view, web.Response) else _json_response(view)
+
+
 @routes.put("/api/experiments/{experiment_id}/name")
 async def handle_update_experiment_name(request: web.Request) -> web.Response:
     """Update an experiment's display name."""
     state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     name = body.get("name")
     if not name or not isinstance(name, str):
         return _error_response("'name' is required")
@@ -839,10 +968,7 @@ async def handle_update_experiment_max_concurrent(request: web.Request) -> web.R
     """
     state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     value = body.get("max_concurrent")
     if value is None or not isinstance(value, int) or value < 0:
         return _error_response("'max_concurrent' (int >= 0) is required")
@@ -912,7 +1038,7 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
     experiment_id = request.match_info["experiment_id"]
-    status_filter = request.query.get("status")
+    status_filter = _status_param(request)
     jobs = await list_jobs_by_experiment(db, experiment_id, status=status_filter)  # type: ignore[arg-type]
     now = time.time()
     out: list[dict[str, Any]] = []
@@ -1005,10 +1131,8 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.query.get("experiment_id")
     campaign = request.query.get("campaign")
-    status = request.query.get("status", "pending")
-    limit_str = request.query.get("limit")
-
-    limit = int(limit_str) if limit_str else None
+    status = _status_param(request, "pending")
+    limit = _limit_param(request)
 
     if experiment_id:
         jobs = await list_jobs_by_experiment(db, experiment_id, status=status)  # type: ignore[arg-type]
@@ -1027,10 +1151,7 @@ async def handle_insert_job(request: web.Request) -> web.Response:
     """Insert a single job."""
     state: ManagerState = request.config_dict[STATE_KEY]
 
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     run_id = body.get("run_id")
     experiment_id = body.get("experiment_id")
@@ -1058,6 +1179,8 @@ async def handle_insert_job(request: web.Request) -> web.Response:
         )
     except ValueError as exc:
         return _error_response(str(exc))
+    except sqlite3.IntegrityError as exc:
+        return _job_insert_refused(exc)
 
     state.request_schedule()
 
@@ -1071,18 +1194,20 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
 
     try:
         body = await _request_json(request)
-    except Exception:
+    except ValueError:
         return _error_response("invalid JSON body")
 
-    jobs_data = body if isinstance(body, list) else body.get("jobs", [])
+    jobs_data = body if isinstance(body, list) else body.get("jobs") if isinstance(body, dict) else None
 
-    if not jobs_data:
+    if not jobs_data or not isinstance(jobs_data, list):
         return _error_response("provide a JSON array of job objects")
 
     try:
         records = await state.db_writer.insert_jobs_bulk(jobs_data)
     except ValueError as exc:
         return _error_response(str(exc))
+    except sqlite3.IntegrityError as exc:
+        return _job_insert_refused(exc)
 
     state.request_schedule()
 
@@ -1104,17 +1229,16 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
     except ValueError as exc:
         return _error_response(str(exc), status=400)
 
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     jobs = body.get("jobs")
-    if not isinstance(jobs, list) or not jobs:
-        return _error_response("'jobs' must be a non-empty array")
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(job, dict) for job in jobs):
+        return _error_response("'jobs' must be a non-empty array of job objects")
     for job in jobs:
         job["experiment_id"] = experiment_id
 
+    if body.get("optimize") is not None:
+        return _error_response("a Bayesian sweep is created without jobs; the manager chooses them")
     fields = await _experiment_fields(request, db, body, experiment_id)
     if isinstance(fields, web.Response):
         return fields
@@ -1138,8 +1262,7 @@ async def handle_list_pending_jobs(request: web.Request) -> web.Response:
     """List pending jobs, optionally filtered by experiment and campaign."""
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     experiment_id = request.query.get("experiment_id")
-    limit_str = request.query.get("limit")
-    limit = int(limit_str) if limit_str else None
+    limit = _limit_param(request)
     jobs = await list_pending_jobs(
         db, experiment_id=experiment_id, limit=limit, campaign=request.query.get("campaign"),
     )
@@ -1163,10 +1286,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
     """Update a job's status (and optionally other fields)."""
     state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     status = body.get("status")
     if not status:
@@ -1175,11 +1295,15 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
     if not experiment_id:
         return _error_response("'experiment_id' is required")
 
+    if status not in JOB_STATUSES:
+        return _error_response(f"'status' must be one of {list(JOB_STATUSES)}")
     if status in ACTIVE_JOB_STATUSES:
         return _error_response("only the scheduler dispatches jobs", status=400)
 
     # Only result columns may be set alongside the status.
     kwargs = {k: v for k, v in body.items() if k in ("exit_code", "elapsed")}
+    if any(v is not None and not _is_number(v) for v in kwargs.values()):
+        return _error_response("'exit_code' and 'elapsed' must be numbers")
 
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     async with state.lock:
@@ -1209,14 +1333,11 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
     """Update a pending job's priority."""
     state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     priority = body.get("priority")
-    if priority is None:
-        return _error_response("'priority' is required")
+    if not _is_number(priority):
+        return _error_response("'priority' (a number) is required")
     experiment_id = body.get("experiment_id", "")
     if not experiment_id:
         return _error_response("'experiment_id' is required")
@@ -1243,10 +1364,7 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
     """Set or clear a job's human-readable label."""
     state: ManagerState = request.config_dict[STATE_KEY]
     run_id = request.match_info["run_id"]
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     experiment_id = body.get("experiment_id", "")
     if not experiment_id:
         return _error_response("'experiment_id' is required")
@@ -1604,14 +1722,11 @@ async def handle_patch_job(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     priority = body.get("priority")
-    if priority is None or not isinstance(priority, int):
-        return _error_response("'priority' (int) is required")
+    if not _is_number(priority):
+        return _error_response("'priority' (a number) is required")
 
     # Verify job exists and belongs to experiment
     job = await get_job(db, run_id, experiment_id)
@@ -1739,7 +1854,7 @@ async def handle_zip_experiment_metrics(request: web.Request) -> web.StreamRespo
 
     jobs = await list_jobs_by_experiment(db, experiment_id)
     if not jobs:
-        return _error_response("no jobs", status=404)
+        return _error_response(f"no jobs in experiment {experiment_id!r}", status=404)
 
     async def fill(tmp_path: str) -> None:
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1760,7 +1875,7 @@ async def handle_zip_experiment_logs(request: web.Request) -> web.StreamResponse
 
     jobs = await list_jobs_by_experiment(db, experiment_id)
     if not jobs:
-        return _error_response("no jobs", status=404)
+        return _error_response(f"no jobs in experiment {experiment_id!r}", status=404)
 
     async def fill(tmp_path: str) -> None:
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2064,10 +2179,7 @@ async def handle_export_wandb(request: web.Request) -> web.Response:
     202 with the export; poll ``/api/exports/{export_id}`` for progress.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
-    try:
-        body = await _request_json(request)
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     if not isinstance(body, dict):
         return _error_response("body must be a JSON object")
     project = str(body.get("project") or "").strip()
@@ -2219,10 +2331,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     host = body.get("host")
     remote_dir = body.get("remote_dir") or ""
@@ -2238,6 +2347,15 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     port = body.get("port", 0)
     devices = body.get("devices")
     scratch_dir = body.get("scratch_dir") or state.scratch_dir
+    for field, value in (("remote_dir", remote_dir), ("ssh_key", ssh_key), ("venv", venv),
+                         ("scratch_dir", scratch_dir), ("worker_id", body.get("worker_id"))):
+        if value is not None and not isinstance(value, str):
+            return _error_response(f"'{field}' must be a string")
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+        return _error_response("'port' must be an integer from 0 to 65535")
+    if devices is not None and not (isinstance(devices, list) and all(
+            isinstance(d, int) and not isinstance(d, bool) for d in devices)):
+        return _error_response("'devices' must be a list of GPU indices")
 
     # Use explicit worker_id (reconnect) or derive from host/port (new worker),
     # and claim it so a concurrent add of the same worker is refused.
@@ -2316,10 +2434,7 @@ async def handle_patch_worker_concurrency(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     value = body.get("max_jobs_per_gpu")
     if value is None or not isinstance(value, int) or value < 0:
@@ -2347,10 +2462,7 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     add_gpus: list[int] = body.get("add") or []
     remove_gpus: list[int] = body.get("remove") or []
@@ -2393,10 +2505,7 @@ async def handle_patch_scheduler(request: web.Request) -> web.Response:
     running jobs stay where they are.
     """
     state: ManagerState = request.config_dict[STATE_KEY]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
     placement = body.get("placement")
     if placement not in PLACEMENTS:
         return _error_response(f"'placement' must be one of {list(PLACEMENTS)}")
@@ -2468,10 +2577,7 @@ async def handle_head_artifact(request: web.Request) -> web.StreamResponse:
 async def handle_register_artifact(request: web.Request) -> web.Response:
     """Register or update an artifact."""
     state: ManagerState = request.config_dict[STATE_KEY]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     artifact_id = body.get("artifact_id") or body.get("id")
     if not artifact_id:
@@ -2480,10 +2586,13 @@ async def handle_register_artifact(request: web.Request) -> web.Response:
         validate_artifact_id(artifact_id)
     except ValueError as exc:
         return _error_response(str(exc))
+    size_bytes = body.get("size_bytes")
+    if size_bytes is not None and (not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0):
+        return _error_response("'size_bytes' must be a non-negative integer")
 
     artifact = await state.db_writer.register_artifact(
         artifact_id=artifact_id,
-        size_bytes=body.get("size_bytes"),
+        size_bytes=size_bytes,
         setup_command=body.get("setup_command"),
     )
 
@@ -2495,12 +2604,11 @@ async def handle_increment_artifact_ref(request: web.Request) -> web.Response:
     """Increment or decrement an artifact's reference count."""
     state: ManagerState = request.config_dict[STATE_KEY]
     artifact_id = request.match_info["artifact_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response("invalid JSON body")
+    body = await _json_body(request)
 
     delta = body.get("delta", 1)
+    if not isinstance(delta, int) or isinstance(delta, bool):
+        return _error_response("'delta' must be an integer")
 
     artifact = await state.db_writer.increment_artifact_ref(artifact_id, delta=delta)
     if artifact is None:
