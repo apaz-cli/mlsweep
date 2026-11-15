@@ -93,8 +93,8 @@ saves now, and hover the bottom one for the clone URL and current commit.
 ### Files
 
 - Open: click a file. It replaces the current tab unless that tab has unsaved
-  changes. Ctrl+click or middle-click opens a new tab.
-- Create: `N`, the icons above the tree, or right-click a folder. A note name
+  changes. Ctrl+click, middle-click or double-click opens a new tab.
+- Create: the icons above the tree or beside the tabs, or right-click a folder. A note name
   may include folders (`ideas/Depth plan`). Clicking a link to a note that doesn't
   exist creates it in the same folder as the note you're in.
 - Rename: `F2`, double-click the title in the toolbar, or right-click. Moving
@@ -183,6 +183,88 @@ shows source beside a rendered preview that follows as you type and scroll; clic
 image there to enlarge it. These views are for notes; other text and code files always
 use this editor.
 
+### Terminals
+
+By default, the tab can open shells on the manager's machine; `mlsweep manager
+--no-terminals` turns them off. Open one with the terminal icon beside a group's
+`+`, Open a terminal on the start page, or Open terminal here when you right-click
+in the file tree, which starts it in
+that folder of the notes. Right-click the icon for your commands and for terminals
+already running.
+A terminal is a tab like any other, so it splits and moves the same way. Nerd Font
+icons, as file managers and prompts such as yazi and starship draw, come with the
+dashboard, so they show whichever machine the browser is on.
+
+The manager owns each shell. Closing the browser leaves it running, and the tab comes
+back attached to it, with what it printed meanwhile. Closing the tab ends the shell,
+and so does `exit`, after which any key closes the tab. A manager restart ends every
+shell.
+
+Each shell runs in a bubblewrap sandbox, with no container. Its home is the
+workspace, `<mlsweep-dir>/workspace`, which persists, shown at your real home path,
+so a script that uses `~/...` looks in the same place it would outside. `~/notes` in
+it is a clone of the notes, set up and given the token for you, so `git pull` and
+`git push` work there, and a new terminal starts in it. That clone can be behind
+the manager's copy; if the folder you asked for is not in it yet, the terminal starts
+in the nearest one that is and says to `git pull`. `mlsweep` is the manager's own install, read-only, and
+`MLSWEEP_MANAGER` and `MLSWEEP_TOKEN` already point it at the manager, so sweeps
+submitted from here run on the workers as usual.
+
+`/usr` and `/etc` are read-only, and nothing else from the machine is there unless
+you list it in `terminals.json` (below). That leaves out the rest of your home (the
+token file, `~/.ssh`), the experiments and the database. There are no GPUs either.
+The GPU device files are not in the sandbox, so nothing in it can open one, whatever
+it sets. The network is shared, which lets the shell reach the manager on loopback
+and an agent reach what it needs.
+
+When `systemd-run --user` works, each shell gets its own scope with a memory cap, a
+process limit and a low CPU weight, so it can't starve the manager. Otherwise it runs
+under `nice`.
+
+The shell holds the manager's token. Anyone who can open the tab already holds it, so
+an agent in a terminal can do what its user can, deleting experiments included.
+
+Terminals need `bwrap` (bubblewrap) on the manager's machine, and a system that
+allows unprivileged user namespaces. If either is missing, the icon is greyed out and
+says why.
+
+#### terminals.json
+
+`<mlsweep-dir>/terminals.json` says what else the sandbox has. Every key is
+optional, and the file is read again for each new terminal, so a change applies to
+the next one you open:
+
+```json
+{
+  "tools": ["~/git/Scripts", "~/.local/bin", "~/.opencode/bin"],
+  "mounts": ["~/data/papers"],
+  "env": ["OPENAI_API_KEY", "EDITOR=vim"],
+  "commands": { "claude": "claude", "pi": "pi" },
+  "shell": "/bin/bash",
+  "limits": { "memory": "50%", "processes": 1024, "terminals": 8 }
+}
+```
+
+| Key | |
+|---|---|
+| `tools` | folders of programs, visible read-only at the same path and on `$PATH` in this order |
+| `mounts` | files or folders visible read-only at the same path, not on `$PATH` |
+| `env` | `NAME` passes a variable through from the manager's environment; `NAME=value` sets one |
+| `commands` | what a new terminal can start with, from the icon's menu; the shell stays open after |
+| `shell` | the shell to run (default `/bin/bash`) |
+| `limits` | per terminal: `memory` (a size such as `8G` or `50%`, or `null`) and `processes`; and how many `terminals` can be open |
+
+`~` in a path means your home. A symlink in a `tools` folder brings what it points
+into: the folder its target is in, the npm package it belongs to, or the whole
+prefix around a `bin/` folder, as for a Python that `uv` installed. So
+`~/.local/bin` alone is enough for most launchers there. A path that does not exist,
+or a variable that is not set, is named in yellow when the terminal opens, and the
+rest still works. A mistake in the file itself, such as a misspelled key, stops new
+terminals with a message saying what to fix.
+
+Logins are your own business inside the sandbox. Run an agent's login there once,
+and it stays in the workspace.
+
 ### Saving and conflicts
 
 Saving is automatic about a second after you stop typing (Ctrl+S to do it now), and
@@ -246,7 +328,6 @@ shows this list in the tab.
 |---|---|
 | Ctrl+S | save now (works while typing) |
 | `T` or `O` | open a file |
-| `N` | new note |
 | `X` | close tab |
 | `{` `}` | previous, next tab in the group |
 | `\` `\|` | split right, split down |
@@ -538,21 +619,27 @@ merge leftovers; it leaves the numbers unchecked.
 ## Rules for agents
 
 The starter `AGENTS.md` in the folder says this; repeat it in your agent's
-instructions if you like:
+instructions if you like. It assumes notes work when a request is open-ended, and
+does whatever else it is asked.
+
+Always:
 
 - Pull before starting, then commit and push as you go, always before you stop. If a push
-  is refused, pull, resolve any conflicts so both sides' findings survive, and push again. Never force-push.
+  is refused, pull, resolve any conflicts so both sides' work survives, and push again. Never force-push.
 - Read before writing: `grep -ri` the folder for what is known.
 - Prefer a new file to rewriting someone else's. To correct a note, add a dated
   line or a new note that links to it.
 - `sources/` is read-only except for adding files.
-- Every number about an experiment comes from its logged metrics, and the note
-  names the experiment and run. Write it as an evidence link so a reader can check
-  it; lint reports a number that disagrees. Plot with a chart block instead of a
-  screenshot, and state the conditions (steps, seeds, size).
-- Record dead ends, with the reason.
 - Keep `STATUS.md` short and readable by someone with no context: what is running, with
   experiment IDs, and what comes next. Read it when you start, and update it before you stop.
+
+When a note reports experiment results:
+
+- Every number comes from the experiment's logged metrics, and the note names the
+  experiment and run. Write it as an evidence link so a reader can check it; lint
+  reports a number that disagrees. Plot with a chart block instead of a screenshot,
+  and state the conditions (steps, seeds, size).
+- Record dead ends, with the reason.
 
 ## Configuration
 
@@ -594,4 +681,4 @@ Only the graph has no command; `links` gives the same neighbors as text.
 | `mlsweep notes status [DIR]` | remote, unpushed commits, recent changes |
 | `mlsweep notes lint [DIR] [--fix] [--json] [--review-prompt]` | checks |
 | `mlsweep notes mv / links / mentions / search / history / show / diff / restore` | see the table above |
-| `mlsweep manager [--notes DIR \| --no-notes]` | serve the tab and the git remote |
+| `mlsweep manager [--notes DIR \| --no-notes] [--no-terminals]` | serve the tab and the git remote; `--no-terminals` turns terminals off |

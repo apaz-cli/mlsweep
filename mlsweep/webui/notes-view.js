@@ -19,7 +19,7 @@ function saveTabs() {
   history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
 }
 
-const TAB_ICONS = { graph: () => ICONS.graph, diff: () => ICONS.diff, version: () => ICONS.diff };
+const TAB_ICONS = { graph: () => ICONS.graph, diff: () => ICONS.diff, version: () => ICONS.diff, term: () => ICONS.term };
 function renderTabs() {
   if (TabDrag) { stripsStale = true; return; }
   for (const g of Groups.values()) renderStrip(g);
@@ -56,10 +56,18 @@ function renderStrip(g) {
     };
     strip.append(d);
   }
-  const plus = el("button", "icon-btn tab-new"); plus.title = "New note (N)";
+  const plus = el("button", "icon-btn tab-new"); plus.title = "New note";
   plus.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>';
   plus.onclick = () => newNote();
   strip.append(plus);
+  if (S.term.enabled) {
+    const tb = el("button", "icon-btn tab-term" + (S.term.error ? " off" : ""));
+    tb.title = S.term.error || "New terminal; right-click for commands and running terminals";
+    tb.innerHTML = ICONS.term;
+    tb.onclick = () => newTerminal();
+    tb.oncontextmenu = termMenu;
+    strip.append(tb);
+  }
   if (!g.tabs.length && Groups.size > 1) {
     const close = el("button", "icon-btn group-close"); close.title = "Close this group (X)";
     close.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="m4 4 8 8M12 4l-8 8"/></svg>';
@@ -93,6 +101,7 @@ async function closeTab(id, force = false) {
   }
   const g = groupOf(t);
   S.tabs = S.tabs.filter(x => x !== t);
+  disposeTab(t);
   if (!g) return;
   const i = g.tabs.indexOf(id);
   g.tabs.splice(i, 1);
@@ -223,11 +232,20 @@ function navigate(dir) {
 }
 // ── Rendering a group's active tab ─────────────────────────────────────────────
 // Tab types other than files draw themselves into the view.
-const TAB_VIEWS = {
-  graph: (view, t) => Graph.mount(view, t),
-  diff: (view, t) => renderDiffView(view, t),
-  version: (view, t) => renderVersionView(view, t),
+// What each tab type does beyond a file view.  view: draws the tab in place of
+// the editor.  dispose: teardown for a tab holding more than DOM (a terminal's
+// shell and socket).  ownRefresh: the tab follows folder changes by itself
+// (files are reloaded by checkOpenTabs; a terminal has nothing to redraw), so
+// a new folder version does not redraw it.
+const TAB_TYPES = {
+  file: { ownRefresh: true },
+  graph: { view: (view, t) => Graph.mount(view, t) },
+  diff: { view: (view, t) => renderDiffView(view, t) },
+  version: { view: (view, t) => renderVersionView(view, t) },
+  term: { view: (view, t) => renderTermView(view, t), dispose: t => disposeTerm(t), ownRefresh: true },
 };
+const tabType = t => TAB_TYPES[t.type] || {};
+function disposeTab(t) { const d = tabType(t).dispose; if (d) d(t); }
 function renderActive(opts = {}) { const g = focusedGroup(); if (g) renderGroup(g, opts); }
 function renderGroup(g, { keepEditor = false } = {}) {
   if (!g || !Groups.has(g.id)) return;
@@ -240,7 +258,8 @@ function renderGroup(g, { keepEditor = false } = {}) {
   renderBanner(t, g);
   if (!S.enabled) { toolbar.classList.add("hidden"); if (S.enabled === false && focused) showSetup(); return; }
   if (!t) { toolbar.classList.add("hidden"); renderEmpty(view); right(); return; }
-  if (TAB_VIEWS[t.type]) { toolbar.classList.add("hidden"); TAB_VIEWS[t.type](view, t); right(); return; }
+  const typeView = tabType(t).view;
+  if (typeView) { toolbar.classList.add("hidden"); typeView(view, t); right(); return; }
   toolbar.classList.remove("hidden");
   renderCrumbs(t);
   renderModeSeg(t);
@@ -291,7 +310,7 @@ function renderCrumbs(t) {
     }
     c.append(s);
   });
-  if (t.meta && t.meta.protected) { const b = el("span", "lockbadge", "🔒 protected"); b.title = "An original: by convention, files here are added and not changed."; c.append(b); }
+  if (t.meta && t.meta.protected) { const b = el("span", "lockbadge", "🔒"); b.title = "Protected: an original. By convention, files here are added and not changed."; c.append(b); }
 }
 function renderModeSeg(t) {
   // Live, Source and Split are ways to read a note.  Other files are simply
@@ -370,10 +389,9 @@ function renderEmpty(v) {
       <div><h3>Recent</h3><div class="empty-list empty-recent"></div></div>
       <div><h3>Recently changed</h3><div class="empty-list empty-changed"></div></div>
       <div><h3>Start</h3><div class="empty-list">
-        <a class="e-new">Create a note</a><a class="e-open">Open a file…</a><a class="e-graph">Open the graph</a><a class="e-lint">Run lint</a></div></div>
+        <a class="e-new">Create a note</a><a class="e-open">Open a file…</a><a class="e-graph">Open the graph</a><a class="e-lint">Run lint</a>${S.term.enabled && !S.term.error ? '<a class="e-term">Open a terminal</a>' : ""}</div></div>
       <div><h3>Keys</h3><div class="kbd-list">
         <span><kbd>T</kbd></span><span>Open a file</span>
-        <span><kbd>N</kbd></span><span>New note</span>
         <span><kbd>E</kbd></span><span>Live / Source</span>
         <span><kbd>/</kbd></span><span>Search</span>
         <span><kbd>G</kbd></span><span>Graph</span>
@@ -392,6 +410,7 @@ function renderEmpty(v) {
   wrap.querySelector(".e-new").onclick = () => newNote("");
   wrap.querySelector(".e-open").onclick = () => Switcher.open();
   wrap.querySelector(".e-graph").onclick = () => openGraph();
+  const et = wrap.querySelector(".e-term"); if (et) et.onclick = () => newTerminal();
   wrap.querySelector(".e-lint").onclick = () => { switchPane("lint"); runLint(); };
 }
 

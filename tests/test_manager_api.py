@@ -18,8 +18,15 @@ from conftest import (
     _api_request,
     _wait_for_job,
 )
+from mlsweep.manager import _parse_args
 
 _TOKEN = "test-token"
+
+
+def test_terminals_are_on_by_default_and_no_terminals_turns_them_off():
+    assert _parse_args([]).terminals is True
+    assert _parse_args(["--terminals"]).terminals is True
+    assert _parse_args(["--no-terminals"]).terminals is False
 
 
 def _api_put(url, token, path, data=None):

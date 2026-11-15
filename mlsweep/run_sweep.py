@@ -53,7 +53,8 @@ from mlsweep._writers import (
 )
 from mlsweep._shared import (
     DEFAULT_CAMPAIGN, DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE,
-    _RESET, _git_root, _mlsweep_dir, set_color, strip_color_flag, validate_campaign,
+    _RESET, _git_root, _mlsweep_dir, mlsweep_dir_id, set_color, strip_color_flag, validate_campaign,
+    validate_experiment_dir,
 )
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1095,6 +1096,49 @@ def manager_check_artifact(
         return False
 
 
+def manager_local_experiment_dir(manager: str, token: str, experiment_id: str) -> Path | None:
+    """The experiment's folder if the manager keeps it on this machine, else None.
+
+    The manager reports its folder and the random ID stored there.  Reading the
+    same ID at that path here means both see the same files.
+    """
+    status, health = _http_request("GET", _manager_url(manager, "/api/health"), token,
+                                   timeout=10, quiet=True)
+    if status != 200 or not isinstance(health, dict):
+        return None
+    remote_dir, remote_id = health.get("mlsweep_dir"), health.get("mlsweep_dir_id")
+    if not isinstance(remote_dir, str) or not isinstance(remote_id, str) or not remote_id:
+        return None
+    if mlsweep_dir_id(remote_dir) != remote_id:
+        return None
+    try:
+        exp_dir = Path(remote_dir) / "experiments" / validate_experiment_dir(experiment_id)
+    except ValueError:
+        return None
+    return exp_dir if exp_dir.is_dir() else None
+
+
+def fetch_or_point_local(
+    manager: str,
+    token: str,
+    experiment_id: str,
+    output_dir: str | Path,
+    explicit_output_dir: bool,
+    campaign: str | None = None,
+) -> None:
+    """Download an experiment's results to *output_dir*.
+
+    When the manager runs on this machine and no output folder was asked for,
+    point at the manager's copy instead of making another one.
+    """
+    local = None if explicit_output_dir else manager_local_experiment_dir(manager, token, experiment_id)
+    if local is not None:
+        sweep_print(f"  {_GREEN}OK{_RESET}    The manager runs on this machine. Results are in {local}")
+        sweep_print("        (pass --output-dir to make a copy)")
+    else:
+        manager_download_experiment(manager, token, experiment_id, output_dir, campaign=campaign)
+
+
 def manager_download_experiment(
     manager: str,
     token: str,
@@ -1183,20 +1227,31 @@ class _HashWriter:
 
 def _project_files(root: Path, excludes: set[str], top_level_excludes: frozenset[str] = frozenset()) -> list[Path]:
     """Directories and regular files under *root*, sorted, without
-    anything whose name matches an exclude pattern or is a symlink, socket or fifo.
+    anything that matches an exclude pattern or is a symlink, socket or fifo.
+    A pattern without ``/`` matches any file or directory name at any depth; a pattern
+    with ``/`` matches the path relative to *root* (``runs/old``, ``data/*.bin``; a
+    leading ``/`` is ignored).
     *top_level_excludes* are directory names skipped directly under *root* only."""
-    def skipped(name: str) -> bool:
-        return any(fnmatch.fnmatchcase(name, pat) for pat in excludes)
+    name_pats = [p for p in excludes if "/" not in p]
+    path_pats = [p.strip("/") for p in excludes if "/" in p]
+
+    def skipped(path: Path) -> bool:
+        if any(fnmatch.fnmatchcase(path.name, pat) for pat in name_pats):
+            return True
+        if not path_pats:
+            return False
+        rel = path.relative_to(root).as_posix()
+        return any(fnmatch.fnmatchcase(rel, pat) for pat in path_pats)
 
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not skipped(d) and not (here / d).is_symlink()
+        dirnames[:] = [d for d in dirnames if not skipped(here / d) and not (here / d).is_symlink()
                        and not (here == root and d in top_level_excludes)]
         out.extend(here / d for d in dirnames)
         for name in filenames:
             path = here / name
-            if not skipped(name) and path.is_file() and not path.is_symlink():
+            if not skipped(path) and path.is_file() and not path.is_symlink():
                 out.append(path)
     return sorted(out)
 
@@ -1776,9 +1831,9 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
         print_jobs_summary(jobs)
     print_leaderboard(rows, metric, goal, parsed.top)
 
-    # Download experiment artifacts
     output_dir = parsed.output_dir or str(_mlsweep_dir() / "downloads" / parsed.experiment)
-    manager_download_experiment(manager, token, parsed.experiment, output_dir, campaign=campaign)
+    fetch_or_point_local(manager, token, parsed.experiment, output_dir,
+                         explicit_output_dir=parsed.output_dir is not None, campaign=campaign)
 
     if had_failure:
         sys.exit(1)
@@ -1823,8 +1878,9 @@ def main() -> None:
     parser.add_argument("sweep_file", help="Path to sweep .py file")
     _add_connection_args(parser)
     _add_campaign_args(parser)
-    parser.add_argument("--output-dir", default=str(_mlsweep_dir() / "submissions"),
-                        help="Directory for local submit-side artifacts (submit log + manifest). "
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory for local submit-side artifacts (submit log + manifest; "
+                             "default: ~/.mlsweep/submissions). "
                              "Results themselves live on the manager under ~/.mlsweep/experiments/.")
     parser.add_argument("--experiment", default=None,
                         help="Experiment name (default: <sweep>_<timestamp>)")
@@ -1845,6 +1901,10 @@ def main() -> None:
                         help="Validate sweep config, print all combinations, and exit")
     parser.add_argument("--max-retries", type=int, default=2,
                         help="Max automatic retries of a run lost with its worker (default: 2)")
+    parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                        help="Leave matching files out of the uploaded project (repeatable; adds to the "
+                             "sweep file's UPLOAD_EXCLUDE). A pattern without '/' matches a name at any "
+                             "depth, one with '/' matches the path from the project root, e.g. runs or data/*.bin.")
     parser.add_argument("--setup-command", default=None,
                         help="Shell command executed before training in the worker workspace")
     parser.add_argument("--wandb-project", default=None,
@@ -1963,7 +2023,7 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     rand_suffix = secrets.token_hex(2)  # 4 hex chars
     experiment_id = args.experiment or f"{sweep_name}_{timestamp}_{rand_suffix}"
-    output_dir = os.path.abspath(args.output_dir)
+    output_dir = os.path.abspath(args.output_dir or str(_mlsweep_dir() / "submissions"))
     exp_dir = os.path.join(output_dir, experiment_id)
     os.makedirs(exp_dir, exist_ok=True)
 
@@ -2042,7 +2102,10 @@ def main() -> None:
     # ── 1. Pack and upload artifact ────────────────────────────────────────
     sweep_print("Packing project artifact...")
     try:
-        tarball_path, artifact_hash = _pack_project(_PROJECT_ROOT)
+        upload_exclude = info["upload_exclude"] + args.exclude
+        if upload_exclude:
+            sweep_print(f"  Leaving out: {', '.join(upload_exclude)}")
+        tarball_path, artifact_hash = _pack_project(_PROJECT_ROOT, exclude_patterns=upload_exclude)
         sweep_print(f"  Artifact created: {os.path.basename(tarball_path)} "
                     f"({os.path.getsize(tarball_path)} bytes, sha256={artifact_hash[:16]}...)")
     except Exception as e:
@@ -2140,8 +2203,8 @@ def main() -> None:
             print_jobs_summary(jobs)
             print_leaderboard(build_leaderboard(manager, token, experiment_id, metric, goal, jobs=jobs,
                                                 campaign=campaign), metric, goal)
-        # Download experiment artifacts
-        manager_download_experiment(manager, token, experiment_id, exp_dir, campaign=campaign)
+        fetch_or_point_local(manager, token, experiment_id, exp_dir,
+                             explicit_output_dir=args.output_dir is not None, campaign=campaign)
     else:
         sweep_print(f"\n{'=' * 80}")
         scope = " ".join(_campaign_argv(campaign))

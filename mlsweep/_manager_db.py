@@ -65,7 +65,7 @@ _IN_CAMPAIGN = "experiment_id IN (SELECT experiment_id FROM experiments WHERE ca
 _ACTIVE_IN = _sql_in(ACTIVE_JOB_STATUSES)
 _UNFINISHED_IN = _sql_in(("pending", *ACTIVE_JOB_STATUSES))
 _FINISHED_IN = _sql_in(FINISHED_JOB_STATUSES)
-WorkerStatus = Literal["offline", "connected", "reconnecting", "dead"]
+WorkerStatus = Literal["offline", "connected", "reconnecting", "updating", "dead"]
 
 
 # ===============================================================================
@@ -738,9 +738,11 @@ async def create_experiment(
                                  skip_rules, metric, goal, optimize)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (experiment_id) DO UPDATE SET
-            name = EXCLUDED.name,
+            -- appending to an experiment keeps its name and note (rename changes the name; a note is only filled in
+            -- if the experiment had none)
+            name = experiments.name,
             controller_id = EXCLUDED.controller_id,
-            note = EXCLUDED.note,
+            note = COALESCE(experiments.note, EXCLUDED.note),
             status = EXCLUDED.status,
             expected_jobs = EXCLUDED.expected_jobs,
             singular_dims = EXCLUDED.singular_dims,

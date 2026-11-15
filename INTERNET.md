@@ -81,6 +81,16 @@ Replace these with four things:
 Cookies also bring in CSRF tokens and an `Origin` check on the WebSocket. Scripts
 that use `?token=` would move to the header.
 
+## Terminals (`--no-terminals`)
+
+Terminals are on by default: the manager serves shells on its own machine to the Notes tab,
+in a bubblewrap sandbox (`_sessions.py`). `--no-terminals` turns them off. It adds no power the
+token lacked, since the token already runs code on every worker. It does make an XSS
+that gets past the CSP an interactive shell on the manager, which raises the stakes
+of decision 4 above. The socket refuses other origins, and keystrokes cross the wire
+in cleartext like everything else until decision 2 is made. The sandbox's shell holds
+the manager token itself; scoped credentials would let it hold less.
+
 ## Smaller items that change behavior
 
 Each of these is small, and each was left out because someone could notice it.

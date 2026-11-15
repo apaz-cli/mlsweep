@@ -160,6 +160,23 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 .drop-zone { position: absolute; display: none; background: var(--accent-soft); pointer-events: none; z-index: 20; transition: left .08s, top .08s, width .08s, height .08s; }
 .drop-zone.show { display: block; }
 .tabstrip .group-close { margin: 0 0 3px auto; }
+.tabstrip .tab-term { margin: 0 0 3px 0; }
+.tabstrip .tab-term.off { opacity: .4; }
+/* Nerd Font icons (yazi, starship, lsd, …) live in the private use area; no regular font
+   has them.  Shipped with the dashboard so they show whichever machine the browser is on,
+   and only fetched when a terminal prints one. */
+@font-face {
+  font-family: "mlsweep Nerd Symbols";
+  src: url("SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-display: swap;
+  unicode-range: U+23FB-23FE, U+2665, U+26A1, U+2B58, U+E000-F8FF, U+F0000-FFFFD;
+}
+.term-pane { display: flex; overflow: hidden; padding: 8px 0 4px 12px; background: var(--doc-bg); }
+.term-host { flex: 1; min-width: 0; min-height: 0; }
+.term-host .xterm { height: 100%; }
+/* xterm 6 draws its own scrollbar; the native viewport under it stays out of sight. */
+.term-host .xterm .xterm-viewport { background-color: transparent; scrollbar-width: none; }
+.term-host .xterm .xterm-viewport::-webkit-scrollbar { display: none; }
 
 /* ── Center: tabs, toolbar, views ────────────────────────────────────────── */
 .tabstrip { display: flex; align-items: flex-end; gap: 0; background: var(--surface); border-bottom: 1px solid var(--border); height: 34px; padding: 0 6px; flex-shrink: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
@@ -185,7 +202,7 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 .crumbs .c.last { color: var(--text-strong); font-weight: 600; cursor: default; }
 .crumbs .c.last:hover { background: none; }
 .crumbs .sep { color: var(--border-input); }
-.crumbs .lockbadge { font-size: 10px; margin-left: 6px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border-input); color: var(--text-dim); }
+.crumbs .lockbadge { font-size: 11px; margin-left: 6px; cursor: help; }
 .save-state { font-size: 11px; color: var(--text-muted); white-space: nowrap; min-width: 60px; text-align: right; }
 .save-state.dirty { color: var(--accent); }
 .save-state.err { color: var(--bad); }
@@ -569,7 +586,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
   <aside id="left">
     <div id="left-head">
       <div id="vault-name">Notes</div>
-      <button class="icon-btn" id="btn-new-note" title="New note (N)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.5H4a1.5 1.5 0 0 0-1.5 1.5v10A1.5 1.5 0 0 0 4 14.5h8a1.5 1.5 0 0 0 1.5-1.5V6"/><path d="M9 1.5V6h4.5"/><path d="M8 8.5v4M6 10.5h4"/></svg></button>
+      <button class="icon-btn" id="btn-new-note" title="New note"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.5H4a1.5 1.5 0 0 0-1.5 1.5v10A1.5 1.5 0 0 0 4 14.5h8a1.5 1.5 0 0 0 1.5-1.5V6"/><path d="M9 1.5V6h4.5"/><path d="M8 8.5v4M6 10.5h4"/></svg></button>
       <button class="icon-btn" id="btn-new-folder" title="New folder"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5v8a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-6a1 1 0 0 0-1-1H8L6.5 3.5h-4a1 1 0 0 0-1 1z"/><path d="M8 7.5v4M6 9.5h4"/></svg></button>
       <button class="icon-btn" id="btn-upload" title="Upload files"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5V2M4.5 5.5 8 2l3.5 3.5"/><path d="M2 10.5v2a1.5 1.5 0 0 0 1.5 1.5h9a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg></button>
       <button class="icon-btn" id="btn-graph" title="Graph view (G)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="7" cy="12.5" r="2"/><path d="M5.8 4.3 10 4.8M5 5.8l1.4 4.9M10.8 6.6 8.3 11"/></svg></button>
@@ -650,6 +667,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
 <script src="notes-view.js"></script>
 <script src="notes-blocks.js"></script>
 <script src="notes-live.js"></script>
+<script src="notes-term.js"></script>
 <script src="notes-panels.js"></script>
 </body>
 </html>

@@ -165,6 +165,9 @@ mlsweep best --experiment EXP_ID                     # top runs by metric (--gro
 mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
 
+On the manager's machine, `fetch` makes no copy. It prints the manager's own
+results folder instead. Pass `--output-dir` to get a copy anyway.
+
 Every command defaults `--manager` to `http://localhost:7891` (override with
 `--manager` or `MLSWEEP_MANAGER`). Add `--json` to `status`, `ls`, `best`, or `fetch` for
 machine-readable output.

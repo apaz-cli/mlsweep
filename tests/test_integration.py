@@ -325,6 +325,44 @@ def test_fetch_subcommand(manager_with_worker, tmp_path):
     assert fetch.returncode == 0, fetch.stderr
     # fetch should print job summary lines
     assert EXP in fetch.stdout or "done" in fetch.stdout.lower() or "Job" in fetch.stdout
+    # An explicit --output-dir copies even when the manager is on this machine.
+    assert any(fetch_dir.iterdir())
+
+    # Without --output-dir, a manager on this machine means no copy is made.
+    client_dir = tmp_path / "client_mlsweep"
+    local = subprocess.run(
+        MLSWEEP_RUN + ["fetch", "--manager", url, "--token", server.token, "--experiment", EXP],
+        env={**os.environ, "MLSWEEP_DIR": str(client_dir)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert local.returncode == 0, local.stderr
+    assert str(server.mlsweep_dir / "experiments" / EXP) in local.stdout
+    assert not (client_dir / "downloads").exists()
+
+
+def test_local_experiment_dir_needs_matching_id(manager_server, monkeypatch):
+    """The manager's folder counts as local only when its ID file matches."""
+    from mlsweep.run_sweep import manager_local_experiment_dir
+
+    server, url = manager_server
+    (server.mlsweep_dir / "experiments" / "e1").mkdir(parents=True)
+    found = manager_local_experiment_dir(url, server.token, "e1")
+    assert found == server.mlsweep_dir.resolve() / "experiments" / "e1"
+    assert manager_local_experiment_dir(url, server.token, "missing") is None
+
+    # Another machine with a folder at the same path has a different ID there.
+    import mlsweep.run_sweep as rs
+    monkeypatch.setattr(rs, "mlsweep_dir_id", lambda d, create=False: "other-machine")
+    assert manager_local_experiment_dir(url, server.token, "e1") is None
+    monkeypatch.undo()
+
+    # A broken ID file makes the manager report no ID, so nothing counts as local.
+    (server.mlsweep_dir / "manager.id").unlink()
+    (server.mlsweep_dir / "manager.id").mkdir()
+    health = json.loads(urllib.request.urlopen(urllib.request.Request(
+        f"{url}/api/health", headers={"Authorization": f"Bearer {server.token}"}), timeout=5).read())
+    assert health["mlsweep_dir_id"] == ""
+    assert manager_local_experiment_dir(url, server.token, "e1") is None
 
 
 # ── Tests: authentication ─────────────────────────────────────────────────────

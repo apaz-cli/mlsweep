@@ -95,6 +95,8 @@ from mlsweep._manager_workers import (
     connect_single_worker,
     declare_worker_dead,
     requeue_runs_locked,
+    update_worker,
+    worker_outdated,
     validate_worker_host,
     worker_id_for,
 )
@@ -103,6 +105,7 @@ from mlsweep._shared import (
     DEFAULT_CAMPAIGN,
     _dir_size,
     _resolve_safe_subpath,
+    mlsweep_dir_id,
     validate_artifact_id,
     validate_campaign,
     validate_experiment_dir,
@@ -539,6 +542,9 @@ _NOTES_PAGE_CSP = _PAGE_CSP.replace("img-src 'self' data: blob:", "img-src 'self
 _API_CSP = "default-src 'none'; frame-ancestors 'self'"
 
 
+_FONT_TYPES = {"ttf": "font/ttf", "otf": "font/otf", "woff": "font/woff", "woff2": "font/woff2"}
+
+
 async def _add_security_headers(request: web.Request, response: web.StreamResponse) -> None:
     """Headers for every response.  A handler's own Content-Security-Policy wins."""
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -546,6 +552,10 @@ async def _add_security_headers(request: web.Request, response: web.StreamRespon
     if "Content-Security-Policy" in response.headers:
         return
     if _is_static(request):
+        # aiohttp's own type table does not know fonts, and with nosniff some browsers refuse them.
+        font = _FONT_TYPES.get(request.path.rsplit(".", 1)[-1].lower())
+        if font:
+            response.headers["Content-Type"] = font
         if request.path.endswith(".html"):
             notes = request.path.endswith("/notes.html")
             response.headers["Content-Security-Policy"] = _NOTES_PAGE_CSP if notes else _PAGE_CSP
@@ -601,6 +611,11 @@ async def _request_json(request: web.Request) -> Any:
 def _bad_request(message: str) -> web.HTTPBadRequest:
     """A JSON 400 to raise from a helper."""
     return web.HTTPBadRequest(text=_json_dumps({"error": message}), content_type="application/json")
+
+
+def _not_found_exc(message: str) -> web.HTTPNotFound:
+    """A JSON 404 to raise from a helper."""
+    return web.HTTPNotFound(text=_json_dumps({"error": message}), content_type="application/json")
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
@@ -1762,9 +1777,6 @@ async def handle_get_job_metrics(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
     rows = await get_metrics_for_run(db, run_id, experiment_id)
-    import sys as _sys
-    print(f"DBGMETRICS exp={experiment_id} run={run_id} rows={len(rows)} "
-          f"campaign={request.query.get('campaign')!r}", file=_sys.stderr, flush=True)
     if not rows:
         return _not_found("metrics")
     jsonl = "\n".join(json.dumps(row) for row in rows)
@@ -2287,6 +2299,7 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         d["gpu_occupancy"] = {}
         d["gpu_stats"] = {}
         d["max_jobs_per_gpu"] = 1
+    d["outdated"] = worker_outdated(state, wr.worker_id)
     return d
 
 
@@ -2422,6 +2435,37 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     await declare_worker_dead(db, state, worker_id, "", shutdown=True)
 
     return _json_response({"worker_id": worker_id, "status": "dead"})
+
+
+@routes.post("/api/workers/{worker_id}/update")
+async def handle_update_worker(request: web.Request) -> web.Response:
+    """Relaunch a worker so it runs this manager's mlsweep code.
+
+    Meant for a worker that runs older mlsweep code than the manager; the
+    relaunch reinstalls the host's venv when its code differs.  A live
+    worker is shut down first and its runs are requeued without spending
+    retries.  The update runs in the background and the worker's status shows
+    ``updating`` until it reconnects or fails with a reason.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    worker_id = request.match_info["worker_id"]
+    if await get_worker(db, worker_id) is None:
+        return _not_found("worker")
+    async with state.lock:
+        wc = state.workers.get(worker_id)
+        if worker_id in state.launching:
+            return _error_response(f"worker {worker_id} is already launching", status=409)
+        live = wc is not None and wc.status != "dead"
+    if live:
+        await declare_worker_dead(db, state, worker_id, "", shutdown=True)
+    async with state.lock:
+        if not state.reserve_worker_id(worker_id):
+            return _error_response(f"worker {worker_id} is already launching", status=409)
+    # Before the task starts, so the page shows the update right away.
+    await state.db_writer.update_worker_status(worker_id, "updating")
+    asyncio.create_task(update_worker(db, state, worker_id))
+    return _json_response({"worker_id": worker_id, "status": "updating"}, status=202)
 
 
 @routes.patch("/api/workers/{worker_id}/concurrency")
@@ -2798,6 +2842,7 @@ async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
     return _json_response({
         "status": "ok",
         "version": _VERSION,
@@ -2805,6 +2850,9 @@ async def handle_health(request: web.Request) -> web.Response:
         "jobs_pending": await count_pending_jobs(db),
         "jobs_in_flight": len(state.runs),
         "public_url": state.public_url or None,
+        # Lets a client on this machine find the manager's folder (see mlsweep fetch).
+        "mlsweep_dir": str(mlsweep_dir),
+        "mlsweep_dir_id": mlsweep_dir_id(mlsweep_dir, create=True),
     })
 
 

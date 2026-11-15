@@ -98,6 +98,32 @@ def _mlsweep_dir() -> Path:
     return Path(os.environ.get("MLSWEEP_DIR", "~/.mlsweep")).expanduser()
 
 
+DIR_ID_FILE = "manager.id"
+
+
+def mlsweep_dir_id(mlsweep_dir: str | Path, *, create: bool = False) -> str:
+    """Random ID stored in *mlsweep_dir*, or "" when there is none.
+
+    A client that reads the same ID from the path the manager reports is looking
+    at the manager's own folder, so it can use the files there without copying.
+    """
+    path = Path(mlsweep_dir) / DIR_ID_FILE
+    try:
+        return path.read_text().strip()
+    except OSError:
+        if not create:
+            return ""
+    new = _token_hex(16)
+    try:
+        with open(path, "x") as f:
+            f.write(new)
+        return new
+    except FileExistsError:
+        return mlsweep_dir_id(mlsweep_dir)
+    except OSError:
+        return ""
+
+
 def _resolve_safe_subpath(base: str | Path, sub: str | None) -> str:
     """Join *base* and relative *sub*; raise ValueError if *sub* escapes *base*."""
     base = str(base)
@@ -158,6 +184,48 @@ def line_chunks(data: bytes) -> list[bytes]:
         chunks.append(bytes(view[start:end]))
         start = end
     return chunks
+
+
+# The modules a worker runs: its import closure, plus the logger its runs use
+# to reach it.  tests/test_worker_update.py checks this against what importing
+# the worker loads.  Edits to other modules (manager, notes, CLI) leave the
+# fingerprint alone, so they do not mark workers outdated.
+WORKER_MODULES = ("__init__.py", "_colors.py", "_env.py", "_shared.py", "_topology.py",
+                  "logger.py", "worker.py")
+
+
+def code_fingerprint(package_dir: Path | None = None) -> str:
+    """Hash of the worker modules in *package_dir* (default: this package) as on disk now.
+
+    A source checkout changes code without changing its version.  The manager
+    compares each worker's ``CODE_FINGERPRINT`` with this, taken from its own
+    package directory, which is what updating a worker would install.  A
+    wheel carries the same ``.py`` files as the tree it was built from.
+    """
+    root = package_dir or Path(__file__).resolve().parent
+    stats: list[tuple[int, int] | None] = []
+    for name in WORKER_MODULES:
+        try:
+            st = (root / name).stat()
+            stats.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            stats.append(None)
+    key = (str(root), tuple(stats))
+    cached = _fingerprint_cache.get(key)
+    if cached is None:
+        h = hashlib.sha256()
+        for name in WORKER_MODULES:
+            try:
+                h.update(name.encode() + b"\0" + (root / name).read_bytes() + b"\0")
+            except OSError:
+                h.update(name.encode() + b"\0missing\0")
+        cached = _fingerprint_cache[key] = h.hexdigest()[:16]
+    return cached
+
+
+# (package dir, per-module (mtime, size)) -> fingerprint.  The manager asks on
+# every worker listing; unchanged files then cost a stat each, not a rehash.
+_fingerprint_cache: dict[tuple[str, tuple[Any, ...]], str] = {}
 
 
 # ── Protocol messages ──────────────────────────────────────────────────────────
@@ -267,6 +335,7 @@ class MsgWorkerHello:
     # ``gpus``.  Defaulted, so an older peer that omits it stays compatible.
     unhealthy_gpus: list[int] = field(default_factory=list)
     protocol: int = 0             # PROTOCOL_VERSION of the worker
+    code: str = ""                # the worker's CODE_FINGERPRINT; "" from older workers
     t: str = "whello"
 
 

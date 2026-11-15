@@ -64,6 +64,7 @@ from mlsweep._shared import (
     MsgSyncReq,
     MsgWorkerHello,
     LOG_CHUNK_BYTES,
+    code_fingerprint,
     PROTOCOL_VERSION,
     _resolve_safe_subpath,
     decode,
@@ -76,6 +77,9 @@ from mlsweep._shared import (
 )
 from mlsweep._topology import _gpu_topology, probe_usable_devices, visible_devices
 from mlsweep import _env
+
+# Taken at import, so a worker reports the code it runs, not what is on disk later.
+CODE_FINGERPRINT = code_fingerprint()
 
 # ── Run state ──────────────────────────────────────────────────────────────────
 
@@ -392,6 +396,7 @@ def _read_thread(conn: ConnState) -> None:
         completed=completed,
         unhealthy_gpus=unhealthy,
         protocol=PROTOCOL_VERSION,
+        code=CODE_FINGERPRINT,
     )
     with _lock:
         conn.send_queue.put(encode(hello_resp))
@@ -1295,7 +1300,7 @@ def main() -> None:
         parser.add_argument("--color", action="store_true",
                             help="Enable ANSI color in human-readable output (default: off)")
         parser.add_argument("--version", action="version",
-                            version=f"%(prog)s {importlib.metadata.version('mlsweep')}")
+                            version=f"%(prog)s {importlib.metadata.version('mlsweep')} {CODE_FINGERPRINT}")
         args = parser.parse_args()
 
         if args.color:

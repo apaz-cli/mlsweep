@@ -161,6 +161,23 @@ async function disconnectWorker(workerId) {
   }
 }
 
+// ── Update an outdated worker ────────────────────────────────────────────────
+async function updateWorker(workerId, isLive) {
+  if (isLive && !await mlConfirm(`Update worker "${workerId}"?\nIt restarts, and its in-flight jobs will be re-queued.`, { confirmLabel: "Update" })) return;
+  this.disabled = true;
+  this.textContent = "Updating…";
+  try {
+    const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}/update`, { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      await mlAlert("Failed to update: " + (data.error || res.status));
+    }
+  } catch (e) {
+    await mlAlert("Network error: " + e.message);
+  }
+  refresh();
+}
+
 // ── Worker live controls ───────────────────────────────────────────────────────
 async function setWorkerConcurrency(workerId, value) {
   try {
@@ -286,7 +303,8 @@ function renderWorkers(workers) {
     const gpuStats = w.gpu_stats || {};
     const status   = w.status || "offline";
     const isLive   = status === "connected";
-    const canDisconnect = status !== "dead";
+    const canDisconnect = status !== "dead" && status !== "updating";
+    const canUpdate     = w.outdated && (status === "dead" || isLive);
     const maxJobs  = w.max_jobs_per_gpu || 0;
 
     return `<div class="worker-card">
@@ -295,6 +313,7 @@ function renderWorkers(workers) {
         ${badge(status)}
       </div>
       ${w.last_error ? `<div class="worker-error">${escHtml(w.last_error)}</div>` : ""}
+      ${w.outdated && isLive ? `<div class="worker-warning">Runs older mlsweep code than the manager.</div>` : ""}
       ${renderGpuList(gpus, occ, gpuStats)}
       ${isLive ? `<div class="worker-controls">
         <div class="worker-control-row">
@@ -318,17 +337,23 @@ function renderWorkers(workers) {
       </div>
       <div class="worker-actions">
         <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
-        ${canDisconnect ? `<button class="btn-disconnect" ${act("disconnectWorker", w.worker_id)}>Disconnect</button>` : ""}
+        <span class="worker-actions-buttons">
+          ${canUpdate ? `<button class="btn-update" title="Install this manager's mlsweep on ${escHtml(w.host)} and restart the worker" ${act("updateWorker", w.worker_id, isLive)}>Update worker</button>` : ""}
+          ${canDisconnect ? `<button class="btn-disconnect" ${act("disconnectWorker", w.worker_id)}>Disconnect</button>` : ""}
+        </span>
       </div>
     </div>`;
   }).join("");
 }
 
 // ── Render in-flight jobs ──────────────────────────────────────────────────────
+let inFlight = [];
+
 function renderInFlight(jobs) {
+  inFlight = jobs;
   const tbody = document.getElementById("inflight-tbody");
   if (!jobs.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="no-data">No jobs currently running.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="no-data">No jobs currently running.</td></tr>`;
     return;
   }
   tbody.innerHTML = jobs.map(j => `<tr>
@@ -338,8 +363,34 @@ function renderInFlight(jobs) {
     <td class="mono">${j.worker_id ? escHtml(j.worker_id.split(":")[0]) : "—"}</td>
     <td class="mono">${j.dispatched_gpu_ids ? escHtml(JSON.parse(j.dispatched_gpu_ids || "[]").join(",")) : "—"}</td>
     <td>${fmtElapsed(j.elapsed)}</td>
+    <td class="actions-cell"><div class="actions">
+      <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", j.experiment_id, j.run_id)}>View ▾</button>
+      <button class="btn-link btn-manage" aria-haspopup="true" title="Rename or cancel" ${act("toggleInFlightMenu", j.experiment_id, j.run_id)}>Manage</button>
+    </div></td>
   </tr>`).join("");
 }
+
+// Every in-flight run is dispatched or running, so Manage offers what applies
+// to an active run.  Moving and deleting wait until it finishes.
+function toggleInFlightMenu(expId, runId) {
+  toggleMenu(this, `run:${expId}/${runId}`, [
+    { label: "Rename…", act: act("renameInFlight", expId, runId) },
+    { label: "Cancel", act: act("cancelInFlight", expId, runId), danger: true },
+  ]);
+}
+
+async function renameInFlight(expId, runId) {
+  const job = inFlight.find(j => j.experiment_id === expId && j.run_id === runId);
+  if (await mlRenameRun(expId, runId, job?.label) !== undefined) await refresh();
+}
+
+async function cancelInFlight(expId, runId) {
+  if (!await mlConfirm(`Cancel run ${runId}?`, { confirmLabel: "Cancel run", cancelLabel: "Keep running" })) return;
+  await postRunAction(expId, runId, "cancel");
+  await refresh();
+}
+
+watchNoteMentions(() => {});
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 async function refresh() {
@@ -402,7 +453,7 @@ async function runGc(dryRun) {
 document.getElementById("gc-scan").onclick = () => runGc(true);
 document.getElementById("gc-run").onclick = () => runGc(false);
 
-bindActions({ disconnectWorker });
+bindActions({ disconnectWorker, updateWorker, toggleRunView, toggleInFlightMenu, renameInFlight, cancelInFlight });
 bindActions({
   workerGpusChanged(workerId, gpus) { setWorkerGpus(this, workerId, gpus); },
   workerConcurrencyChanged(workerId) { setWorkerConcurrency(workerId, +this.value); },

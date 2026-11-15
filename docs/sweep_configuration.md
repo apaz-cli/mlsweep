@@ -17,7 +17,7 @@ and, for pairs that don't fit a tree, [`EXCLUDE`](#exclude-predicate-static-filt
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, and `RUN_FROM`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, `RUN_FROM`, and `UPLOAD_EXCLUDE`:
 
 ```python
 COMMAND = ["python", "train.py"]
@@ -28,6 +28,7 @@ GPUS_PER_RUN = 1      # (default: 1) GPUs per run on each node
 NODES_PER_RUN = 1     # (default: 1) worker nodes allocated per run
 SET_DIST_ENV = False  # (default: False) auto-set standard dist env vars
 RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
+UPLOAD_EXCLUDE = ["/runs", "*.ckpt"]  # leave these out of the uploaded project
 EXTRA_FLAGS = ["--seed", "42"]
 
 # Optional ranking defaults (stored on the experiment; see below)
@@ -338,6 +339,19 @@ OPTIONS = {
         "name": "lr",
     },
 }
+```
+
+### `UPLOAD_EXCLUDE`
+
+Patterns for files and directories to leave out of the project upload, on top of the
+built-in list (VCS dirs, caches, `outputs`, venvs and so on). A pattern without `/`
+matches a file or directory name at any depth (`*.ckpt`, `wandb`). A pattern with `/`
+matches the path from the project root (`/runs` is only the top-level `runs`,
+`data/*.bin` only those files). `mlsweep run --exclude PATTERN` adds more for one
+submission; the run prints what it leaves out.
+
+```python
+UPLOAD_EXCLUDE = ["/runs", "/swarm_run", "*.ckpt"]
 ```
 
 ### `RUN_FROM`

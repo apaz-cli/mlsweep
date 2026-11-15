@@ -19,7 +19,6 @@ const NB_PALETTE = [
   "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
   "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
 ];
-let _plotlyPromise = null;
 
 function nbCssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -73,17 +72,29 @@ function nbInitialTitle(raw, kind) {
     || (kind === "table" ? "Table" : "Chart");
 }
 
+// Load a script (and its stylesheet, if any) once; a failed load can be retried.
+const _scriptLoads = new Map();
+function nbLoadScript(src, what, css) {
+  if (!_scriptLoads.has(src)) {
+    _scriptLoads.set(src, new Promise((resolve, reject) => {
+      if (css) {
+        const l = document.createElement("link");
+        l.rel = "stylesheet"; l.href = css;
+        document.head.append(l);
+      }
+      const s = document.createElement("script");
+      s.src = src;
+      s.onload = () => resolve();
+      s.onerror = () => { _scriptLoads.delete(src); reject(new Error(`could not load ${what}`)); };
+      document.head.append(s);
+    }));
+  }
+  return _scriptLoads.get(src);
+}
+
 function nbPlotly() {
   if (typeof Plotly !== "undefined") return Promise.resolve();
-  if (_plotlyPromise) return _plotlyPromise;
-  _plotlyPromise = new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = "plotly-basic-2.35.2.min.js";
-    s.onload = () => resolve();
-    s.onerror = () => { _plotlyPromise = null; reject(new Error("could not load the chart library")); };
-    document.head.append(s);
-  });
-  return _plotlyPromise;
+  return nbLoadScript("plotly-basic-2.35.2.min.js", "the chart library");
 }
 
 async function nbFetchBlock(kind, spec) {

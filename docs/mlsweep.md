@@ -16,6 +16,8 @@ All three are reachable through one command: `mlsweep manager` / `mlsweep run` /
 
 The manager bootstraps mlsweep on remote workers automatically over SSH (builds wheels locally, SCPs them, installs into `/tmp/mlsweep_venv/`). No manual install is needed on workers.
 
+That venv is reused only when its version and a fingerprint of its worker code both match the manager's, so a source checkout that changed worker code without a version bump gets reinstalled on the next launch. A worker that is already running keeps its code until it is relaunched. The System page flags a connected worker whose code differs, and a worker on a fixed port that the manager refused for speaking an older protocol. For those it offers an Update worker button, which shuts the worker down and relaunches it (`POST /api/workers/{id}/update`).
+
 Token auth: the manager generates a token on first startup and saves it to `~/.mlsweep/manager.token`. All client commands (`mlsweep run`, `watch`, `fetch`, `status`) resolve it the same way, in order: `--token`, `MLSWEEP_TOKEN`, then `~/.mlsweep/manager.token`.
 
 ## What was removed in v1.1 (don't suggest these)
@@ -47,6 +49,7 @@ mlsweep logs RUN_ID --experiment EXP_ID    # tail a run's training.log
 mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape keys (--last, --with-dims, 2-group --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
+                                           # (on the manager's machine: prints its results folder, no copy)
 
 # 4. Control a running sweep
 mlsweep cancel EXP_ID --running            # cancel jobs (--pending / --all --yes)

@@ -221,6 +221,7 @@ function splitTab(t, side) {
 function closeGroup(g) {
   if (Groups.size < 2) return;
   for (const id of [...g.tabs]) { const t = tabById(id); if (t && t.dirty) saveTab(t); }
+  for (const t of S.tabs.filter(t => t.group === g.id)) disposeTab(t);
   S.tabs = S.tabs.filter(t => t.group !== g.id);
   if (removeGroup(g.id)) { renderLayout(); renderTabs(); renderGroup(focusedGroup()); saveTabs(); }
 }
@@ -359,13 +360,14 @@ function dropTab(t, g, zone) {
 }
 
 // ── Saving and restoring the layout ────────────────────────────────────────────
-const PERSISTED = new Set(["file", "graph"]);
+const PERSISTED = new Set(["file", "graph", "term"]);
 function serializeLayout() {
   const ser = n => {
     if (n.kind === "split") return { kind: "split", dir: n.dir, sizes: n.sizes, children: n.children.map(ser) };
     const g = Groups.get(n.id);
     const tabs = g.tabs.map(tabById).filter(t => t && PERSISTED.has(t.type));
-    return { kind: "group", tabs: tabs.map(t => ({ type: t.type, path: t.path, mode: t.mode })), active: tabs.findIndex(t => t.id === g.active) };
+    const one = t => t.type === "term" ? { type: "term", sid: t.sid, title: t.baseTitle || t.title } : { type: t.type, path: t.path, mode: t.mode };
+    return { kind: "group", tabs: tabs.map(one), active: tabs.findIndex(t => t.id === g.active) };
   };
   return { tree: ser(S.layout), focus: groupOrder().indexOf(S.focus) };
 }
@@ -385,10 +387,14 @@ async function restoreLayout() {
     const tabs = store.get("tabs", []), act = store.get("activeTab", null);
     saved = { tree: { kind: "group", tabs, active: act ? tabs.findIndex(s => s.type === act.type && s.path === act.path) : 0 }, focus: 0 };
   }
+  // Files opened while the page was still starting are kept, in the focused group.
+  const early = S.tabs.filter(t => t.type === "file" && t.meta);
+  const earlyActive = activeTab();
   for (const g of Groups.values()) g.root.remove();
   Groups.clear();
   S.tabs = [];
   const wantActive = new Map();
+  const alive = new Set(S.term.sessions.filter(s => !s.exited).map(s => s.id));
   const build = n => {
     if (n && n.kind === "split" && Array.isArray(n.children) && n.children.length) {
       const kids = n.children.map((c, i) => ({ node: build(c), size: Number((n.sizes || [])[i]) > 0 ? Number(n.sizes[i]) : 1 }));
@@ -399,6 +405,10 @@ async function restoreLayout() {
     let graph = !!S.tabs.find(t => t.type === "graph");
     for (const st of (n && n.tabs) || []) {
       if (st.type === "graph") { if (!graph) { addTab(newTab({ type: "graph", title: "Graph" }), g); graph = true; } }
+      else if (st.type === "term") {
+        // Only a shell that is still running comes back.
+        if (alive.has(st.sid) && !S.tabs.some(t => t.type === "term" && t.sid === st.sid)) addTab(newTab({ type: "term", sid: st.sid, title: st.title || "Terminal" }), g);
+      }
       else if (st.path && S.fileMap.has(st.path) && !S.tabs.some(t => t.path === st.path && t.type === "file")) {
         const mode = { read: "live", edit: "source" }[st.mode] || st.mode || "live";
         addTab(newTab({ path: st.path, title: titleFor(st.path), kind: kindOf(st.path), mode }), g);
@@ -417,6 +427,13 @@ async function restoreLayout() {
   }
   const order = groupOrder();
   S.focus = order[saved.focus] || order[0];
+  const fg = Groups.get(S.focus);
+  for (const t of early) {
+    if (S.tabs.some(x => x.type === "file" && x.path === t.path)) continue;
+    addTab(t, fg);
+    if (t === earlyActive) fg.active = t.id;
+  }
+  if (early.length && !fg.active) fg.active = fg.tabs[fg.tabs.length - 1];
   for (const id of order) if (!Groups.get(id).tabs.length) removeGroup(id);
   renderLayout();
   renderAll();

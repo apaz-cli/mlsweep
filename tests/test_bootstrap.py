@@ -10,6 +10,7 @@ artifacts while they run, and a manager running from it ships its wheel to
 remote workers.
 """
 
+import asyncio
 import importlib.metadata
 import subprocess
 import threading
@@ -19,9 +20,11 @@ from types import SimpleNamespace
 import pytest
 
 from mlsweep import _manager_workers
+from mlsweep._shared import code_fingerprint
 from mlsweep._manager_workers import _ensure_worker_wheels, _worker_candidates, _worker_shell_cmd
 
 VERSION = importlib.metadata.version("mlsweep")
+STAMP = f"{VERSION} {code_fingerprint()}"  # the code on disk, which a build ships
 
 
 @pytest.fixture
@@ -51,13 +54,13 @@ def test_ensure_worker_wheels_builds_and_records_the_version(wheels):
     _ensure_worker_wheels()
     assert len(wheels.calls) == 1 and "wheel" in wheels.calls[0]
     assert [p.name for p in wheels.dir.glob("*.whl")] == [f"mlsweep-{VERSION}-py3-none-any.whl"]
-    assert (wheels.dir / ".complete").read_text() == VERSION
+    assert (wheels.dir / ".complete").read_text() == STAMP
 
 
 def test_ensure_worker_wheels_reuses_a_current_wheel(wheels):
     wheels.dir.mkdir()
     (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"wheel")
-    (wheels.dir / ".complete").write_text(VERSION)
+    (wheels.dir / ".complete").write_text(STAMP)
     wheels.pip(ok=True)
     _ensure_worker_wheels()
     assert wheels.calls == []
@@ -70,7 +73,7 @@ def test_ensure_worker_wheels_rebuilds_after_a_version_change(wheels):
     wheels.pip(ok=True)
     _ensure_worker_wheels()
     assert len(wheels.calls) == 1
-    assert (wheels.dir / ".complete").read_text() == VERSION
+    assert (wheels.dir / ".complete").read_text() == STAMP
 
 
 def test_managers_starting_together_build_the_wheel_once(wheels):
@@ -81,7 +84,7 @@ def test_managers_starting_together_build_the_wheel_once(wheels):
     for t in threads:
         t.join()
     assert len(wheels.calls) == 1
-    assert (wheels.dir / ".complete").read_text() == VERSION
+    assert (wheels.dir / ".complete").read_text() == STAMP
 
 
 def test_ensure_worker_wheels_survives_a_failed_build(wheels):
@@ -120,3 +123,91 @@ def test_worker_candidates_defaults():
     candidates = _worker_candidates(venv=None)
     assert any("mlsweep_worker" in c for c in candidates)
     assert "/tmp/mlsweep_venv/bin/mlsweep_worker" in candidates
+
+
+def test_a_code_change_rebuilds_a_wheel_of_the_same_version(wheels):
+    """A source checkout changes code without changing its version, so the
+    sentinel also records the code fingerprint and a mismatch rebuilds."""
+    wheels.dir.mkdir()
+    (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"old code")
+    (wheels.dir / ".complete").write_text(f"{VERSION} 0000000000000000")
+    wheels.pip(ok=True)
+    _ensure_worker_wheels()
+    assert len(wheels.calls) == 1
+    assert (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").read_bytes() == b"wheel"
+
+
+def _fake_ssh(monkeypatch, version_output: bytes, pip_stderr: bytes | None = None) -> list[str]:
+    """Stand in for ssh/scp; returns the remote commands run, in order.  With
+    *pip_stderr*, the install step fails and prints it."""
+    remote: list[str] = []
+
+    async def exec_(*argv, **kwargs):
+        remote.append(argv[-1])
+        out = version_output if "--version" in argv[-1] else b""
+        fail = pip_stderr is not None and "pip install" in argv[-1]
+        proc = SimpleNamespace(returncode=1 if fail else 0)
+
+        async def communicate():
+            return out, pip_stderr if fail else b""
+        proc.communicate = communicate
+        return proc
+    monkeypatch.setattr(_manager_workers.asyncio, "create_subprocess_exec", exec_)
+    return remote
+
+
+def _current_wheel(wheels) -> None:
+    """A built wheel whose stamp matches the code on disk, so a bootstrap ships it as is."""
+    wheels.dir.mkdir()
+    (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"wheel")
+    (wheels.dir / ".complete").write_text(STAMP)
+
+
+def test_bootstrap_reuses_a_venv_with_the_same_code(wheels, monkeypatch):
+    _current_wheel(wheels)
+    remote = _fake_ssh(monkeypatch, f"mlsweep_worker {STAMP}".encode())
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    assert len(remote) == 1                # only the version check
+
+
+def test_bootstrap_reinstalls_a_venv_of_the_same_version_with_other_code(wheels, monkeypatch):
+    """A source checkout changes code without changing its version."""
+    _current_wheel(wheels)
+    for reported in (f"mlsweep_worker {VERSION}", f"mlsweep_worker {VERSION} 0000000000000000"):
+        remote = _fake_ssh(monkeypatch, reported.encode())
+        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+        assert any(c.startswith("rm -rf /tmp/mlsweep_venv") for c in remote)
+
+
+def test_bootstrap_rebuilds_a_stale_wheel_before_shipping_it(wheels, monkeypatch):
+    """Worker code edited after the manager started reaches the next launch."""
+    wheels.dir.mkdir()
+    (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"old code")
+    (wheels.dir / ".complete").write_text(f"{VERSION} 0000000000000000")
+    wheels.pip(ok=True)
+    _fake_ssh(monkeypatch, b"MISSING")
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    assert len(wheels.calls) == 1
+    assert (wheels.dir / ".complete").read_text() == STAMP
+
+
+def test_bootstrap_installs_only_the_wheel_it_ships(wheels, monkeypatch):
+    """A wheel an older manager left in /tmp/mlsweep_wheels made pip refuse to
+    install two versions of mlsweep at once, so every bootstrap failed."""
+    _current_wheel(wheels)
+    remote = _fake_ssh(monkeypatch, b"MISSING")
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    assert "rm -rf /tmp/mlsweep_wheels && mkdir -p /tmp/mlsweep_wheels" in remote
+    [install] = [c for c in remote if "pip install" in c]
+    assert install.endswith(f"pip install /tmp/mlsweep_wheels/mlsweep-{VERSION}-py3-none-any.whl")
+
+
+def test_a_failed_install_reports_pips_error(wheels, monkeypatch):
+    _current_wheel(wheels)
+    _fake_ssh(monkeypatch, b"MISSING", pip_stderr=(
+        b"Processing /tmp/mlsweep_wheels/x.whl\n"
+        b"ERROR: Could not find a version that satisfies the requirement aiohttp\n"))
+    with pytest.raises(_manager_workers.BootstrapError) as e:
+        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    assert str(e.value) == ("installing mlsweep failed on gpu1: "
+                            "ERROR: Could not find a version that satisfies the requirement aiohttp")

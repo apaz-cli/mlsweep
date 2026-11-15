@@ -168,3 +168,45 @@ def test_system_page_shows_whole_run_and_experiment_ids(mgr, page):
     assert exp_cell == eid
     # Long IDs wrap inside the table rather than spilling out of it.
     assert page.eval(f"[...{row}.cells].every(c => c.scrollWidth <= c.clientWidth)")
+
+
+def test_system_page_in_flight_view_and_manage(mgr, page):
+    # r1 is pending, which cancels like a running run; render it as running.
+    eid = seed(mgr, "default", prefix="sysmenu")
+    job = {"experiment_id": eid, "run_id": "r1", "status": "running",
+           "worker_id": "localhost:1", "dispatched_gpu_ids": "[0]", "elapsed": 5}
+    page.goto(page.url("system.html"))
+    page.wait_for("!document.getElementById('inflight-tbody').textContent.includes('Loading')")
+    page.eval(f"renderInFlight([{json.dumps(job)}])")
+    row = "document.querySelector('#inflight-tbody tr')"
+
+    page.eval(f"{row}.querySelector('.btn-menu').click()")
+    hrefs = page.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
+    assert any(h.startswith("results.html") and f"experiment={eid}" in h and "run=" not in h for h in hrefs)
+    assert any(h.startswith("logs.html") and f"experiment={eid}" in h and "run=r1" in h for h in hrefs)
+    assert any(h.startswith("files.html") and "run=r1" in h for h in hrefs)
+
+    page.eval(f"renderInFlight([{json.dumps(job)}])")  # keep the row against a poll
+    page.eval(f"{row}.querySelector('.btn-manage').click()")
+    labels = page.eval("[...document.querySelectorAll('.row-menu .mi-label')].map(e => e.textContent)")
+    assert labels == ["Rename…", "Cancel"]
+
+    _answer_prompt(page, "from system")
+    page.eval("[...document.querySelectorAll('.row-menu-item')].find(e => e.textContent === 'Rename…').click()")
+    deadline = time.time() + 5
+    while _label(mgr, eid, "r1") != "from system" and time.time() < deadline:
+        time.sleep(0.1)
+    assert _label(mgr, eid, "r1") == "from system"
+
+    page.eval("window.mlConfirm = async () => true")
+    page.eval(f"renderInFlight([{json.dumps(job)}])")
+    page.eval(f"{row}.querySelector('.btn-manage').click()")
+    page.eval("[...document.querySelectorAll('.row-menu-item')].find(e => e.textContent === 'Cancel').click()")
+    deadline = time.time() + 5
+    status = None
+    while time.time() < deadline:
+        status = ok(mgr, "GET", f"/api/jobs/r1?experiment_id={eid}")["status"]
+        if status == "cancelled":
+            break
+        time.sleep(0.1)
+    assert status == "cancelled"

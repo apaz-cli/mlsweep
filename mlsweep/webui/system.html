@@ -18,8 +18,9 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .badge-connected    { background: #2ca02c22; color: #2ca02c;  border: 1px solid #2ca02c44; }
 .badge-offline      { background: #7f7f7f22; color: var(--text-dim); border: 1px solid #7f7f7f33; }
 .badge-dead         { background: #d6272822; color: #d62728;  border: 1px solid #d6272844; }
-.badge-connecting   { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
 .badge-reconnecting { background: #e07b0022; color: #b85c00;  border: 1px solid #e07b0044; }
+.badge-connecting,
+.badge-updating     { background: #1a56c422; color: #4c9be8;  border: 1px solid #4c9be844; }
 [data-theme=dark] .badge-connected    { color: #5cd65c; border-color: #5cd65c44; background: #5cd65c22; }
 [data-theme=dark] .badge-reconnecting { color: #ffaa44; border-color: #ffaa4444; background: #ffaa4422; }
 
@@ -31,10 +32,16 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .worker-detail { font-size: 11px; color: var(--text-muted); }
 .worker-detail span { color: var(--text-dim); }
 .worker-error { font-size: 11px; color: #d62728; background: #d6272814; border: 1px solid #d6272833; border-radius: 4px; padding: 6px 8px; word-break: break-word; white-space: pre-wrap; }
+.worker-warning { font-size: 11px; color: #b85c00; background: #e07b0014; border: 1px solid #e07b0033; border-radius: 4px; padding: 6px 8px; }
+[data-theme=dark] .worker-warning { color: #ffaa44; }
 .worker-actions { display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 8px; }
 .worker-last-seen { font-size: 10px; color: var(--text-muted); }
 .btn-disconnect { font-size: 11px; padding: 2px 8px; border-radius: 3px; border: 1px solid #c0392b44; background: var(--btn-bg); color: #c0392b; cursor: pointer; }
 .btn-disconnect:hover { background: #c0392b18; }
+.btn-update { font-size: 11px; padding: 2px 8px; border-radius: 3px; border: 1px solid #4c9be866; background: var(--btn-bg); color: #4c9be8; cursor: pointer; }
+.btn-update:hover { background: #4c9be818; }
+.btn-update:disabled { opacity: 0.6; cursor: default; }
+.worker-actions-buttons { display: flex; gap: 6px; }
 
 /* Section header with action button */
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -148,8 +155,8 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
   <div>
     <h3>In-Flight Jobs</h3>
     <table class="jobs-table">
-      <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th></tr></thead>
-      <tbody id="inflight-tbody"><tr><td colspan="6" class="no-data">Loading…</td></tr></tbody>
+      <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th><th>Actions</th></tr></thead>
+      <tbody id="inflight-tbody"><tr><td colspan="7" class="no-data">Loading…</td></tr></tbody>
     </table>
   </div>
   <div>
@@ -209,6 +216,7 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
   </div>
 </div>
 
+<script src="rowmenu.js"></script>
 <script src="page-system.js"></script>
 </body>
 </html>

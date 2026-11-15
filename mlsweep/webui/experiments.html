@@ -32,30 +32,9 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .exp-note { font-size: 11px; color: var(--text-muted); font-style: italic; margin-left: 8px; }
 /* Action cells stay table cells (the buttons flex inside a div), so they
    stretch to the row and its bottom border stays one line. */
-.actions-cell { white-space: nowrap; }
-.actions { display: flex; gap: 6px; align-items: center; }
-.btn-link { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; text-decoration: none; white-space: nowrap; }
-.btn-link:hover { background: var(--btn-hover); }
 .btn-delete { color: #c0392b; border-color: #c0392b44; }
 .runs-tools td { padding: 6px 10px 6px 28px !important; background: var(--bg) !important; border-bottom: 1px solid var(--border); }
 .btn-delete:hover { background: #c0392b18; }
-
-/* Two controls per row: View ▾ for the pages, Manage for the verbs.  The menu is
-   fixed-positioned, so it can overhang the table however narrow the window is. */
-.btn-menu, .btn-manage { padding: 2px 7px; }
-.row-menu { position: fixed; z-index: 50; min-width: 170px; padding: 4px; background: var(--surface); border: 1px solid var(--border-input); border-radius: 5px; box-shadow: 0 6px 20px rgba(0,0,0,.28); display: flex; flex-direction: column; }
-.row-menu-item { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; font: inherit; font-size: 12px; padding: 5px 9px; border: 0; border-radius: 3px; background: none; color: var(--text); cursor: pointer; text-decoration: none; white-space: nowrap; }
-.row-menu-item:hover { background: var(--btn-hover); }
-.row-menu-item.danger { color: #d62728; }
-.row-menu-item.disabled { color: var(--text-muted); cursor: default; }
-.row-menu-item.disabled:hover { background: none; }
-.mi-icon { display: flex; flex-shrink: 0; color: var(--text-dim); }
-.mi-icon svg { width: 12px; height: 12px; display: block; }
-.row-menu-item:hover .mi-icon { color: inherit; }
-.mi-label { flex: 1; }
-.mi-count { color: var(--text-dim); font-variant-numeric: tabular-nums; }
-.row-menu-item:hover .mi-count { color: var(--text-label); }
-.row-menu hr { border: 0; border-top: 1px solid var(--border); margin: 4px 2px; }
 
 /* Runs: rows of the experiments table, right after their experiment's row,
    so they share its columns.  Worker, Elapsed and Combo span the count columns. */
@@ -122,6 +101,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
   </table>
 </div>
 
+<script src="rowmenu.js"></script>
 <script src="page-experiments.js"></script>
 </body>
 </html>

@@ -9,7 +9,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 
 - Never start a CUDA process yourself (smoke tests included) on GPUs a worker owns. Running jobs then OOM or fail with `CUDA-capable device(s) is/are busy`. Submit a 1-run sweep instead.
 - `retry` and `resume` rerun the code submitted with the experiment. After fixing a bug, submit a new sweep with `mlsweep run`. Use `retry` for failures outside the code, such as a lost worker or a full disk.
-- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv` and caches are skipped). Do not commit just to submit.
+- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv`, `outputs` and caches are skipped; symlinks are not followed). Do not commit just to submit. Leave large local folders (old runs, checkpoints) out with `UPLOAD_EXCLUDE = ["/runs"]` in the sweep file or `--exclude`; the run prints the upload size.
 - `logger.log()` without `step=` advances the step on every call. Log train and val metrics in one dict, or pass `step=`. Logging a step lower than the last one, or the same key twice at one step, raises `ValueError` (it would overwrite data).
 - A run that exits with an error is not retried automatically. Only runs lost with their worker are, up to `max_retries` (default 2). `retry` re-queues any finished run with a fresh budget, so read its log first.
 
@@ -134,6 +134,7 @@ mlsweep scheduler                               # show or set GPU placement (--p
 
 - Manager and dashboard: every command uses `--manager`, else `$MLSWEEP_MANAGER`, else http://localhost:7891.
 - Token: auto-read from `~/.mlsweep/manager.token` (or `MLSWEEP_TOKEN`, or `--token`). On another machine you need one of the last two.
+- `MLSWEEP_SANDBOX=1` means you are in a dashboard terminal on the manager. The manager, the token and `~/notes` are already set up, and there are no GPUs, so run everything that needs one as a sweep.
 - Results live on the manager's host, at `~/.mlsweep/experiments/<experiment_id>/<run>/{metrics.jsonl, training.log, artifacts/}`. From another machine, use `metrics`, `logs` and `fetch`.
 - `fetch --wait`/`best --wait` exit `1` if the experiment settled with failures.
 - `--experiment NAME` refuses a name already in use. Pass `--append` to add the new runs to that experiment.
@@ -153,7 +154,8 @@ mlsweep scheduler                               # show or set GPU placement (--p
 - Write experiment IDs in full (`rzo_e1_zo_20261001_0309_c37e`) so the dashboard links them.
 - The first column of `best` is the run's best step, and `final=` is its last. `mlsweep metrics --experiment <id> --last` gives only the last, so use `--keys` without `--last` to check a best-step value. Lint checks the number behind an evidence link, not whether it is the right claim to make, so still read the curve.
 - `best` ranks only runs that finished and logged the metric, and its header counts the rest. A failed arm is a result, so report it.
-- Keep `STATUS.md` at the top of the notes short and readable by someone with none of your context: what is running, with experiment IDs, and what comes next.
+- Notes are for people: plain words, findings first, and say when a term is one you made up. `AGENTS.md` in the notes has the rules.
+- Keep `STATUS.md` (one per project folder) short and readable by someone with none of your context: what is running, with experiment IDs, and what comes next.
 - `mlsweep notes lint` checks links, experiment and run IDs, chart/table specs, and the numbers behind evidence links, and reports leftover conflict markers and empty files. It always exits 0, so read the report. It needs the manager for the IDs (`--manager`, or `--no-manager` to skip them). `--fix` applies safe link-path fixes, and `--review-prompt` prints a brief for an independent reviewing agent.
 
 ### Recording results

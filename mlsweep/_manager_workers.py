@@ -16,6 +16,7 @@ to hold ``state.lock``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import importlib.metadata
 import json
@@ -38,9 +39,11 @@ from mlsweep._manager_optimizer import advance_optimizers_locked
 from mlsweep._manager_db import (
     JobRecord,
     SchedulableJob,
+    WorkerRecord,
     count_jobs_by_status,
     experiment_concurrency_caps,
     get_experiment,
+    get_worker,
     last_log_seq,
     list_active_jobs,
     list_job_nodes,
@@ -75,6 +78,7 @@ from mlsweep._shared import (
     _RESET,
     _git_root,
     aread_msg,
+    code_fingerprint,
     decode,
     encode,
     from_obj,
@@ -200,8 +204,9 @@ def _ensure_worker_wheels() -> None:
     own Python and platform.  We deliberately do not pre-download dependency
     wheels: a wheel for the manager's Python may not fit the remote's Python.
 
-    The ``.complete`` sentinel stores the mlsweep version the wheel was built
-    from, so a version bump (or a sentinel left by an older checkout)
+    The ``.complete`` sentinel stores the mlsweep version and the worker
+    code's ``code_fingerprint()`` the wheel was built from, so a version bump
+    or a worker-code change in a source checkout (which keeps its version)
     invalidates the cache.  Without this, a stale wheel would be shipped to
     remote workers and install an ``mlsweep_worker`` that lacks flags the
     manager passes (e.g. ``--jobs``).
@@ -219,20 +224,38 @@ def _ensure_worker_wheels() -> None:
             _build_worker_wheel(local_version)
 
 
-def _wheel_is_current(local_version: str) -> bool:
-    """Whether the sentinel matches the version we are about to ship *and* a
-    wheel for that version is actually present."""
+def _read_stamp() -> str | None:
+    """The stamp the last finished wheel build left, or None if there is none."""
     try:
-        cached_version = (_WHEELS_DIR / ".complete").read_text(encoding="utf-8").strip()
+        return (_WHEELS_DIR / ".complete").read_text(encoding="utf-8").strip()
     except OSError:
-        return False
-    return cached_version == local_version and bool(
+        return None
+
+
+def _wheel_is_current(local_version: str) -> bool:
+    """Whether the sentinel matches the version and code we are about to ship
+    *and* a wheel for that version is actually present."""
+    return _read_stamp() == _wheel_stamp(local_version) and bool(
         list(_WHEELS_DIR.glob(f"mlsweep-{local_version}-*.whl")))
+
+
+def _wheel_stamp(local_version: str) -> str:
+    # The code on disk, which is what a build ships, not what this process loaded.
+    return f"{local_version} {code_fingerprint()}"
+
+
+def _shipped_stamp(local_version: str) -> str:
+    """Version and code fingerprint of the wheel a bootstrap would install.
+
+    An installed worker prints the same pair after its name for ``--version``.
+    """
+    return _read_stamp() or _wheel_stamp(local_version)
 
 
 def _build_worker_wheel(local_version: str) -> None:
     """Replace the cached wheel with one for *local_version*.  Caller holds the lock."""
     complete = _WHEELS_DIR / ".complete"
+    stamp = _wheel_stamp(local_version)  # before the build, so a later edit invalidates it
     print("[wheels] Building worker wheel...", flush=True)
 
     # Drop stale mlsweep wheels from older versions.  We install the wheel
@@ -261,10 +284,10 @@ def _build_worker_wheel(local_version: str) -> None:
         )
         return
 
-    # Record the version so the sentinel self-invalidates the moment the
-    # local mlsweep version changes.
+    # Record version and code so the sentinel self-invalidates the moment
+    # either changes.
     try:
-        complete.write_text(local_version, encoding="utf-8")
+        complete.write_text(stamp, encoding="utf-8")
     except OSError:
         pass
 
@@ -276,149 +299,107 @@ async def _bootstrap_worker_venv(
     host: str,
     ssh_key: str | None = None,
     password: str | None = None,
-) -> bool:
-    """Ensure ``/tmp/mlsweep_venv/bin/mlsweep_worker`` exists on *host*.
+) -> None:
+    """Ensure ``/tmp/mlsweep_venv/bin/mlsweep_worker`` on *host* runs this manager's worker code.
 
-    If the binary is already present and its version matches the local
-    mlsweep, returns ``True`` immediately.  If it is present but outdated,
-    the old venv is removed and a fresh one installed (``/tmp/mlsweep_venv``
-    is manager-owned ephemeral state, so reinstalling it is safe).
-    Otherwise it SCPs the bundled wheels to ``/tmp/mlsweep_wheels/``,
-    creates the venv, and pip-installs ``mlsweep`` into it.
+    The wheel is first rebuilt if the worker code here changed since it was
+    built.  If the remote binary reports the wheel's version and code
+    fingerprint, returns immediately.  Otherwise the old venv, if any, is
+    removed and a fresh one installed (``/tmp/mlsweep_venv`` is
+    manager-owned ephemeral state, so reinstalling it is safe): the wheel is
+    copied to ``/tmp/mlsweep_wheels/``, the venv created and ``mlsweep``
+    pip-installed into it.  Comparing the fingerprint, not just the version,
+    matters for a source checkout, which changes code without changing its
+    version.
 
-    Returns ``True`` on success, ``False`` if any install step fails.
+    Raises ``BootstrapError`` naming the step that failed and why.
     """
     key_args = ["-i", ssh_key] if ssh_key else []
     ssh_opts = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
     sshpass_args, sshpass_env = _sshpass_args(password)
 
+    ssh = ["ssh", *ssh_opts, *key_args, "--", host]
+
+    async def run(step: str, argv: list[str], timeout: float) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *sshpass_args, *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=sshpass_env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (OSError, asyncio.TimeoutError) as e:
+            raise BootstrapError(f"{step} failed on {host}: {e or type(e).__name__}") from None
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")
+            print(f"[bootstrap] {step} failed for {host}:\n{err}", file=sys.stderr)
+            raise BootstrapError(f"{step} failed on {host}: {_error_summary(err)}")
+        return stdout.decode(errors="replace").strip()
+
     # 1. Quick check: is the binary already present and up to date?
+    await asyncio.to_thread(_ensure_worker_wheels)
     local_version = importlib.metadata.version("mlsweep")
+    expected = _shipped_stamp(local_version)
     check_cmd = (
         "if [ -x /tmp/mlsweep_venv/bin/mlsweep_worker ]; then "
         "/tmp/mlsweep_venv/bin/mlsweep_worker --version 2>/dev/null; "
         "else echo MISSING; fi"
     )
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *sshpass_args,
-            "ssh", *ssh_opts,
-            *key_args,
-            "--",
-            host,
-            check_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=sshpass_env,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        out = stdout.decode(errors="replace").strip()
-        if out == "MISSING":
-            pass  # not installed — fall through to a fresh bootstrap
-        elif local_version in out:
-            return True  # present and matching — reuse it
-        else:
-            remote_ver = out.split()[-1] if out else "older (no --version flag)"
-            print(
-                f"  {_YELLOW}WARN{_RESET}  worker on {host} is outdated "
-                f"(remote: {remote_ver}, expected: {local_version}); "
-                f"reinstalling /tmp/mlsweep_venv",
-                flush=True,
-            )
-            # fall through to a fresh bootstrap below
-    except (OSError, asyncio.TimeoutError):
-        pass  # fall through to bootstrap
-
-    # 2. mkdir + SCP bundled wheels to remote.
-    wheel_files = [str(p) for p in _WHEELS_DIR.glob("*.whl")]
-    if not wheel_files:
+    out = "MISSING"
+    with contextlib.suppress(BootstrapError):
+        out = await run("checking the venv", [*ssh, check_cmd], 15.0)
+    if out != "MISSING":
+        remote = " ".join(out.split()[1:])  # drop the program name
+        if remote == expected:
+            return  # present and matching — reuse it
         print(
-            f"[bootstrap] no mlsweep wheel in {_WHEELS_DIR} — "
-            f"run the manager once to build it",
-            file=sys.stderr,
+            f"  {_YELLOW}WARN{_RESET}  worker on {host} is outdated "
+            f"(remote: {remote or 'older, no --version flag'}, expected: {expected}); "
+            f"reinstalling /tmp/mlsweep_venv",
+            flush=True,
         )
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *sshpass_args,
-            "ssh", *ssh_opts,
-            *key_args,
-            "--",
-            host,
-            "mkdir -p /tmp/mlsweep_wheels",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=sshpass_env,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        if proc.returncode != 0:
-            print(
-                f"[bootstrap] mkdir failed for {host}: "
-                f"{stderr.decode(errors='replace')[:200]}",
-                file=sys.stderr,
-            )
-            return False
-    except (OSError, asyncio.TimeoutError) as e:
-        print(f"[bootstrap] mkdir failed for {host}: {e}", file=sys.stderr)
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *sshpass_args,
-            "scp", *ssh_opts,
-            *key_args,
-            "--",
-            *wheel_files,
-            f"{host}:/tmp/mlsweep_wheels/",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=sshpass_env,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-        if proc.returncode != 0:
-            print(
-                f"[bootstrap] scp failed for {host}: "
-                f"{stderr.decode(errors='replace')[:200]}",
-                file=sys.stderr,
-            )
-            return False
-    except (OSError, asyncio.TimeoutError) as e:
-        print(f"[bootstrap] scp failed for {host}: {e}", file=sys.stderr)
-        return False
+
+    # 2. Ship the bundled wheel into an emptied /tmp/mlsweep_wheels, so wheels
+    # from older managers do not pile up there.  Step 3 names the wheels it
+    # installs, since pip refuses two versions of mlsweep at once.
+    wheels = sorted(_WHEELS_DIR.glob("*.whl"))
+    if not wheels:
+        raise BootstrapError(f"no mlsweep wheel in {_WHEELS_DIR}; the manager failed to build it "
+                             "(its log has pip's error)")
+    await run("preparing /tmp/mlsweep_wheels",
+              [*ssh, "rm -rf /tmp/mlsweep_wheels && mkdir -p /tmp/mlsweep_wheels"], 30.0)
+    await run("copying the wheel",
+              ["scp", *ssh_opts, *key_args, "--", *map(str, wheels), f"{host}:/tmp/mlsweep_wheels/"],
+              120.0)
 
     # 3. Remove any stale venv, then create a fresh one and install the
     # bundled mlsweep wheel.  Dependencies are resolved by the remote's pip
     # against its own Python/platform.  The rm -rf matters: python3 -m venv
     # on an existing dir does not purge an old mlsweep install, and pip would
     # leave the stale worker's console script in place alongside the new one.
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *sshpass_args,
-            "ssh", *ssh_opts,
-            *key_args,
-            "--",
-            host,
-            (
-                "rm -rf /tmp/mlsweep_venv && "
-                "python3 -m venv /tmp/mlsweep_venv && "
-                "/tmp/mlsweep_venv/bin/pip install "
-                "/tmp/mlsweep_wheels/mlsweep-*.whl"
-            ),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=sshpass_env,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300.0)
-        if proc.returncode != 0:
-            print(
-                f"[bootstrap] install failed for {host}: "
-                f"{stderr.decode(errors='replace')[:200]}",
-                file=sys.stderr,
-            )
-            return False
-        return True
-    except (OSError, asyncio.TimeoutError) as e:
-        print(f"[bootstrap] install failed for {host}: {e}", file=sys.stderr)
-        return False
+    remote_wheels = " ".join(shlex.quote(f"/tmp/mlsweep_wheels/{w.name}") for w in wheels)
+    await run("installing mlsweep", [*ssh, (
+        "rm -rf /tmp/mlsweep_venv && "
+        "python3 -m venv /tmp/mlsweep_venv && "
+        f"/tmp/mlsweep_venv/bin/pip install {remote_wheels}"
+    )], 300.0)
+
+
+class BootstrapError(RuntimeError):
+    """Installing mlsweep on a remote worker host failed; the message says why."""
+
+
+def _error_summary(stderr: str, limit: int = 300) -> str:
+    """The lines of a failed command's stderr that say what went wrong.
+
+    pip prints progress before its error, so prefer its ``ERROR:`` lines and
+    fall back to the last few lines.
+    """
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    errors = [ln for ln in lines if ln.startswith("ERROR")]
+    text = " ".join(errors or lines[-3:]) or "no output"
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 _sshpass_available: bool | None = None
@@ -508,14 +489,9 @@ async def launch_worker(
 
     # ── Try to reuse an existing worker at the fixed port ────────────────
     if bind_port != 0:
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_host, bind_port),
-                timeout=2.0,
-            )
-            return reader, writer, bind_port
-        except (OSError, asyncio.TimeoutError):
-            pass
+        conn = await _try_connect(connect_host, bind_port)
+        if conn is not None:
+            return conn[0], conn[1], bind_port
 
     # ── Launch a fresh worker ────────────────────────────────────────────
     if host == "localhost":
@@ -536,13 +512,7 @@ async def launch_worker(
     else:
         # Remote: bootstrap venv if needed, then SSH and run worker binary
         sshpass_args, sshpass_env = _sshpass_args(password)
-        ok = await _bootstrap_worker_venv(
-            host, ssh_key=ssh_key, password=password,
-        )
-        if not ok:
-            raise RuntimeError(
-                f"failed to bootstrap /tmp/mlsweep_venv on {host}"
-            )
+        await _bootstrap_worker_venv(host, ssh_key=ssh_key, password=password)
         worker_args = [
             "--token", token,
             "--remote-dir", remote_dir,
@@ -839,9 +809,28 @@ async def declare_worker_dead(
         if wc is not None and wc.status != "dead":
             wc.status = "dead"
             _disconnect(wc, shutdown=shutdown)
+            _close_tunnel(wc)
         await state.db_writer.update_worker_status(worker_id, "dead", last_error=reason or None)
     if not shutdown:
         print(f"  {_RED}FAIL{_RESET}  Worker {worker_id}: {reason}")
+
+
+def _close_tunnel(wc: WorkerConn) -> None:
+    """End *wc*'s reverse tunnel and the task that restarts it.  A relaunch of
+    the worker opens a new one on the same remote port, which an open old
+    tunnel would hold."""
+    task, wc.tunnel_task = wc.tunnel_task, None
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+    proc, wc.tunnel_proc = wc.tunnel_proc, None
+    _terminate_proc(proc)
+
+
+def _terminate_proc(proc: "asyncio.subprocess.Process | None") -> None:
+    """Ask *proc* to exit if it is still running."""
+    if proc is not None and proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
 
 
 # ===============================================================================
@@ -873,10 +862,11 @@ async def _handle_worker_hello(
         result is just acknowledged.
     """
     if msg.protocol != PROTOCOL_VERSION:
+        state.outdated.add(wc.worker_id)
         await declare_worker_dead(
             db, state, wc.worker_id,
             f"worker speaks protocol {msg.protocol}, this manager {PROTOCOL_VERSION}; "
-            "restart the worker with this mlsweep version",
+            "update the worker to this mlsweep version",
             shutdown=True,
         )
         return
@@ -925,6 +915,10 @@ async def _handle_worker_hello(
 
         wc.status = "connected"
         wc.reconnect_attempts = 0
+        # Compared with the code on disk when the worker is listed (see
+        # ``worker_outdated``), so an update clears it without a manager restart.
+        wc.code = msg.code
+        state.outdated.discard(wc.worker_id)
         await state.db_writer.upsert_worker(
             worker_id=wc.worker_id,
             host=wc.host,
@@ -1391,7 +1385,6 @@ async def reconnect_known_workers(
                 continue
         covered.add(wr.host)
 
-        devices = json.loads(wr.devices) if wr.devices else None
         # Show the retry in the UI immediately instead of the previous
         # session's error; the connect task below replaces this with
         # "connected" or a fresh failure reason.
@@ -1400,18 +1393,7 @@ async def reconnect_known_workers(
         )
 
         asyncio.create_task(connect_single_worker(
-            db, state,
-            host=wr.host,
-            remote_dir=wr.remote_dir,
-            worker_id=wr.worker_id,
-            scratch_dir=wr.scratch_dir or state.scratch_dir,
-            ssh_key=wr.ssh_key,
-            venv=wr.venv,
-            port=wr.port,
-            devices=devices,
-            max_jobs_per_gpu=1,
-            manager_port=manager_port,
-        ))
+            db, state, **_relaunch_args(state, wr), manager_port=manager_port))
         scheduled += 1
 
     return scheduled
@@ -1444,6 +1426,14 @@ async def connect_single_worker(
     writer: asyncio.StreamWriter | None
     reason = ""
     try:
+        # Every worker has a row from its first launch on, so the System page
+        # lists one that fails to start (and its retry or update has a target).
+        if await get_worker(db, worker_id) is None:
+            await state.db_writer.upsert_worker(
+                worker_id=worker_id, host=host, remote_dir=remote_dir, scratch_dir=scratch_dir,
+                port=port, ssh_key=ssh_key, venv=venv,
+                devices=json.dumps(devices) if devices else None, status="offline",
+            )
         try:
             reader, writer, actual_port = await launch_worker(
                 host=host,
@@ -1481,7 +1471,7 @@ async def connect_single_worker(
         )
         if host != "localhost" and manager_port:
             wc.tunnel_proc = await _launch_tunnel(host, manager_port, ssh_key=ssh_key, password=password)
-            asyncio.create_task(_tunnel_monitor_task(wc, manager_port, state.shutdown_event))
+            wc.tunnel_task = asyncio.create_task(_tunnel_monitor_task(wc, manager_port, state.shutdown_event))
 
         async with state.lock:
             state.workers[worker_id] = wc
@@ -1496,6 +1486,99 @@ async def connect_single_worker(
 
     print(f"  {_CYAN}START{_RESET} Worker {host}:{actual_port}")
     return wc
+
+
+def worker_outdated(state: ManagerState, worker_id: str) -> bool:
+    """Whether *worker_id* runs other worker code than updating it would install.
+
+    True for a worker refused at its hello for speaking another protocol (a
+    long-lived worker on a fixed port from an older mlsweep), and for a
+    connected remote worker whose fingerprint differs from the worker modules
+    on disk here (an older worker sends none).  A local worker runs this
+    manager's own interpreter, so a restart of the manager, not an update, is
+    what changes its code.
+    """
+    if worker_id in state.outdated:
+        return True
+    wc = state.workers.get(worker_id)
+    return (wc is not None and wc.status == "connected" and wc.host != "localhost"
+            and wc.code != code_fingerprint())
+
+
+async def _try_connect(
+    host: str, port: int,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+    """Connect to *host*:*port* within two seconds, or None if nothing answers."""
+    try:
+        return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.0)
+    except (OSError, asyncio.TimeoutError):
+        return None
+
+
+async def _wait_until_closed(host: str, port: int, timeout: float = 20.0) -> None:
+    """Wait until nothing accepts connections on *host*:*port*, up to *timeout*."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        conn = await _try_connect(host, port)
+        if conn is None:
+            return
+        _close_writer(conn[1])
+        await asyncio.sleep(0.5)
+
+
+def _relaunch_args(state: ManagerState, record: WorkerRecord) -> dict[str, Any]:
+    """``connect_single_worker`` arguments that relaunch a stored worker.
+
+    Settings the database does not keep (the ssh password and jobs per GPU)
+    come from the live connection when there is one.
+    """
+    wc = state.workers.get(record.worker_id)
+    return dict(
+        host=record.host,
+        remote_dir=record.remote_dir,
+        worker_id=record.worker_id,
+        scratch_dir=record.scratch_dir or state.scratch_dir,
+        password=wc.password if wc is not None else None,
+        ssh_key=record.ssh_key,
+        venv=record.venv,
+        port=record.port,
+        devices=json.loads(record.devices) if record.devices else None,
+        max_jobs_per_gpu=wc.max_jobs_per_gpu if wc is not None else 1,
+    )
+
+
+async def update_worker(
+    db: aiosqlite.Connection,
+    state: ManagerState,
+    worker_id: str,
+) -> None:
+    """Relaunch a retired worker, so it runs this manager's worker code.
+
+    The launch's bootstrap reinstalls ``/tmp/mlsweep_venv`` on a remote host
+    whose venv has other code (see ``_bootstrap_worker_venv``).  A local
+    worker runs the manager's own interpreter and code on disk.
+
+    The caller has retired the old worker, claimed *worker_id* with
+    ``state.reserve_worker_id`` and set its status to ``updating``; the claim
+    is released here.  A failure marks the worker dead with the reason.
+    """
+    handed_off = False  # connect_single_worker releases the claim itself
+    try:
+        record = await get_worker(db, worker_id)
+        if record is None:
+            return
+        args = _relaunch_args(state, record)
+        print(f"  {_CYAN}UPDATE{_RESET} {record.host}: relaunching the worker", flush=True)
+        if record.port:
+            # The launch reuses a worker it finds on a fixed port, so let the old
+            # one finish shutting down first.
+            await _wait_until_closed(_bare_host(record.host), record.port)
+        state.outdated.discard(worker_id)
+        handed_off = True
+        await connect_single_worker(db, state, **args, manager_port=state.manager_port)
+    finally:
+        if not handed_off:
+            state.launching.discard(worker_id)
 
 
 # ===============================================================================
@@ -1846,9 +1929,10 @@ def _tunnel_remote_cmd(manager_port: int) -> str:
 def _reap_tunnels_script(manager_port: int) -> str:
     """Remote script that kills sshd sessions left by earlier managers on this machine.
 
-    Prints ``killed <pid>`` for each one killed and ``held <hostname>`` for a
-    live tunnel recorded by another machine's manager, which is left alone.
-    Records of exited processes are removed.
+    Prints ``killed <pid>`` for each one killed, ``held <hostname>`` for a
+    live tunnel recorded by another machine's manager and ``own <pid>`` for
+    one of this manager's own; both of those are left alone.  Records of
+    exited processes are removed.
     """
     machine, instance = _manager_identity()
     return f"""
@@ -1860,7 +1944,7 @@ for f in {manager_port}.*; do
   if [ "$(echo $(ps -o lstart= -p "$pid" 2>/dev/null))" != "$st" ]; then rm -f "$f"; continue; fi
   case "$(ps -o comm= -p "$pid")" in sshd*) ;; *) rm -f "$f"; continue ;; esac
   if [ "$m" = {shlex.quote(machine)} ]; then
-    [ "$i" = {shlex.quote(instance)} ] && continue
+    [ "$i" = {shlex.quote(instance)} ] && {{ echo "own $pid"; continue; }}
     kill "$pid" && rm -f "$f" && echo "killed $pid"
   else
     echo "held $h"
@@ -1890,12 +1974,18 @@ async def _reap_stale_tunnels(wc: WorkerConn, manager_port: int) -> str:
     except (OSError, RuntimeError, asyncio.TimeoutError) as e:
         return f"could not check for stale tunnels: {e}"
     lines = out.decode(errors="replace").split()
-    killed = [lines[k + 1] for k in range(len(lines) - 1) if lines[k] == "killed"]
-    holders = [lines[k + 1] for k in range(len(lines) - 1) if lines[k] == "held"]
+    found: dict[str, list[str]] = {"killed": [], "held": [], "own": []}
+    for word, value in zip(lines, lines[1:]):
+        if word in found:
+            found[word].append(value)
+    killed, holders, own = found["killed"], found["held"], found["own"]
     if killed:
         return f"killed stale sshd session(s) {', '.join(killed)} from an earlier manager"
     if holders:
         return f"port {manager_port} is used by the manager on {', '.join(sorted(set(holders)))}"
+    if own:
+        return (f"port {manager_port} is held by another tunnel of this manager "
+                f"(sshd {', '.join(own)} on the worker host)")
     return (
         f"port {manager_port} is held by an unrecorded process, likely a stale ssh session "
         "from an older mlsweep; it frees within ~2h, or kill it on the worker host"
@@ -1948,6 +2038,11 @@ async def _tunnel_exit_reason(proc: "asyncio.subprocess.Process") -> str:
     return lines[-1] if lines else f"ssh exited with code {proc.returncode}"
 
 
+def _terminate_launched(launch: "asyncio.Future[Any]") -> None:
+    """End a tunnel whose monitor was cancelled while it was being spawned."""
+    _terminate_proc(None if launch.cancelled() or launch.exception() else launch.result())
+
+
 async def _tunnel_monitor_task(
     wc: WorkerConn,
     manager_port: int,
@@ -1960,6 +2055,8 @@ async def _tunnel_monitor_task(
     the remote port is taken, typically by a stale sshd session left over from
     a manager that died without closing its connection.  Those are reaped via
     the records written by ``_tunnel_remote_cmd`` before retrying.
+
+    Retiring the worker cancels this task (see ``_close_tunnel``).
     """
     backoff = 2.0
     healthy = False  # becomes True once a tunnel survives the settle window
@@ -1979,7 +2076,7 @@ async def _tunnel_monitor_task(
         for t in pending:
             t.cancel()
 
-        if shutdown_event.is_set() or wc.status == "dead":
+        if shutdown_event.is_set():
             if proc.returncode is None:
                 proc.terminate()
             return
@@ -2005,9 +2102,16 @@ async def _tunnel_monitor_task(
         failed = True
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60.0)
+        if shutdown_event.is_set():
+            return
 
-        new_proc = await _launch_tunnel(
-            wc.host, manager_port, ssh_key=wc.ssh_key, password=wc.password
-        )
+        # Shielded: a cancel mid-spawn would otherwise lose the new ssh process.
+        launch = asyncio.ensure_future(_launch_tunnel(
+            wc.host, manager_port, ssh_key=wc.ssh_key, password=wc.password))
+        try:
+            new_proc = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            launch.add_done_callback(_terminate_launched)
+            raise
         if new_proc is not None:
             wc.tunnel_proc = new_proc

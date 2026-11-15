@@ -159,3 +159,12 @@ def test_reaper_is_a_no_op_without_a_record_dir(tmp_path):
     r = _shell(_reap_tunnels_script(PORT), tmp_path)
     assert r.returncode == 0
     assert r.stdout == ""
+
+
+def test_reaper_reports_this_managers_own_tunnel(tmp_path, fake_sshd):
+    holder = fake_sshd()
+    path = _record(tmp_path, holder.pid, *_manager_identity())
+    r = _shell(_reap_tunnels_script(PORT), tmp_path)
+    assert f"own {holder.pid}" in r.stdout
+    assert holder.poll() is None
+    os.remove(path)

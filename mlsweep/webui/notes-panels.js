@@ -856,7 +856,6 @@ const KEYS = [
   ]],
   ["When not typing", [
     ["T or O", "open a file"],
-    ["N", "new note"],
     ["X", "close tab"],
     ["{ / }", "previous / next tab"],
     ["\\", "split right: move the tab to a group beside this one"],
@@ -938,7 +937,6 @@ document.addEventListener("keydown", e => {
   const key = e.key;
   const act = {
     "t": () => Switcher.open(), "o": () => Switcher.open(),
-    "n": () => newNote(),
     "x": () => { if (t) closeTab(t.id); else closeGroup(focusedGroup()); },
     "\\": () => { if (t) splitTab(t, "right"); },
     "|": () => { if (t) splitTab(t, "down"); },
@@ -962,7 +960,7 @@ document.addEventListener("keydown", e => {
 async function init() {
   initLayout();
   await loadExperiments();
-  await poll(true);
+  await Promise.all([poll(true), loadSessions()]);
   if (!S.enabled) return;
   // Restore the groups and their tabs, then honour ?path= / ?q= / ?mentions=.
   await restoreLayout();
@@ -971,6 +969,7 @@ async function init() {
   if (_qp.get("q") || _qp.get("mentions")) searchFor(_qp.get("q") || _qp.get("mentions"));
   else switchPane(store.get("pane", "files") === "lint" ? "files" : store.get("pane", "files"));
   if (activeTab() && activeTab().path) revealInTree(activeTab().path);
+  S.ready = true;   // the saved layout is back; tests wait for this
   // Mark everything seen so "fresh" dots only show changes from now on.
   setTimeout(() => { S.seenMtime = Date.now() / 1000 - 15 * 60; store.set("seenMtime", Date.now() / 1000); }, 4000);
   setInterval(() => { if (!document.hidden) poll(); }, 4000);

@@ -82,6 +82,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not serve a notes folder",
     )
     parser.add_argument(
+        "--terminals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow terminals in the Notes tab: shells on this machine in a bubblewrap sandbox, "
+             "CPU only, with the workspace in <mlsweep-dir>/workspace and settings in "
+             "<mlsweep-dir>/terminals.json (see `mlsweep docs notes`); on by default",
+    )
+    parser.add_argument(
         "--color",
         action="store_true",
         help="Enable ANSI color in human-readable output (default: off)",
@@ -276,6 +284,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     # ── HTTP server ──────────────────────────────────────────────────────
     from mlsweep._manager_http import create_app, setup_audit_log
     from mlsweep._notes_http import setup_notes
+    from mlsweep._sessions import setup_sessions
     from mlsweep._manager_workers import (
         connect_workers,
         reconnect_known_workers,
@@ -296,6 +305,11 @@ async def _async_main(args: argparse.Namespace) -> None:
     setup_notes(app, notes_dir)
     if notes_dir:
         print(f"Notes: {notes_dir}")
+    setup_sessions(app, mlsweep_dir, args.port, enabled=args.terminals, notes=notes_dir is not None)
+    if args.terminals:
+        print(f"Terminals: on, sandboxed, workspace {mlsweep_dir / 'workspace'}")
+    else:
+        print("Terminals: off (--no-terminals)")
 
     runner = web.AppRunner(app)
     await runner.setup()

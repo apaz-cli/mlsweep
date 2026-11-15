@@ -19,6 +19,7 @@ import fcntl
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -33,6 +34,7 @@ from mlsweep._shared import (
     MsgCancel,
     MsgHello,
     MsgRun,
+    MsgShutdown,
     MsgWorkerHello,
     decode,
     encode,
@@ -401,3 +403,59 @@ def test_hello_reporting_another_attempt_is_a_ghost(tmp_path):
         mgr.wait()
         server.close()
 
+
+
+# ── updating an outdated worker ────────────────────────────────────────────────
+
+
+def _old_worker(port: int) -> threading.Thread:
+    """Serve *port* as a worker from an older mlsweep: answer the hello with a stale
+    protocol, then exit when the manager says shutdown (freeing the port)."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen()
+
+    def serve():
+        conn, _ = srv.accept()
+        srv.close()
+        with conn:
+            _recv(conn, MsgHello)
+            conn.sendall(encode(MsgWorkerHello(gpus=[0], topo={}, resuming=[], scratch_dir="/tmp",
+                                               protocol=PROTOCOL_VERSION - 1)))
+            _recv(conn, MsgShutdown)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return t
+
+
+def test_an_outdated_worker_is_flagged_and_the_update_relaunches_it(tmp_path):
+    Q = _find_free_port()
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    wf = tmp_path / "workers.toml"
+    wf.write_text(f'[[workers]]\nhost = "localhost"\nremote_dir = "{proj}"\nport = {Q}\n')
+    old = _old_worker(Q)
+    M = _find_free_port()
+    manager = _start_manager(tmp_path, M, str(wf))
+    url = f"http://127.0.0.1:{M}"
+    try:
+        def worker():
+            ws = _api(url, "/api/workers")
+            return ws[0] if ws else None
+        refused = _wait(lambda: (w := worker()) and w["status"] == "dead" and w, 30,
+                        "the old worker to be refused")
+        assert refused["outdated"] and "protocol" in refused["last_error"]
+        old.join(10)
+        assert not old.is_alive()          # told to shut down, so the port is free
+
+        resp = _api(url, f"/api/workers/{refused['worker_id']}/update", {})
+        assert resp["status"] == "updating"
+        updated = _wait(lambda: (w := worker()) and w["status"] == "connected" and w, 30,
+                        "the updated worker to connect")
+        assert not updated["outdated"] and updated["last_error"] is None
+    finally:
+        manager.terminate()
+        manager.wait(10)
+        _kill_worker(proj, Q)

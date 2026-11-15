@@ -28,6 +28,7 @@ import os
 import platform
 import shutil
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -115,7 +116,40 @@ def _build(venv_dir: str, spec: EnvSpec, project_dir: str, run: RunCmd) -> None:
              "--disable-pip-version-check", *spec.install], project_dir)
 
 
+def _link_mlsweep(venv_dir: str) -> None:
+    """Make the worker's own mlsweep importable in *venv_dir*, so ``MLSweepLogger`` works there.
+
+    The venv holds only the project's dependencies, which rarely list mlsweep. A ``.pth`` file adds a small
+    directory holding a link to this package (only mlsweep, not the worker's other packages), after the venv's
+    own site-packages, so a version the project installs itself still wins. Safe to repeat, and to
+    run concurrently on one venv: each file is put in place with a rename, so no run sees it half made.
+    """
+    import glob
+    import mlsweep
+    pkg = os.path.dirname(os.path.abspath(mlsweep.__file__))
+    shim = os.path.join(venv_dir, "mlsweep-shim")
+    os.makedirs(shim, exist_ok=True)
+    link = os.path.join(shim, "mlsweep")
+    tmp_suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
+    if os.path.realpath(link) != os.path.realpath(pkg):
+        os.symlink(pkg, link + tmp_suffix)
+        os.replace(link + tmp_suffix, link)
+    for site in glob.glob(os.path.join(venv_dir, "lib", "python*", "site-packages")):
+        pth = os.path.join(site, "zz-mlsweep-shim.pth")
+        if not os.path.isfile(pth) or open(pth).read().strip() != shim:
+            with open(pth + tmp_suffix, "w") as f:
+                f.write(shim + "\n")
+            os.replace(pth + tmp_suffix, pth)
+
+
 def ensure(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log) -> str:
+    """Return a venv satisfying *spec*, building it if needed, with the worker's mlsweep importable."""
+    venv_dir = _ensure_venv(spec, project_dir, run_dir, run, log)
+    _link_mlsweep(venv_dir)
+    return venv_dir
+
+
+def _ensure_venv(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log) -> str:
     """Return a venv satisfying *spec*, building it if needed.
 
     Cacheable specs share one venv per machine, built once under a file lock so

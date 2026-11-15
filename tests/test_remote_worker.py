@@ -11,6 +11,7 @@ the manager to have a public IP:
 """
 
 import asyncio
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -173,26 +174,48 @@ def test_tunnel_monitor_restarts_dead_proc():
     asyncio.run(_run())
 
 
-def test_tunnel_monitor_exits_when_worker_dead():
-    """Monitor exits without restarting if wc.status is 'dead'."""
+def test_retiring_a_worker_stops_its_tunnel_monitor(monkeypatch):
+    """Retirement cancels the monitor, so it does not relaunch the tunnel the
+    worker's relaunch needs the port of, even mid-backoff or mid-spawn."""
+    from mlsweep import _manager_workers as mw
+
     async def _run():
-        proc = await asyncio.create_subprocess_exec(
-            "true",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        launched: list[object] = []
+        spawning = asyncio.Event()
+
+        async def slow_launch(*args, **kwargs):
+            spawning.set()
+            await asyncio.sleep(0.2)
+            proc = await asyncio.create_subprocess_exec("sleep", "30")
+            launched.append(proc)
+            return proc
+
+        monkeypatch.setattr(mw, "_launch_tunnel", slow_launch)
+        monkeypatch.setattr(mw.asyncio, "sleep", _fast_sleep(asyncio.sleep))
         wc = _make_wc()
-        wc.tunnel_proc = proc
-        wc.status = "dead"
-
-        await asyncio.wait_for(
-            _tunnel_monitor_task(wc, 7891, asyncio.Event()),
-            timeout=5.0,
-        )
-
-        assert wc.tunnel_proc is proc, "Monitor should not restart tunnel for dead worker"
+        wc.tunnel_proc = await asyncio.create_subprocess_exec("true")
+        wc.tunnel_task = asyncio.create_task(_tunnel_monitor_task(wc, 7891, asyncio.Event()))
+        await asyncio.wait_for(spawning.wait(), 5)
+        task = wc.tunnel_task
+        mw._close_tunnel(wc)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert task.cancelled() and wc.tunnel_proc is None and wc.tunnel_task is None
+        # The ssh the cancelled launch was spawning is ended once it exists.
+        for _ in range(50):
+            if launched and launched[0].returncode is not None:
+                break
+            await asyncio.sleep(0.1)
+        assert launched and launched[0].returncode is not None
 
     asyncio.run(_run())
+
+
+def _fast_sleep(real_sleep):
+    """``asyncio.sleep`` that skips the monitor's backoff but keeps short waits."""
+    async def sleep(delay, *args, **kwargs):
+        return await real_sleep(min(delay, 0.2), *args, **kwargs)
+    return sleep
 
 
 # ── reconnect_known_workers ────────────────────────────────────────────────────

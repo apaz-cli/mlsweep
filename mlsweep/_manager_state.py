@@ -104,11 +104,13 @@ class WorkerConn:
     reconnect_attempts: int = 0
     hello_seen: bool = False  # later hellos keep GPU/concurrency settings changed via the API
     scratch_dir: str = DEFAULT_SCRATCH_DIR
+    code: str = ""  # fingerprint of the worker's mlsweep code, from its hello
     remote_dir: str = ""
     password: str | None = None
     ssh_key: str | None = None
     venv: str | None = None
     tunnel_proc: Any = None  # asyncio.subprocess.Process keeping the reverse tunnel alive
+    tunnel_task: Any = None  # asyncio.Task of _tunnel_monitor_task, cancelled on retirement
 
 
 # ── Manager state ──────────────────────────────────────────────────────────────
@@ -132,6 +134,9 @@ class ManagerState:
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
         self.launching: set[str] = set()  # worker ids with a launch in progress
+        # Worker ids refused at their hello for speaking an older protocol.
+        # The System page offers to update them (see ``update_worker``).
+        self.outdated: set[str] = set()
         self.runs: dict[RunKey, InFlightRun] = {}
         self.placement: Placement = DEFAULT_PLACEMENT
         # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.

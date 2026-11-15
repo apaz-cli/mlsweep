@@ -79,34 +79,67 @@ See AGENTS.md for the rules agents follow.
 """
 
 AGENTS_MD = """\
-# Rules for agents writing here
+# Rules for agents working here
+
+This is a shared repo of research notes, papers, plots and data. Most work here is
+on the notes themselves: reading, summarizing, drafting, reorganizing, fixing links
+and formatting. When a request is open-ended, assume that is what is wanted. If you
+are asked for something else (a sweep, code, a question), do that instead.
+
+## Always
 
 This is a git repo. Run `git pull` before you start. Commit and `git push` as you go,
-so another agent can pick up from what you pushed, and always before you stop. If the push is refused because someone else got there first, run
-`git pull`, resolve any conflicts so both sides' findings survive, and push again.
-Never force-push.
+so another agent can pick up from what you pushed, and always before you stop. If the
+push is refused because someone else got there first, run `git pull`, resolve any
+conflicts so both sides' work survives, and push again. Never force-push.
 
 1. Read before you write. `grep -ri` the folder for what is already known.
 2. Prefer a new file to rewriting someone else's. To correct a note, add a dated
    line or a new note that links to it (`[[old note]]`); do not delete what it said.
 3. `sources/` is read-only for you, except to add new files.
-4. Every number about an experiment must come from that experiment's logged
-   metrics, and the note must name the experiment and run. Write it as an evidence
-   link, `[0.42](mlsweep:EXPERIMENT/RUN/metric@STEP)`, so a reader can check it with
-   one click and lint reports a number that disagrees with the log. Plot with a
-   `mlsweep-chart` block instead of pasting a screenshot.
-5. State the conditions a result holds under (steps, seeds, model size).
-   One seed is one seed.
-6. Record dead ends too, with the reason, so nobody retries them.
-7. Keep `STATUS.md` short and readable by someone with none of your context: what is
-   running, with experiment IDs, and what comes next. Read it when you start, and update
-   it before you stop.
+4. Each project folder keeps its own `STATUS.md` (a repo with one project can keep it
+   at the top). Keep it short and readable by someone with none of your context: what
+   is running, with experiment IDs, and what comes next. Read it when you start, and
+   update it before you stop.
 
 Markdown is GitHub-flavored plus `[[links]]`, `![[embeds]]`, `$math$`, `> [!note]`
 callouts, `[^footnotes]`, numbered figure captions (`Figure: ...`), and two live data
 blocks fetched from the manager: `mlsweep-chart` and `mlsweep-table`. Pandoc
 `:::` divs do not render. Rename notes with `mlsweep notes mv`, which keeps links
 working. Full reference: `mlsweep docs notes`.
+
+## Write for people
+
+Notes are read by people, often quickly and without your context. Write so that a
+person can follow them on the first read. Clarity for a reader matters more than
+looking thorough.
+
+1. Use plain words and short sentences. Say what was found first, then why it
+   matters, then the details. If a paragraph needs a second read, rewrite it.
+2. Be concrete. Give numbers with their conditions instead of adjectives like
+   "significant" or "robust".
+3. Mark the terms you made up. A name you coined for a method or an effect means
+   nothing to anyone else. The first time a note uses one, say that it is your own
+   name and explain it in ordinary words, for example: "what I call *hub chaining*
+   (my name for it, not a standard term) estimates ...". Standard terms can be used
+   as they are, with a link or citation when they are not common knowledge. When you
+   use a standard term for your own particular construction, say what yours is.
+4. Long documents drift into jargon. Before you push a long note, reread it from the
+   top as a newcomer would, and cut jargon, stacked qualifiers, and lists that would
+   read better as sentences. Several short notes are easier to read than one long one.
+
+## When a note reports experiment results
+
+These apply to any note that gives numbers from a sweep.
+
+1. Every number must come from that experiment's logged metrics, and the note must
+   name the experiment and run. Write it as an evidence link,
+   `[0.42](mlsweep:EXPERIMENT/RUN/metric@STEP)`, so a reader can check it with one
+   click and lint reports a number that disagrees with the log. Plot with a
+   `mlsweep-chart` block instead of pasting a screenshot.
+2. State the conditions a result holds under (steps, seeds, model size).
+   One seed is one seed.
+3. Record dead ends too, with the reason, so nobody retries them.
 """
 
 SOURCES_README = """\

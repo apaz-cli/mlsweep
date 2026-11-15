@@ -98,6 +98,11 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     setup_command = getattr(mod, "SETUP_COMMAND", None)
     if setup_command is not None and not isinstance(setup_command, str):
         raise ValueError(f"{path}: SETUP_COMMAND must be a str, got {type(setup_command).__name__}")
+    upload_exclude = getattr(mod, "UPLOAD_EXCLUDE", [])
+    if isinstance(upload_exclude, str):
+        upload_exclude = [upload_exclude]
+    if not isinstance(upload_exclude, (list, tuple)) or not all(isinstance(p, str) and p for p in upload_exclude):
+        raise ValueError(f"{path}: UPLOAD_EXCLUDE must be a list of non-empty str patterns")
 
     return {
         "name": Path(path).stem,
@@ -114,6 +119,7 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "metric": metric,
         "goal": goal,
         "setup_command": setup_command,
+        "upload_exclude": list(upload_exclude),
     }
 
 

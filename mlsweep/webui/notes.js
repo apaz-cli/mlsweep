@@ -129,6 +129,7 @@ const ICONS = {
   dir: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M1.5 4.5v8a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-6a1 1 0 0 0-1-1H8L6.5 3.5h-4a1 1 0 0 0-1 1z"/></svg>',
   graph: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="7" cy="12.5" r="2"/><path d="M5.8 4.3 10 4.8M5 5.8l1.4 4.9M10.8 6.6 8.3 11"/></svg>',
   diff: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 2v8M1 6h6M9 12h6"/><circle cx="12" cy="4" r="2"/></svg>',
+  term: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="m4.5 6 2 2-2 2M8.5 10.5h3"/></svg>',
 };
 // The tree's own `kind` (from the server's _notes.kind_of) when the file is
 // known; the extension rules below only cover paths not in the tree yet.
@@ -271,7 +272,8 @@ async function poll(force = false) {
       await loadTree();
       if (!first) await checkOpenTabs();
       S.index = null;
-      for (const g of Groups.values()) { const t = tabById(g.active); if (!t || t.type !== "file") renderGroup(g); }
+      // Views drawn from the folder (graph, start page) catch up.
+      for (const g of Groups.values()) { const t = tabById(g.active); if (!t || !tabType(t).ownRefresh) renderGroup(g); }
       refreshRight();
     }
   } catch (e) {
@@ -298,6 +300,26 @@ async function ensureIndex() {
 }
 
 // ── File tree ──────────────────────────────────────────────────────────────────
+// A click that would replace the current tab waits briefly: if a second click
+// turns it into a double-click, the tab is kept and the file opens in a new one.
+let treeClick = null;
+const TREE_CLICK_MS = 300;
+function runTreeClick() {
+  const c = treeClick;
+  if (!c) return;
+  treeClick = null;
+  openFile(c.path);
+}
+function laterTreeClick(path) {
+  if (treeClick && treeClick.path === path) clearTimeout(treeClick.timer);
+  else runTreeClick();
+  treeClick = { path, timer: setTimeout(runTreeClick, TREE_CLICK_MS) };
+}
+function cancelTreeClick() {
+  if (!treeClick) return;
+  clearTimeout(treeClick.timer);
+  treeClick = null;
+}
 async function loadTree() {
   const t = await api("/api/notes/tree");
   S.files = t.files; S.dirs = t.dirs; S.protectedDirs = new Set(t.protected_dirs); S.version = t.version || S.version;
@@ -329,7 +351,7 @@ function renderTree() {
   const scroll = tree.parentElement.scrollTop;
   tree.innerHTML = "";
   if (!S.files.length && !S.dirs.length) {
-    tree.innerHTML = `<div class="tree-empty">This folder is empty.<br>Create a note with <kbd>Alt</kbd>+<kbd>N</kbd>, or drop files here.</div>`;
+    tree.innerHTML = `<div class="tree-empty">This folder is empty.<br>Create a note with the icon above, or drop files here.</div>`;
     return;
   }
   const activePath = activeTab() && activeTab().path;
@@ -357,8 +379,8 @@ function renderTree() {
       row.dataset.path = f.path;
       const ic = el("span", "ficon"); ic.innerHTML = iconFor(f.path); row.append(ic);
       const nm = el("span", "tname");
-      if (isMd(f.path)) nm.textContent = stemOf(f.path);
-      else { nm.textContent = stemOf(f.path) || basename(f.path); const e = extOf(f.path); if (e && stemOf(f.path)) nm.append(el("span", "ext", "." + e)); }
+      nm.textContent = stemOf(f.path) || basename(f.path);
+      const e = extOf(f.path); if (e && stemOf(f.path)) nm.append(el("span", "ext", "." + e));
       row.append(nm);
       if (f.mtime > fresh && f.mtime > S.seenMtime && S.ownSaves.get(f.path) !== f.mtime) { const d = el("span", "fresh"); d.title = "Changed " + ago(f.mtime); row.append(d); }
       row.title = `${f.path}\n${fmtSize(f.size)} · modified ${ago(f.mtime)}`;
@@ -373,13 +395,30 @@ function renderTree() {
 $("tree").addEventListener("click", e => {
   const row = e.target.closest(".tnode");
   if (!row || e.target.tagName === "INPUT") return;
+  const path = row.dataset.path;
+  const plain = !row.dataset.dir && !e.altKey && !e.ctrlKey && !e.metaKey;
+  // A plain click replaces the current tab, but the first half of a
+  // double-click must not consume the tab that double-click should keep.
+  const cur = activeTab();
+  if (plain && cur && cur.type === "file" && !cur.dirty
+      && !S.tabs.some(t => t.type === "file" && t.path === path)) {
+    laterTreeClick(path);
+    return;
+  }
+  runTreeClick();
   if (row.dataset.dir) toggleDir(row);
-  else if (e.altKey) openToSide(row.dataset.path);
-  else openFile(row.dataset.path, { newTab: e.ctrlKey || e.metaKey });
+  else if (e.altKey) openToSide(path);
+  else openFile(path, { newTab: e.ctrlKey || e.metaKey });
+});
+$("tree").addEventListener("dblclick", e => {
+  const row = e.target.closest(".tnode.file");
+  if (!row || e.target.tagName === "INPUT") return;
+  cancelTreeClick();
+  openFile(row.dataset.path, { newTab: true });
 });
 $("tree").addEventListener("auxclick", e => {
   const row = e.target.closest(".tnode.file");
-  if (row && e.button === 1) { e.preventDefault(); openFile(row.dataset.path, { newTab: true }); }
+  if (row && e.button === 1) { e.preventDefault(); runTreeClick(); openFile(row.dataset.path, { newTab: true }); }
 });
 function toggleDir(row) {
   const p = row.dataset.path, open = !S.openDirs.has(p);
@@ -436,6 +475,7 @@ $("tree").addEventListener("contextmenu", e => {
     items.push("-");
   }
   items.push({ label: "New note", run: () => newNote(folder) }, { label: "New folder", run: () => newFolder(folder) }, { label: "Upload files here…", run: () => pickUpload(folder) });
+  if (S.term.enabled && !S.term.error) items.push({ label: "Open terminal here", run: () => newTerminal(null, folder) });
   if (row) {
     items.push("-", { label: "Rename…", key: "F2", run: () => startRename(row) }, { label: "Move to…", run: () => moveDialog(path) });
     if (!isDir) {

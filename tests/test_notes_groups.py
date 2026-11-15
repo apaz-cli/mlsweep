@@ -17,7 +17,8 @@ from campaign_helpers import shared_manager, static_url
 CHROME = find_chromium()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chromium-family browser installed")
 
-FILES = {"ga.md": "# A\n\nalpha\n", "gb.md": "# B\n\nbeta\n", "gc.md": "# C\n\ngamma\n", "gd.txt": "plain\n"}
+FILES = {"ga.md": "# A\n\nalpha\n", "gb.md": "# B\n\nbeta\n", "gc.md": "# C\n\ngamma\n", "gd.txt": "plain\n",
+         "ge.md": "# E\n\nepsilon\n", "gf.txt": "another plain\n"}
 
 # drag(srcSelector, targetSelector, fx, fy): drag the source onto the target at a
 # fraction of its box (0..1 in each direction), as the browser would.
@@ -58,7 +59,7 @@ def page(mgr, browser):
     browser.goto(static_url(mgr, "notes.html"))
     browser.eval("localStorage.clear()")
     browser.goto(static_url(mgr, "notes.html"))
-    browser.wait_for("S.fileMap && S.fileMap.has('gc.md') && Groups.size === 1", timeout=20)
+    browser.wait_for("S.ready && S.fileMap.has('gc.md') && Groups.size === 1", timeout=20)
     browser.eval(DRAG_JS)
     for name in ("ga.md", "gb.md", "gc.md"):
         browser.eval(f"openFile({json.dumps(name)}, {{ newTab: true }})")
@@ -73,6 +74,38 @@ def strips(page):
 
 def tab_sel(title):
     return f"[...document.querySelectorAll('.dtab')].find(d => d.querySelector('.tt').textContent === {json.dumps(title)})"
+
+
+def test_file_tree_always_shows_the_extension(page) -> None:
+    name = lambda path: f"document.querySelector('#tree .tnode.file[data-path={json.dumps(path)}] .tname').textContent"
+    assert page.eval(name("ga.md")) == "ga.md"
+    assert page.eval(name("gd.txt")) == "gd.txt"
+
+
+def double_click(page, path) -> None:  # type: ignore[no-untyped-def]
+    page.eval(f"""(() => {{
+      const row = document.querySelector('#tree .tnode.file[data-path={json.dumps(path)}]');
+      for (const detail of [1, 2]) row.dispatchEvent(new MouseEvent('click', {{ bubbles: true, detail }}));
+      row.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true, detail: 2 }}));
+    }})()""")
+
+
+def test_double_click_opens_a_new_tab_for_the_same_or_another_type(page) -> None:
+    page.eval("activate(S.tabs.find(t => t.path === 'ga.md').id)")
+    double_click(page, "gf.txt")
+    page.wait_for("activeTab().path === 'gf.txt'")
+    assert strips(page) == [["ga", "gf.txt", "gb", "gc"]]
+    page.eval("activate(S.tabs.find(t => t.path === 'ga.md').id)")
+    double_click(page, "ge.md")
+    page.wait_for("activeTab().path === 'ge.md'")
+    assert strips(page) == [["ga", "ge", "gf.txt", "gb", "gc"]]
+
+
+def test_single_click_still_replaces_the_current_tab(page) -> None:
+    page.eval("activate(S.tabs.find(t => t.path === 'ga.md').id)")
+    page.eval("document.querySelector('#tree .tnode.file[data-path=\"gd.txt\"]').click()")
+    page.wait_for("activeTab().path === 'gd.txt' && document.querySelector('.dtab.active .tt').textContent === 'gd.txt'")
+    assert strips(page) == [["gd.txt", "gb", "gc"]]
 
 
 def test_dragging_a_tab_to_the_right_edge_splits(page) -> None:
@@ -222,3 +255,13 @@ def test_opening_a_file_open_in_another_group_focuses_it(page) -> None:
     page.wait_for("activeTab().path === 'gc.md'")
     assert strips(page) == [["ga", "gb"], ["gc"]]
     assert page.eval("focusedGroup() === Groups.get(groupOrder()[1])")
+
+
+def test_a_file_opened_before_the_layout_is_restored_is_kept(page) -> None:
+    # As if gc had been clicked while the page was still starting: the saved layout lacks it.
+    page.eval("localStorage.setItem('notes.layout', JSON.stringify({ tree: { kind: 'group', tabs: [{ type: 'file', path: 'ga.md', mode: 'live' }], active: 0 }, focus: 0 }))")
+    page.eval("activate(S.tabs.find(t => t.path === 'gc.md').id)")
+    page.eval("restoreLayout()")
+    page.wait_for("S.tabs.length === 3 && S.tabs.every(t => t.meta)")
+    assert strips(page) == [["ga", "gb", "gc"]]
+    assert page.eval("activeTab().path") == "gc.md"

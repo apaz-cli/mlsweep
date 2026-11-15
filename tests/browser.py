@@ -105,10 +105,17 @@ class Browser:
         raise TimeoutError(f"timed out waiting for {expr!r} (last value {last!r})")
 
     def goto(self, url):
-        """Load *url* and wait for the document to finish loading."""
+        """Load *url* and wait for the new document to finish loading.
+
+        The old document is marked first, so going to the page already open
+        waits for its replacement rather than returning on the old one.
+        """
+        try:
+            self.eval("window.__mlsweepOldPage = true")
+        except RuntimeError:
+            pass
         self.call("Page.navigate", url=url)
-        time.sleep(0.1)
-        self.wait_for(f"location.href.startsWith({json.dumps(url.split('?')[0])}) "
+        self.wait_for(f"!window.__mlsweepOldPage && location.href.startsWith({json.dumps(url.split('?')[0])}) "
                       "&& document.readyState === 'complete'")
 
     def close(self):

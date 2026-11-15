@@ -156,10 +156,15 @@ def test_menus_and_citation_counts(notes_mgr):
         b.wait_for(f"runRowsOf({json.dumps(eid)}).some(r => r.classList.contains('run-row'))")
         b.eval(f"document.querySelector('#exp-tbody tr[data-runs-of={eid}] .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
-        assert _menu_items(b) == [["Artifacts", None], ["Logs", None], ["Notes", "1"]]
+        assert _menu_items(b) == [["Results", None], ["Artifacts", None], ["Logs", None],
+                                  ["Notes", "1"]]
         run_hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
-        # Both runs are cited, so the first run row's links carry its own ID.
-        assert all("run=" in h for h in run_hrefs if "notes.html" not in h), run_hrefs
+        # Results goes to the run's experiment; the other pages carry the run.
+        results_hrefs = [h for h in run_hrefs if h.startswith("results.html")]
+        assert len(results_hrefs) == 1 and "run=" not in results_hrefs[0], run_hrefs
+        assert f"experiment={eid}" in results_hrefs[0], run_hrefs
+        assert all("run=" in h for h in run_hrefs
+                   if not h.startswith(("results.html", "notes.html"))), run_hrefs
         assert any("notes.html?mentions=run_a" in h for h in run_hrefs), run_hrefs
         b.eval(f"document.querySelector('#exp-tbody tr[data-runs-of={eid}] .btn-manage').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
