@@ -759,8 +759,6 @@ async def notes_evidence(request: web.Request) -> web.Response:
     refs = body.get("refs")
     if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
         raise _bad_request("refs must be a list of strings")
-    if len(refs) > _notes_blocks.MAX_EVIDENCE_REFS:
-        raise _bad_request(f"at most {_notes_blocks.MAX_EVIDENCE_REFS} references at once")
     results = await _notes_blocks.resolve_evidence_many(request.config_dict[DB_KEY], refs)
     return _json_response({"results": results})
 

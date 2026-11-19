@@ -12,6 +12,7 @@ import argparse
 import base64
 import collections
 import fnmatch
+import gzip
 import hashlib
 import importlib.metadata
 import json
@@ -571,8 +572,9 @@ def manager_upload_artifact_data(
 ) -> bool:
     """Upload artifact tarball bytes to the manager.
 
-    Uses PUT /api/artifacts/{artifact_id}/data with raw binary body.
-    Streams the file in chunks to avoid loading the entire tarball into memory.
+    Uses PUT /api/artifacts/{artifact_id}/data with a raw binary body.  The file
+    object is handed to ``urlopen`` so the tarball is streamed instead of read
+    into memory; Content-Length lets the manager read exactly that many bytes.
     """
     path = Path(filepath)
     if not path.exists():
@@ -580,18 +582,39 @@ def manager_upload_artifact_data(
         return False
 
     file_size = path.stat().st_size
+    url = _manager_url(manager, f"/api/artifacts/{artifact_id}/data")
 
-    status, resp = _http_request(
-        "PUT",
-        _manager_url(manager, f"/api/artifacts/{artifact_id}/data"),
-        token,
-        data=path.read_bytes(),
-        headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(file_size),
-        },
-        timeout=120,
-    )
+    try:
+        with open(path, "rb") as body:
+            req = Request(url, data=body, method="PUT", headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(file_size),
+            })
+            with urlopen(req, timeout=120) as response:
+                raw = response.read()
+                status = response.status
+                content_type = response.headers.get_content_type()
+    except HTTPError as e:
+        status = e.code
+        raw = e.read()
+        content_type = e.headers.get_content_type()
+    except URLError as e:
+        sweep_print(f"{_RED}Error: cannot reach manager at {url}: {e.reason}{_RESET}")
+        return False
+    except Exception as e:
+        sweep_print(f"{_RED}Error: artifact upload failed: {e}{_RESET}")
+        return False
+
+    resp: Any = None
+    if content_type == "application/json":
+        try:
+            resp = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    if resp is None and raw:
+        resp = raw.decode("utf-8", errors="replace")
+
     if status in (200, 201, 204):
         sweep_print(f"  {_GREEN}OK{_RESET}    Artifact uploaded ({file_size} bytes)")
         return True
@@ -1280,7 +1303,8 @@ def _pack_project(
     Returns (tarball_path, sha256_hex).
     Skips common VCS and cache directories, matching each path component
     against shell-style patterns.  Skipped directories are not walked, so a
-    large ``.venv`` costs nothing.
+    large ``.venv`` costs nothing.  Packing is deterministic: the same tree
+    gives the same sha256, which is what lets the manager dedupe artifacts.
     """
     root = Path(project_root).resolve()
     if exclude_patterns is None:
@@ -1309,12 +1333,17 @@ def _pack_project(
     try:
         with open(tmp_path, "wb") as raw_f:
             hw = _HashWriter(raw_f, sha)
-            with tarfile.open(fileobj=hw, mode="w:gz") as tar:  # type: ignore[call-overload]
-                for entry in _project_files(root, excludes, _build_output_dirs(root)):
-                    try:
-                        tar.add(str(entry), arcname=str(entry.relative_to(root)), recursive=False)
-                    except (PermissionError, OSError):
-                        continue
+            # Compress level 1: large ML projects ship tensors that are already
+            # incompressible, where level 9 is ~40x slower for ~10% less size.
+            # mtime=0 makes the gzip header fixed, so packing the same tree
+            # twice yields the same hash and the manager can dedupe artifacts.
+            with gzip.GzipFile(fileobj=hw, mode="wb", compresslevel=1, mtime=0) as gz:
+                with tarfile.TarFile(fileobj=gz, mode="w") as tar:
+                    for entry in _project_files(root, excludes, _build_output_dirs(root)):
+                        try:
+                            tar.add(str(entry), arcname=str(entry.relative_to(root)), recursive=False)
+                        except (PermissionError, OSError):
+                            continue
 
         # SHA-256 is computed incrementally during the write above
 

@@ -467,6 +467,20 @@ def test_pack_project_skips_caches_venvs_and_build_metadata(tmp_path):
     assert names == {"train.py", "pkg", "pkg/mod.py", "data", "data/empty", "data/empty/.keep"}
 
 
+def test_pack_project_is_deterministic(tmp_path):
+    """The same tree packs to the same sha, so the manager can dedupe artifacts."""
+    from mlsweep.run_sweep import _pack_project
+    (tmp_path / "train.py").write_text("x")
+    first, h1 = _pack_project(tmp_path)
+    second, h2 = _pack_project(tmp_path)
+    try:
+        assert h1 == h2
+        assert Path(first).read_bytes() == Path(second).read_bytes()
+    finally:
+        os.unlink(first)
+        os.unlink(second)
+
+
 @pytest.mark.parametrize("venv", [True, False], ids=["with-venv", "without-venv"])
 def test_pack_project_skips_top_level_build_only_next_to_a_venv(tmp_path, venv):
     """With a venv in the project root, a top-level build/ is setuptools output;

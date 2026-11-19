@@ -51,7 +51,6 @@ DEFAULT_CHART_RUNS = 60
 DEFAULT_TABLE_RUNS = 300
 DEFAULT_POINTS = 400
 MAX_POINTS = 2000
-MAX_EVIDENCE_REFS = 500
 
 CHART_KEYS = {
     "experiments", "runs", "metric", "x", "x_min", "x_max", "split_by", "color_by",
@@ -999,7 +998,7 @@ async def resolve_evidence_many(db: Connection, refs: Sequence[str]) -> dict[str
     """Resolve references in one batch, loading each run's rows only once."""
     out: dict[str, dict[str, Any]] = {}
     cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for ref in refs:  # the HTTP route applies MAX_EVIDENCE_REFS; lint may pass more
+    for ref in refs:
         try:
             experiment, run, metric, at = parse_evidence_ref(ref)
         except SpecError as exc:
