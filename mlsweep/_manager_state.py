@@ -54,6 +54,21 @@ class InFlightRun:
     log_end: int = 0  # training.log is stored up to this byte offset
     replay_requested: bool = False
     last_progress: float = 0.0  # epoch seconds of the last log/metric/start event
+    last_step: int | None = None  # newest metric step this session
+    last_step_time: float = 0.0  # epoch seconds when last_step first arrived here
+    step_seconds: float | None = None  # the logger's wall seconds per step, if it sent one
+
+    def note_step(self, step: int, step_seconds: float | None, now: float) -> None:
+        """Record a metric for *step* that arrived at *now*.
+
+        Only a higher step restarts the clock, so several log() calls at one
+        step count once.  *step_seconds* is measured by the logger.
+        """
+        if step_seconds is not None:
+            self.step_seconds = step_seconds
+        if self.last_step is None or step > self.last_step:
+            self.last_step = step
+            self.last_step_time = now
 
     @classmethod
     def from_job(cls, job: JobRecord, primary: str, **kwargs: Any) -> InFlightRun:
@@ -113,6 +128,21 @@ class WorkerConn:
     tunnel_task: Any = None  # asyncio.Task of _tunnel_monitor_task, cancelled on retirement
 
 
+@dataclass
+class Pin:
+    """Where the next dispatch of a job must go, chosen by hand (System page or
+    ``mlsweep reschedule --to``).  The scheduler uses it once and drops it."""
+
+    worker_id: str
+    gpus: list[int]
+    made: float = field(default_factory=time.time)
+
+
+# A pin the scheduler could not use for this long is forgotten, so a job that
+# was cancelled or paused meanwhile does not jump to that GPU much later.
+PIN_TTL_SECONDS = 600.0
+
+
 # ── Manager state ──────────────────────────────────────────────────────────────
 
 
@@ -138,6 +168,7 @@ class ManagerState:
         # The System page offers to update them (see ``update_worker``).
         self.outdated: set[str] = set()
         self.runs: dict[RunKey, InFlightRun] = {}
+        self.pins: dict[RunKey, Pin] = {}  # hand-chosen placements for pending jobs
         self.placement: Placement = DEFAULT_PLACEMENT
         # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.
         self.run_values: dict[tuple[int, int], float | None] = {}
@@ -170,6 +201,14 @@ class ManagerState:
             return False
         self.launching.add(worker_id)
         return True
+
+    def runs_by_gpu(self, worker_id: str) -> dict[int, list[InFlightRun]]:
+        """In-flight runs on each GPU of *worker_id*, in or out of its pool."""
+        out: dict[int, list[InFlightRun]] = {}
+        for run in self.runs.values():
+            for g in run.nodes.get(worker_id, ()):
+                out.setdefault(g, []).append(run)
+        return out
 
     def occupancy(self, wc: WorkerConn) -> dict[int, int]:
         """Number of in-flight runs on each of *wc*'s GPUs."""
@@ -217,5 +256,7 @@ __all__ = [
     "InFlightRun",
     "ManagerState",
     "RunKey",
+    "Pin",
+    "PIN_TTL_SECONDS",
     "WorkerConn",
 ]

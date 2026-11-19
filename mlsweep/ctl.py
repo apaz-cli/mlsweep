@@ -825,6 +825,39 @@ def retry_cmd(argv: list[str]) -> None:
     _cancel_retry(argv, retry=True)
 
 
+# ── reschedule ─────────────────────────────────────────────────────────────────
+
+
+def reschedule_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep reschedule",
+        "Move a run. A running run is stopped and queued again without spending a retry; it "
+        "restarts from scratch unless the script resumes from a checkpoint. With --to it starts "
+        "next on that worker (and GPUs) even if they are at their jobs-per-GPU limit.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("run", help="Run ID")
+    parser.add_argument("--to", metavar="WORKER", help="Worker ID to start it on (see `mlsweep workers`)")
+    parser.add_argument("--gpus", help="GPU indices on that worker, e.g. 2,3 (default: its least busy)")
+    args = parser.parse_args(argv)
+    if args.gpus and not args.to:
+        parser.error("--gpus needs --to")
+    manager, token, campaign = _connect(args, args.experiment)
+    body: dict[str, Any] = {}
+    if args.to:
+        body = {"worker_id": args.to, **({"gpus": _parse_ints(args.gpus)} if args.gpus else {})}
+    url = _manager_url(manager, _with_campaign(
+        f"/api/jobs/{args.run}/reschedule?experiment_id={args.experiment}", campaign))
+    status, resp = _http_request("POST", url, token, json_data=body)
+    ok = status == 200 and isinstance(resp, dict)
+    where = ""
+    if ok and resp.get("pinned"):
+        where = f" to {resp['pinned']['worker_id']} GPU {','.join(map(str, resp['pinned']['gpus']))}"
+    _report(ok, f"{args.run}: {'requeued' if ok and resp.get('requeued') else 'queued'}{where}")
+    if not ok:
+        _fail("reschedule", status, resp)
+
+
 # ── rename ─────────────────────────────────────────────────────────────────────
 
 
@@ -1650,7 +1683,9 @@ def workers_cmd(argv: list[str]) -> None:
     st.add_argument("worker_id")
     st.add_argument("--jobs", type=int, help="Max concurrent jobs per GPU (0 = unlimited)")
     st.add_argument("--add-devices", help="GPU indices to start using, e.g. 2,3")
-    st.add_argument("--remove-devices", help="GPU indices to stop using")
+    st.add_argument("--remove-devices", help="GPU indices to stop using; their runs are re-queued")
+    st.add_argument("--drain-devices",
+                    help="GPU indices to take out of the pool while their runs finish")
     args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "-h", "--help")
                              else ["ls", *argv])
     manager, token = _manager_token(args)
@@ -1672,15 +1707,16 @@ def workers_cmd(argv: list[str]) -> None:
             sys.exit(1)
         return
     if args.action == "set":
-        if args.jobs is None and not args.add_devices and not args.remove_devices:
-            parser.error("give --jobs, --add-devices or --remove-devices")
+        if args.jobs is None and not (args.add_devices or args.remove_devices or args.drain_devices):
+            parser.error("give --jobs, --add-devices, --remove-devices or --drain-devices")
         ok = True
         if args.jobs is not None:
             ok &= _report_request("set concurrency", f"{args.worker_id}: {args.jobs or 'unlimited'} job(s) per GPU",
                                   "PATCH", _manager_url(manager, f"/api/workers/{args.worker_id}/concurrency"),
                                   token, json_data={"max_jobs_per_gpu": args.jobs})
-        if args.add_devices or args.remove_devices:
-            body = {"add": _parse_ints(args.add_devices) or [], "remove": _parse_ints(args.remove_devices) or []}
+        if args.add_devices or args.remove_devices or args.drain_devices:
+            body = {"add": _parse_ints(args.add_devices) or [], "remove": _parse_ints(args.remove_devices) or [],
+                    "drain": _parse_ints(args.drain_devices) or []}
             ok &= _report_request("set devices", f"{args.worker_id}: devices updated",
                                   "PATCH", _manager_url(manager, f"/api/workers/{args.worker_id}/devices"),
                                   token, json_data=body)

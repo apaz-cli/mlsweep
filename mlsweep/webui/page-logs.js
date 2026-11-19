@@ -49,11 +49,88 @@ let wsReconnTimer = null;
 let loadAbort     = null;   // AbortController for in-flight history fetches
 
 // ── Log rendering ─────────────────────────────────────────────────────────────
+// With "Collapse JSON" on, a line that is a whole JSON object shows as one
+// summary row that opens to the pretty-printed object.  Lines are only known to
+// be whole once their newline arrives, so the unfinished last line is drawn in
+// a tail element and redrawn as more of it comes.
+const collapseCb = document.getElementById("collapse-json");
+const COLLAPSE_KEY = "mlsweep_log_collapse_json";
+collapseCb.checked = localStorage.getItem(COLLAPSE_KEY) !== "0";
+let logRaw  = "";     // everything shown so far, to redraw when the toggle changes
+let pending = "";     // the last line, until its newline arrives
+let tailEl  = null;
+
+function jsonOf(line) {
+  const t = line.trim();
+  if (t.length < 2 || t[0] !== "{" || t[t.length - 1] !== "}") return null;
+  try {
+    const obj = JSON.parse(t);
+    return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
+  } catch { return null; }
+}
+
+function shortValue(v) {
+  if (typeof v === "number") return Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(4)));
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s.length > 40 ? s.slice(0, 37) + "…" : s;
+}
+
+function jsonLineHtml(obj) {
+  const keys = Object.keys(obj);
+  const first = keys.includes("step") ? ["step", ...keys.filter(k => k !== "step")] : keys;
+  const shown = first.slice(0, 6);
+  const parts = shown.map(k => `<span class="jk">${escHtml(k)}</span> <span class="jv">${escHtml(shortValue(obj[k]))}</span>`);
+  const more = keys.length - shown.length;
+  return `<details class="json-line"><summary>${parts.join('<span class="jsep">·</span>')}`
+    + `${more > 0 ? `<span class="jmore">+${more} keys</span>` : ""}</summary>`
+    + `<pre>${escHtml(JSON.stringify(obj, null, 2))}</pre></details>`;
+}
+
+// Append *text* to the output, without recording it (see appendLog).
+function renderChunk(text) {
+  if (!collapseCb.checked) {
+    logOutput.insertAdjacentHTML("beforeend", ansiUp.ansi_to_html(text));
+    return;
+  }
+  const lines = (pending + text).split("\n");
+  pending = lines.pop();
+  let plain = "";   // consecutive non-JSON lines go through ansi_up together
+  const flush = () => { if (plain) { tailEl.insertAdjacentHTML("beforebegin", ansiUp.ansi_to_html(plain)); plain = ""; } };
+  if (!tailEl) { tailEl = document.createElement("span"); logOutput.append(tailEl); }
+  for (const line of lines) {
+    const obj = jsonOf(line);
+    if (obj) { flush(); tailEl.insertAdjacentHTML("beforebegin", jsonLineHtml(obj)); }
+    else plain += line + "\n";
+  }
+  flush();
+  // Draw the unfinished line with a copy of the ANSI state, so the real state
+  // only advances once the line is complete.
+  const peek = Object.assign(Object.create(Object.getPrototypeOf(ansiUp)), ansiUp);
+  tailEl.innerHTML = pending ? peek.ansi_to_html(pending) : "";
+}
+
 function appendLog(text) {
   if (!text) return;
-  logOutput.insertAdjacentHTML("beforeend", ansiUp.ansi_to_html(text));
+  logRaw += text;
+  renderChunk(text);
   if (autoScrollCb.checked) logOutput.scrollTop = logOutput.scrollHeight;
 }
+
+function resetLog() {
+  logOutput.innerHTML = "";
+  ansiUp  = new AnsiUp();
+  logRaw  = "";
+  pending = "";
+  tailEl  = null;
+}
+
+collapseCb.addEventListener("change", () => {
+  try { localStorage.setItem(COLLAPSE_KEY, collapseCb.checked ? "1" : "0"); } catch {}
+  const text = logRaw, atBottom = autoScrollCb.checked;
+  resetLog();
+  appendLog(text);
+  if (atBottom) logOutput.scrollTop = logOutput.scrollHeight;
+});
 
 // ── Job selection ─────────────────────────────────────────────────────────────
 async function selectJob(job) {
@@ -79,9 +156,9 @@ async function selectJob(job) {
   });
 
   // Reset output.
-  logOutput.innerHTML  = "";
-  ansiUp               = new AnsiUp();
+  resetLog();
   autoScrollCb.checked = true;
+  MLStepTimer.tick();
   jumpBtn.style.display = "none";
 
   // Fetch history.
@@ -187,7 +264,9 @@ async function loadJobs(expId) {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
     if (!r.ok) return;
     jobsData = await r.json();
+    jobsData.forEach(MLStepTimer.seed);
     renderJobList();
+    MLStepTimer.tick();
   } catch {}
 }
 
@@ -197,8 +276,9 @@ async function selectExperiment(expId) {
   currentExpId = expId;
   currentRunId = null;
   jobsData     = [];
+  MLStepTimer.clear();
 
-  logOutput.innerHTML      = "";
+  resetLog();
   logHeader.style.display  = "none";
   logWrap.style.display    = "none";
   noSel.style.display      = "";
@@ -247,6 +327,8 @@ function connectWS(expId) {
 function handleWsEvent(evt) {
   if (evt.type === "log" && evt.run_id === currentRunId) {
     appendLog(evt.data);
+  } else if (evt.type === "metric") {
+    MLStepTimer.onMetric(evt);
   } else if (evt.type === "job_started") {
     setJobStatus(evt.run_id, "running");
   } else if (evt.type === "job_dispatched") {
@@ -270,7 +352,8 @@ function clearExperiment() {
   currentExpId = null;
   currentRunId = null;
   jobsData = [];
-  logOutput.innerHTML       = "";
+  MLStepTimer.clear();
+  resetLog();
   logHeader.style.display   = "none";
   logWrap.style.display     = "none";
   noSel.style.display       = "";
@@ -324,6 +407,12 @@ refreshBtn.addEventListener("click", async () => {
 
 // Refresh job list periodically to pick up newly submitted jobs.
 setInterval(() => { if (currentExpId) loadJobs(currentExpId); }, 15000);
+
+// The step timer shows while the selected run is running.
+MLStepTimer.mount(document.getElementById("step-timer"), () => {
+  const job = jobsData.find(j => j.run_id === currentRunId);
+  return job && job.status === "running" ? job.run_id : null;
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadExperiments();

@@ -28,6 +28,7 @@ import operator
 import os
 import socket
 import threading
+import time
 from typing import Any
 
 
@@ -53,6 +54,9 @@ class MLSweepLogger:
 
     Attributes:
         step: Current training step.  Updated by every ``log()`` call.
+        step_seconds: Wall seconds per step over the last step advance, or
+            ``None`` until the step has advanced once.  Sent with each metric
+            so the dashboard can show a step timer.
     """
 
     def __init__(
@@ -88,6 +92,8 @@ class MLSweepLogger:
         self.step: int = 0
         self._logged_any = False
         self._step_keys: set[str] = set()   # keys already logged at self.step
+        self.step_seconds: float | None = None
+        self._step_clock: float | None = None  # monotonic time self.step was first logged
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
@@ -129,6 +135,7 @@ class MLSweepLogger:
                 *metrics* was already logged at *step*.  Either would
                 overwrite a value already recorded.
         """
+        prev_step = self.step if self._logged_any else None
         if step is not None:
             step = _as_step(step)
             if self._logged_any and step < self.step:
@@ -148,6 +155,7 @@ class MLSweepLogger:
             self.step += 1
             self._step_keys = set()
         self._step_keys.update(metrics)
+        self._time_step(prev_step)
         self._logged_any = True
         self._send({
             "type": "metric",
@@ -155,7 +163,17 @@ class MLSweepLogger:
             "experiment": self._experiment,
             "step": self.step,
             "data": metrics,
+            "step_seconds": self.step_seconds,
         })
+
+    def _time_step(self, prev_step: int | None) -> None:
+        """Update step_seconds when this log() moved to a new step."""
+        if prev_step is not None and self.step == prev_step:
+            return
+        now = time.monotonic()
+        if prev_step is not None and self._step_clock is not None:
+            self.step_seconds = (now - self._step_clock) / (self.step - prev_step)
+        self._step_clock = now
 
     def sync(self) -> None:
         """Fire-and-forget: signal the worker to rsync artifacts to the controller."""

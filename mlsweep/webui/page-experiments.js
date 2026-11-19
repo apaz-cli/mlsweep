@@ -4,6 +4,8 @@ const expandedJobs = new Set();  // "expId/runId"
 const jobsCache = {};  // experiment_id → [jobs]
 let experiments = [];     // experiments in the selected campaign
 let allExperiments = [];  // every experiment, for the campaign list
+let expSearch = "";       // words to match in name, ID and note
+let expFilter = "all";    // all | running | completed | failed
 
 // What the View menu's entries lead to, counted the way each page lists them:
 // results and export are finished runs, logs are every run, artifacts are the
@@ -175,7 +177,7 @@ async function renameExperiment(expId) {
   });
   if (r.ok) {
     if (exp) exp.name = newName;
-    renderExperiments(experiments);
+    renderCurrent();
   } else {
     await mlAlert(`Rename failed: ${r.status}`);
   }
@@ -246,6 +248,18 @@ function toggleJobDetail(expId, runId) {
   }
 }
 
+// A pencil and count beside a name that notes mention, linking to those notes.
+function noteRefHtml(expId, runId) {
+  const n = notesEnabled ? noteCount(expId, runId) : 0;
+  if (!n) return "";
+  const what = runId || expId;
+  const title = runId
+    ? `${n} note${n === 1 ? "" : "s"} mention this run`
+    : `${n} note${n === 1 ? "" : "s"} mention this experiment or its runs`;
+  return `<a class="note-ref" href="${escHtml(pageHref("notes.html", { mentions: what }))}" title="${title}" data-act="">`
+    + `${VIEW_ICONS.notes}${n}</a>`;
+}
+
 // ── Render runs ───────────────────────────────────────────────────────────────
 // An experiment's runs are rows of the experiments table, tagged with
 // data-runs-of so they can be replaced together.
@@ -262,18 +276,19 @@ function runsHtml(expId) {
       <td colspan="2">${j.worker_id ? escHtml(j.worker_id.split(":")[0]) : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
+      <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
       <td class="actions-cell" data-act=""><div class="actions">
         <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
     <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
-      <td colspan="9">${isOpen ? renderJobDetail(j) : ""}</td>
+      <td colspan="10">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
   const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
-      <td>Elapsed</td><td colspan="3">Combo</td><td></td></tr>`;
-  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="9">No jobs</td></tr>`);
+      <td>Elapsed</td><td colspan="3">Combo</td><td>Notes</td><td></td></tr>`;
+  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="10">No jobs</td></tr>`);
 }
 
 // Experiment controls (the same as mlsweep pause/unpause/stop/retry/cancel/purge).
@@ -291,7 +306,7 @@ function runTools(expId, jobs) {
   if (active) btns.push(b(`Cancel active (${active})`, ["bulkRuns", expId, "cancel"], "Cancel pending and running runs (mlsweep cancel --all)", "btn-delete"));
   if (purgeable) btns.push(b(`Delete failed (${purgeable})`, ["bulkRuns", expId, "purge"], "Delete failed, cancelled and xfailed runs with their files (mlsweep purge)", "btn-delete"));
   if (!btns.length) return "";
-  return `<tr class="runs-tools"><td colspan="9"><div class="actions">${btns.join("")}</div></td></tr>`;
+  return `<tr class="runs-tools"><td colspan="10"><div class="actions">${btns.join("")}</div></td></tr>`;
 }
 
 function runRowsOf(expId) {
@@ -384,8 +399,61 @@ function emptyHtml() {
     const r = await apiFetch("/api/health");
     if (r.ok) publicUrl = (await r.json()).public_url || null;
   } catch (_) {}
-  document.getElementById("empty-msg").innerHTML = emptyHtml();
+  if (!filtering()) document.getElementById("empty-msg").innerHTML = emptyHtml();
 })();
+
+// ── Search and status filter ─────────────────────────────────────────────────
+// Running covers anything still scheduling work; failed is an aborted
+// experiment or a finished one with failed runs.
+function expCategory(exp) {
+  if (["running", "pending", "paused"].includes(exp.status)) return "running";
+  if (exp.status === "aborted" || (exp.job_counts?.failed || 0) > 0) return "failed";
+  if (exp.status === "completed") return "completed";
+  return "other";
+}
+
+function expMatches(exp) {
+  if (expFilter !== "all" && expCategory(exp) !== expFilter) return false;
+  const words = expSearch.toLowerCase().split(/\s+/).filter(Boolean);
+  const hay = `${exp.name || ""} ${exp.experiment_id} ${exp.note || ""}`.toLowerCase();
+  return words.every(w => hay.includes(w));
+}
+
+function clearExpFilters() {
+  expSearch = "";
+  expFilter = "all";
+  document.getElementById("exp-search").value = "";
+  renderCurrent();
+}
+
+const filtering = () => !!expSearch.trim() || expFilter !== "all";
+
+function renderCurrent() {
+  const counts = { all: experiments.length, running: 0, completed: 0, failed: 0 };
+  for (const exp of experiments) {
+    const cat = expCategory(exp);
+    if (cat in counts) counts[cat]++;
+  }
+  document.querySelectorAll("#exp-filters .filter-chip").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.filter === expFilter);
+    btn.querySelector(".n").textContent = counts[btn.dataset.filter];
+  });
+  const shown = experiments.filter(expMatches);
+  document.getElementById("exp-shown").textContent =
+    filtering() && experiments.length ? `${shown.length} of ${experiments.length} shown` : "";
+  renderExperiments(shown);
+}
+
+document.getElementById("exp-search").addEventListener("input", e => {
+  expSearch = e.target.value;
+  renderCurrent();
+});
+document.getElementById("exp-filters").addEventListener("click", e => {
+  const btn = e.target.closest(".filter-chip");
+  if (!btn) return;
+  expFilter = btn.dataset.filter;
+  renderCurrent();
+});
 
 // ── Render experiments table ──────────────────────────────────────────────────
 function renderExperiments(exps) {
@@ -396,7 +464,9 @@ function renderExperiments(exps) {
   if (exps.length === 0) {
     tbody.innerHTML = "";
     table.style.display = "none";
-    emptyMsg.innerHTML = emptyHtml();
+    emptyMsg.innerHTML = filtering() && experiments.length
+      ? `No experiments match. <button class="btn-link" ${act("clearExpFilters")}>Clear search and filter</button>`
+      : emptyHtml();
     emptyMsg.style.display = "";
     return;
   }
@@ -437,11 +507,12 @@ function renderExperiments(exps) {
       </td>
       <td>${badge(exp.status || "unknown")}</td>
       <td class="count-cell">${c.done || 0}</td>
-      <td class="count-cell">${c.failed ? `<span style="color:#d62728">${c.failed}</span>` : (done ? "0" : "—")}</td>
+      <td class="count-cell">${c.failed ? `<span style="color:var(--bad)">${c.failed}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${c.xfailed || (done ? "0" : "—")}</td>
-      <td class="count-cell">${running ? `<span style="color:#2ca02c">${running}</span>` : (done ? "0" : "—")}</td>
+      <td class="count-cell">${running ? `<span style="color:var(--ok)">${running}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
+      <td class="notes-cell">${noteRefHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
         <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Notes, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
@@ -496,7 +567,7 @@ const campaignSelect = document.getElementById("campaign-select");
 function showCampaign() {
   MLCampaign.fill(campaignSelect, allExperiments);
   experiments = MLCampaign.filter(allExperiments);
-  renderExperiments(experiments);
+  renderCurrent();
 }
 
 MLCampaign.bind(campaignSelect, showCampaign);
@@ -517,5 +588,5 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 bindActions({
   toggleJobDetail, renameJob, runAction, moveRun, purgeRun, setExpStatus, bulkRuns,
   toggleExpand, renameExperiment, moveExperiment, deleteExperiment,
-  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu,
+  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters,
 });

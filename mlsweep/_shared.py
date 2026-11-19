@@ -366,6 +366,7 @@ class MsgMetric:
     data: dict[str, Any]
     experiment: str
     attempt: int = 0
+    step_seconds: float | None = None  # the logger's wall seconds per step, if known
     t: str = "metric"
 
 
@@ -403,7 +404,8 @@ class MsgPong:
 @dataclass
 class MsgGpuStats:
     stats: list[dict[str, Any]] = field(default_factory=list)
-    # Each entry: {"gpu": int, "util_pct": int, "mem_used_mb": int, "mem_total_mb": int}
+    # Each entry: {"gpu": int, "util_pct": int, "mem_used_mb": int, "mem_total_mb": int,
+    # "name": str}.  Older workers send no "name".
     t: str = "gpu_stats"
 
 

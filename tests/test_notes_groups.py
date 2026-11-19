@@ -101,11 +101,16 @@ def test_double_click_opens_a_new_tab_for_the_same_or_another_type(page) -> None
     assert strips(page) == [["ga", "ge", "gf.txt", "gb", "gc"]]
 
 
-def test_single_click_still_replaces_the_current_tab(page) -> None:
+def test_tree_click_selects_and_double_click_opens_a_new_tab(page) -> None:
     page.eval("activate(S.tabs.find(t => t.path === 'ga.md').id)")
-    page.eval("document.querySelector('#tree .tnode.file[data-path=\"gd.txt\"]').click()")
-    page.wait_for("activeTab().path === 'gd.txt' && document.querySelector('.dtab.active .tt').textContent === 'gd.txt'")
-    assert strips(page) == [["gd.txt", "gb", "gc"]]
+    row = "document.querySelector('#tree .tnode.file[data-path=\"gd.txt\"]')"
+    page.eval(f"{row}.click()")
+    page.wait_for(f"{row}.classList.contains('selected')")
+    assert page.eval("activeTab().path") == "ga.md"
+    assert strips(page) == [["ga", "gb", "gc"]]
+    page.eval(f"{row}.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true }}))")
+    page.wait_for("activeTab().path === 'gd.txt'")
+    assert strips(page) == [["ga", "gd.txt", "gb", "gc"]]
 
 
 def test_dragging_a_tab_to_the_right_edge_splits(page) -> None:

@@ -1,14 +1,22 @@
 const _urlParams = new URLSearchParams(location.search);
 document.addEventListener("mlthemechange", () => { if (DATA) buildActiveChart(); });
 const INIT_EXP = _urlParams.get("experiment") || "";
+const INIT_RUN = _urlParams.get("run") || "";
 
 // ── Constants & state (from visualize.py verbatim) ────────────────────────────
 
-const PALETTE = [
-  "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
-  "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf",
-  "#aec7e8","#ffbb78","#98df8a","#ff9896","#c5b0d5",
+const PALETTE_LIGHT = [
+  "#2563eb", "#ea580c", "#16a34a", "#dc2626", "#7c3aed",
+  "#a16207", "#db2777", "#475569", "#65a30d", "#0891b2",
+  "#60a5fa", "#fb923c", "#4ade80", "#f87171", "#a78bfa",
 ];
+const PALETTE_DARK = [
+  "#60a5fa", "#fb923c", "#4ade80", "#f87171", "#c084fc",
+  "#facc15", "#f472b6", "#94a3b8", "#a3e635", "#22d3ee",
+  "#93c5fd", "#fdba74", "#86efac", "#fca5a5", "#d8b4fe",
+];
+const currentPalette = () =>
+  document.documentElement.getAttribute("data-theme") === "dark" ? PALETTE_DARK : PALETTE_LIGHT;
 
 let DATA         = null;  // experiment metadata (dims, runs, metricNames, subDims)
 let METRIC_CACHE = {};    // metric_name → {run_hash: {steps, values}}, loaded on demand
@@ -21,6 +29,10 @@ let METRIC_NAMES = [];    // populated by buildMetricSelect
 let activeTab    = "curves";
 const dirtyTabs  = new Set(["curves", "sensitivity", "optimization"]);
 let optMinimize  = true;   // true = lower metric is better
+let selectedRun  = INIT_RUN || null;  // run highlighted in the curves chart
+let hiddenRuns   = new Set();         // runs hidden with the highlight bar's Hide
+let _chartRunHashes = [];             // line-trace order in chart-curves
+let JOBS         = new Map();         // run_id → job record, for status and the step timer
 
 // ── Live state (SSE replaced with WS) ────────────────────────────────────────
 let LIVE_RUNS      = new Set();  // run hashes currently status=running
@@ -51,6 +63,7 @@ function setTab(name) {
     el.style.display = (name === "curves") ? "" : "none");
   document.getElementById("opt-minimize-label").style.display =
     name === "optimization" ? "flex" : "none";
+  renderRunBar();
   document.querySelectorAll(".chart-pane").forEach(el => el.style.display = "none");
   const pane = document.getElementById(`chart-${name}`);
   pane.style.display = "";
@@ -96,7 +109,8 @@ function ema(vals, alpha) {
 // Map an array of dim values to palette colors.
 function colorMap(dimValues) {
   const m = {};
-  dimValues.forEach((v, i) => { m[v] = PALETTE[i % PALETTE.length]; });
+  const palette = currentPalette();
+  dimValues.forEach((v, i) => { m[v] = palette[i % palette.length]; });
   return m;
 }
 
@@ -146,7 +160,7 @@ function hoverText(combo) {
 }
 
 function visibleRuns() {
-  return DATA.runs.filter(r =>
+  return DATA.runs.filter(r => !hiddenRuns.has(r.hash) &&
     Object.entries(filters).every(([dim, vals]) => !(dim in r.combo) || vals.has(r.combo[dim]))
   );
 }
@@ -272,6 +286,10 @@ function buildCurvesChart() {
   // Capture trace-index map for incremental WS updates.
   _traceIndexMap = {};
   runs.forEach((r, i) => { _traceIndexMap[r.hash] = i; });
+  _chartRunHashes = runs.map(r => r.hash);
+  if (selectedRun && !_chartRunHashes.includes(selectedRun)) selectedRun = null;
+  bindCurveEvents();
+  applyRunSelection();
 
   // Resync EMA state from full cache (after a full rebuild, accumulator is reset).
   if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
@@ -287,10 +305,131 @@ function buildCurvesChart() {
   }
 
   const liveCount = runs.filter(r => LIVE_RUNS.has(r.hash)).length;
-  document.getElementById("status").textContent =
+  document.getElementById("status").innerHTML =
     `${runs.length} / ${DATA.runs.length} runs visible` +
-    (liveCount ? `  •  ${liveCount} live` : "");
+    (liveCount ? `  •  ${liveCount} live` : "") + hiddenNote();
 }
+
+// ── Highlight and click-to-filter (curves tab) ───────────────────────────────
+// Click a curve to highlight its run; click it again, click empty chart space,
+// or press Escape to clear.  The bar above the chart names the highlighted run;
+// its settings filter to that value and Hide drops the run.  A legend entry
+// toggles its value in the sidebar filter, and a double-click shows only it.
+
+function setSelectedRun(hash) {
+  selectedRun = hash;
+  applyRunSelection();
+}
+
+function applyRunSelection() {
+  const n = _chartRunHashes.length;
+  const gd = document.getElementById("chart-curves");
+  if (n && gd.data && gd.data.length === 2 * n) {
+    const on = i => !selectedRun || _chartRunHashes[i] === selectedRun;
+    const idx = [...Array(2 * n).keys()];
+    Plotly.restyle(gd, {
+      opacity: idx.map(i => on(i % n) ? 1 : 0.12),
+      "line.width": idx.map(i => selectedRun && on(i % n) ? 2.6 : 1.5),
+    }, idx);
+  }
+  renderRunBar();
+}
+
+function bindCurveEvents() {
+  const gd = document.getElementById("chart-curves");
+  if (gd._mlBound || !gd.on) return;
+  gd._mlBound = true;
+  let lastCurveClick = 0, downAt = null;
+  gd.on("plotly_click", e => {
+    const pt = e.points && e.points[0];
+    if (!pt) return;
+    lastCurveClick = Date.now();
+    const hash = _chartRunHashes[pt.curveNumber % _chartRunHashes.length];
+    setSelectedRun(hash === selectedRun ? null : hash);
+  });
+  // A click that hit no curve (and was not the end of a zoom drag) clears.
+  gd.addEventListener("mousedown", e => { downAt = [e.clientX, e.clientY]; });
+  gd.addEventListener("click", e => {
+    const moved = downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4;
+    if (moved || e.target.closest(".modebar, .legend")) return;
+    setTimeout(() => { if (Date.now() - lastCurveClick > 300 && selectedRun) setSelectedRun(null); }, 0);
+  });
+  gd.on("plotly_legendclick", e => {
+    const val = e.data[e.curveNumber]?.legendgroup;
+    if (val === undefined || colorBy.startsWith("_m:")) return false;
+    const set = filters[colorBy];
+    if (set.has(val)) set.delete(val); else set.add(val);
+    filtersChanged();
+    return false;
+  });
+  gd.on("plotly_legenddoubleclick", e => {
+    const val = e.data[e.curveNumber]?.legendgroup;
+    if (val === undefined || colorBy.startsWith("_m:")) return false;
+    showOnly(colorBy, val);
+    return false;
+  });
+}
+
+// Show only runs whose *dim* is *val*; again on an already-isolated value shows all.
+function showOnly(dim, val) {
+  const set = filters[dim];
+  const isolated = set.size === 1 && set.has(val);
+  filters[dim] = isolated ? new Set(DATA.dims[dim]) : new Set([val]);
+  filtersChanged();
+}
+
+function filtersChanged() {
+  buildFilters();
+  buildActiveChart();
+}
+
+function hideRun(hash) {
+  hiddenRuns.add(hash);
+  if (selectedRun === hash) selectedRun = null;
+  buildActiveChart();
+}
+
+function showHiddenRuns() {
+  hiddenRuns = new Set();
+  buildActiveChart();
+}
+
+function runLink(page, hash) {
+  return MLCampaign.href(pageHref(`${page}.html`, { experiment: DATA.experiment, run: hash }));
+}
+
+function renderRunBar() {
+  const bar = document.getElementById("run-bar");
+  const r = selectedRun && activeTab === "curves" && DATA ? DATA.runs.find(x => x.hash === selectedRun) : null;
+  bar.style.display = r ? "" : "none";
+  if (!r) { MLStepTimer.tick(); return; }
+  const color = document.getElementById("chart-curves").data?.[_chartRunHashes.indexOf(r.hash)]?.line?.color || "#888";
+  const job = JOBS.get(r.hash);
+  const pills = orderedComboEntries(r.combo, null).map(([k, v]) =>
+    `<button class="rb-pill" title="Show only runs with ${escHtml(k)}=${escHtml(v)} (again to show all)" ${act("showOnly", k, v)}>`
+    + `<span class="rb-k">${escHtml(k)}</span>=${escHtml(v)}</button>`).join("");
+  document.getElementById("run-bar-main").innerHTML =
+    `<span class="color-swatch" style="background:${escHtml(color)}"></span>`
+    + `<span class="rb-name" title="${escHtml(r.hash)}">${escHtml(r.name)}</span>`
+    + (job ? badge(job.status) : "")
+    + `<span class="rb-pills">${pills}</span>`;
+  document.getElementById("run-bar-links").innerHTML =
+    `<a class="btn-link" href="${escHtml(runLink("logs", r.hash))}">Logs</a>`
+    + `<a class="btn-link" href="${escHtml(runLink("files", r.hash))}">Artifacts</a>`
+    + `<button class="btn-link" title="Hide this run from the charts" ${act("hideRun", r.hash)}>Hide</button>`
+    + `<button class="btn-link" title="Clear the highlight (Esc)" ${act("setSelectedRun", null)}>✕</button>`;
+  MLStepTimer.tick();
+}
+
+function hiddenNote() {
+  return hiddenRuns.size
+    ? `  ·  <button class="link-btn" title="Show the hidden runs again" ${act("showHiddenRuns")}>${hiddenRuns.size} hidden, show</button>`
+    : "";
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && selectedRun && !e.target.closest("input, textarea, select")) setSelectedRun(null);
+});
 
 // ── Tab: Sensitivity (from visualize.py verbatim) ────────────────────────────
 
@@ -329,7 +468,8 @@ function buildSensitivityChart() {
   const allLabels = [...new Set(
     effects.flatMap(e => e.valueMeans.map(vm => String(vm.val)))
   )];
-  const labelColorMap = Object.fromEntries(allLabels.map((l, i) => [l, PALETTE[i % PALETTE.length]]));
+  const palette = currentPalette();
+  const labelColorMap = Object.fromEntries(allLabels.map((l, i) => [l, palette[i % palette.length]]));
 
   allLabels.forEach(label => {
     const xs = [], ys = [], customdata = [];
@@ -459,7 +599,7 @@ function buildOptimizationChart() {
     {
       x: trialNums, y: bestLine,
       mode: "lines", name: optMinimize ? "best (min)" : "best (max)",
-      line: { color: "#4c9be8", width: 2, shape: "hv" },
+      line: { color: cssVar("--accent"), width: 2, shape: "hv" },
       hovertemplate: "after trial %{x}<br>best: %{y:.4f}<extra></extra>",
     },
   ], {
@@ -587,6 +727,12 @@ function buildFilters() {
       lbl.className = "check-label";
       lbl.textContent = val;
       row.appendChild(lbl);
+      const only = document.createElement("button");
+      only.className = "only-btn";
+      only.textContent = "only";
+      only.title = `Show only ${dim}=${val} (again to show all)`;
+      only.addEventListener("click", e => { e.preventDefault(); showOnly(dim, val); });
+      row.appendChild(only);
       list.appendChild(row);
 
       // Nest any child dims under this value, hidden when unchecked.
@@ -860,9 +1006,9 @@ function _flushPendingMetrics() {
       Plotly.restyle("chart-curves",      { x: dotXs,  y: dotYs  }, dotIdxs);
     }
     const vis = Object.keys(_traceIndexMap).length;
-    document.getElementById("status").textContent =
+    document.getElementById("status").innerHTML =
       `${vis} / ${DATA.runs.length} runs visible` +
-      (LIVE_RUNS.size ? `  •  ${LIVE_RUNS.size} live` : "");
+      (LIVE_RUNS.size ? `  •  ${LIVE_RUNS.size} live` : "") + hiddenNote();
   } else {
     buildActiveChart();
   }
@@ -912,6 +1058,7 @@ function connectWS(expId) {
     if (!DATA) return;
 
     if (evt.type === "metric") {
+      MLStepTimer.onMetric(evt);
       const runId = evt.run_id;
       const step  = evt.step;
       if (!_pendingMetrics[runId]) _pendingMetrics[runId] = {};
@@ -926,6 +1073,7 @@ function connectWS(expId) {
 
     else if (evt.type === "job_started" || evt.type === "job_dispatched") {
       LIVE_RUNS.add(evt.run_id);
+      setJobStatus(evt.run_id, evt.type === "job_started" ? "running" : "dispatched");
       // If this run isn't in DATA.runs yet (started after page load), schedule a
       // refresh to add it to the chart and give _traceIndexMap an entry for it.
       if (DATA && !DATA.runs.some(r => r.hash === evt.run_id))
@@ -934,6 +1082,7 @@ function connectWS(expId) {
 
     else if (evt.type === "job_done") {
       LIVE_RUNS.delete(evt.run_id);
+      setJobStatus(evt.run_id, evt.status || (evt.success ? "done" : "failed"));
       // Retroactively reclassified singular-probe failures arrive in xfailed[].
       if (evt.xfailed && evt.xfailed.length) {
         for (const id of evt.xfailed) LIVE_RUNS.delete(id);
@@ -959,6 +1108,17 @@ function connectWS(expId) {
   };
 }
 
+function rememberJobs(jobs) {
+  for (const j of jobs) { JOBS.set(j.run_id, j); MLStepTimer.seed(j); }
+  if (selectedRun) renderRunBar();
+}
+
+function setJobStatus(runId, status) {
+  const j = JOBS.get(runId);
+  if (j) j.status = status;
+  if (runId === selectedRun) renderRunBar();
+}
+
 // combo is stored as a JSON string in the DB; parse it.
 function parseCombo(raw) {
   if (!raw) return {};
@@ -978,6 +1138,7 @@ async function _refreshJobs(expId) {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
     if (!r.ok) return;
     const jobs = await r.json();
+    rememberJobs(jobs);
     const existing = new Set(DATA.runs.map(r => r.hash));
     let added = false;
     for (const j of jobs) {
@@ -1049,6 +1210,10 @@ async function loadExperiment(expId) {
   if (_ws) { _ws.close(); _ws = null; }
   clearTimeout(_jobRefreshTimer);
   DATA = null; METRIC_CACHE = {}; _traceIndexMap = {}; LAST_EMA_S = {}; LIVE_RUNS = new Set();
+  // The ?run= highlight applies to the experiment named in the address only.
+  selectedRun = expId === INIT_EXP && !loadExperiment._done ? (INIT_RUN || null) : null;
+  loadExperiment._done = true;
+  hiddenRuns = new Set(); JOBS = new Map(); MLStepTimer.clear();
   _pendingMetrics = {}; _rafPending = false;
   dirtyTabs.add("curves"); dirtyTabs.add("sensitivity"); dirtyTabs.add("optimization");
   if (typeof Plotly !== "undefined") {
@@ -1063,6 +1228,7 @@ async function loadExperiment(expId) {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const jobs = await r.json();
+    rememberJobs(jobs);
 
     // Build manifest-like DATA structure.
     const dimValues = {};
@@ -1127,6 +1293,12 @@ async function refreshExperiments() {
     document.getElementById("status").textContent = "Error refreshing: " + err;
   }
 }
+
+bindActions({ showOnly, hideRun, setSelectedRun, showHiddenRuns });
+
+// The step timer in the highlight bar shows while the highlighted run is running.
+MLStepTimer.mount(document.getElementById("run-bar-timer"), () =>
+  selectedRun && activeTab === "curves" && JOBS.get(selectedRun)?.status === "running" ? selectedRun : null);
 
 // ── Bootstrap (replaces the bottom fetch block from visualize.py) ─────────────
 

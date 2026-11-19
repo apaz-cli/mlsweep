@@ -87,7 +87,7 @@ from mlsweep._manager_optimizer import (
     read_progress,
     status_view,
 )
-from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState
+from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState, Pin
 from mlsweep._manager_workers import (
     _check_experiments_complete_locked,
     _detach_locked,
@@ -1048,7 +1048,10 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
 
     Running jobs additionally carry ``stall_seconds`` (seconds since the last
     log/metric progress) and ``stalled`` (whether that exceeds the manager's
-    default threshold), merged from in-memory run state.
+    default threshold), merged from in-memory run state.  Once a metric has
+    arrived this session they also carry ``last_step``, ``step_age_seconds``
+    (seconds since that step first arrived) and ``step_seconds`` (wall seconds
+    per step as the run's logger measured it, or null until it has one).
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -1065,6 +1068,10 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
                 stall = _stall_seconds(run, now)
                 d["stall_seconds"] = stall
                 d["stalled"] = stall >= MANAGER_STALL_THRESHOLD_SECONDS
+                if run.last_step is not None:
+                    d["last_step"] = run.last_step
+                    d["step_age_seconds"] = max(0.0, now - run.last_step_time)
+                    d["step_seconds"] = run.step_seconds
         out.append(d)
     return _json_response(out)
 
@@ -1417,6 +1424,76 @@ async def handle_cancel_job(request: web.Request) -> web.Response:
 
     updated = await get_job(db, run_id, experiment_id)
     return _json_response(updated if updated is not None else job)
+
+
+@routes.post("/api/jobs/{run_id}/reschedule")
+async def handle_reschedule_job(request: web.Request) -> web.Response:
+    """Restart an in-flight job elsewhere, or choose where a pending one starts.
+
+    Accepts JSON: {"worker_id": str, "gpus": [int, ...]}, both optional.  An
+    in-flight run is stopped and put back to pending without spending a retry
+    (it restarts from scratch, or from its checkpoint if the script resumes).
+    With *worker_id* the job is pinned there: its next dispatch takes those
+    GPUs from the worker's pool, filling up to ``gpus_per_run`` with the least
+    busy others, and ignores the worker's jobs-per-GPU cap.  Without it, the
+    scheduler places it as usual.  Multi-node jobs cannot be pinned.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    run_id = request.match_info["run_id"]
+    experiment_id = request.query.get("experiment_id", "")
+    body = await _json_body(request)
+
+    job = await get_job(db, run_id, experiment_id)
+    if job is None:
+        return _not_found("job")
+    if job.status not in ("pending", "dispatched", "running"):
+        return _error_response(f"job is {job.status}; only pending and in-flight jobs can be rescheduled", status=409)
+    worker_id = body.get("worker_id")
+    gpus = body.get("gpus") or []
+    if worker_id is not None and not isinstance(worker_id, str):
+        return _error_response("'worker_id' must be a string")
+    if not (isinstance(gpus, list) and all(isinstance(g, int) and not isinstance(g, bool) for g in gpus)):
+        return _error_response("'gpus' must be a list of GPU indices")
+    if gpus and worker_id is None:
+        return _error_response("'gpus' needs a 'worker_id'")
+
+    key = (job.experiment_id, run_id)
+    async with state.lock:
+        pin: Pin | None = None
+        if worker_id is not None:
+            if job.nodes_per_run > 1:
+                return _error_response("a multi-node job cannot be pinned to one worker")
+            wc = state.workers.get(worker_id)
+            if wc is None or wc.status != "connected":
+                return _error_response(f"worker {worker_id} is not connected", status=409)
+            if not set(gpus) <= set(wc.gpus):
+                return _error_response(f"GPUs {sorted(set(gpus) - set(wc.gpus))} are not in {worker_id}'s pool")
+            if len(set(gpus)) > job.gpus_per_run:
+                return _error_response(f"the job uses {job.gpus_per_run} GPU(s)")
+            occ = state.occupancy(wc)
+            # The run's own GPUs free up when it is requeued below.
+            for g in (state.runs[key].nodes.get(worker_id, ()) if key in state.runs else ()):
+                if g in occ:
+                    occ[g] -= 1
+            chosen = sorted(set(gpus))
+            others = sorted((g for g in wc.gpus if g not in chosen), key=lambda g: occ[g])
+            chosen += others[:job.gpus_per_run - len(chosen)]
+            if len(chosen) < job.gpus_per_run:
+                return _error_response(f"{worker_id} has only {len(wc.gpus)} GPU(s) in its pool")
+            pin = Pin(worker_id=worker_id, gpus=sorted(chosen))
+        requeued = key in state.runs
+        if requeued:
+            await requeue_runs_locked(db, state, [key], lost=False)
+        if pin is not None:
+            state.pins[key] = pin
+        else:
+            state.pins.pop(key, None)
+        state.request_schedule()
+    return _json_response({
+        "run_id": run_id, "experiment_id": job.experiment_id, "requeued": requeued,
+        "pinned": {"worker_id": pin.worker_id, "gpus": pin.gpus} if pin else None,
+    })
 
 
 @routes.post("/api/jobs/{run_id}/retry")
@@ -2299,6 +2376,16 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         d["gpu_occupancy"] = {}
         d["gpu_stats"] = {}
         d["max_jobs_per_gpu"] = 1
+    # Every GPU's runs, including GPUs out of the pool whose runs are finishing,
+    # and the jobs pinned to start here next.
+    d["gpu_runs"] = {
+        str(g): [{"run_id": r.run_id, "experiment_id": r.experiment_id} for r in runs]
+        for g, runs in state.runs_by_gpu(wr.worker_id).items()
+    }
+    d["pins"] = [
+        {"experiment_id": key[0], "run_id": key[1], "gpus": pin.gpus}
+        for key, pin in state.pins.items() if pin.worker_id == wr.worker_id
+    ]
     d["outdated"] = worker_outdated(state, wr.worker_id)
     return d
 
@@ -2499,8 +2586,10 @@ async def handle_patch_worker_concurrency(request: web.Request) -> web.Response:
 async def handle_patch_worker_devices(request: web.Request) -> web.Response:
     """Add or remove GPU device indices from a live worker.
 
-    Accepts JSON: {"add": [int, ...], "remove": [int, ...]}.
+    Accepts JSON: {"add": [int, ...], "remove": [int, ...], "drain": [int, ...]}.
     Removing a GPU evicts any jobs currently using it (they are re-queued).
+    Draining one takes it out of the pool too, but its runs keep going until
+    they finish; nothing new is placed on it.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -2510,9 +2599,13 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
 
     add_gpus: list[int] = body.get("add") or []
     remove_gpus: list[int] = body.get("remove") or []
+    drain_gpus: list[int] = body.get("drain") or []
 
-    if not isinstance(add_gpus, list) or not isinstance(remove_gpus, list):
-        return _error_response("'add' and 'remove' must be lists of ints")
+    def int_list(v: Any) -> bool:
+        return isinstance(v, list) and all(isinstance(g, int) and not isinstance(g, bool) and g >= 0 for g in v)
+
+    if not (int_list(add_gpus) and int_list(remove_gpus) and int_list(drain_gpus)):
+        return _error_response("'add', 'remove' and 'drain' must be lists of GPU indices")
 
     wc = state.workers.get(worker_id)
     if wc is None:
@@ -2522,12 +2615,16 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
         # Runs on a GPU being removed are requeued (no retry spent).
         remove_set = set(remove_gpus)
         evict = [r for r in state.runs_on(worker_id) if remove_set & set(r.nodes[worker_id])]
-        wc.gpus = sorted((set(wc.gpus) - remove_set) | set(add_gpus))
+        wc.gpus = sorted((set(wc.gpus) - remove_set - set(drain_gpus)) | set(add_gpus))
+        # A pin to a GPU that just left the pool is dropped by the next pass.
         await requeue_runs_locked(db, state, [r.key for r in evict], lost=False)
         await state.db_writer.update_worker_devices(worker_id, json.dumps(wc.gpus))
     to_evict = [r.run_id for r in evict]
     state.request_schedule()
-    return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict})
+    draining = sorted({r.run_id for r in state.runs_on(worker_id)
+                       if set(drain_gpus) & set(r.nodes[worker_id])})
+    return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict,
+                           "draining": draining})
 
 
 # ── Scheduler ──────────────────────────────────────────────────────────────────

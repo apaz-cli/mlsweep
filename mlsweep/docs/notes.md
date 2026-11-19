@@ -82,7 +82,7 @@ of it, as for the rest of the manager.
 The left sidebar has Files, Search, Changes and Lint. The centre holds one or more
 groups, each with its own tabs, toolbar and open file. The right panel shows
 details about the file in the group you last clicked into. Drag the edges to
-resize the sidebars; the toolbar button at the far right hides the right panel.
+resize the sidebars. The toolbar buttons at the far left and far right hide them (`L` and `R`).
 Groups, their tabs and views, folder state and sizes are remembered per browser.
 `notes.html?path=FILE` links to a file, and `?q=WORDS` or `?mentions=EXPERIMENT`
 opens a search.
@@ -92,9 +92,10 @@ saves now, and hover the bottom one for the clone URL and current commit.
 
 ### Files
 
-- Open: click a file. It replaces the current tab unless that tab has unsaved
-  changes. Ctrl+click, middle-click or double-click opens a new tab.
-- Create: the icons above the tree or beside the tabs, or right-click a folder. A note name
+- Open: double-click a file to open it in a new tab. A single click only selects
+  it, so the tab you are reading stays put. Ctrl+click and middle-click also open
+  a new tab.
+- Create: right-click a folder, or empty space in the file tree, for New note or New folder. A note name
   may include folders (`ideas/Depth plan`). Clicking a link to a note that doesn't
   exist creates it in the same folder as the note you're in.
 - Rename: `F2`, double-click the title in the toolbar, or right-click. Moving
@@ -186,8 +187,8 @@ use this editor.
 ### Terminals
 
 By default, the tab can open shells on the manager's machine; `mlsweep manager
---no-terminals` turns them off. Open one with the terminal icon beside a group's
-`+`, Open a terminal on the start page, or Open terminal here when you right-click
+--no-terminals` turns them off. Open one with the terminal icon after a group's
+tabs, or Open terminal here when you right-click
 in the file tree, which starts it in
 that folder of the notes. Right-click the icon for your commands and for terminals
 already running.
@@ -297,7 +298,8 @@ An author name is whatever that clone's git config says; nothing verifies it.
 
 `/` searches file paths and the text of markdown and text files. PDFs are left out. Every word
 must match, case-insensitively; `"quote"` a phrase. Click a result to open the file,
-or a line to open it at that line.
+or a line to open it at that line. A note opens in Live view, scrolled to that line, with
+the search words highlighted for a few seconds.
 
 ### Graph
 
@@ -335,6 +337,7 @@ shows this list in the tab.
 | `E` | notes: Live or Source |
 | `S` | notes: Split |
 | `/` | search |
+| `L`, `R` | hide or show the left, right panel |
 | `G`, `Shift+G` | graph, this note's graph |
 | `F2` | rename |
 | Ctrl+Z, Ctrl+Shift+Z | undo, redo in Live (outside a block) |

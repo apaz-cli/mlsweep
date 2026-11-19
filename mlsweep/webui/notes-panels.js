@@ -2,7 +2,9 @@
 "use strict";
 
 // ── Left panes ─────────────────────────────────────────────────────────────────
-function switchPane(name) {
+function switchPane(name, { reveal = true } = {}) {
+  // Asking for a pane shows the panel, except when restoring the last one at startup.
+  if (reveal && document.body.classList.contains("left-collapsed")) toggleLeft();
   document.querySelectorAll(".ltab").forEach(b => b.classList.toggle("active", b.dataset.pane === name));
   document.querySelectorAll(".lpane").forEach(p => p.classList.toggle("active", p.id === "pane-" + name));
   store.set("pane", name);
@@ -121,12 +123,17 @@ const doSearch = debounce(async () => {
       head.append(ic, el("span", "", titleFor(res.path)));
       if (dirname(res.path)) head.append(el("span", "dir", dirname(res.path)));
       box.append(head);
-      box.onclick = () => openFile(res.path, { mode: res.kind === "md" ? "live" : null });
+      // An open tab keeps its view (Live, Source or Split); a new one opens Live.
+      const isOpen = () => S.tabs.some(t => t.type === "file" && t.path === res.path);
+      box.onclick = () => openFile(res.path, { mode: !isOpen() && res.kind === "md" ? "live" : null });
       for (const m of res.matches.slice(0, 5)) {
         const line = el("div", "sr-line");
         line.append(el("span", "ln", m.line));
         line.append(markTerms(m.text.trim(), terms));
-        line.onclick = e => { e.stopPropagation(); openFile(res.path, { mode: res.kind === "md" ? "split" : "source", line: m.line }); };
+        line.onclick = e => {
+          e.stopPropagation();
+          openFile(res.path, { mode: isOpen() ? null : res.kind === "md" ? "live" : "source", line: m.line, hits: terms });
+        };
         box.append(line);
       }
       out.append(box);
@@ -464,6 +471,13 @@ function refreshOutline(t) {
     ob.append(it);
   });
   if (!n) ob.append(el("div", "rempty", "No headings."));
+}
+function toggleLeft() {
+  // With no tab open the tree is all there is, so it stays.
+  if (!S.tabs.length && !document.body.classList.contains("left-collapsed")) return;
+  const c = document.body.classList.toggle("left-collapsed");
+  store.set("leftCollapsed", c);
+  eachEditor(ed => ed.cm.refresh());
 }
 function toggleRight() {
   const c = document.body.classList.toggle("right-collapsed");
@@ -843,6 +857,7 @@ function setupResizer(id, side) {
 setupResizer("resize-left", "left");
 setupResizer("resize-right", "right");
 if (store.get("rightCollapsed", false)) document.body.classList.add("right-collapsed");
+if (store.get("leftCollapsed", false)) document.body.classList.add("left-collapsed");
 if (store.get("wide", false)) document.body.classList.add("wide-doc");
 
 // ── Keyboard ───────────────────────────────────────────────────────────────────
@@ -861,6 +876,7 @@ const KEYS = [
     ["\\", "split right: move the tab to a group beside this one"],
     ["|", "split down"],
     ["/", "search"],
+    ["L / R", "hide or show the left / right panel"],
     ["E", "notes: Live ↔ Source"],
     ["S", "notes: split view"],
     ["G", "graph (Shift+G: this note's graph)"],
@@ -946,6 +962,7 @@ document.addEventListener("keydown", e => {
     "s": () => { if (t && t.type === "file") setMode(t.mode === "split" ? "live" : "split"); },
     "g": () => openGraph(), "G": () => openGraph(t && t.path && isMd(t.path) ? t.path : null),
     "[": () => navigate(-1), "]": () => navigate(1),
+    "l": () => toggleLeft(), "r": () => toggleRight(),
     "?": () => showKeys(),
     "F2": () => {
       if (!t || !t.path) return;
@@ -967,7 +984,7 @@ async function init() {
   const want = _qp.get("path");
   if (want && S.fileMap.has(want)) await openFile(want, { pushNav: false });
   if (_qp.get("q") || _qp.get("mentions")) searchFor(_qp.get("q") || _qp.get("mentions"));
-  else switchPane(store.get("pane", "files") === "lint" ? "files" : store.get("pane", "files"));
+  else switchPane(store.get("pane", "files") === "lint" ? "files" : store.get("pane", "files"), { reveal: false });
   if (activeTab() && activeTab().path) revealInTree(activeTab().path);
   S.ready = true;   // the saved layout is back; tests wait for this
   // Mark everything seen so "fresh" dots only show changes from now on.

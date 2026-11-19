@@ -300,25 +300,13 @@ async function ensureIndex() {
 }
 
 // ── File tree ──────────────────────────────────────────────────────────────────
-// A click that would replace the current tab waits briefly: if a second click
-// turns it into a double-click, the tab is kept and the file opens in a new one.
-let treeClick = null;
-const TREE_CLICK_MS = 300;
-function runTreeClick() {
-  const c = treeClick;
-  if (!c) return;
-  treeClick = null;
-  openFile(c.path);
-}
-function laterTreeClick(path) {
-  if (treeClick && treeClick.path === path) clearTimeout(treeClick.timer);
-  else runTreeClick();
-  treeClick = { path, timer: setTimeout(runTreeClick, TREE_CLICK_MS) };
-}
-function cancelTreeClick() {
-  if (!treeClick) return;
-  clearTimeout(treeClick.timer);
-  treeClick = null;
+// A click selects a file; a double-click (or Ctrl/Cmd-click, middle-click)
+// opens it in a new tab, so the tab you were reading stays open.
+let treeSel = null;
+function selectTreeRow(path) {
+  treeSel = path;
+  document.querySelectorAll("#tree .tnode.selected").forEach(n => n.classList.remove("selected"));
+  treeRow(path)?.classList.add("selected");
 }
 async function loadTree() {
   const t = await api("/api/notes/tree");
@@ -374,7 +362,7 @@ function renderTree() {
       else row._lazy = () => walk(d, depth + 1, kids);
     }
     for (const f of files) {
-      const row = el("div", "tnode file" + (f.path === activePath ? " active" : ""));
+      const row = el("div", "tnode file" + (f.path === activePath ? " active" : "") + (f.path === treeSel ? " selected" : ""));
       row.style.paddingLeft = (8 + depth * 14 + 13) + "px";
       row.dataset.path = f.path;
       const ic = el("span", "ficon"); ic.innerHTML = iconFor(f.path); row.append(ic);
@@ -396,29 +384,19 @@ $("tree").addEventListener("click", e => {
   const row = e.target.closest(".tnode");
   if (!row || e.target.tagName === "INPUT") return;
   const path = row.dataset.path;
-  const plain = !row.dataset.dir && !e.altKey && !e.ctrlKey && !e.metaKey;
-  // A plain click replaces the current tab, but the first half of a
-  // double-click must not consume the tab that double-click should keep.
-  const cur = activeTab();
-  if (plain && cur && cur.type === "file" && !cur.dirty
-      && !S.tabs.some(t => t.type === "file" && t.path === path)) {
-    laterTreeClick(path);
-    return;
-  }
-  runTreeClick();
   if (row.dataset.dir) toggleDir(row);
   else if (e.altKey) openToSide(path);
-  else openFile(path, { newTab: e.ctrlKey || e.metaKey });
+  else if (e.ctrlKey || e.metaKey) openFile(path, { newTab: true });
+  else selectTreeRow(path);
 });
 $("tree").addEventListener("dblclick", e => {
   const row = e.target.closest(".tnode.file");
   if (!row || e.target.tagName === "INPUT") return;
-  cancelTreeClick();
   openFile(row.dataset.path, { newTab: true });
 });
 $("tree").addEventListener("auxclick", e => {
   const row = e.target.closest(".tnode.file");
-  if (row && e.button === 1) { e.preventDefault(); runTreeClick(); openFile(row.dataset.path, { newTab: true }); }
+  if (row && e.button === 1) { e.preventDefault(); openFile(row.dataset.path, { newTab: true }); }
 });
 function toggleDir(row) {
   const p = row.dataset.path, open = !S.openDirs.has(p);
@@ -469,7 +447,7 @@ $("tree").addEventListener("contextmenu", e => {
   const folder = isDir ? path : dirname(path);
   const items = [];
   if (row && !isDir) {
-    items.push({ label: "Open", run: () => openFile(path) }, { label: "Open in new tab", key: "Ctrl+Click", run: () => openFile(path, { newTab: true }) },
+    items.push({ label: "Open", key: "Double-click", run: () => openFile(path, { newTab: true }) },
       { label: "Open to the side", key: "Alt+Click", run: () => openToSide(path) });
     if (kindOf(path) === "md" || kindOf(path) === "text") items.push({ label: "Edit", run: () => openFile(path, { mode: "source" }) });
     items.push("-");
@@ -647,5 +625,3 @@ window.addEventListener("drop", async e => {
   const saved = await uploadFiles(e.dataTransfer.files, folder);
   if (saved.length && t && t.type === "file" && t.kind === "md" && (t.mode !== "live" || (t.live && t.live.ta))) insertEmbeds(saved);
 });
-$("btn-new-note").onclick = () => newNote();
-$("btn-new-folder").onclick = () => newFolder(attachDir(activeTab()));

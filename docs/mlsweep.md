@@ -398,10 +398,27 @@ manager's own login; set `WANDB_MODE=offline` where the manager runs to try it s
 ```sh
 mlsweep workers                         # list
 mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1]
-mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0]
+mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0] [--drain-devices 1]
 mlsweep workers rm WORKER
 mlsweep scheduler [--placement pack|spread]
+mlsweep reschedule EXP RUN [--to WORKER [--gpus 2,3]]
 ```
+
+A worker's GPUs are each in its pool or out of it, and the scheduler only places runs on
+GPUs in the pool. `--drain-devices` takes GPUs out of the pool and lets the runs already on
+them finish. `--remove-devices` takes them out and requeues their runs at once, without
+spending a retry. `--add-devices` puts GPUs back.
+
+`mlsweep reschedule` stops a running run and queues it again without spending a retry. The
+run starts over, unless the script resumes from a checkpoint in `MLSWEEP_RUN_DIR`. With
+`--to` it starts next on that worker, on the given GPUs or the least busy ones, even when
+they are at their jobs-per-GPU limit. A pin that has not been used after ten minutes is
+dropped. Multi-node runs can be requeued but not pinned.
+
+On the System page each GPU is a tile with its runs on it. The switch on a tile drains the
+GPU or puts it back. Click tiles to select several, then drain, remove or return them
+together. Drag a run onto another GPU, on any worker, to restart it there, or use the run's
+menu.
 
 `pack` fills busy GPUs first, keeping whole GPUs and machines free for big jobs. `spread`
 puts each job on the least busy GPU. `mlsweep rename EXP --experiment-name NAME` renames an

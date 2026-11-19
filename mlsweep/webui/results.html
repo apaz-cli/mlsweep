@@ -48,7 +48,7 @@ h1 { font-size: 13px; font-weight: 700; color: var(--text-strong); }
 
 select { width: 100%; padding: 5px 7px; border: 1px solid var(--border-input);
          border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
-select:focus { outline: none; border-color: #4c9be8; }
+select:focus { outline: none; border-color: var(--accent); }
 
 
 .radio-row { display: flex; flex-wrap: wrap; gap: 3px; }
@@ -102,6 +102,23 @@ select:focus { outline: none; border-color: #4c9be8; }
 #sweep-note { font-size: 11px; color: var(--text-muted); font-style: italic;
               margin-top: 4px; word-break: break-word; }
 
+/* Highlighted run (curves tab) */
+#run-bar { display: flex; align-items: center; gap: 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); min-height: 36px; }
+#run-bar-main { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; overflow: hidden; }
+.rb-name { font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--text-strong); white-space: nowrap; }
+.rb-pills { display: flex; gap: 4px; flex-wrap: nowrap; overflow: hidden; }
+.rb-pill { font-size: 11px; padding: 1px 7px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--radio-bg); color: var(--text); cursor: pointer; white-space: nowrap; font-family: var(--font-mono); }
+.rb-pill:hover { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); }
+.rb-pill .rb-k { color: var(--text-dim); }
+.rb-pill:hover .rb-k { color: inherit; }
+#run-bar-links { display: flex; gap: 4px; flex-shrink: 0; }
+.link-btn { border: 0; background: none; padding: 0; font: inherit; color: var(--accent-text); cursor: pointer; }
+.link-btn:hover { text-decoration: underline; }
+/* "only" on a filter value, shown on hover */
+.only-btn { font-size: 9px; padding: 0 5px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; visibility: hidden; }
+.check-row:hover .only-btn { visibility: visible; }
+.only-btn:hover { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); }
+
 /* Optimization tab */
 .opt-scatter-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px; padding: 8px 0 0; }
 .opt-scatter-panel { height: 220px; border: 1px solid var(--border); border-radius: 6px; background: var(--plot-bg); }
@@ -111,6 +128,7 @@ select:focus { outline: none; border-color: #4c9be8; }
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
 <script src="campaign.js"></script>
+<script src="steptimer.js"></script>
 </head>
 <body>
 
@@ -179,6 +197,11 @@ select:focus { outline: none; border-color: #4c9be8; }
         <input type="checkbox" id="opt-minimize" checked> minimize
       </label>
     </div>
+  </div>
+  <div id="run-bar" style="display:none">
+    <div id="run-bar-main"></div>
+    <span class="step-timer" id="run-bar-timer" style="display:none"></span>
+    <div id="run-bar-links"></div>
   </div>
   <div id="chart-curves" class="chart-pane"></div>
   <div id="chart-sensitivity" class="chart-pane" style="display:none"></div>

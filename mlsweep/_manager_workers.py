@@ -51,7 +51,9 @@ from mlsweep._manager_db import (
     list_workers,
     multinode_progress,
 )
-from mlsweep._manager_state import InFlightRun, ManagerState, Placement, RunKey, WorkerConn
+from mlsweep._manager_state import (
+    PIN_TTL_SECONDS, InFlightRun, ManagerState, Pin, Placement, RunKey, WorkerConn,
+)
 from mlsweep._parsync import parsync_bin
 from mlsweep._shared import (
     DEFAULT_SCRATCH_DIR,
@@ -1033,9 +1035,11 @@ async def _handle_metric(
     if run is None:
         return
     run.last_progress = time.time()
+    run.note_step(msg.step, msg.step_seconds, run.last_progress)
     await state.db_writer.insert_metric(run.job_key, run.attempt, msg.step, msg.data)
     state.broadcast(run.experiment_id, {
         "type": "metric", "run_id": run.run_id, "step": msg.step, "data": msg.data,
+        "step_seconds": msg.step_seconds,
     })
 
 
@@ -1228,6 +1232,8 @@ async def cancel_runs_locked(
     db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey],
 ) -> list[JobRecord]:
     """Cancel jobs, pending or in flight.  Finished jobs are left alone."""
+    for key in keys:
+        state.pins.pop(key, None)
     _detach_locked(state, keys)
     cancelled = await state.db_writer.cancel_jobs(keys)
     for job in cancelled:
@@ -1620,7 +1626,11 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
         wc.max_jobs_per_gpu <= 0 or n < wc.max_jobs_per_gpu
         for wc in connected for n in occupancy[wc.worker_id].values()
     )
-    pending = await list_schedulable_jobs(db, cpu_only=not gpu_free)
+    now = time.time()
+    for key in [k for k, p in state.pins.items() if now - p.made > PIN_TTL_SECONDS]:
+        del state.pins[key]
+    # A pinned job goes to its GPUs even when every GPU is at its cap.
+    pending = await list_schedulable_jobs(db, cpu_only=not gpu_free and not state.pins)
     if not pending:
         return
     caps = await experiment_concurrency_caps(db)
@@ -1639,6 +1649,18 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
         cap = caps.get(job.experiment_id, 0)
         if cap and running.get(job.experiment_id, 0) >= cap:
             continue
+        pin = state.pins.get((job.experiment_id, job.run_id))
+        placements = _pinned_placement(job, pin, state) if pin is not None else None
+        if pin is not None and placements is None:
+            # The worker left or the GPUs left its pool: place it as usual.
+            del state.pins[(job.experiment_id, job.run_id)]
+        if placements is not None:
+            if not await _dispatch_locked(state, job, placements):
+                continue
+            del state.pins[(job.experiment_id, job.run_id)]
+            _book(placements, occupancy, on_worker)
+            running[job.experiment_id] = running.get(job.experiment_id, 0) + 1
+            continue
         shape = (job.gpus_per_run, job.nodes_per_run)
         if shape in no_fit:
             continue
@@ -1650,6 +1672,21 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
             continue
         _book(placements, occupancy, on_worker)
         running[job.experiment_id] = running.get(job.experiment_id, 0) + 1
+
+
+def _pinned_placement(
+    job: SchedulableJob, pin: Pin, state: ManagerState,
+) -> list[tuple[WorkerConn, list[int]]] | None:
+    """*pin* as a placement for *job*, or ``None`` once it can no longer be used.
+
+    A pin ignores ``max_jobs_per_gpu``: whoever chose the GPU chose to share it.
+    """
+    wc = state.workers.get(pin.worker_id)
+    if wc is None or wc.status != "connected" or job.nodes_per_run > 1:
+        return None
+    if len(pin.gpus) != job.gpus_per_run or not set(pin.gpus) <= set(wc.gpus):
+        return None
+    return [(wc, list(pin.gpus))]
 
 
 def _book(

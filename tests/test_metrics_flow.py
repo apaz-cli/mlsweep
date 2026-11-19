@@ -176,3 +176,23 @@ def test_logger_noop_without_env():
     finally:
         if env_saved is not None:
             os.environ["MLSWEEP_WORKER_SOCKET"] = env_saved
+
+
+def test_logger_times_steps(monkeypatch):
+    """step_seconds is the wall time per step over the last step advance."""
+    import mlsweep.logger as logger_mod
+    monkeypatch.delenv("MLSWEEP_WORKER_SOCKET", raising=False)
+    clock = iter([100.0, 110.0, 114.0])
+    monkeypatch.setattr(logger_mod.time, "monotonic", lambda: next(clock))
+    sent: list[dict] = []
+    logger = logger_mod.MLSweepLogger()
+    monkeypatch.setattr(logger, "_send", sent.append)
+
+    logger.log({"loss": 1.0}, step=1)           # t=100
+    logger.log({"val_loss": 1.0}, step=1)       # same step: no clock read
+    assert logger.step_seconds is None
+    logger.log({"loss": 0.9}, step=6)           # t=110, 5 steps in 10 s
+    assert logger.step_seconds == 2.0
+    logger.log({"loss": 0.8})                   # t=114, one step
+    assert logger.step_seconds == 4.0
+    assert [m["step_seconds"] for m in sent] == [None, None, 2.0, 4.0]

@@ -1157,8 +1157,10 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
                 f.write(line)
         except OSError:
             pass
+        secs = msg.get("step_seconds")
         _send_run_msg(encode(MsgMetric(
-            run_id=run_id, experiment=state.experiment, attempt=state.attempt, step=step, data=data)))
+            run_id=run_id, experiment=state.experiment, attempt=state.attempt, step=step, data=data,
+            step_seconds=float(secs) if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None)))
 
     elif msg_type == "sync":
         _send_run_msg(encode(MsgSyncReq(run_id=run_id, experiment=state.experiment,
@@ -1174,7 +1176,7 @@ def _query_gpu_stats() -> list[dict[str, Any]]:
         try:
             r = subprocess.run(
                 ["nvidia-smi",
-                 "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                 "--query-gpu=index,utilization.gpu,memory.used,memory.total,name",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
             )
@@ -1190,6 +1192,8 @@ def _query_gpu_stats() -> list[dict[str, Any]]:
                             "util_pct": int(parts[1]),
                             "mem_used_mb": int(parts[2]),
                             "mem_total_mb": int(parts[3]),
+                            # Last, so a comma in a name cannot shift the numbers.
+                            "name": ", ".join(parts[4:]),
                         })
                     except ValueError:
                         continue
@@ -1200,7 +1204,7 @@ def _query_gpu_stats() -> list[dict[str, Any]]:
     if shutil.which("rocm-smi"):
         try:
             r = subprocess.run(
-                ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"],
+                ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--showproductname", "--json"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
@@ -1219,6 +1223,7 @@ def _query_gpu_stats() -> list[dict[str, Any]]:
                             "util_pct": int(float(util_str)),
                             "mem_used_mb": int(int(used_str) / 1024 / 1024),
                             "mem_total_mb": int(int(total_str) / 1024 / 1024),
+                            "name": str(val.get("Card Series") or val.get("Card series") or ""),
                         })
                     except (ValueError, KeyError):
                         continue

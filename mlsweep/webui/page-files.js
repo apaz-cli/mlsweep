@@ -366,7 +366,7 @@ async function loadExperiment(eid) {
     setConnStatus("connected");
   } catch (e) {
     setConnStatus("disconnected");
-    document.getElementById("run-list").innerHTML = `<div style="color:#d62728;font-size:12px;padding:4px">Error loading runs</div>`;
+    document.getElementById("run-list").innerHTML = `<div style="color:var(--bad);font-size:12px;padding:4px">Error loading runs</div>`;
     return;
   }
 

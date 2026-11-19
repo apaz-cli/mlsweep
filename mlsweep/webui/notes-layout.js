@@ -42,6 +42,7 @@ function makeGroup() {
   g.modeSeg.querySelectorAll("button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
   q(".btn-more").onclick = e => moreMenu(e);
   q(".btn-right").onclick = () => toggleRight();
+  q(".btn-left").onclick = () => toggleLeft();
   wireGroupDrop(g);
   Groups.set(g.id, g);
   return g;

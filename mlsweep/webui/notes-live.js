@@ -119,7 +119,7 @@ function livePane(t) {
   art.addEventListener("change", e => lvTaskToggle(L, e));
   requestAnimationFrame(() => {
     if (t.pendingHeading) { scrollToHeading(pane, t.pendingHeading); t.pendingHeading = null; }
-    else if (t.pendingLine) { lvRevealLine(L, t.pendingLine); t.pendingLine = null; }
+    else if (t.pendingLine) { lvRevealLine(L, t.pendingLine, t.pendingHits); t.pendingLine = null; t.pendingHits = null; }
     else if (t.scroll.read != null) pane.scrollTop = t.scroll.read;
     if (t.liveResume) { lvResume(L, t.liveResume); t.liveResume = null; }
     else if (t.focusEnd) { t.focusEnd = false; lvEdit(L, Math.max(0, L.doc.blocks.length - 1)); }
@@ -351,19 +351,131 @@ function lvTaskToggle(L, e) {
 }
 
 // Scroll to the block containing (1-based) line `line`.
-function lvRevealLine(L, line) {
+// Scroll to the block that holds source *line* and, given search *terms*,
+// mark them in the rendered text.  A block can render many source lines (a
+// list, a long paragraph), so the line's markdown is reduced to its plain text
+// and found in the block first; the terms are marked inside that stretch.
+function lvRevealLine(L, line, terms = null) {
   let n = 0;
   for (let i = 0; i < L.doc.blocks.length; i++) {
     const b = L.doc.blocks[i];
     n += b.pre.length;
     if (line <= n + b.lines.length) {
       const node = L.art.children[i];
-      node.scrollIntoView({ block: "center" });
-      node.animate([{ background: "var(--accent-soft)" }, { background: "transparent" }], { duration: 1400 });
+      const src = b.lines[Math.max(0, line - n - 1)] || "";
+      const marks = terms && terms.length ? lvMarkHits(node, src, terms) : [];
+      lvHoldInView(L, marks[0] || node);
+      if (!marks.length) node.animate([{ background: "var(--accent-soft)" }, { background: "transparent" }], { duration: 1400 });
       return;
     }
     n += b.lines.length;
   }
+}
+
+// Scroll *target* to the middle and keep it there while math, images and
+// charts above it finish rendering and change the page's height.  Stops after
+// a few seconds, or as soon as the reader scrolls, clicks or types.
+function lvHoldInView(L, target) {
+  const pane = L.pane;
+  let held = true;
+  const center = () => { if (held && target.isConnected) target.scrollIntoView({ block: "center" }); };
+  center();
+  const ro = new ResizeObserver(center);
+  ro.observe(L.art);
+  pane.querySelectorAll("img").forEach(img => { if (!img.complete) img.addEventListener("load", center, { once: true }); });
+  const stop = () => {
+    held = false;
+    ro.disconnect();
+    for (const ev of ["wheel", "mousedown", "keydown", "touchstart"]) pane.removeEventListener(ev, stop);
+  };
+  for (const ev of ["wheel", "mousedown", "keydown", "touchstart"]) pane.addEventListener(ev, stop, { passive: true });
+  setTimeout(stop, 5000);
+}
+
+// Markdown source line → roughly the text it renders as.
+function lvPlainLine(src) {
+  return src
+    .replace(/^\s*(#{1,6}\s+|>\s?|[-*+]\s+\[[ xX]\]\s+|[-*+]\s+|\d+[.)]\s+)/, "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[\[([^\]|#]*)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]/g, (_, t, label) => label || t)
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[\^[^\]]*\]/g, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/(\*\*|__|~~|\*|_|`)/g, "")
+    .replace(/^\s*\||\|\s*$/g, "").replace(/\s*\|\s*/g, " ")
+    .replace(/\s+/g, " ").trim();
+}
+
+function lvMarkHits(node, src, terms, { anywhere = true } = {}) {
+  const texts = [];
+  const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) texts.push(walker.currentNode);
+  // One string for the block, with each character's text node and offset.
+  let full = "";
+  const at = [];
+  for (const t of texts) {
+    for (let k = 0; k < t.nodeValue.length; k++) at.push([t, k]);
+    full += t.nodeValue;
+  }
+  const lower = full.toLowerCase();
+  // Where the source line landed: its plain text, else its longest run of words.
+  // Searched in a whitespace-collapsed copy; map[] leads back to the raw offsets.
+  let col = "";
+  const map = [];
+  for (let k = 0; k < lower.length; k++) {
+    const ws = /\s/.test(lower[k]);
+    if (ws && col.endsWith(" ")) continue;
+    col += ws ? " " : lower[k];
+    map.push(k);
+  }
+  let from = 0, to = full.length, located = false;
+  const plain = lvPlainLine(src).toLowerCase();
+  const tries = plain ? [plain, ...plain.split(/[^\p{L}\p{N}\s]+/u).map(x => x.trim()).sort((x, y) => y.length - x.length)] : [];
+  for (const t of tries) {
+    if (t.length < 4) break;
+    const i = col.indexOf(t);
+    if (i >= 0) { from = map[i]; to = map[i + t.length - 1] + 1; located = true; break; }
+  }
+  const find = (lo, hi) => {
+    const out = [];
+    for (const term of terms) {
+      if (!term) continue;
+      let i = lower.indexOf(term, lo);
+      while (i >= 0 && i + term.length <= hi) { out.push([i, i + term.length]); i = lower.indexOf(term, i + term.length); }
+    }
+    return out;
+  };
+  // If the line was not found, or has none of the terms, mark them anywhere in
+  // *node*, unless *node* is a whole document (anywhere=false), where that
+  // would land on the wrong occurrence.
+  let ranges = located ? find(from, to) : [];
+  if (!ranges.length && anywhere) ranges = find(0, full.length);
+  ranges.sort((a, b) => a[0] - b[0]);
+  // Overlapping hits ("loss" in "val_loss") become one mark.
+  ranges = ranges.reduce((acc, r) => {
+    const last = acc[acc.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else acc.push([...r]);
+    return acc;
+  }, []);
+  // Wrap from the end so earlier offsets stay valid.
+  const marks = [];
+  for (const [s0, e0] of ranges.reverse()) {
+    for (let k = e0 - 1; k >= s0; ) {
+      const [t, off] = at[k];
+      let start = k;
+      while (start - 1 >= s0 && at[start - 1][0] === t) start--;
+      const r = document.createRange();
+      r.setStart(t, at[start][1]); r.setEnd(t, off + 1);
+      const m = document.createElement("mark");
+      m.className = "lv-hit";
+      r.surroundContents(m);
+      marks.unshift(m);
+      k = start - 1;
+    }
+  }
+  // The highlight fades, then the marks go so they never reach an edit.
+  setTimeout(() => marks.forEach(m => m.isConnected && m.replaceWith(...m.childNodes)), 6000);
+  return marks;
 }
 
 // Before the doc is replaced (sync, undo): remember the open block.

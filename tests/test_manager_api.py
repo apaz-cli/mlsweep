@@ -267,6 +267,20 @@ def test_create_experiment_rejects_bad_goal(manager_server):
         assert e.code == 400
 
 
+def test_note_step_keeps_newest_step_and_logger_timing():
+    from mlsweep._manager_state import InFlightRun
+
+    run = InFlightRun(experiment_id="e", run_id="r", job_key=1, attempt=0, primary="w")
+    run.note_step(10, None, 100.0)
+    assert (run.last_step, run.last_step_time, run.step_seconds) == (10, 100.0, None)
+    run.note_step(10, None, 104.0)      # a second log() at the same step
+    assert run.last_step_time == 100.0
+    run.note_step(12, 2.5, 106.0)
+    assert (run.last_step, run.last_step_time, run.step_seconds) == (12, 106.0, 2.5)
+    run.note_step(5, None, 200.0)       # never goes backwards, keeps the last timing
+    assert (run.last_step, run.step_seconds) == (12, 2.5)
+
+
 def test_stall_helpers_use_last_progress():
     from types import SimpleNamespace
 

@@ -290,6 +290,7 @@ mlsweep export tensorboard|wandb     mlsweep rename EXP --experiment-name NAME
 
 # cluster (the System page)
 mlsweep workers [ls|add|rm|set]      mlsweep scheduler [--placement pack|spread]
+mlsweep reschedule EXP RUN [--to W]
 
 # notes (a shared research notes folder in a git repo the manager hosts; mlsweep docs notes)
 mlsweep notes clone DIR              mlsweep notes status

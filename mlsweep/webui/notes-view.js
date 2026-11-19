@@ -56,10 +56,6 @@ function renderStrip(g) {
     };
     strip.append(d);
   }
-  const plus = el("button", "icon-btn tab-new"); plus.title = "New note";
-  plus.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>';
-  plus.onclick = () => newNote();
-  strip.append(plus);
   if (S.term.enabled) {
     const tb = el("button", "icon-btn tab-term" + (S.term.error ? " off" : ""));
     tb.title = S.term.error || "New terminal; right-click for commands and running terminals";
@@ -126,7 +122,7 @@ function stashScroll(t) {
 
 // Open a file: reuse its tab (in whichever group has it), else replace the
 // focused group's file tab (unless newTab), else add a tab at *index*.
-async function openFile(path, { newTab: inNew = false, mode = null, line = null, heading = null, focusEnd = false, pushNav = true, index = null } = {}) {
+async function openFile(path, { newTab: inNew = false, mode = null, line = null, hits = null, heading = null, focusEnd = false, pushNav = true, index = null } = {}) {
   if (!path) return;
   let t = S.tabs.find(x => x.type === "file" && x.path === path);
   if (!t) {
@@ -150,7 +146,7 @@ async function openFile(path, { newTab: inNew = false, mode = null, line = null,
       toast("Could not open: " + e.message, "err");
     }
   } else if (mode) t.mode = mode;
-  t.pendingLine = line; t.pendingHeading = heading; t.focusEnd = focusEnd;
+  t.pendingLine = line; t.pendingHits = hits; t.pendingHeading = heading; t.focusEnd = focusEnd;
   activate(t.id, { pushNav });
 }
 
@@ -378,40 +374,16 @@ function updateSaveState(t) {
   }
 }
 
+// No tab open: a little help, and the file tree on screen, since it is the
+// way to open or make anything.
 function renderEmpty(v) {
   const p = el("div", "vpane");
-  const wrap = el("div", "empty-view");
-  const st = S.status || {};
-  wrap.innerHTML = `<h1>${esc(st.name || "Notes")}</h1>
-    <div class="sub">${S.files.length} files · git remote <code>${esc(st.remote || "")}</code>.
-    Agents clone it with <code>mlsweep notes clone DIR</code>; their changes arrive when they push.</div>
-    <div class="empty-grid">
-      <div><h3>Recent</h3><div class="empty-list empty-recent"></div></div>
-      <div><h3>Recently changed</h3><div class="empty-list empty-changed"></div></div>
-      <div><h3>Start</h3><div class="empty-list">
-        <a class="e-new">Create a note</a><a class="e-open">Open a file…</a><a class="e-graph">Open the graph</a><a class="e-lint">Run lint</a>${S.term.enabled && !S.term.error ? '<a class="e-term">Open a terminal</a>' : ""}</div></div>
-      <div><h3>Keys</h3><div class="kbd-list">
-        <span><kbd>T</kbd></span><span>Open a file</span>
-        <span><kbd>E</kbd></span><span>Live / Source</span>
-        <span><kbd>/</kbd></span><span>Search</span>
-        <span><kbd>G</kbd></span><span>Graph</span>
-        <span><kbd>X</kbd></span><span>Close tab</span>
-        <span><kbd>?</kbd></span><span>All keys</span>
-      </div></div>
-    </div>`;
-  p.append(wrap); v.append(p);
-  const rec = wrap.querySelector(".empty-recent");
-  const recents = S.recent.filter(r => S.fileMap.has(r)).slice(0, 8);
-  if (!recents.length) rec.append(el("div", "muted", "Nothing opened yet."));
-  for (const r of recents) { const a = el("a", "", titleFor(r)); a.title = r; a.onclick = () => openFile(r); rec.append(a); }
-  const ch = wrap.querySelector(".empty-changed");
-  const changed = [...S.files].filter(f => f.kind === "md").sort((a, b) => b.mtime - a.mtime).slice(0, 8);
-  for (const f of changed) { const a = el("a", "", `${titleFor(f.path)}`); a.title = `${f.path} · ${ago(f.mtime)}`; a.onclick = () => openFile(f.path); ch.append(a); }
-  wrap.querySelector(".e-new").onclick = () => newNote("");
-  wrap.querySelector(".e-open").onclick = () => Switcher.open();
-  wrap.querySelector(".e-graph").onclick = () => openGraph();
-  const et = wrap.querySelector(".e-term"); if (et) et.onclick = () => newTerminal();
-  wrap.querySelector(".e-lint").onclick = () => { switchPane("lint"); runLint(); };
+  const msg = el("div", "empty-view");
+  msg.append(el("div", "", "Double-click a file in the tree to open it."),
+             el("div", "", "Right-click in the tree to create a note or folder."));
+  p.append(msg);
+  v.append(p);
+  if (!S.tabs.length && document.body.classList.contains("left-collapsed")) switchPane("files");   // reopens it
 }
 
 function showSetup() {
@@ -1189,11 +1161,40 @@ function makeEditor(group) { return {
       this.cm.refresh();
     }
   },
+  // Go to source *line*, with the search terms on it highlighted.  In split
+  // mode the rendered side is moved to the same place with the terms marked,
+  // since following the source's scroll ratio only gets near it.
+  revealLine(t, line, terms) {
+    const ln = line - 1, text = this.cm.getLine(ln) || "";
+    const lower = text.toLowerCase();
+    const hit = (terms || []).map(w => [lower.indexOf(w), w.length]).filter(([i]) => i >= 0).sort((a, b) => a[0] - b[0])[0];
+    this.cm.setCursor({ line: ln, ch: hit ? hit[0] : 0 });
+    // Every term on the line gets the same fading highlight as the rendered views.
+    const marks = [];
+    for (const w of terms || []) {
+      if (!w) continue;
+      for (let i = lower.indexOf(w); i >= 0; i = lower.indexOf(w, i + w.length))
+        marks.push(this.cm.markText({ line: ln, ch: i }, { line: ln, ch: i + w.length }, { className: "cm-search-hit" }));
+    }
+    setTimeout(() => marks.forEach(m => m.clear()), 6000);
+    const top = this.cm.charCoords({ line: ln, ch: 0 }, "local").top;
+    this.cm.scrollTo(null, Math.max(0, top - this.cm.getScrollInfo().clientHeight / 2));
+    this.cm.focus();
+    if (t.mode !== "split" || !terms || !terms.length) return;
+    // After the source's scroll has been mirrored, so that does not undo this.
+    setTimeout(() => {
+      const pane = this.group.view.querySelector(".vpane.reader");
+      const art = pane && pane.querySelector("article.doc");
+      if (!art) return;
+      const marks = lvMarkHits(art, text, terms, { anywhere: false });
+      if (marks.length) lvHoldInView({ pane, art }, marks[0]);
+    }, 150);
+  },
   refresh(t) {
     requestAnimationFrame(() => {
       if (!this.cm) return;
       this.cm.refresh();
-      if (t.pendingLine) { const ln = t.pendingLine - 1; this.cm.setCursor({ line: ln, ch: 0 }); this.cm.scrollIntoView({ line: ln, ch: 0 }, 120); t.pendingLine = null; this.cm.focus(); }
+      if (t.pendingLine) { this.revealLine(t, t.pendingLine, t.pendingHits); t.pendingLine = null; t.pendingHits = null; }
       else if (t.focusEnd) { this.cm.setCursor(this.cm.lineCount(), 0); this.cm.focus(); t.focusEnd = false; }
       else if (t.scroll.edit != null) this.cm.scrollTo(null, t.scroll.edit);
     });

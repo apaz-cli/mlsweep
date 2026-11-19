@@ -33,13 +33,24 @@ function showLoginProblem(message) {
   box.setAttribute("role", "alert");
   box.textContent = message;
   box.style.cssText = "position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:1000;max-width:90vw;"
-    + "padding:10px 14px;border:1px solid #d62728;border-radius:6px;background:var(--surface);color:var(--text);font-size:13px";
+    + "padding:10px 14px;border:1px solid var(--bad);border-radius:6px;background:var(--surface);color:var(--text);font-size:13px";
   document.body.append(box);
 }
 
 // *path* for the places a request can't carry a header: images, downloads.
 function authURL(path) {
   return TOKEN ? path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN) : path;
+}
+
+// Copy *text* and confirm with a small toast.  (The Notes page has its own.)
+function copyText(text, label = "Copied") {
+  if (!navigator.clipboard?.writeText) return;
+  navigator.clipboard.writeText(text).then(() => {
+    document.getElementById("copy-toast")?.remove();
+    const t = Object.assign(document.createElement("div"), { id: "copy-toast", textContent: label });
+    document.body.append(t);
+    setTimeout(() => t.remove(), 1200);
+  }).catch(() => {});
 }
 
 // The WebSocket at *path* (a page can't set headers on one, so the token rides along).
@@ -113,8 +124,11 @@ const MLChrome = (() => {
       ? make("a", { className: "nav-link active", href: "#", textContent: label })
       : make("a", { className: "nav-link", id: `nav-${page}`, href: pageHref(`${page}.html`), textContent: label }));
     const btn = make("button", { id: "theme-toggle" });
+    const searchBtn = make("button", { id: "palette-open", className: "nav-search-btn", type: "button",
+                                       title: "Search runs, experiments, notes and docs" });
+    searchBtn.innerHTML = `Search <kbd>${/Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌘K" : "Ctrl K"}</kbd>`;
     bar.replaceChildren(logo, ...links, make("span", { className: "nav-spacer" }),
-                        ...(extras.length ? extras : [connIndicator()]), btn);
+                        searchBtn, ...(extras.length ? extras : [connIndicator()]), btn);
     showTheme(prefersDark());
     btn.addEventListener("click", () => {
       const dark = root.getAttribute("data-theme") !== "dark";
@@ -126,3 +140,12 @@ const MLChrome = (() => {
 
   return { PAGES: PAGES.map(([page]) => page), nav };
 })();
+
+// The Ctrl/Cmd+K palette (palette.js, searching through search-core.js) on every page.
+window.addEventListener("DOMContentLoaded", () => {
+  if (document.getElementById("palette-back")) return;
+  const core = document.createElement("script");
+  core.src = "search-core.js";
+  core.onload = () => document.body.append(Object.assign(document.createElement("script"), { src: "palette.js" }));
+  document.body.append(core);
+});

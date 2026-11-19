@@ -33,9 +33,9 @@
 }
 .ml-btn-ok:hover { opacity: 0.85; }
 .ml-btn-danger {
-  border: 1px solid #c0392b55; background: var(--btn-bg); color: #c0392b; font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--bad) 33%, transparent); background: var(--btn-bg); color: var(--bad); font-weight: 600;
 }
-.ml-btn-danger:hover { background: #c0392b18; }
+.ml-btn-danger:hover { background: color-mix(in srgb, var(--bad) 9%, transparent); }
 `;
 
   const styleEl = document.createElement("style");
