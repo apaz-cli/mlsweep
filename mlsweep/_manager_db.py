@@ -624,9 +624,29 @@ async def init_db(db: aiosqlite.Connection) -> None:
             size_bytes    INTEGER,
             stored_at     REAL NOT NULL,
             ref_count     INTEGER NOT NULL DEFAULT 0,
-            setup_command TEXT
+            setup_command TEXT,
+            manifest      TEXT
         );
     """)
+    # A code snapshot (``snap:`` ID) keeps its manifest here; a legacy
+    # tarball (``sha256:`` ID) has none.
+    await _add_missing_columns(db, "artifacts", {"manifest": "TEXT"})
+
+    # ── code_submissions ────────────────────────────────────────────
+    # One row per submission of code to an experiment: which snapshot, and the
+    # client's provenance (sweep file, command line, host, VCS state).  An
+    # experiment appended to with other code has several.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS code_submissions (
+            submission_id  INTEGER PRIMARY KEY,
+            experiment_id  TEXT NOT NULL,
+            artifact_id    TEXT,
+            submit_time    REAL NOT NULL,
+            meta           TEXT NOT NULL DEFAULT '{}'
+        );
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_code_submissions_experiment ON code_submissions(experiment_id)")
 
     await db.execute(_JOBS_TABLE)
     await db.execute(_METRICS_TABLE)
@@ -720,12 +740,15 @@ async def create_experiment(
     metric: str | None = None,
     goal: str | None = None,
     optimize: dict[str, Any] | None = None,
+    code: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row.
 
     Re-creating an existing experiment updates it in place but keeps its
     campaign; ``update_experiment_campaign`` is the only way to move it.
+    *code* is the submitting client's provenance for the code it ships
+    (``{"snapshot": ID, ...}``), recorded as one more ``code_submissions`` row.
     With ``commit=False`` the caller owns the transaction.
     """
     now = _now_epoch()
@@ -757,10 +780,184 @@ async def create_experiment(
          singular_dims_json, max_concurrent, json.dumps(skip_rules or {}), metric, goal,
          json.dumps(optimize) if optimize is not None else None),
     )
+    if code is not None:
+        await insert_code_submission(db, experiment_id, code, commit=False)
     if commit:
         await db.commit()
     assert row is not None
     return _row_to_experiment(row)
+
+
+# ===============================================================================
+# Code snapshots and submissions
+# ===============================================================================
+
+
+async def insert_code_submission(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    meta: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> None:
+    """Record that *meta*'s snapshot was submitted to *experiment_id*."""
+    snapshot = meta.get("snapshot")
+    await db.execute(
+        "INSERT INTO code_submissions (experiment_id, artifact_id, submit_time, meta) VALUES (?, ?, ?, ?)",
+        (experiment_id, snapshot if isinstance(snapshot, str) else None, _now_epoch(),
+         json.dumps(meta, separators=(",", ":"))),
+    )
+    if commit:
+        await db.commit()
+
+
+async def list_code_submissions(db: aiosqlite.Connection, experiment_id: str) -> list[dict[str, Any]]:
+    """The experiment's code submissions, oldest first."""
+    rows = await _exec_all(
+        db,
+        "SELECT submission_id, artifact_id, submit_time, meta FROM code_submissions "
+        "WHERE experiment_id = ? ORDER BY submit_time, submission_id",
+        (experiment_id,),
+    )
+    out = []
+    for sid, aid, t, meta in rows:
+        try:
+            parsed = json.loads(meta)
+        except (TypeError, ValueError):
+            parsed = {}
+        out.append({"submission_id": sid, "snapshot": aid,
+                    "submit_time": _utc(t).isoformat(), "meta": parsed})
+    return out
+
+
+async def experiment_code_versions(db: aiosqlite.Connection, experiment_id: str) -> list[dict[str, Any]]:
+    """Each code ID the experiment used, oldest first, with how many of its runs use it.
+
+    A version is code a run used or code submitted to the experiment, so code
+    stays listed after its runs are purged (``runs`` is then 0).  A snapshot's
+    entry also has its file count and size; a legacy tarball's is marked
+    ``kind: "archive"``.
+    """
+    rows = await _exec_all(
+        db,
+        """
+        SELECT u.aid, SUM(u.runs), MIN(u.t), a.size_bytes, json_array_length(a.manifest, '$.files')
+        FROM (
+            SELECT artifact_id AS aid, COUNT(*) AS runs, MIN(submit_time) AS t FROM jobs
+            WHERE experiment_id = ? AND artifact_id IS NOT NULL GROUP BY artifact_id
+            UNION ALL
+            SELECT artifact_id, 0, MIN(submit_time) FROM code_submissions
+            WHERE experiment_id = ? AND artifact_id IS NOT NULL GROUP BY artifact_id
+        ) u LEFT JOIN artifacts a ON a.artifact_id = u.aid
+        GROUP BY u.aid ORDER BY MIN(u.t)
+        """,
+        (experiment_id, experiment_id),
+    )
+    out: list[dict[str, Any]] = []
+    for aid, runs, _t, size, n_files in rows:
+        v: dict[str, Any] = {"artifact_id": aid, "runs": int(runs or 0)}
+        if n_files is not None:
+            v.update(kind="snapshot", files=int(n_files), size_bytes=int(size or 0))
+        else:
+            v.update(kind="archive")
+        out.append(v)
+    return out
+
+
+async def get_code_submission(db: aiosqlite.Connection, submission_id: int) -> dict[str, Any] | None:
+    """One code submission with its full provenance (diff and sweep source included)."""
+    row = await _exec_one(
+        db, "SELECT submission_id, experiment_id, artifact_id, submit_time, meta FROM code_submissions "
+            "WHERE submission_id = ?", (submission_id,))
+    if row is None:
+        return None
+    try:
+        meta = json.loads(row[4])
+    except (TypeError, ValueError):
+        meta = {}
+    return {"submission_id": row[0], "experiment_id": row[1], "snapshot": row[2],
+            "submit_time": _utc(row[3]).isoformat(), "meta": meta}
+
+
+async def snapshot_usage(db: aiosqlite.Connection, artifact_id: str) -> dict[str, Any]:
+    """The experiments whose runs used a snapshot or that it was submitted to, and those submissions."""
+    used = await _exec_all(
+        db, "SELECT j.experiment_id, COUNT(*), e.name, e.campaign FROM jobs j "
+            "JOIN experiments e USING (experiment_id) WHERE j.artifact_id = ? "
+            "GROUP BY j.experiment_id ORDER BY MIN(j.submit_time)", (artifact_id,))
+    subs = await _exec_all(
+        db, "SELECT c.submission_id, c.experiment_id, c.submit_time, c.meta, e.name, e.campaign "
+            "FROM code_submissions c LEFT JOIN experiments e USING (experiment_id) "
+            "WHERE c.artifact_id = ? ORDER BY c.submit_time", (artifact_id,))
+    experiments: dict[str, dict[str, Any]] = {}
+    for exp, runs, name, campaign in used:
+        experiments[exp] = {"experiment_id": exp, "name": name, "campaign": campaign, "runs": int(runs)}
+    submissions = []
+    for sid, exp, t, meta, name, campaign in subs:
+        experiments.setdefault(exp, {"experiment_id": exp, "name": name, "campaign": campaign, "runs": 0})
+        try:
+            parsed = json.loads(meta)
+        except (TypeError, ValueError):
+            parsed = {}
+        submissions.append({"submission_id": sid, "experiment_id": exp, "snapshot": artifact_id,
+                            "submit_time": _utc(t).isoformat(), "meta": parsed})
+    return {"snapshot": artifact_id, "experiments": list(experiments.values()), "submissions": submissions}
+
+
+async def register_snapshot(
+    db: aiosqlite.Connection,
+    *,
+    artifact_id: str,
+    manifest: str,
+    size_bytes: int,
+) -> None:
+    """Insert a code snapshot, or refresh an existing one's age for GC.
+
+    The ID is the manifest's hash, so an existing row already holds this
+    manifest and only its age changes.
+    """
+    await db.execute(
+        """
+        INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, manifest)
+        VALUES (?, ?, ?, 0, ?)
+        ON CONFLICT (artifact_id) DO UPDATE SET
+            stored_at = EXCLUDED.stored_at,
+            manifest = COALESCE(artifacts.manifest, EXCLUDED.manifest)
+        """,
+        (artifact_id, size_bytes, _now_epoch(), manifest),
+    )
+    await db.commit()
+
+
+async def get_snapshot_manifest(db: aiosqlite.Connection, artifact_id: str) -> str | None:
+    """The snapshot's manifest JSON, or None for a legacy tarball or an unknown ID."""
+    row = await _exec_one(db, "SELECT manifest FROM artifacts WHERE artifact_id = ?", (artifact_id,))
+    return row[0] if row is not None else None
+
+
+async def snapshot_stats(db: aiosqlite.Connection, artifact_id: str) -> tuple[int, int]:
+    """(file count, total bytes) of a stored snapshot; (0, 0) if it is unknown."""
+    row = await _exec_one(
+        db, "SELECT json_array_length(manifest, '$.files'), COALESCE(size_bytes, 0) FROM artifacts "
+            "WHERE artifact_id = ?", (artifact_id,))
+    return (int(row[0] or 0), int(row[1])) if row is not None else (0, 0)
+
+
+async def resolve_snapshot_prefix(db: aiosqlite.Connection, prefix: str) -> list[tuple[str, str]]:
+    """(ID, manifest JSON) of snapshots whose ID starts with *prefix*.
+
+    At most two, enough to tell the prefix is ambiguous.
+    """
+    rows = await _exec_all(
+        db, "SELECT artifact_id, manifest FROM artifacts WHERE manifest IS NOT NULL "
+            "AND substr(artifact_id, 1, ?) = ? LIMIT 2", (len(prefix), prefix))
+    return [(r[0], r[1]) for r in rows]
+
+
+async def all_snapshot_manifests(db: aiosqlite.Connection) -> list[tuple[str, str]]:
+    """(artifact_id, manifest JSON) for every stored snapshot."""
+    return [(r[0], r[1]) for r in await _exec_all(
+        db, "SELECT artifact_id, manifest FROM artifacts WHERE manifest IS NOT NULL")]
 
 
 async def get_experiment(
@@ -2123,6 +2320,7 @@ async def delete_experiment(
     await db.execute(f"DELETE FROM logs WHERE job_key IN ({keys})", (experiment_id,))
     await db.execute("DELETE FROM jobs WHERE experiment_id = ?", (experiment_id,))
     await db.execute("DELETE FROM job_nodes WHERE experiment_id = ?", (experiment_id,))
+    await db.execute("DELETE FROM code_submissions WHERE experiment_id = ?", (experiment_id,))
     row = await _exec_one(
         db,
         "DELETE FROM experiments WHERE experiment_id = ? RETURNING experiment_id",
@@ -2203,7 +2401,14 @@ _ORPHAN_ROWS = {
     "job_node_rows": ("job_nodes", "NOT EXISTS (SELECT 1 FROM jobs j "
                                    "WHERE j.run_id = job_nodes.run_id AND j.experiment_id = job_nodes.experiment_id)"),
 }
-_UNUSED_ARTIFACT = "artifact_id NOT IN (SELECT artifact_id FROM jobs WHERE artifact_id IS NOT NULL)"
+# Code is in use while a run, a code submission, or a Bayesian sweep's spec
+# (which hands its artifact to every new trial) names it.
+_UNUSED_ARTIFACT = (
+    "artifact_id NOT IN (SELECT artifact_id FROM jobs WHERE artifact_id IS NOT NULL)"
+    " AND artifact_id NOT IN (SELECT artifact_id FROM code_submissions WHERE artifact_id IS NOT NULL)"
+    " AND NOT EXISTS (SELECT 1 FROM experiments e WHERE e.optimize IS NOT NULL"
+    " AND instr(e.optimize, '\"' || artifacts.artifact_id || '\"') > 0)"
+)
 
 
 async def find_orphans(db: aiosqlite.Connection, *, artifact_min_age: float = 3600.0) -> dict[str, Any]:
@@ -2227,7 +2432,8 @@ async def find_orphans(db: aiosqlite.Connection, *, artifact_min_age: float = 36
         "rows": counts,
         "artifacts": [{"artifact_id": r[0], "size_bytes": int(r[1])} for r in arts],
         "referenced_artifacts": {r[0] for r in await _exec_all(
-            db, "SELECT DISTINCT artifact_id FROM jobs WHERE artifact_id IS NOT NULL")},
+            db, "SELECT DISTINCT artifact_id FROM jobs WHERE artifact_id IS NOT NULL "
+                "UNION SELECT artifact_id FROM code_submissions WHERE artifact_id IS NOT NULL")},
         "known_artifacts": {r[0] for r in await _exec_all(db, "SELECT artifact_id FROM artifacts")},
         "experiments": {r[0] for r in await _exec_all(db, "SELECT experiment_id FROM experiments")},
         "runs": {(r[0], r[1]) for r in await _exec_all(db, "SELECT experiment_id, run_id FROM jobs")},
@@ -2606,6 +2812,7 @@ class DbWriter:
         metric: str | None = None,
         goal: str | None = None,
         optimize: dict[str, Any] | None = None,
+        code: dict[str, Any] | None = None,
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
@@ -2614,6 +2821,7 @@ class DbWriter:
             status=status, expected_jobs=expected_jobs,
             singular_dims=singular_dims, max_concurrent=max_concurrent,
             skip_rules=skip_rules, metric=metric, goal=goal, optimize=optimize,
+            code=code,
         ))
 
     async def create_experiment_with_jobs(
@@ -2867,6 +3075,11 @@ class DbWriter:
         return await self._enqueue(lambda: register_artifact(
             db, artifact_id=artifact_id, size_bytes=size_bytes, setup_command=setup_command
         ))
+
+    async def register_snapshot(self, *, artifact_id: str, manifest: str, size_bytes: int) -> None:
+        db = self._db
+        await self._enqueue(lambda: register_snapshot(
+            db, artifact_id=artifact_id, manifest=manifest, size_bytes=size_bytes))
 
     async def increment_artifact_ref(
         self, artifact_id: str, delta: int = 1

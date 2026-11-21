@@ -240,7 +240,7 @@ mlsweep_manager --workers workers.toml
 
 ## Dashboard
 
-The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, export, and system status. Open it in a browser while your sweep runs. The Rename buttons on the Experiments and Logs pages set a run's display name, the same one `mlsweep rename` sets.
+The manager serves a web dashboard at the URL printed at startup (default `http://localhost:7891`). It shows live metrics, per-run logs, file browser, the code each run used, export, and system status. Open it in a browser while your sweep runs. The Rename buttons on the Experiments and Logs pages set a run's display name, the same one `mlsweep rename` sets.
 
 ## Useful CLI flags
 
@@ -360,6 +360,7 @@ other way round (watching live is the exception; `mlsweep watch` and
 | Experiments: pause, unpause, stop, retry failed, cancel active, delete failed | `mlsweep pause`, `unpause`, `stop`, `retry --failed`, `cancel --running`, `purge --failed` |
 | Runs: rename, cancel, retry, move, delete | `mlsweep rename`, `cancel`, `retry`, `move`, `purge` |
 | Results, Logs, Artifacts | `mlsweep metrics`, `mlsweep best`, `mlsweep logs`, `mlsweep fetch` |
+| Code: a run's files, where they came from, diffs between versions | `mlsweep code EXP [PATH]`, `mlsweep code diff A B`, `mlsweep code checkout EXP DIR` |
 | Export (TensorBoard, W&B) | `mlsweep export tensorboard`, `mlsweep export wandb` |
 | System: workers, devices, jobs per GPU, placement | `mlsweep workers ...`, `mlsweep scheduler --placement` |
 | System: storage cleanup | `mlsweep gc` |

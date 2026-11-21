@@ -5,7 +5,7 @@
   const VIEWS_KEY = "mlsweep_saved_views";
   const PAGES = [
     ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
-    ["files", "Artifacts", "▣"], ["notes", "Notes", "✎"], ["export", "Export", "⇩"],
+    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"], ["export", "Export", "⇩"],
     ["system", "System", "⚙"],
   ];
 

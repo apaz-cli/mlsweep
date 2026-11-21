@@ -11,7 +11,7 @@ from campaign_helpers import shared_manager, static_url
 
 
 WEBUI = Path(__file__).parent.parent / "mlsweep" / "webui"
-PAGES = ["experiments", "results", "logs", "files", "notes", "export", "system"]
+PAGES = ["experiments", "results", "logs", "files", "code", "notes", "export", "system"]
 CHROME = find_chromium()
 
 
@@ -45,12 +45,12 @@ def browser():  # type: ignore[no-untyped-def]
 def test_nav_is_the_same_on_every_page(browser, mgr, page_name: str) -> None:  # type: ignore[no-untyped-def]
     browser.goto(static_url(mgr, f"{page_name}.html"))
     labels = browser.eval("[...document.querySelectorAll('nav a.nav-link')].map(a => a.textContent)")
-    assert labels == ["Experiments", "Results", "Logs", "Artifacts", "Notes", "Export", "System"]
+    assert labels == ["Experiments", "Results", "Logs", "Artifacts", "Code", "Notes", "Export", "System"]
     active = browser.eval("[...document.querySelectorAll('a.nav-link.active')].map(a => a.textContent)")
     assert active == [dict(zip(PAGES, labels))[page_name]]
     # Campaign links are added to these, but the token never is.
     hrefs = browser.eval("[...document.querySelectorAll('a.nav-link[id]')].map(a => a.getAttribute('href'))")
-    assert len(hrefs) == 6 and not any("token" in h for h in hrefs)
+    assert len(hrefs) == 7 and not any("token" in h for h in hrefs)
     assert browser.eval("!!document.getElementById('theme-toggle')")
     assert browser.eval("!!document.getElementById('nav-sync')") == (page_name == "notes")
     assert browser.eval("!!document.getElementById('conn-dot')") == (page_name != "notes")

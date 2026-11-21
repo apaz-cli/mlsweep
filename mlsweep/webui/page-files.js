@@ -278,6 +278,9 @@ async function loadBrowse(runId) {
   document.getElementById("run-dl-zip").href = runZipURL(expId(), runId);
   const _browseJob = jobs.find(j => j.run_id === runId);
   document.getElementById("browse-run-label").innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
+  const codeBtn = document.getElementById("run-code-btn");
+  codeBtn.href = pageHref("code.html", { experiment: expId(), run: runId });
+  codeBtn.style.display = _browseJob && _browseJob.artifact_id ? "" : "none";
   tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">Loading…</div>`;
   pane.innerHTML = `<div class="placeholder">Loading files…</div>`;
 

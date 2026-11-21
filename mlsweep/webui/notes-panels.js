@@ -514,7 +514,7 @@ async function runLint() {
   if (linting) return;
   linting = true;
   $("lint-run").disabled = true; $("lint-run").textContent = "Running…";
-  $("lint-summary").textContent = "Checking links, experiment and run IDs, chart specs, evidence numbers and merge leftovers…";
+  $("lint-summary").textContent = "Checking links, experiment and run IDs, chart specs, evidence numbers, code links and merge leftovers…";
   try {
     S.lint = await api("/api/notes/lint");
     renderLint();
@@ -528,7 +528,7 @@ function renderLint() {
   const reports = L.findings.filter(f => f.tier === "report");
   const st = L.stats;
   $("lint-summary").textContent = `${st.notes} notes, ${st.links} links, ${st.experiments_cited} experiments cited` +
-    (st.data_blocks ? `, ${st.data_blocks} chart/table block${st.data_blocks === 1 ? "" : "s"}` : "") +
+    (st.data_blocks ? `, ${st.data_blocks} data block${st.data_blocks === 1 ? "" : "s"}` : "") +
     (st.evidence_refs ? `, ${st.evidence_refs} evidence link${st.evidence_refs === 1 ? "" : "s"}` : "") + ". " +
     (L.findings.length ? `${fixes.length} safe fix${fixes.length === 1 ? "" : "es"}, ${reports.length} report${reports.length === 1 ? "" : "s"}.` : "") +
     (st.experiments_checked ? (st.runs_checked ? "" : " Run IDs not checked.") : " Experiment and run IDs not checked.") +
@@ -890,11 +890,12 @@ const KEYS = [
     ["↑ / ↓", "into the block above / below"],
     ["Ctrl+Enter", "new block below"],
     ["[[", "link completion"],
+    ["mlsweep:", "experiment ID completion"],
     ["Ctrl+B / Ctrl+I", "bold / italic"],
   ]],
   ["Source", [
     ["Esc", "back to Live"],
-    ["Ctrl+Space", "link completion"],
+    ["Ctrl+Space", "link or experiment ID completion"],
     ["Ctrl+B / Ctrl+I", "bold / italic"],
   ]],
 ];

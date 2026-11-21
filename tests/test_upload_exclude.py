@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from mlsweep._sweep import load_sweep_file
-from mlsweep.run_sweep import _project_files
+from mlsweep._snapshot import project_files as _project_files
 
 
 def _tree(root: Path) -> None:

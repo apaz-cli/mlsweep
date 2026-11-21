@@ -215,6 +215,15 @@ def _prompt(b, value):
         document.querySelector('.ml-dialog .ml-btn-ok').click(); }})()""")
 
 
+def _pick_new_campaign(b, name):
+    """In the campaign picker, choose "New campaign…" and name it."""
+    b.wait_for("!!document.querySelector('.ml-pick')")
+    b.eval("""[...document.querySelectorAll('.ml-pick-item')]
+        .find(x => x.textContent.startsWith('New campaign')).click()""")
+    b.wait_for("!document.querySelector('.ml-pick')")
+    _prompt(b, name)
+
+
 def _click_move(b, eid):
     """Move lives in the row's ⋯ menu."""
     b.eval(f"document.querySelector('#exp-row-{eid} .btn-manage').click()")
@@ -228,7 +237,7 @@ def test_move_button_moves_experiment(page, mgr):
     page.goto(page.url("experiments.html", campaign="gamma"))
     _wait_rows(page, [eid])
     _click_move(page, eid)
-    _prompt(page, "delta")
+    _pick_new_campaign(page, "delta")
     _wait_rows(page, [])
     assert ok(mgr, "GET", f"/api/experiments/{eid}")["campaign"] == "delta"
     page.wait_for("[...document.getElementById('campaign-select').options].some(o => o.value === 'delta')")
@@ -241,7 +250,7 @@ def test_move_button_rejects_invalid_name(page, mgr):
     page.goto(page.url("experiments.html", campaign="gamma2"))
     _wait_rows(page, [eid])
     _click_move(page, eid)
-    _prompt(page, "not valid!")
+    _pick_new_campaign(page, "not valid!")
     page.wait_for("document.querySelector('.ml-dialog-message')?.textContent.includes('campaign must be')")
     page.eval("document.querySelector('.ml-dialog .ml-btn-ok').click()")
     assert ok(mgr, "GET", f"/api/experiments/{eid}")["campaign"] == "gamma2"
@@ -430,3 +439,20 @@ def test_campaign_follows_from_page_to_page(page, seeded):
     page.wait_for("location.pathname.endsWith('logs.html')")
     _wait_shown(page, "logs.html", seeded["b1"])
     assert _selected(page, "campaign-select") == "beta"
+
+
+def test_move_picks_an_existing_campaign(page, mgr):
+    eid = seed(mgr, "gamma4", prefix="mv")
+    other = seed(mgr, "gamma5", prefix="mv")
+    page.goto(page.url("experiments.html", campaign="gamma4"))
+    _wait_rows(page, [eid])
+    _click_move(page, eid)
+    page.wait_for("!!document.querySelector('.ml-pick')")
+    # The current campaign is listed but can't be chosen; typing narrows the list.
+    assert page.eval("""[...document.querySelectorAll('.ml-pick-item.disabled')].map(x => x.querySelector('.l').textContent)""") == ["gamma4"]
+    page.eval("""(() => { const s = document.querySelector('.ml-pick-search'); s.value = 'gamma5';
+        s.dispatchEvent(new Event('input')); })()""")
+    page.eval("""[...document.querySelectorAll('.ml-pick-item')].find(x => x.querySelector('.l').textContent === 'gamma5').click()""")
+    _wait_rows(page, [])
+    assert ok(mgr, "GET", f"/api/experiments/{eid}")["campaign"] == "gamma5"
+    assert other

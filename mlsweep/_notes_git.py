@@ -103,9 +103,10 @@ conflicts so both sides' work survives, and push again. Never force-push.
    update it before you stop.
 
 Markdown is GitHub-flavored plus `[[links]]`, `![[embeds]]`, `$math$`, `> [!note]`
-callouts, `[^footnotes]`, numbered figure captions (`Figure: ...`), and two live data
-blocks fetched from the manager: `mlsweep-chart` and `mlsweep-table`. Pandoc
-`:::` divs do not render. Rename notes with `mlsweep notes mv`, which keeps links
+callouts, `[^footnotes]`, numbered figure captions (`Figure: ...`), live data blocks
+fetched from the manager (`mlsweep-chart`, `mlsweep-table`), and links to the code an
+experiment ran (`[text](mlsweep:code/EXP/path#L40-60)`, and `mlsweep-code` and
+`mlsweep-diff` blocks). Pandoc `:::` divs do not render. Rename notes with `mlsweep notes mv`, which keeps links
 working. Full reference: `mlsweep docs notes`.
 
 ## Write for people

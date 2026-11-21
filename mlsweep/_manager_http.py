@@ -128,6 +128,8 @@ THROTTLE_KEY: web.AppKey["_AuthThrottle"] = web.AppKey("mlsweep_auth_throttle", 
 
 _MAX_JSON_BODY_BYTES = 128 * 1024 * 1024
 _MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+# Provenance recorded with a code submission (diff, sweep source and so on).
+_MAX_CODE_META_BYTES = 4 * 1024 * 1024
 _MAX_WS_MESSAGE_BYTES = 1024 * 1024
 # Zip exports build a temp file first; more than this at once wait their turn.
 _ZIP_SLOTS = asyncio.Semaphore(4)
@@ -763,6 +765,12 @@ async def _experiment_fields(
     existing = await get_experiment(db, experiment_id)
     if existing is not None and existing.campaign != campaign:
         return _wrong_campaign(experiment_id, existing.campaign, campaign, status=409)
+    code = body.get("code")
+    if code is not None:
+        if not isinstance(code, dict) or not isinstance(code.get("snapshot"), str):
+            return _error_response("'code' must be an object naming its 'snapshot'")
+        if len(_json_dumps(code)) > _MAX_CODE_META_BYTES:
+            return _error_response(f"'code' is larger than {_MAX_CODE_META_BYTES // (1024 * 1024)} MB")
     optimizer: dict[str, Any] = {}
     if body.get("optimize") is not None:
         if existing is not None:
@@ -790,6 +798,7 @@ async def _experiment_fields(
         "skip_rules": body.get("skip_rules") or {},
         "metric": body.get("metric"),
         "goal": goal,
+        "code": code,
         **optimizer,
     }
 
@@ -1742,7 +1751,8 @@ async def handle_gc(request: web.Request) -> web.Response:
 
     * run directories of experiments or runs that no longer exist;
     * database rows (metrics, logs, run nodes) whose run is gone;
-    * uploaded code archives no run uses, older than an hour.
+    * uploaded code archives and snapshots no run uses, older than an hour, and
+      stored file contents no remaining snapshot lists.
 
     ``{"vacuum": true}`` also compacts the database file afterwards.  The
     default is a dry run that changes nothing.
@@ -1762,22 +1772,29 @@ async def handle_gc(request: web.Request) -> web.Response:
     # A dry run changes nothing, so it does not hold up the scheduler.  A real
     # one keeps the lock until it has deleted: a run moved in meanwhile would
     # look like an orphan, since moving keeps a directory's old mtime.
+    from mlsweep._manager_code import object_gc_plan, remove_objects
+
     guard: AsyncContextManager[Any] = contextlib.nullcontext() if dry_run else state.lock
     async with guard:
         orphans = await find_orphans(db, artifact_min_age=_GC_MIN_AGE)
         active = set(state.runs)
         dirs, files = await asyncio.to_thread(_gc_scan, mlsweep_dir, orphans, active)
+        objects = await object_gc_plan(db, mlsweep_dir, {a["artifact_id"] for a in orphans["artifacts"]},
+                                       min_age=_GC_MIN_AGE, now=time.time())
+        object_bytes = sum(size for _, size in objects)
         plan = {
             "dry_run": dry_run,
             "directories": dirs,
             "artifact_files": files,
+            "objects": {"count": len(objects), "bytes": object_bytes},
             "database": orphans["rows"],
             "artifact_rows": len(orphans["artifacts"]),
-            "bytes": sum(item["bytes"] for item in dirs + files),
+            "bytes": sum(item["bytes"] for item in dirs + files) + object_bytes,
         }
         if dry_run:
             return _json_response(plan)
         deleted_rows = await state.db_writer.delete_orphans([a["artifact_id"] for a in orphans["artifacts"]])
+        await asyncio.to_thread(remove_objects, mlsweep_dir, [h for h, _ in objects], min_age=_GC_MIN_AGE)
 
         def _delete() -> int:
             n = 0
@@ -3041,7 +3058,9 @@ def create_app(
     app[THROTTLE_KEY] = _AuthThrottle()
 
     # Register REST routes
+    from mlsweep._manager_code import code_routes
     app.add_routes(routes)
+    app.add_routes(code_routes)
 
     # Static file serving for web UI
     webui_dir = Path(mlsweep_dir).expanduser().resolve() / "webui"

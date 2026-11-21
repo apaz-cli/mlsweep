@@ -43,6 +43,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 from mlsweep._shared import (
@@ -75,6 +76,7 @@ from mlsweep._shared import (
     same_attempt,
     set_color,
 )
+from mlsweep._snapshot import ObjectStore, fetch_object, is_snapshot_id, materialize, parse_manifest
 from mlsweep._topology import _gpu_topology, probe_usable_devices, visible_devices
 from mlsweep import _env
 
@@ -500,6 +502,59 @@ def _download_file(url: str, dest: str, timeout: int = 300) -> None:
                 f.write(chunk)
 
 
+# ── Code snapshots ────────────────────────────────────────────────────────────
+#
+# Each worker keeps the file contents its runs have used in <scratch>/.objects,
+# keyed by hash, and fetches only what a new snapshot adds.  The cache is
+# trimmed to MLSWEEP_OBJECT_CACHE_GB (default 20) after each run's code is
+# written out, least recently used first, never touching that run's files.
+
+_DEFAULT_OBJECT_CACHE_GB = 20.0
+
+
+def _object_cache() -> ObjectStore:
+    # Dot-prefixed so no experiment's scratch directory can have its name.
+    return ObjectStore(os.path.join(_scratch_dir, ".objects"))
+
+
+def _object_cache_limit() -> int:
+    try:
+        gb = float(os.environ.get("MLSWEEP_OBJECT_CACHE_GB", _DEFAULT_OBJECT_CACHE_GB))
+    except ValueError:
+        gb = _DEFAULT_OBJECT_CACHE_GB
+    return int(max(gb, 0.0) * 1e9)
+
+
+def _snapshot_urls(manifest_url: str) -> tuple[str, str]:
+    """(manager base URL, query string with the token) from a snapshot's manifest URL."""
+    parts = urlsplit(manifest_url)
+    return f"{parts.scheme}://{parts.netloc}", parts.query
+
+
+def _materialize_snapshot(msg: MsgRun, rs: RunState, workspace: str) -> None:
+    """Write the run's code snapshot into *workspace*, fetching only missing objects."""
+    base, query = _snapshot_urls(msg.artifact_url)
+    with urlopen(msg.artifact_url, timeout=120) as resp:
+        manifest = parse_manifest(json.loads(resp.read())["manifest"])
+    cache = _object_cache()
+    missing = {f.hash: f.size for f in manifest.files if not cache.has(f.hash)}
+    if missing:
+        _append_log(rs, f"[mlsweep] fetching {len(missing)} of {len(manifest.hashes())} code objects "
+                        f"({sum(missing.values()) / 1e6:.1f} MB); the rest are cached on this worker\n".encode())
+
+    def fetch(h: str) -> None:
+        _check_cancelled(rs)
+        fetch_object(cache, f"{base}/api/objects/{h}" + (f"?{query}" if query else ""), h)
+
+    materialize(manifest, workspace, cache, fetch=fetch)
+    # The cache only grows by fetching, so a run that fetched nothing has nothing to trim.
+    if missing:
+        try:
+            cache.trim(_object_cache_limit(), keep=manifest.hashes())
+        except OSError as exc:
+            print(f"[worker] object cache trim failed: {exc}", file=sys.stderr, flush=True)
+
+
 
 def _handle_run(msg: MsgRun, rs: RunState) -> None:
     """Set up the run, then spawn one training subprocess per GPU in its group."""
@@ -620,8 +675,19 @@ def _setup_and_spawn(msg: MsgRun, rs: RunState) -> None:
         remote_dir = msg.remote_dir or _remote_dir
         cwd = remote_dir
 
-    # ── Artifact download & extraction ───────────────────────────────────────
-    if msg.artifact_id and msg.artifact_url:
+    # ── Code: a snapshot from the object cache, or a legacy tarball ──────────
+    if msg.artifact_id and msg.artifact_url and is_snapshot_id(msg.artifact_id):
+        if workspace is None:
+            workspace = os.path.join(scratch_path, "workspace")
+            os.makedirs(workspace, exist_ok=True)
+        # Runs of one snapshot starting together fetch its objects once.
+        try:
+            with _artifact_lock_for(msg.artifact_id):
+                _materialize_snapshot(msg, rs, workspace)
+        finally:
+            _artifact_lock_done(msg.artifact_id)
+        cwd = workspace
+    elif msg.artifact_id and msg.artifact_url:
         try:
             with _artifact_lock_for(msg.artifact_id):
                 if workspace is None:

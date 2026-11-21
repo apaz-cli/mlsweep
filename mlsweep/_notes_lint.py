@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from mlsweep import _notes, _notes_blocks
+from mlsweep import _notes, _notes_blocks, _notes_code
 from mlsweep._notes_git import read_config
 from mlsweep._notes_rules import is_protected
 
@@ -48,6 +48,7 @@ KIND_TITLES = {
     "unknown-run": "Unknown run IDs",
     "block-spec": "Chart and table specs",
     "evidence-ref": "Evidence links",
+    "code-ref": "Code links and blocks",
     "stale-evidence": "Evidence numbers that do not match",
     "conflict-marker": "Leftover conflict markers",
     "empty-file": "Empty files",
@@ -57,6 +58,10 @@ _CONFLICT_RE = re.compile(r"^(<{7}|={7}|>{7})( |$)")
 _FENCE_OPEN_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`]*)")
 _EVIDENCE_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(\s*<?mlsweep:([^()\s<>]+)>?\s*\)")
 _CLAIM_NUM_CLEAN = re.compile(r"[^0-9eE+.\-]")
+# The last part of an evidence link that names a file, not a metric: a code link without `code/`.
+_LOOKS_LIKE_FILE = re.compile(
+    r"\.(py|pyi|sh|bash|toml|ya?ml|json|cfg|ini|txt|md|c|cc|cpp|h|hpp|cu|cuh|rs|go|js|ts|java|ipynb)(#L\d.*)?$",
+    re.IGNORECASE)
 
 
 def _check_conflict_markers(path: str, text: str, findings: list[Finding]) -> None:
@@ -108,9 +113,29 @@ def _check_blocks(
     evidence: dict[str, dict[str, Any]] | None,
     findings: list[Finding],
 ) -> int:
-    """Check chart/table specs and ``mlsweep:`` evidence links.  Returns the block count."""
+    """Check data blocks and ``mlsweep:`` links (evidence and code).  Returns the block count.
+
+    *evidence* holds what the manager resolved for each reference, code ones
+    included; without it, code references are only checked for form.
+    """
     count = 0
     for lang, body, line_no in _fences(text):
+        if lang in ("mlsweep-code", "mlsweep-diff"):
+            count += 1
+            try:
+                refs = _notes_code.block_refs(lang, body)
+                spec_warnings = (_notes_code.code_block_ref(body)[1] if lang == "mlsweep-code"
+                                 else _notes_code.diff_block_refs(body)[3])
+            except _notes_blocks.SpecError as exc:
+                findings.append(Finding("report", "block-spec", path, line_no, f"{lang}: {exc}"))
+                continue
+            for warning in spec_warnings:
+                findings.append(Finding("report", "block-spec", path, line_no, f"{lang}: {warning}"))
+            for ref in refs:
+                _check_code_ref(path, line_no, ref, evidence, findings, f"{lang} block")
+            if evidence is not None:
+                _check_code_block_extent(path, line_no, lang, body, evidence, findings)
+            continue
         kind = {"mlsweep-chart": "chart", "mlsweep-table": "table"}.get(lang)
         if kind is None:
             continue
@@ -157,6 +182,15 @@ def _check_blocks(
         line = _notes.strip_inline_code(raw_line)
         for m in _EVIDENCE_LINK_RE.finditer(line):
             link_text, raw = m.group(1), m.group(2)
+            if _notes_code.is_code_ref(raw):
+                _check_code_ref(path, i + 1, raw, evidence, findings, "code link")
+                continue
+            if _LOOKS_LIKE_FILE.search(raw):
+                findings.append(Finding(
+                    "report", "code-ref", path, i + 1,
+                    f"mlsweep:{raw} names a file, but a code link starts with `mlsweep:code/` "
+                    f"(mlsweep:code/{raw})", {"ref": raw}))
+                continue
             try:
                 exp, run, _metric, _at = _notes_blocks.parse_evidence_ref(raw)
             except _notes_blocks.SpecError as exc:
@@ -197,6 +231,50 @@ def _check_blocks(
     return count
 
 
+def _check_code_ref(path: str, line: int, raw: str, resolved: dict[str, dict[str, Any]] | None,
+                    findings: list[Finding], what: str) -> None:
+    try:
+        _notes_code.parse_code_ref(raw)
+    except _notes_code.CodeRefError as exc:
+        findings.append(Finding("report", "code-ref", path, line, f"{what} mlsweep:{raw}: {exc}", {"ref": raw}))
+        return
+    hit = (resolved or {}).get(raw)
+    if hit is not None and not hit.get("ok"):
+        findings.append(Finding("report", "code-ref", path, line,
+                                f"{what} mlsweep:{raw}: {hit.get('error', 'does not resolve')}", {"ref": raw}))
+    elif hit is not None and hit.get("experiment") and (hit.get("versions") or 1) > 1:
+        # An experiment appended to with other code: its ID means the latest version.
+        findings.append(Finding(
+            "report", "code-ref", path, line,
+            f"{what} mlsweep:{raw}: the runs of {hit['experiment']} used {hit['versions']} code "
+            f"versions and this shows the latest ({hit.get('short')}); to cite another, name its "
+            "snapshot instead of the experiment (`mlsweep code EXP` lists them)",
+            {"ref": raw, "versions": hit["versions"]}))
+
+
+def _check_code_block_extent(path: str, line: int, lang: str, body: str,
+                             resolved: dict[str, dict[str, Any]], findings: list[Finding]) -> None:
+    """A code block too long to show whole, or a diff whose path is in neither side's code."""
+    if lang == "mlsweep-code":
+        ref, _ = _notes_code.code_block_ref(body)
+        hit = resolved.get(ref.text())
+        if not hit or not hit.get("ok") or not hit.get("lines"):
+            return
+        shown = (ref.end or hit["lines"]) - (ref.start or 1) + 1
+        if shown > _notes_code.MAX_EXCERPT_LINES:
+            findings.append(Finding(
+                "report", "code-ref", path, line,
+                f"mlsweep-code block shows {shown} lines of {ref.path}, but only the first "
+                f"{_notes_code.MAX_EXCERPT_LINES} fit; narrow it with `lines:`", {"ref": ref.text()}))
+        return
+    sides = [resolved.get(r) for r in _notes_code.diff_path_refs(body)]
+    if sides and all(s is not None and not s.get("ok") and "no file" in str(s.get("error")) for s in sides):
+        _a, _b, prefix, _ = _notes_code.diff_block_refs(body)
+        findings.append(Finding("report", "code-ref", path, line,
+                                f"mlsweep-diff block: `{prefix}` is in neither experiment's code, "
+                                "so the diff is empty", {"path": prefix}))
+
+
 def evidence_refs(index: _notes.Index, root: str | Path) -> list[str]:
     """Every ``mlsweep:`` reference in the notes, in order, without duplicates.
 
@@ -216,6 +294,16 @@ def evidence_refs(index: _notes.Index, root: str | Path) -> list[str]:
                 ref = m.group(2)
                 if ref not in refs:
                     refs.append(ref)
+        for lang, body, _line in _fences(text):
+            if lang not in ("mlsweep-code", "mlsweep-diff"):
+                continue
+            try:
+                block = _notes_code.block_refs(lang, body)
+                if lang == "mlsweep-diff":
+                    block += _notes_code.diff_path_refs(body)
+            except _notes_blocks.SpecError:
+                continue
+            refs.extend(r for r in block if r not in refs)
     return refs
 
 
@@ -383,7 +471,9 @@ Mechanical lint report:
 
 Chart/table blocks and evidence links (`[0.42](mlsweep:EXP/RUN/metric@step)`)
 were checked for unknown experiments and runs, and each evidence number was
-compared with the logged metric. A stale-evidence finding means they disagree;
+compared with the logged metric. Code links (`mlsweep:code/EXP/path#L40-60`) and
+code/diff blocks were checked to resolve to a file and lines in the code that
+experiment ran; read the code itself with `mlsweep code EXP PATH`. A stale-evidence finding means they disagree;
 still judge whether the number is the right one to cite.
 """
 
@@ -407,7 +497,7 @@ def format_report(result: dict[str, Any]) -> str:
     s = result.get("stats", {})
     out.append(f"{s.get('notes', 0)} notes, {s.get('links', 0)} links, "
                f"{s.get('experiments_cited', 0)} experiments cited"
-               + (f", {s['data_blocks']} chart/table blocks" if s.get("data_blocks") else "")
+               + (f", {s['data_blocks']} data blocks" if s.get("data_blocks") else "")
                + ("" if s.get("experiments_checked") else "; experiment and run IDs not checked (no manager)"))
     return "\n".join(out)
 

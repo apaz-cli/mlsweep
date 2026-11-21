@@ -12,7 +12,7 @@ mlsweep has three components:
 
 **`mlsweep_run`** is a thin HTTP client. Loads a sweep file, generates the run combinations, and POSTs them to the manager. It does not launch anything itself.
 
-All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, `campaign`, the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`, and `rename` for run display names.
+All three are reachable through one command: `mlsweep manager` / `mlsweep run` / `mlsweep worker` (the individual binaries are aliases). `mlsweep` also adds `watch`, `fetch`, `best`, `status`/`doctor`, `ls`, `logs`, `docs`, `gen_makefile`, `campaign`, the control verbs `cancel` / `retry` / `resume` / `stop` / `pause` / `unpause`, `rename` for run display names, and `code` for the code an experiment ran.
 
 The manager bootstraps mlsweep on remote workers automatically over SSH (builds wheels locally, SCPs them, installs into `/tmp/mlsweep_venv/`). No manual install is needed on workers.
 
@@ -371,11 +371,12 @@ mlsweep gc --downloads                  # also this machine's downloads of delet
 pending or running, and one whose ID the target already has. `purge` removes finished runs
 for good. `delete` leaves the experiment's files on disk until `gc --yes`.
 
-`gc` finds files of deleted experiments and runs, database rows of deleted runs, and code
-archives no run uses. Files and archives younger than an hour are left alone, in case
-they're about to be used. The System page's Storage cleanup does the same.
+`gc` finds files of deleted experiments and runs, database rows of deleted runs, code
+snapshots no run uses, and stored files that no remaining snapshot lists. Anything used in
+the last hour is left alone, in case it's about to be used again. The System page's Storage
+cleanup does the same.
 
-Each row on the Experiments page has `View ▾` (Results, Logs, Artifacts, Notes, Export)
+Each row on the Experiments page has `View ▾` (Results, Logs, Artifacts, Code, Notes, Export)
 and `Manage` (Rename, Move to campaign, Delete). A run's row has the same two: `View ▾`
 for its Artifacts and Logs, `Manage` for Rename, Cancel or Retry, Move and Delete. The
 page has
@@ -387,11 +388,13 @@ experiment's runs.
 ```sh
 mlsweep export tensorboard [--experiment EXP] [--only-done] [-o FILE.zip]
 mlsweep export wandb --project P [--entity E] [--api-key K] [--experiment EXP] [--only-done] [--no-wait]
+mlsweep export cancel EXPORT_ID
 ```
 
 The scope is one experiment, else the current campaign, else everything with
 `--all-campaigns`. `wandb` uploads from the manager, for real, using the key given or the
-manager's own login; set `WANDB_MODE=offline` where the manager runs to try it safely.
+manager's own login; set `WANDB_MODE=offline` where the manager runs to try it safely. An
+upload prints its export ID when it starts, and `export cancel` stops it.
 
 ## Workers and placement
 
@@ -399,6 +402,7 @@ manager's own login; set `WANDB_MODE=offline` where the manager runs to try it s
 mlsweep workers                         # list
 mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1]
 mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0] [--drain-devices 1]
+mlsweep workers update WORKER
 mlsweep workers rm WORKER
 mlsweep scheduler [--placement pack|spread]
 mlsweep reschedule EXP RUN [--to WORKER [--gpus 2,3]]
@@ -408,6 +412,9 @@ A worker's GPUs are each in its pool or out of it, and the scheduler only places
 GPUs in the pool. `--drain-devices` takes GPUs out of the pool and lets the runs already on
 them finish. `--remove-devices` takes them out and requeues their runs at once, without
 spending a retry. `--add-devices` puts GPUs back.
+
+`mlsweep workers update` installs the manager's mlsweep on a worker that runs older code and
+restarts it. Its in-flight runs are requeued without spending a retry.
 
 `mlsweep reschedule` stops a running run and queues it again without spending a retry. The
 run starts over, unless the script resumes from a checkpoint in `MLSWEEP_RUN_DIR`. With
@@ -423,6 +430,64 @@ menu.
 `pack` fills busy GPUs first, keeping whole GPUs and machines free for big jobs. `spread`
 puts each job on the least busy GPU. `mlsweep rename EXP --experiment-name NAME` renames an
 experiment; its ID never changes.
+
+## Code snapshots
+
+`mlsweep run` sends the project's files to the manager as a snapshot. A snapshot is a list
+of every file's path, size, permissions and the sha256 of its content. Its ID
+(`snap:3fa9c1e2...`) is the hash of that list, so the same files always give the same ID.
+Each file's content is stored once on the manager, under `<mlsweep-dir>/store/objects`,
+however many snapshots use it. A submission uploads only the files the manager doesn't
+have, and prints how much was new:
+
+```
+  OK    Code snap:3fa9c1e2b0d4: 240 files, 501.0 MB
+          new: 2 files, 41.0 KB · reused: 238 files, 501.0 MB
+          git: 9a5b61a3c0 master +1 uncommitted
+          not tracked by git: data/ (450.0 MB)
+```
+
+The manager refuses a submission whose new files add up to more than 512 MB. Files it
+already has don't count, so a large dataset costs one upload and is reused after that.
+Shipping data with the code works, but it's better kept out with `UPLOAD_EXCLUDE` and
+read from a path on the workers.
+
+Each worker keeps the files its runs have used in `<scratch>/.objects` and fetches only
+what a new snapshot adds. The cache is trimmed to 20 GB after each run's code is written
+out, least recently used first. `MLSWEEP_OBJECT_CACHE_GB` on the worker changes that.
+
+The client also records where the code came from: the sweep file, the `mlsweep run`
+command line, the host, and, when the project is a git repository, the commit, branch,
+remote, whether the tree had uncommitted changes, the diff against the commit, and which
+shipped files git doesn't track. None of this is needed to run anything. It's there for
+reading an experiment later.
+
+```sh
+mlsweep code EXP                        # the code EXP's runs used, and where it came from
+mlsweep code EXP yoco/train.py          # one file, as EXP ran it
+mlsweep code EXP --files [PREFIX]       # the snapshot's file list
+mlsweep code EXP --uncommitted          # the uncommitted changes recorded at submit
+mlsweep code diff EXP_A EXP_B           # what changed (--path DIR to narrow, --stat for a summary)
+mlsweep code checkout EXP DIR           # write EXP's code out to DIR
+```
+
+The dashboard's Code tab shows the same. Pick an experiment and a run, as on Logs, to see
+that run's code as a file tree and files with line numbers, and where it came from.
+Details shows everything recorded at submit, the uncommitted diff included. The version
+menu picks any version of the experiment's code. Compare picks another version, a run that
+used other code, or any experiment from a list you can search, then marks the tree and
+shows each changed file's diff. Right-click a file, a folder, a line number or a run for
+the rest: comparing a file with the previous version, links for a note, and downloads. The
+download button gives the whole snapshot as a zip. Results, Logs and Artifacts, a run's
+details and `View ▾` menu on the Experiments page, and the search palette link to it. Notes can link to a file and lines there, and show code or a diff inline.
+See "Code links" in `mlsweep docs notes`.
+
+Where an experiment ID is accepted, a snapshot ID works too, or a unique prefix of one with
+at least 8 hex digits. An experiment appended to with different code has more than one
+snapshot. `mlsweep code EXP` lists them all, and `--snapshot ID` picks one.
+
+Experiments submitted before snapshots ran from a single tarball per submission. Their
+runs still retry from it, but `mlsweep code`, the code page and notes can't show it.
 
 ## Notes
 

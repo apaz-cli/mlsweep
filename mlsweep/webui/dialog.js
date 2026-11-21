@@ -36,6 +36,33 @@
   border: 1px solid color-mix(in srgb, var(--bad) 33%, transparent); background: var(--btn-bg); color: var(--bad); font-weight: 600;
 }
 .ml-btn-danger:hover { background: color-mix(in srgb, var(--bad) 9%, transparent); }
+
+/* mlPick: a searchable list instead of typing an ID */
+.ml-dialog.ml-pick { width: 520px; gap: 10px; padding: 16px 18px 14px; }
+.ml-pick-search { width: 100%; box-sizing: border-box; padding: 7px 10px; font-size: 13px; border: 1px solid var(--border-input); border-radius: 5px; background: var(--btn-bg); color: var(--text); outline: none; }
+.ml-pick-search:focus { border-color: var(--accent, var(--radio-checked-border)); }
+.ml-pick-list { max-height: min(52vh, 440px); overflow-y: auto; margin: 0 -6px; padding: 0 6px; }
+.ml-pick-group { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; padding: 10px 8px 4px; }
+.ml-pick-item { display: flex; align-items: baseline; gap: 10px; padding: 6px 8px; border-radius: 5px; cursor: pointer; font-family: system-ui, -apple-system, sans-serif; }
+.ml-pick-item .l { font-size: 12.5px; color: var(--text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.ml-pick-item .s { font-size: 11px; color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+.ml-pick-item .mono { font-family: ui-monospace, monospace; font-size: 11.5px; }
+.ml-pick-item.on { background: var(--radio-checked-bg); }
+.ml-pick-item.on .l { color: var(--radio-checked-color); }
+.ml-pick-item.disabled { opacity: .45; cursor: default; }
+.ml-pick-empty { padding: 18px 8px; text-align: center; font-size: 12px; color: var(--text-muted); }
+.ml-pick-hint { font-size: 10.5px; color: var(--text-muted); }
+
+/* mlContextMenu: what a right-click offers */
+.ml-ctx { position: fixed; z-index: 1100; min-width: 210px; max-width: 340px; background: var(--surface); border: 1px solid var(--border-input); border-radius: 7px; box-shadow: 0 8px 28px rgba(0,0,0,.28); padding: 4px; font-family: system-ui, -apple-system, sans-serif; animation: ml-fade-in 0.08s ease; }
+.ml-ctx-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: 0; border-radius: 4px; padding: 6px 10px; font-size: 12.5px; color: var(--text); cursor: pointer; }
+.ml-ctx-item:hover, .ml-ctx-item.on { background: var(--btn-hover); }
+.ml-ctx-item .l { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ml-ctx-item .h { font-size: 10.5px; color: var(--text-muted); white-space: nowrap; }
+.ml-ctx-item.danger { color: var(--bad); }
+.ml-ctx-item[disabled] { opacity: .45; cursor: default; background: none; }
+.ml-ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+.ml-ctx-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
 
   const styleEl = document.createElement("style");
@@ -141,7 +168,189 @@
       ],
     });
   };
+
+  // mlPick(message, items, opts?) → Promise<value|null>
+  // A searchable list to choose from, so nobody has to type an ID.
+  // items: [{ value, label, sub?, group?, mono?, disabled? }], shown in order, under
+  // their group headings.  opts: { placeholder, okLabel, create: { label, prompt } }:
+  // *create* adds an item that asks for a new name instead (e.g. a new campaign).
+  window.mlPick = function (message, items, opts = {}) {
+    const { placeholder = "Search…", create = null } = opts;
+    return new Promise(resolve => {
+      const backdrop = document.createElement("div");
+      backdrop.className = "ml-dialog-backdrop";
+      const dlg = document.createElement("div");
+      dlg.className = "ml-dialog ml-pick";
+      dlg.setAttribute("role", "dialog");
+      dlg.setAttribute("aria-modal", "true");
+      const msg = document.createElement("div");
+      msg.className = "ml-dialog-message";
+      msg.textContent = message;
+      const search = document.createElement("input");
+      search.className = "ml-pick-search";
+      search.placeholder = placeholder;
+      search.autocomplete = "off";
+      search.spellcheck = false;
+      const list = document.createElement("div");
+      list.className = "ml-pick-list";
+      list.setAttribute("role", "listbox");
+      const hint = document.createElement("div");
+      hint.className = "ml-pick-hint";
+      hint.textContent = "↑↓ to move · Enter to choose · Esc to cancel";
+      const actions = document.createElement("div");
+      actions.className = "ml-dialog-actions";
+      actions.style.alignItems = "center";
+      const cancel = document.createElement("button");
+      cancel.className = "ml-btn ml-btn-cancel";
+      cancel.textContent = "Cancel";
+      const spacer = document.createElement("span");
+      spacer.style.flex = "1";
+      actions.append(hint, spacer, cancel);
+      dlg.append(msg, search, list, actions);
+      backdrop.append(dlg);
+
+      let shown = [], active = 0;
+      const CREATE = {};
+      async function choose(item) {
+        if (!item || item.disabled) return;
+        if (item.value === CREATE) {
+          backdrop.remove();
+          const name = await mlPrompt(create.prompt || create.label, search.value.trim(), { okLabel: "OK" });
+          resolve(name || null);
+          return;
+        }
+        backdrop.remove();
+        resolve(item.value);
+      }
+      function render() {
+        const q = search.value.trim().toLowerCase();
+        shown = items.filter(it => !q || [it.label, it.sub, String(it.value)].some(t => t && String(t).toLowerCase().includes(q)));
+        if (create) shown.push({ value: CREATE, label: create.label, group: "" });
+        active = Math.max(0, Math.min(active, shown.length - 1));
+        while (shown[active] && shown[active].disabled && active < shown.length - 1) active++;
+        list.replaceChildren();
+        if (!shown.length) {
+          const e = document.createElement("div");
+          e.className = "ml-pick-empty";
+          e.textContent = "Nothing matches.";
+          list.append(e);
+        }
+        let group = null;
+        shown.forEach((it, i) => {
+          if ((it.group || "") !== group) {
+            group = it.group || "";
+            if (group) {
+              const g = document.createElement("div");
+              g.className = "ml-pick-group";
+              g.textContent = group;
+              list.append(g);
+            }
+          }
+          const row = document.createElement("div");
+          row.className = "ml-pick-item" + (i === active ? " on" : "") + (it.disabled ? " disabled" : "");
+          row.setAttribute("role", "option");
+          const l = document.createElement("span");
+          l.className = "l" + (it.mono ? " mono" : "");
+          l.textContent = it.label;
+          row.append(l);
+          if (it.sub) {
+            const s2 = document.createElement("span");
+            s2.className = "s";
+            s2.textContent = it.sub;
+            row.append(s2);
+          }
+          row.title = it.title || String(it.value === CREATE ? "" : it.value);
+          row.onmouseenter = () => { if (!it.disabled) { active = i; paint(); } };
+          row.onclick = () => choose(it);
+          list.append(row);
+        });
+      }
+      function paint() {
+        [...list.querySelectorAll(".ml-pick-item")].forEach((r, i) => r.classList.toggle("on", i === active));
+        const on = list.querySelectorAll(".ml-pick-item")[active];
+        if (on) on.scrollIntoView({ block: "nearest" });
+      }
+      function step(d) {
+        if (!shown.length) return;
+        let i = active;
+        do { i = (i + d + shown.length) % shown.length; } while (shown[i].disabled && i !== active);
+        active = i;
+        paint();
+      }
+      search.addEventListener("input", () => { active = 0; render(); });
+      backdrop.addEventListener("keydown", e => {
+        if (e.key === "Escape") { backdrop.remove(); resolve(null); }
+        else if (e.key === "ArrowDown") { e.preventDefault(); step(1); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); step(-1); }
+        else if (e.key === "Enter") { e.preventDefault(); choose(shown[active]); }
+      });
+      backdrop.addEventListener("mousedown", e => { if (e.target === backdrop) { backdrop.remove(); resolve(null); } });
+      cancel.onclick = () => { backdrop.remove(); resolve(null); };
+      render();
+      document.body.append(backdrop);
+      search.focus();
+    });
+  };
+
+  // mlContextMenu(event, items) shows a right-click menu at the pointer.
+  // items: [{ label, hint?, run, danger?, disabled? } | "-" | { title }].
+  let ctx = null;
+  function closeCtx() { if (ctx) { ctx.remove(); ctx = null; } }
+  window.mlContextMenu = function (event, items) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCtx();
+    const menu = document.createElement("div");
+    menu.className = "ml-ctx";
+    menu.setAttribute("role", "menu");
+    for (const it of items) {
+      if (!it) continue;
+      if (it === "-") { const sep = document.createElement("div"); sep.className = "ml-ctx-sep"; menu.append(sep); continue; }
+      if (it.title) { const t = document.createElement("div"); t.className = "ml-ctx-title"; t.textContent = it.title; menu.append(t); continue; }
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ml-ctx-item" + (it.danger ? " danger" : "");
+      b.setAttribute("role", "menuitem");
+      if (it.disabled) b.disabled = true;
+      const l = document.createElement("span");
+      l.className = "l";
+      l.textContent = it.label;
+      b.append(l);
+      if (it.hint) { const h = document.createElement("span"); h.className = "h"; h.textContent = it.hint; b.append(h); }
+      b.onclick = () => { closeCtx(); it.run(); };
+      menu.append(b);
+    }
+    // Drop separators left at the edges by items that were filtered out.
+    while (menu.lastChild && menu.lastChild.className === "ml-ctx-sep") menu.lastChild.remove();
+    document.body.append(menu);
+    const w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = Math.max(4, Math.min(event.clientX, innerWidth - w - 4)) + "px";
+    menu.style.top = Math.max(4, Math.min(event.clientY, innerHeight - h - 4)) + "px";
+    ctx = menu;
+  };
+  document.addEventListener("mousedown", e => { if (ctx && !ctx.contains(e.target)) closeCtx(); }, true);
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeCtx(); });
+  window.addEventListener("blur", closeCtx);
+  window.addEventListener("resize", closeCtx);
+  document.addEventListener("scroll", closeCtx, true);
 })();
+
+// Experiments as mlPick items: the current campaign's first, newest first in each group.
+function mlExperimentItems(exps, { exclude = [], campaign = null } = {}) {
+  const skip = new Set(exclude);
+  const when = e => Date.parse(e.submit_time) || 0;
+  const day = e => { const d = new Date(e.submit_time); return isNaN(d) ? "" : d.toLocaleDateString([], { month: "short", day: "numeric" }); };
+  const camp = e => e.campaign || "default";
+  const sorted = exps.filter(e => !skip.has(e.experiment_id)).sort((a, b) => when(b) - when(a));
+  const item = (e, group) => ({
+    value: e.experiment_id, label: e.name && e.name !== e.experiment_id ? e.name : e.experiment_id,
+    sub: [campaign ? null : camp(e), day(e), e.status].filter(Boolean).join(" · "),
+    title: e.experiment_id, group,
+  });
+  if (!campaign) return sorted.map(e => item(e, ""));
+  return [...sorted.filter(e => camp(e) === campaign).map(e => item(e, `Campaign ${campaign}`)),
+          ...sorted.filter(e => camp(e) !== campaign).map(e => ({ ...item(e, "Other campaigns"), sub: [camp(e), day(e), e.status].filter(Boolean).join(" · ") }))];
+}
 
 function escHtml(s) {
   return String(s)

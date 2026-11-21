@@ -28,6 +28,7 @@ from mlsweep._shared import _BLUE, _BOLD, _BRIGHT_BLUE, _CYAN, _DIM, _GREEN, _MA
 from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
+    _fmt_bytes,
     _http_request,
     _manager_url,
     _report_failure,
@@ -1355,14 +1356,6 @@ def campaign_cmd(argv: list[str]) -> None:
 # ── move / purge / gc ──────────────────────────────────────────────────────────
 
 
-def _fmt_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            break
-        n /= 1024  # type: ignore[assignment]
-    return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-
-
 def _select_runs(manager: str, token: str, experiment: str, campaign: str | None,
                  run_ids: list[str], statuses: list[str]) -> list[str]:
     jobs = manager_list_experiment_jobs(manager, token, experiment, campaign=campaign)
@@ -1525,8 +1518,12 @@ def gc_cmd(argv: list[str]) -> None:
         sweep_print(f"  {f['path'][:70]:<70} {_fmt_bytes(f['bytes']):>9}  ({f['reason']})")
     for p, b in local:
         sweep_print(f"  {p:<70} {_fmt_bytes(b):>9}  (download of a deleted experiment)")
+    objects = plan.get("objects") or {"count": 0, "bytes": 0}
+    if objects["count"]:
+        sweep_print(f"  {'store/objects: ' + str(objects['count']) + ' stored files':<70} "
+                    f"{_fmt_bytes(objects['bytes']):>9}  (no code snapshot lists them)")
     sweep_print(f"  database: {db['metric_rows']} metric rows, {db['log_rows']} log rows, "
-                f"{db['job_node_rows']} run-node rows, {plan['artifact_rows']} archive records")
+                f"{db['job_node_rows']} run-node rows, {plan['artifact_rows']} code records")
     if not args.yes:
         if total or rows or plan["artifact_rows"]:
             sweep_print(f"{_YELLOW}Nothing deleted. Pass --yes to delete these "
@@ -1535,6 +1532,272 @@ def gc_cmd(argv: list[str]) -> None:
             sweep_print("Nothing to collect.")
     elif plan.get("vacuumed"):
         sweep_print("Database compacted.")
+
+
+# ── code: the code snapshots experiments ran ───────────────────────────────────
+
+
+_CODE_HELP = """\
+mlsweep code EXP                     what code EXP's runs used, and where it came from
+mlsweep code EXP PATH                print one file as EXP ran it
+mlsweep code EXP --files [PREFIX]    list the snapshot's files
+mlsweep code diff A B [--path P]     what changed between two experiments' code (--stat for a summary)
+mlsweep code checkout EXP DIR        write EXP's code out to DIR
+
+EXP is an experiment ID or a snapshot ID (snap:..., or a unique prefix of 8+ hex digits).
+When an experiment's runs used more than one snapshot, --snapshot picks one; the default
+is the latest submitted."""
+
+
+def _code_get(manager: str, token: str, path: str, *, raw: bool = False, timeout: int = 120) -> Any:
+    """GET *path*; exit with the manager's error on failure.  *raw* returns bytes."""
+    status, resp = _http_request("GET", _manager_url(manager, path), token, timeout=timeout, raw=raw)
+    if status != 200:
+        _fail(f"GET {path}", status, resp)
+    return resp
+
+
+def _die(msg: str) -> NoReturn:
+    sweep_print(f"{_RED}Error: {msg}{_RESET}")
+    sys.exit(1)
+
+
+def _experiment_code(manager: str, token: str, exp: str, campaign: str | None) -> dict[str, Any]:
+    require_campaign(manager, token, exp, campaign)
+    return _code_get(manager, token, _with_campaign(f"/api/experiments/{exp}/code", campaign))  # type: ignore[no-any-return]
+
+
+def _pick_snapshot(info: dict[str, Any], wanted: str | None) -> str:
+    """The snapshot of an experiment to show: *wanted*, else the latest submitted, else the most used."""
+    versions = info.get("versions") or []
+    ids = [v["artifact_id"] for v in versions]
+    if wanted:
+        matches: list[str] = [i for i in ids if i.startswith(wanted)]
+        if len(matches) != 1:
+            _die(f"{wanted} is {'ambiguous' if matches else 'not one of'} this experiment's code versions: "
+                 + ", ".join(ids))
+        return matches[0]
+    subs = [s["snapshot"] for s in info.get("submissions") or [] if s.get("snapshot") in ids]
+    if subs:
+        return subs[-1]  # type: ignore[no-any-return]
+    if not ids:
+        _die(f"no run of {info.get('experiment_id')} has code recorded")
+    return max(versions, key=lambda v: v["runs"])["artifact_id"]  # type: ignore[no-any-return]
+
+
+def _resolve_code_ref(manager: str, token: str, ref: str, campaign: str | None,
+                      snapshot: str | None) -> str:
+    """A snapshot ID from an experiment ID or a snapshot ID (or prefix)."""
+    from mlsweep._snapshot import is_snapshot_id, short_id
+    if is_snapshot_id(ref):
+        return ref
+    info = _experiment_code(manager, token, ref, campaign)
+    sid = _pick_snapshot(info, snapshot)
+    if not is_snapshot_id(sid):
+        _die(f"{ref} ran from a code archive made before snapshots, which can't be shown ({short_id(sid)}...).")
+    return sid
+
+
+def _snapshot_manifest(manager: str, token: str, sid: str) -> tuple[str, Any]:
+    from mlsweep._snapshot import parse_manifest
+    resp = _code_get(manager, token, f"/api/snapshots/{sid}")
+    return resp["artifact_id"], parse_manifest(resp["manifest"])
+
+
+def _print_code_info(info: dict[str, Any]) -> None:
+    from mlsweep._snapshot import short_id
+    versions = info.get("versions") or []
+    subs = info.get("submissions") or []
+    sweep_print(f"{_BOLD}{info['experiment_id']}{_RESET}")
+    if not versions:
+        sweep_print("  no run has code recorded")
+    for v in versions:
+        aid = v["artifact_id"]
+        if v.get("kind") == "snapshot":
+            size = f"{v['files']} files, {_fmt_bytes(v['size_bytes'])}"
+            sweep_print(f"  {_CYAN}{short_id(aid)}{_RESET}  {size}  ·  {v['runs']} run(s)")
+        else:
+            sweep_print(f"  {short_id(aid)}...  code archive from before snapshots  ·  {v['runs']} run(s)")
+    if len(versions) > 1:
+        sweep_print(f"  {_YELLOW}Runs of this experiment used {len(versions)} different code versions.{_RESET}")
+    for sub in subs:
+        meta = sub.get("meta") or {}
+        when = (sub.get("submit_time") or "")[:19].replace("T", " ")
+        sid = sub.get("snapshot") or "?"
+        sweep_print(f"\n  {_BOLD}Submitted{_RESET} {when} UTC from {meta.get('host', '?')}: {short_id(sid)}")
+        if meta.get("sweep_file"):
+            sweep_print(f"    sweep file  {meta['sweep_file']}"
+                        + ("" if meta.get("sweep_file_in_snapshot") else "  (outside the snapshot; source kept)"))
+        if meta.get("argv"):
+            sweep_print(f"    command     mlsweep run {' '.join(meta['argv'])}")
+        vcs = meta.get("vcs")
+        if vcs:
+            commit = (vcs.get("commit") or "no commit")[:12]
+            line = f"    git         {commit} {vcs.get('branch') or '(detached)'}"
+            if vcs.get("subject"):
+                line += f"  {vcs['subject'][:70]}"
+            sweep_print(line)
+            if vcs.get("dirty"):
+                n = len(vcs.get("changed_files") or [])
+                sweep_print(f"                {_YELLOW}{n} file(s) changed since that commit{_RESET} "
+                            f"(`mlsweep code {info['experiment_id']} --uncommitted` shows the diff)")
+            if vcs.get("untracked_count"):
+                sweep_print(f"                {vcs['untracked_count']} file(s) not tracked by git, "
+                            f"{_fmt_bytes(vcs.get('untracked_bytes') or 0)}")
+            if vcs.get("remote"):
+                sweep_print(f"    remote      {vcs['remote']}")
+
+
+def _code_diff(manager: str, token: str, a: str, b: str, prefix: str | None, stat_only: bool) -> None:
+    import difflib
+
+    from mlsweep._snapshot import FileEntry, diff_manifests, looks_binary, short_id
+    a_id, ma = _snapshot_manifest(manager, token, a)
+    b_id, mb = _snapshot_manifest(manager, token, b)
+    d = diff_manifests(ma, mb, prefix)
+    sweep_print(f"{_BOLD}{short_id(a_id)} → {short_id(b_id)}{_RESET}: {len(d.changed)} changed, "
+                f"{len(d.added)} added, {len(d.removed)} removed" + (f" under {prefix}" if prefix else ""))
+    if d.empty:
+        return
+    if stat_only:
+        for old, new in d.changed:
+            note = " (mode)" if old.hash == new.hash else ""
+            sweep_print(f"  M {new.path}  {_fmt_bytes(old.size)} → {_fmt_bytes(new.size)}{note}")
+        for f in d.added:
+            sweep_print(f"  {_GREEN}A{_RESET} {f.path}  {_fmt_bytes(f.size)}")
+        for f in d.removed:
+            sweep_print(f"  {_RED}D{_RESET} {f.path}")
+        return
+
+    limit = 2 << 20
+
+    def text(h: str | None, size: int) -> list[str] | None:
+        if h is None:
+            return []
+        if size > limit:
+            return None
+        data: bytes = _code_get(manager, token, f"/api/objects/{h}", raw=True)
+        if looks_binary(data):
+            return None
+        return data.decode("utf-8", errors="replace").splitlines(keepends=True)
+
+    pairs: list[tuple[str, FileEntry | None, FileEntry | None]] = (
+        [(o.path, o, n) for o, n in d.changed] + [(f.path, None, f) for f in d.added]
+        + [(f.path, f, None) for f in d.removed])
+    for path, was, now in sorted(pairs, key=lambda t: t[0]):
+        before = text(was.hash if was else None, was.size if was else 0)
+        after = text(now.hash if now else None, now.size if now else 0)
+        if before is None or after is None:
+            sweep_print(f"Binary or large file {path} differs "
+                        f"({_fmt_bytes(was.size) if was else 'absent'} → {_fmt_bytes(now.size) if now else 'absent'})")
+            continue
+        lines = list(difflib.unified_diff(before, after, fromfile=f"a/{path}" if was else "/dev/null",
+                                          tofile=f"b/{path}" if now else "/dev/null"))
+        if not lines and was and now:
+            sweep_print(f"mode change {path}: {oct(was.mode)} → {oct(now.mode)}")
+        for line in lines:
+            sys.stdout.write(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
+
+
+def _code_checkout(manager: str, token: str, sid: str, dest_dir: str) -> None:
+    import tempfile
+    from pathlib import Path
+
+    from mlsweep._snapshot import ObjectStore, fetch_object, materialize
+    dest = Path(dest_dir)
+    if dest.exists() and any(dest.iterdir()):
+        _die(f"{dest} is not empty")
+    sid, manifest = _snapshot_manifest(manager, token, sid)
+    with tempfile.TemporaryDirectory(prefix="mlsweep-code-") as tmp:
+        store = ObjectStore(tmp)
+
+        def fetch(h: str) -> None:
+            fetch_object(store, _manager_url(manager, f"/api/objects/{h}"), h,
+                         headers={"Authorization": f"Bearer {token}"}, timeout=600)
+
+        materialize(manifest, dest, store, fetch=fetch)
+    sweep_print(f"Wrote {len(manifest.files)} files ({_fmt_bytes(manifest.total_bytes)}) of {sid} to {dest}")
+
+
+def _print_uncommitted(manager: str, token: str, exp: str, campaign: str | None, snapshot: str | None) -> None:
+    info = _experiment_code(manager, token, exp, campaign)
+    sid = _pick_snapshot(info, snapshot)
+    subs = [s for s in info.get("submissions") or [] if s.get("snapshot") == sid]
+    if not subs:
+        _die(f"no submission of {sid[:17]} to {exp} recorded where its code came from")
+    full = _code_get(manager, token, f"/api/code/submissions/{subs[-1]['submission_id']}")
+    vcs = (full.get("meta") or {}).get("vcs") or {}
+    if not vcs.get("diff"):
+        sweep_print("No uncommitted changes were recorded." if vcs else "The code was not in a git repository.")
+        return
+    sys.stdout.write(vcs["diff"] if vcs["diff"].endswith("\n") else vcs["diff"] + "\n")
+    if vcs.get("diff_truncated"):
+        sweep_print(f"{_YELLOW}(cut at 1 MB when it was recorded){_RESET}")
+
+
+def code_cmd(argv: list[str]) -> None:
+    verb = argv[0] if argv and argv[0] in ("diff", "checkout") else "show"
+    parser = argparse.ArgumentParser(prog=f"mlsweep code{'' if verb == 'show' else ' ' + verb}",
+                                     description="The code experiments ran: show, print, diff, check out.",
+                                     epilog=_CODE_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_manager_args(parser)
+    parser.add_argument("--json", action="store_true", help="Print what the manager returned, as JSON")
+    if verb == "show":
+        parser.add_argument("ref", metavar="EXP", help="Experiment ID or snapshot ID")
+        parser.add_argument("path", nargs="?", help="A file to print, as the experiment ran it")
+        parser.add_argument("--files", nargs="?", const="", metavar="PREFIX", help="List the snapshot's files")
+        parser.add_argument("--snapshot", help="Which of the experiment's code versions (ID or prefix)")
+        parser.add_argument("--uncommitted", action="store_true",
+                            help="Print the uncommitted changes recorded when the code was submitted")
+    elif verb == "diff":
+        parser.add_argument("a", metavar="A")
+        parser.add_argument("b", metavar="B")
+        parser.add_argument("--path", help="Only files under this path")
+        parser.add_argument("--stat", action="store_true", help="List changed files instead of the diff")
+    else:
+        parser.add_argument("ref", metavar="EXP")
+        parser.add_argument("dest", metavar="DIR")
+        parser.add_argument("--snapshot", help="Which of the experiment's code versions (ID or prefix)")
+    args = parser.parse_args(argv[1:] if verb != "show" else argv)
+    manager, token = _manager_token(args)
+    campaign = _resolve_campaign(args)
+
+    if verb == "diff":
+        a = _resolve_code_ref(manager, token, args.a, campaign, None)
+        b = _resolve_code_ref(manager, token, args.b, campaign, None)
+        _code_diff(manager, token, a, b, args.path, args.stat)
+    elif verb == "checkout":
+        _code_checkout(manager, token, _resolve_code_ref(manager, token, args.ref, campaign, args.snapshot),
+                       args.dest)
+    elif args.uncommitted:
+        _print_uncommitted(manager, token, args.ref, campaign, args.snapshot)
+    elif args.path is not None or args.files is not None:
+        sid = _resolve_code_ref(manager, token, args.ref, campaign, args.snapshot)
+        if args.path is not None:
+            from urllib.parse import quote
+            data = _code_get(manager, token, f"/api/snapshots/{sid}/files/{quote(args.path)}", raw=True)
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+            return
+        from mlsweep._snapshot import under_prefix
+        sid, manifest = _snapshot_manifest(manager, token, sid)
+        for f in manifest.files:
+            if under_prefix(f.path, args.files):
+                print(f"{f.size:>12}  {oct(f.mode)[2:]}  {f.hash[:12]}  {f.path}")
+    elif args.ref.startswith("snap:"):
+        resp = _code_get(manager, token, f"/api/snapshots/{args.ref}")
+        info = {k: resp[k] for k in ("artifact_id", "files", "size_bytes")}
+        sid = info["artifact_id"]
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            sweep_print(f"{_BOLD}{sid}{_RESET}  {info['files']} files, {_fmt_bytes(info['size_bytes'])}")
+    else:
+        info = _experiment_code(manager, token, args.ref, campaign)
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            _print_code_info(info)
 
 
 # ── delete / export / workers / scheduler (what the dashboard can do) ──────────
@@ -1586,6 +1849,9 @@ def export_cmd(argv: list[str]) -> None:
     sub = parser.add_subparsers(dest="target", required=True)
     tb = sub.add_parser("tensorboard", help="Download a zip of TensorBoard event files")
     wb = sub.add_parser("wandb", help="Upload to Weights & Biases from the manager")
+    cancel = sub.add_parser("cancel", help="Stop a running W&B export")
+    _add_manager_args(cancel)
+    cancel.add_argument("export_id", help="The ID `export wandb` printed when it started")
     for p in (tb, wb):
         _add_manager_args(p)
         p.add_argument("--experiment", help="Only this experiment")
@@ -1597,6 +1863,16 @@ def export_cmd(argv: list[str]) -> None:
     wb.add_argument("--no-wait", action="store_true", help="Start the upload and return")
     args = parser.parse_args(argv)
     manager, token = _manager_token(args)
+
+    if args.target == "cancel":
+        status, resp = _http_request("POST", _manager_url(manager, f"/api/exports/{args.export_id}/cancel"),
+                                     token)
+        ok = status == 200 and isinstance(resp, dict)
+        _report(ok, f"W&B export {args.export_id}: cancelling")
+        if not ok:
+            _fail("cancel export", status, resp)
+        return
+
     query = _export_query(args)
 
     if args.target == "tensorboard":
@@ -1624,6 +1900,7 @@ def export_cmd(argv: list[str]) -> None:
     sweep_print(f"  started W&B export {eid}: {resp['total']} run(s) of {resp['scope_label']} "
                 f"to {args.entity + '/' if args.entity else ''}{args.project}")
     if args.no_wait:
+        sweep_print(f"  `mlsweep export cancel {eid}` stops it")
         return
     last = -1
     while True:
@@ -1664,14 +1941,16 @@ def _report_request(verb: str, success: str, method: str, url: str, token: str, 
 def workers_cmd(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="mlsweep workers",
-        description="List, connect, disconnect and tune workers (the System page's controls).",
+        description="List, connect, disconnect, update and tune workers (the System page's controls).",
     )
     sub = parser.add_subparsers(dest="action")
     ls = sub.add_parser("ls", help="List workers (the default)")
     add = sub.add_parser("add", help="Connect a worker over SSH (mlsweep is installed there for you)")
     rm = sub.add_parser("rm", help="Disconnect and forget a worker")
     st = sub.add_parser("set", help="Change a live worker's jobs per GPU or its GPUs")
-    for p in (ls, add, rm, st):
+    up = sub.add_parser("update", help="Reinstall this manager's mlsweep on a worker and restart it "
+                                       "(its in-flight runs are requeued)")
+    for p in (ls, add, rm, st, up):
         _add_manager_args(p)
     ls.add_argument("--json", action="store_true")
     add.add_argument("host", help="SSH destination, e.g. user@host")
@@ -1680,13 +1959,14 @@ def workers_cmd(argv: list[str]) -> None:
     add.add_argument("--venv", help="Existing venv for the worker binary (advanced)")
     add.add_argument("--devices", help="GPU indices to use, e.g. 0,1 (default: all)")
     rm.add_argument("worker_id")
+    up.add_argument("worker_id")
     st.add_argument("worker_id")
     st.add_argument("--jobs", type=int, help="Max concurrent jobs per GPU (0 = unlimited)")
     st.add_argument("--add-devices", help="GPU indices to start using, e.g. 2,3")
     st.add_argument("--remove-devices", help="GPU indices to stop using; their runs are re-queued")
     st.add_argument("--drain-devices",
                     help="GPU indices to take out of the pool while their runs finish")
-    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "-h", "--help")
+    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "update", "-h", "--help")
                              else ["ls", *argv])
     manager, token = _manager_token(args)
 
@@ -1705,6 +1985,14 @@ def workers_cmd(argv: list[str]) -> None:
         if not _report_request("remove worker", f"removed {args.worker_id}", "DELETE",
                                _manager_url(manager, f"/api/workers/{args.worker_id}"), token):
             sys.exit(1)
+        return
+    if args.action == "update":
+        status, resp = _http_request("POST", _manager_url(manager, f"/api/workers/{args.worker_id}/update"),
+                                     token)
+        ok = status == 202
+        _report(ok, f"{args.worker_id}: updating (`mlsweep workers` shows when it reconnects)")
+        if not ok:
+            _fail("update worker", status, resp)
         return
     if args.action == "set":
         if args.jobs is None and not (args.add_devices or args.remove_devices or args.drain_devices):

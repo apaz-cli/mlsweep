@@ -652,11 +652,14 @@ setInterval(refresh, 5000);
 function renderGc(plan, done) {
   const box = document.getElementById("gc-box");
   const db = plan.database;
+  const objects = plan.objects || { count: 0, bytes: 0 };
   const items = [...plan.directories, ...plan.artifact_files];
+  if (objects.count) items.push({ path: `store/objects (${objects.count} stored file${objects.count === 1 ? "" : "s"})`,
+                                  reason: "no code snapshot lists them", bytes: objects.bytes });
   const rows = db.metric_rows + db.log_rows + db.job_node_rows + plan.artifact_rows;
   let html = `<div class="gc-sum"><b>${done ? "Deleted" : "Can free"} ${fmtSize(plan.bytes)}</b> in ${items.length} path${items.length === 1 ? "" : "s"}` +
     `, plus ${rows} database record${rows === 1 ? "" : "s"} (${db.metric_rows} metric, ${db.log_rows} log, ${db.job_node_rows} run-node, ` +
-    `${plan.artifact_rows} archive).${done && plan.vacuumed ? " Database compacted." : ""}</div>`;
+    `${plan.artifact_rows} code).${done && plan.vacuumed ? " Database compacted." : ""}</div>`;
   if (items.length) {
     html += "<table>" + items.slice(0, 300).map(it =>
       `<tr><td>${escHtml(it.path)}</td><td class="why">${escHtml(it.reason)}</td><td class="num">${fmtSize(it.bytes)}</td></tr>`).join("") + "</table>";

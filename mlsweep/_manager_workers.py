@@ -55,6 +55,7 @@ from mlsweep._manager_state import (
     PIN_TTL_SECONDS, InFlightRun, ManagerState, Pin, Placement, RunKey, WorkerConn,
 )
 from mlsweep._parsync import parsync_bin
+from mlsweep._snapshot import is_snapshot_id
 from mlsweep._shared import (
     DEFAULT_SCRATCH_DIR,
     MsgCancel,
@@ -1764,7 +1765,10 @@ async def _dispatch_locked(
     env: dict[str, str] = json.loads(claimed.env)
     artifact_url = ""
     if state.artifact_base_url and claimed.artifact_id:
-        artifact_url = f"{state.artifact_base_url}/api/artifacts/{claimed.artifact_id}"
+        # A snapshot's URL gives its manifest; the worker fetches the objects
+        # it lacks from the same manager.  A legacy ID's gives the tarball.
+        kind = "snapshots" if is_snapshot_id(claimed.artifact_id) else "artifacts"
+        artifact_url = f"{state.artifact_base_url}/api/{kind}/{claimed.artifact_id}"
         if state.token:
             artifact_url += f"?token={state.token}"
     master_port = dist_master_port(job.experiment_id, job.run_id)

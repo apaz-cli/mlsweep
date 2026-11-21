@@ -898,3 +898,31 @@ def test_fetch_wait_settles_after_stop(manager_server):
     _mk_job(url, "e", "r1")  # pending: no worker
     ctl.stop_cmd(_base(url, server) + ["e", "--yes"])
     assert run_sweep._wait_until_settled(url, server.token, "e", interval=1) is False
+
+
+def test_workers_update_and_export_cancel_report_unknown_ids(manager_server, capsys):
+    server, url = manager_server
+    with pytest.raises(SystemExit):
+        ctl.workers_cmd(["update", "nope"] + _base(url, server))
+    with pytest.raises(SystemExit):
+        ctl.export_cmd(["cancel", "nope"] + _base(url, server))
+    out = capsys.readouterr().out
+    assert "update worker" in out and "cancel export" in out
+
+
+@pytest.mark.parametrize("argv, path, status", [
+    (["workers", "update", "w0"], "/api/workers/w0/update", 202),
+    (["export", "cancel", "x1"], "/api/exports/x1/cancel", 200),
+])
+def test_workers_update_and_export_cancel_post(monkeypatch, capsys, argv, path, status):
+    calls = []
+
+    def fake(method, url, token, **kw):
+        calls.append((method, url))
+        return status, {"worker_id": "w0", "status": "updating"}
+
+    monkeypatch.setattr(ctl, "_http_request", fake)
+    cmd = ctl.workers_cmd if argv[0] == "workers" else ctl.export_cmd
+    cmd(argv[1:] + ["--manager", "http://m:1", "--token", "t"])
+    assert calls == [("POST", "http://m:1" + path)]
+    assert ("updating" if argv[0] == "workers" else "cancelling") in capsys.readouterr().out

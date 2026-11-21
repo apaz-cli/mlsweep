@@ -26,6 +26,8 @@ function toggleExpView(expId) {
     { label: "Results", icon: "results", count: n.finished, href: pageHref("results.html", { experiment: expId }) },
     { label: "Logs", icon: "logs", count: n.total, href: pageHref("logs.html", { experiment: expId }) },
     { label: "Artifacts", icon: "artifacts", count: n.withArtifacts, href: pageHref("files.html", { experiment: expId }) },
+    { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId }),
+      title: "The code this experiment ran, with its file tree and where it came from" },
     notesItem(expId),
     { label: "Export", icon: "export", count: n.finished, href: pageHref("export.html", { experiment: expId }) },
   ].filter(Boolean));
@@ -126,15 +128,10 @@ async function bulkRuns(expId, action) {
 }
 
 async function moveRun(expId, runId) {
-  const input = await mlPrompt(`Move run ${runId} (with its metrics, logs and files) to experiment:`, "",
-                               { okLabel: "Move", placeholder: "target experiment ID" });
-  if (!input) return;
-  const target = input.trim();
-  if (!allExperiments.some(e => e.experiment_id === target)) {
-    const near = allExperiments.map(e => e.experiment_id).filter(id => id.includes(target)).slice(0, 5);
-    await mlAlert(`No experiment ${target}.` + (near.length ? `\n\nDid you mean:\n${near.join("\n")}` : ""));
-    return;
-  }
+  const here = MLCampaign.campaignOf(allExperiments.find(e => e.experiment_id === expId));
+  const target = await mlPick(`Move run ${runId}, with its metrics, logs and files, to:`,
+    mlExperimentItems(allExperiments, { exclude: [expId], campaign: here }), { placeholder: "Search experiments" });
+  if (!target) return;
   if (!(await postRuns(expId, "move", { run_ids: [runId], to: target }, "Move"))) return;
   delete jobsCache[target];
   await refreshRuns(expId);
@@ -149,8 +146,15 @@ async function purgeRun(expId, runId) {
 async function moveExperiment(expId) {
   const exp = allExperiments.find(e => e.experiment_id === expId);
   const current = MLCampaign.campaignOf(exp);
-  const target = await mlPrompt(`Move "${exp?.name || expId}" to campaign:`, current, { okLabel: "Move" });
-  if (target === null || target.trim() === current) return;
+  const counts = new Map();
+  for (const e of allExperiments) counts.set(MLCampaign.campaignOf(e), (counts.get(MLCampaign.campaignOf(e)) || 0) + 1);
+  const items = MLCampaign.names(allExperiments).map(c => ({
+    value: c, label: c, sub: `${counts.get(c) || 0} experiment${counts.get(c) === 1 ? "" : "s"}` + (c === current ? " · here now" : ""),
+    disabled: c === current,
+  }));
+  const target = await mlPick(`Move "${exp?.name || expId}" to campaign:`, items,
+                              { placeholder: "Search campaigns", create: { label: "New campaign…", prompt: "Name of the new campaign:" } });
+  if (!target || target.trim() === current) return;
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/campaign`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -222,6 +226,7 @@ function renderJobDetail(j) {
       <div class="job-detail-item"><span class="job-detail-label">Retries</span><span class="job-detail-value ${j.retry_count === 0 ? 'muted' : ''}">${retryStr}</span></div>
       <div class="job-detail-item"><span class="job-detail-label">Priority</span><span class="job-detail-value">${j.priority}</span></div>
       ${resources ? `<div class="job-detail-item"><span class="job-detail-label">Resources</span><span class="job-detail-value">${escHtml(resources)}</span></div>` : ""}
+      ${j.artifact_id ? `<div class="job-detail-item"><span class="job-detail-label">Code</span><span class="job-detail-value"><a class="code-btn" href="${pageHref("code.html", { experiment: j.experiment_id, run: j.run_id })}" title="The code this run used"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/></svg>Code <span class="snap">${escHtml(j.artifact_id.slice(0, 17))}</span></a></span></div>` : ""}
     </div>
     ${cmd ? `<div><div class="job-detail-label" style="margin-bottom:3px">Command</div><div class="job-cmd-block">${cmd.replace(/&/g,"&amp;").replace(/</g,"&lt;")}</div></div>` : ""}
   </div>`;
@@ -278,7 +283,7 @@ function runsHtml(expId) {
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
       <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
       <td class="actions-cell" data-act=""><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
@@ -514,7 +519,7 @@ function renderExperiments(exps) {
       <td>${relTime(exp.submit_time)}</td>
       <td class="notes-cell">${noteRefHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Notes, Export" ${act("toggleExpView", expId)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
       </div></td>`;
 

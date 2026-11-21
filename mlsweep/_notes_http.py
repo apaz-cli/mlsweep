@@ -37,10 +37,11 @@ from typing import Any
 
 from aiohttp import BodyPartReader, web
 
-from mlsweep import _notes, _notes_blocks, _notes_git, _notes_lint, _notes_rules
+from mlsweep import _notes, _notes_blocks, _notes_code, _notes_git, _notes_lint, _notes_rules
 from mlsweep._manager_db import list_experiment_meta, list_run_ids
 from mlsweep._manager_http import (
     DB_KEY,
+    DIR_KEY,
     _bad_request,
     _error_response,
     _json_body,
@@ -675,7 +676,7 @@ async def _run_lint(request: web.Request, svc: NotesService) -> dict[str, Any]:
     # Resolve evidence links first, in this event loop, so the thread that walks
     # the folder can compare each claimed number with the logged metric.
     refs = await asyncio.to_thread(_notes_lint.evidence_refs, idx, svc.root)
-    evidence = await _notes_blocks.resolve_evidence_many(request.config_dict[DB_KEY], refs)
+    evidence = await _resolve_refs(request, refs)
     return await asyncio.to_thread(_notes_lint.lint, svc.root, known_experiments=known,
                                    known_runs=runs, evidence=evidence, index=idx)
 
@@ -736,16 +737,23 @@ async def notes_block(request: web.Request) -> web.Response:
     body = await _json_body(request)
     kind = body.get("kind")
     raw = body.get("spec")
-    if kind not in ("chart", "table"):
-        raise _bad_request("kind must be 'chart' or 'table'")
+    if kind not in ("chart", "table", "code", "diff"):
+        raise _bad_request("kind must be 'chart', 'table', 'code' or 'diff'")
     if not isinstance(raw, str):
         raise _bad_request("spec must be the block's text")
     if len(raw.encode("utf-8", "replace")) > _notes_blocks.MAX_SPEC_BYTES:
         raise _bad_request("spec is too large")
     db = request.config_dict[DB_KEY]
+    mlsweep_dir = request.config_dict[DIR_KEY]
     try:
-        result = (await _notes_blocks.build_chart(db, raw) if kind == "chart"
-                  else await _notes_blocks.build_table(db, raw))
+        if kind == "chart":
+            result = await _notes_blocks.build_chart(db, raw)
+        elif kind == "table":
+            result = await _notes_blocks.build_table(db, raw)
+        elif kind == "code":
+            result = await _notes_code.build_code_block(db, mlsweep_dir, raw)
+        else:
+            result = await _notes_code.build_diff_block(db, mlsweep_dir, raw)
     except _notes_blocks.SpecError as exc:
         raise _bad_request(str(exc)) from None
     return _json_response(result)
@@ -753,14 +761,24 @@ async def notes_block(request: web.Request) -> web.Response:
 
 @notes_routes.post("/api/notes/evidence")
 async def notes_evidence(request: web.Request) -> web.Response:
-    """Resolve ``[number](mlsweep:EXP/RUN/METRIC@STEP)`` links for a note."""
+    """Resolve a note's ``mlsweep:`` links: ``[number](mlsweep:EXP/RUN/METRIC@STEP)`` and
+    ``[text](mlsweep:code/EXP/path#L40-60)``."""
     _service(request)
     body = await _json_body(request)
     refs = body.get("refs")
     if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
         raise _bad_request("refs must be a list of strings")
-    results = await _notes_blocks.resolve_evidence_many(request.config_dict[DB_KEY], refs)
-    return _json_response({"results": results})
+    return _json_response({"results": await _resolve_refs(request, refs)})
+
+
+async def _resolve_refs(request: web.Request, refs: list[str]) -> dict[str, dict[str, Any]]:
+    """Resolve ``mlsweep:`` links: ``code/...`` against the code snapshots, the rest against metrics."""
+    code = [r for r in refs if _notes_code.is_code_ref(r)]
+    other = [r for r in refs if not _notes_code.is_code_ref(r)]
+    db = request.config_dict[DB_KEY]
+    out = await _notes_blocks.resolve_evidence_many(db, other)
+    out.update(await _notes_code.resolve_code_refs(db, request.config_dict[DIR_KEY], code))
+    return out
 
 
 # ── the git remote ─────────────────────────────────────────────────────────────

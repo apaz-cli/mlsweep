@@ -34,7 +34,9 @@ body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg);
 
 /* Nav */
 nav { background: var(--chrome); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 4px; padding: 0 14px; height: 40px; flex-shrink: 0; }
-.nav-link { font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 4px 10px; border-radius: 4px; text-decoration: none; color: var(--btn-text); border: 1px solid transparent; }
+.nav-link svg { width: 13px; height: 13px; flex-shrink: 0; opacity: .8; }
+.nav-link.active svg { opacity: 1; }
 .nav-link:hover { background: var(--btn-hover); }
 /* A text shadow, not bold, so the active tab doesn't shift the tabs beside it. */
 .nav-link.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
@@ -53,6 +55,11 @@ nav { background: var(--chrome); border-bottom: 1px solid var(--border); display
 .icon-btn { flex-shrink: 0; width: 28px; height: 28px; background: var(--btn-bg); border: 1px solid var(--border-input); border-radius: 4px; font-size: 14px; cursor: pointer; color: var(--text); display: flex; align-items: center; justify-content: center; text-decoration: none; }
 .icon-btn svg { display: block; }
 .icon-btn:hover { background: var(--btn-hover); }
+/* "Code" links to the code a run used, on Logs, Artifacts and Experiments. */
+.code-btn { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 3px 10px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); text-decoration: none; white-space: nowrap; cursor: pointer; flex-shrink: 0; }
+.code-btn:hover { background: var(--btn-hover); color: var(--text-strong); }
+.code-btn svg { flex-shrink: 0; }
+.code-btn .snap { font-family: monospace; font-size: 10px; color: var(--text-muted); }
 
 /* Status badges: jobs and experiments.  A page may resize .badge. */
 .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }

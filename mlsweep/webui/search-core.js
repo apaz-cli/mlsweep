@@ -242,6 +242,8 @@
   function filesHref(j, file) { return qs("files", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id, ...(file ? { file } : {}) }); }
   function expResultsHref(e) { return qs("results", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
   function expFilesHref(e) { return qs("files", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
+  function codeHref(j) { return qs("code", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id }); }
+  function expCodeHref(e) { return qs("code", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
   function expLogsHref(e) { return qs("logs", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
   function copy(text, label) { if (window.copyText) copyText(text, label); }
   function go(href) { location.href = href; }
@@ -283,6 +285,7 @@
         { label: "Highlight in Results", icon: "▥", run: () => go(runHref(j)) },
         { label: "Open logs", icon: "≡", run: () => go(logsHref(j)) },
         { label: "Open artifacts", icon: "▣", run: () => go(filesHref(j)) },
+        { label: "Open code", icon: "‹›", run: () => go(codeHref(j)) },
         { label: "Copy run ID", icon: "⧉", run: () => copy(j.run_id, "Run ID copied") },
         { label: "Copy command", icon: "⌘", run: () => copy((() => { try { return JSON.parse(j.command || "[]").join(" "); } catch { return j.command || ""; } })(), "Command copied") },
         ...(["running", "dispatched", "pending"].includes(j.status) ? [{ label: "Cancel run", icon: "■", run: () => cancelRun(j) }] : []),
@@ -307,6 +310,7 @@
         { label: "Open results", icon: "▥", run: () => go(expResultsHref(e)) },
         { label: "Open logs", icon: "≡", run: () => go(expLogsHref(e)) },
         { label: "Open artifacts", icon: "▣", run: () => go(expFilesHref(e)) },
+        { label: "Open code", icon: "‹›", run: () => go(expCodeHref(e)) },
         { label: "Copy experiment ID", icon: "⧉", run: () => copy(e.experiment_id, "Experiment ID copied") },
         ...(e.status === "running" ? [{ label: "Pause experiment", icon: "❚❚", run: () => setExpStatus(e, "paused") }] : []),
         ...(e.status === "paused" ? [{ label: "Resume experiment", icon: "▶", run: () => setExpStatus(e, "running") }] : []),

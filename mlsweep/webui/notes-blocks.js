@@ -7,7 +7,19 @@
 // [0.42](mlsweep:EXP/RUN/metric@20000) ties a number in prose to the metric it
 // came from: this file asks the manager for that value, marks the number ✓
 // when it matches (⚠ when it does not) and links it to the run's Results.
+//
+// Code: [text](mlsweep:code/EXP/path#L40-60) links to a file as an experiment
+// ran it, on the code page.  ```mlsweep-code shows those lines in the note and
+// ```mlsweep-diff what changed between two experiments' code.
 "use strict";
+
+// Fence language -> block kind the manager evaluates.
+const NB_BLOCK_KINDS = {
+  "mlsweep-chart": "chart", "mlsweep-table": "table", "mlsweep-code": "code", "mlsweep-diff": "diff",
+};
+
+// The code page for a code reference (code/EXP[/path][#Lstart-end]).
+function codeHref(ref) { return pageHref("code.html", { ref: String(ref).replace(/^mlsweep:/i, "") }); }
 
 const NB_CACHE = new Map();          // kind + spec -> { at, data }
 const NB_CACHE_MS = 20_000;
@@ -68,6 +80,11 @@ function nbFigureMeta(raw) {
 // Before the data arrives, say what the spec asks for; the server sends the
 // final title (which also covers runs picked by `experiments`).
 function nbInitialTitle(raw, kind) {
+  if (kind === "code") return nbSpecField(raw, "title") || nbSpecField(raw, "path") || "Code";
+  if (kind === "diff") {
+    const a = nbSpecField(raw, "from"), b = nbSpecField(raw, "to");
+    return nbSpecField(raw, "title") || (a && b ? `${a} → ${b}` : "Diff");
+  }
   return nbSpecField(raw, "title") || nbSpecField(raw, "metric")
     || (kind === "table" ? "Table" : "Chart");
 }
@@ -353,8 +370,95 @@ function nbTableBox(data) {
 
 // ── block wiring ─────────────────────────────────────────────────────────────
 
+// ── code and diff blocks ─────────────────────────────────────────────────────
+
+// Lines with their numbers; highlighted like the note's code blocks when the
+// file type is known.  (Class names avoid nb-code / nb-diff, which the block's
+// card already carries.)
+function nbCodeBox(data) {
+  const holder = el("div", "nb-srcbox");
+  const table = el("div", "nb-src-lines");
+  const gutter = el("pre", "nb-gutter");
+  const code = el("pre", "nb-src");
+  const inner = el("code");
+  code.append(inner);
+  gutter.textContent = data.lines.map((_, i) => String(data.start + i)).join("\n");
+  const text = data.lines.join("\n");
+  const mode = typeof modeForPath === "function" ? modeForPath(data.path) : null;
+  if (mode && typeof CodeMirror !== "undefined" && CodeMirror.runMode) CodeMirror.runMode(text, mode, inner);
+  else inner.textContent = text;
+  table.append(gutter, code);
+  holder.append(table);
+  return holder;
+}
+
+// One file's unified diff as rows of old number, new number and the line.
+function nbDiffRows(lines) {
+  const table = el("table", "nb-diff-table");
+  let oldN = 0, newN = 0;
+  for (const line of lines) {
+    const tr = el("tr");
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line);
+    if (hunk) {
+      oldN = Number(hunk[1]); newN = Number(hunk[2]);
+      tr.className = "hunk";
+      tr.append(el("td", "ln", "⋯"), el("td", "ln", "⋯"),
+                el("td", "dl", `from line ${newN}${hunk[3] && hunk[3].trim() ? " · " + hunk[3].trim() : ""}`));
+      table.append(tr);
+      continue;
+    }
+    const sign = line[0];
+    const kind = sign === "+" ? "add" : sign === "-" ? "del" : "ctx";
+    tr.className = kind;
+    tr.append(el("td", "ln", kind === "add" ? "" : String(oldN)),
+              el("td", "ln", kind === "del" ? "" : String(newN)),
+              el("td", "dl", line.slice(1) || " "));
+    if (kind !== "add") oldN++;
+    if (kind !== "del") newN++;
+    table.append(tr);
+  }
+  return table;
+}
+
+function nbDiffBox(data) {
+  const box = el("div", "nb-diffbox");
+  const c = data.counts;
+  const summary = el("div", "nb-diff-sum");
+  summary.textContent = data.same ? "Both ran the same code."
+    : `${c.changed} changed, ${c.added} added, ${c.removed} removed` + (data.path ? ` under ${data.path}/` : "")
+      + (data.files.length > 1 ? " · click a file to show or hide it" : "");
+  summary.title = `${data.from.short} → ${data.to.short}`;
+  box.append(summary);
+  const many = data.files.length > 1;
+  for (const f of data.files) {
+    const det = el("details", "nb-diff-file");
+    const size = (f.diff || []).length;
+    // Whole new or deleted files and long diffs start closed when there are others to see.
+    det.open = !many || (f.status === "M" && size <= 60);
+    const sum = el("summary");
+    const label = { A: "added", D: "deleted", M: "changed", mode: "mode" }[f.status] || f.status;
+    sum.append(el("span", "nb-diff-status st-" + f.status.toLowerCase(), label),
+               el("span", "nb-diff-path", f.path));
+    if (f.added || f.removed) {
+      sum.append(el("span", "nb-diff-n add", "+" + (f.added || 0)), el("span", "nb-diff-n del", "−" + (f.removed || 0)));
+    }
+    det.append(sum);
+    if (f.binary) det.append(el("div", "nb-diff-note", "Binary or large file; not shown."));
+    else if (f.status === "mode") det.append(el("div", "nb-diff-note", `Mode ${f.old_mode} → ${f.new_mode}`));
+    else {
+      const body = el("div", "nb-diff-body");
+      body.append(nbDiffRows(f.diff));
+      if (f.truncated) body.append(el("div", "nb-diff-note", "Cut short; the code page has the whole file."));
+      det.append(body);
+    }
+    box.append(det);
+  }
+  return box;
+}
+
 function nbRenderBody(kind, data) {
-  const body = kind === "chart" ? nbChartBox(data) : nbTableBox(data);
+  const body = kind === "chart" ? nbChartBox(data) : kind === "table" ? nbTableBox(data)
+    : kind === "code" ? nbCodeBox(data) : nbDiffBox(data);
   if (data.warnings && data.warnings.length) {
     const holder = el("div");
     holder.append(body);
@@ -410,6 +514,11 @@ function nbBlock(pre, kind, raw, figState) {
       }
     };
     head.append(png);
+  } else if (kind === "code" || kind === "diff") {
+    const open = el("a", "nb-refresh nb-open", "↗");
+    open.title = "Open on the code page";
+    open.addEventListener("click", e => e.stopPropagation());
+    head.append(open);
   } else {
     const copy = el("button", "nb-refresh", "⧉");
     copy.title = "Copy this table as a markdown table";
@@ -449,6 +558,11 @@ function nbBlock(pre, kind, raw, figState) {
       title.textContent = data.title || spec.title
         || (kind === "chart" ? spec.metric || "Chart" : "Table");
       title.title = title.textContent;
+      const open = head.querySelector(".nb-open");
+      if (open) {
+        open.href = kind === "code" ? codeHref(data.ref)
+          : codeHref(`code/${data.to.experiment || data.to.snapshot}${data.path ? "/" + data.path : ""}`);
+      }
     } catch (e) {
       nbError(body, e.message || String(e));
     }
@@ -525,6 +639,49 @@ async function annotateEvidence(root) {
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.evRef);
     nbEvidenceMark(a, hit && hit.data);
+  }
+}
+
+// ── code links ───────────────────────────────────────────────────────────────
+
+// Says where a code link leads; marks it ⚠ when the file or lines are gone.
+async function annotateCode(root) {
+  const anchors = [...root.querySelectorAll("a[data-code-ref]")];
+  if (!anchors.length) return;
+  const refs = [...new Set(anchors.map(a => a.dataset.codeRef))];
+  const missing = refs.filter(r => {
+    const hit = EV_CACHE.get(r);
+    return !hit || Date.now() - hit.at >= EV_CACHE_MS;
+  });
+  if (missing.length) {
+    try {
+      const r = await apiFetch("/api/notes/evidence", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refs: missing }),
+      });
+      const body = await r.json();
+      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
+      for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
+    } catch (e) {
+      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
+    }
+  }
+  for (const a of anchors) {
+    const hit = EV_CACHE.get(a.dataset.codeRef);
+    const res = hit && hit.data;
+    a.querySelectorAll(".ev-mark").forEach(m => m.remove());
+    a.classList.remove("code-ok", "code-bad");
+    if (!res || !res.ok) {
+      a.classList.add("code-bad");
+      a.append(el("span", "ev-mark", "⚠"));
+      a.title = (res && res.error) || "could not check this code link";
+      continue;
+    }
+    a.classList.add("code-ok");
+    const lines = res.start ? (res.end && res.end !== res.start ? ` lines ${res.start}–${res.end}` : ` line ${res.start}`) : "";
+    const what = res.kind === "tree" ? `the code (${res.files} files)` : res.kind === "dir" ? `${res.path}/` : res.path + lines;
+    a.title = `${what} as ${res.experiment || "snapshot"} ran it · ${res.short}`
+      + (res.versions > 1 ? ` (latest of ${res.versions} code versions)` : "");
   }
 }
 

@@ -178,7 +178,8 @@ to zoom or hover, and use the header's `↻` to refetch.
 Source is the whole file in the same editor used for text and code files: monospace,
 line numbers, markdown colored by syntax. Frontmatter, links and embeds, callouts,
 footnotes, evidence links, tags and tables are colored too. Enter continues lists, brackets close
-themselves, `[[` or Ctrl+Space completes links, Ctrl+B and Ctrl+I format. `E` switches
+themselves, `[[` or Ctrl+Space completes links, experiment IDs complete after `mlsweep:` and on
+the `experiment:`, `from:` and `to:` lines of data blocks, Ctrl+B and Ctrl+I format. `E` switches
 Live and Source; Esc returns to Live (in a text file, it just leaves the editor). `S`
 shows source beside a rendered preview that follows as you type and scroll; click an
 image there to enlarge it. These views are for notes; other text and code files always
@@ -488,6 +489,65 @@ such as `@50%`. A metric name may contain `/` (`train/loss`); the first two
 segments are the experiment and run. Use it for every number about a run: it is one click of checking
 for the reader. Lint reports references to experiments or runs that do not exist,
 and numbers that do not match the logged value. Elsewhere the link is just a link.
+
+### Code links
+
+Point at the code an experiment ran:
+
+```md
+The warmup is in [lr()](mlsweep:code/EXP/yoco/train.py#L40-60).
+```
+
+The link opens the code page at that file, with lines 40 to 60 highlighted. `#L40`
+is one line, and the lines and path are optional, so `mlsweep:code/EXP` opens the
+whole snapshot. A snapshot ID works in place of the experiment (`snap:3fa9c1e2`, or any
+unique prefix of 8 or more hex digits), which pins one version of the code. An
+experiment ID means the latest code submitted to it. The tab checks each link, and
+marks it ⚠ with the reason when the file or the lines aren't in that code.
+
+Lint reports a code link or block whose file or lines aren't there, and a link written
+`mlsweep:EXP/path.py` without `code/`. It also reports a link to an experiment whose runs
+used more than one version of the code, since the link then shows only the latest. Name
+the snapshot instead to cite an older version. A code block longer than 400 lines, and a
+diff whose `path:` is in neither experiment's code, are reported too.
+
+On the code page, click a line number to select it, and shift-click to select a range.
+Right-click the line numbers, or use **Copy**, for the markdown that cites that
+selection, as a link or a `mlsweep-code` block. The code page is the
+dashboard's Code tab.
+
+Code that ran from a tarball, from before snapshots, can't be linked.
+
+### Code and diff blocks
+
+A `mlsweep-code` block shows the lines in the note:
+
+````
+```mlsweep-code
+experiment: EXP
+path: yoco/train.py
+lines: 40-60
+caption: The learning-rate schedule. {#fig-lr}
+```
+````
+
+`path` is required. Without `lines` the whole file is shown, up to 400 lines.
+`snapshot:` can replace `experiment:`.
+
+A `mlsweep-diff` block shows what changed between two experiments' code, one file at
+a time:
+
+````
+```mlsweep-diff
+from: EXP_A
+to: EXP_B
+path: yoco/
+```
+````
+
+`path` narrows it to one folder or file, and `context` sets the unchanged lines shown
+around each change (3 by default). Both blocks take `caption` and `title` like a chart,
+and the header's ↗ opens the code page.
 
 ### Footnotes
 

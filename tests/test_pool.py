@@ -19,9 +19,7 @@ from mlsweep.run_sweep import (
     manager_get_experiment_summary,
     manager_get_job_logs,
     manager_list_experiment_jobs,
-    manager_register_artifact,
     manager_submit_jobs_bulk,
-    manager_upload_artifact_data,
 )
 
 # Import helpers from conftest

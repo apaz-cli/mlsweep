@@ -11,9 +11,6 @@ Usage:
 import argparse
 import base64
 import collections
-import fnmatch
-import gzip
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -25,7 +22,6 @@ import ssl
 import struct
 import sys
 import tarfile
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -48,6 +44,8 @@ from mlsweep._sweep import (
     validate_optimize_spec,
     validate_options,
 )
+from mlsweep._provenance import submit_provenance, untracked_summary
+from mlsweep._snapshot import ScannedTree, scan_tree, short_id
 from mlsweep._writers import (
     MultiWriterFactory,
     WriterFactory,
@@ -187,10 +185,12 @@ def _http_request(
     headers: dict[str, str] | None = None,
     timeout: int = 30,
     quiet: bool = False,
+    raw: bool = False,
 ) -> tuple[int, Any]:
     """Make an HTTP request to the manager. Returns (status_code, parsed_response).
 
     Accepts JSON response and returns the parsed object or raw body for non-JSON.
+    With *raw*, a successful response's body is returned as bytes, undecoded.
     On error, prints a message (unless *quiet*) and returns (status, None).
     """
     req_headers = {"Authorization": f"Bearer {token}"}
@@ -205,12 +205,12 @@ def _http_request(
     req = Request(url, data=data, headers=req_headers, method=method)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            raw_body = resp.read()
             status = resp.status
             content_type = resp.headers.get_content_type()
     except HTTPError as e:
         status = e.code
-        raw = e.read()
+        raw_body = e.read()
         content_type = e.headers.get_content_type()
     except URLError as e:
         if not quiet:
@@ -221,14 +221,16 @@ def _http_request(
             sweep_print(f"{_RED}Error: HTTP request failed: {e}{_RESET}")
         return (0, None)
 
+    if raw and 200 <= status < 300:
+        return (status, raw_body)
     # Decode by declared type. Guessing breaks on text bodies that happen to
     # be valid JSON, such as a one-line metrics.jsonl.
     if content_type == "application/json":
         try:
-            return (status, json.loads(raw))
+            return (status, json.loads(raw_body))
         except json.JSONDecodeError:
             pass
-    return (status, raw.decode("utf-8", errors="replace") if raw else None)
+    return (status, raw_body.decode("utf-8", errors="replace") if raw_body else None)
 
 
 def _ws_refusal(header: str, body: bytes) -> str:
@@ -502,8 +504,11 @@ def manager_create_experiment(
     campaign: str = DEFAULT_CAMPAIGN,
     jobs: list[dict[str, Any]] | None = None,
     optimize: dict[str, Any] | None = None,
+    code: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Create an experiment in *campaign* on the manager. Returns the response dict or None.
+
+    *code* is the provenance of the code snapshot the jobs use, recorded with the experiment.
 
     With *jobs*, the experiment and its jobs are created in one atomic request:
     either all of it lands or none of it does.
@@ -528,6 +533,7 @@ def manager_create_experiment(
             "goal": goal,
             **({"jobs": jobs} if jobs else {}),
             **({"optimize": optimize} if optimize else {}),
+            **({"code": code} if code else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -539,87 +545,6 @@ def manager_create_experiment(
     return None
 
 
-def manager_register_artifact(
-    manager: str,
-    token: str,
-    artifact_id: str,
-    size_bytes: int,
-    setup_command: str | None = None,
-) -> dict[str, Any] | None:
-    """Register an artifact on the manager."""
-    status, resp = _http_request(
-        "POST",
-        _manager_url(manager, "/api/artifacts"),
-        token,
-        json_data={
-            "artifact_id": artifact_id,
-            "size_bytes": size_bytes,
-            "setup_command": setup_command,
-        },
-    )
-    if status in (200, 201) and isinstance(resp, dict):
-        sweep_print(f"  {_GREEN}OK{_RESET}    Artifact registered: {artifact_id[:16]}...")
-        return resp
-    _report_failure("Register artifact", status, resp)
-    return None
-
-
-def manager_upload_artifact_data(
-    manager: str,
-    token: str,
-    artifact_id: str,
-    filepath: str | Path,
-) -> bool:
-    """Upload artifact tarball bytes to the manager.
-
-    Uses PUT /api/artifacts/{artifact_id}/data with a raw binary body.  The file
-    object is handed to ``urlopen`` so the tarball is streamed instead of read
-    into memory; Content-Length lets the manager read exactly that many bytes.
-    """
-    path = Path(filepath)
-    if not path.exists():
-        sweep_print(f"  {_RED}FAIL{_RESET}  Artifact file not found: {filepath}")
-        return False
-
-    file_size = path.stat().st_size
-    url = _manager_url(manager, f"/api/artifacts/{artifact_id}/data")
-
-    try:
-        with open(path, "rb") as body:
-            req = Request(url, data=body, method="PUT", headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(file_size),
-            })
-            with urlopen(req, timeout=120) as response:
-                raw = response.read()
-                status = response.status
-                content_type = response.headers.get_content_type()
-    except HTTPError as e:
-        status = e.code
-        raw = e.read()
-        content_type = e.headers.get_content_type()
-    except URLError as e:
-        sweep_print(f"{_RED}Error: cannot reach manager at {url}: {e.reason}{_RESET}")
-        return False
-    except Exception as e:
-        sweep_print(f"{_RED}Error: artifact upload failed: {e}{_RESET}")
-        return False
-
-    resp: Any = None
-    if content_type == "application/json":
-        try:
-            resp = json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-    if resp is None and raw:
-        resp = raw.decode("utf-8", errors="replace")
-
-    if status in (200, 201, 204):
-        sweep_print(f"  {_GREEN}OK{_RESET}    Artifact uploaded ({file_size} bytes)")
-        return True
-    _report_failure("Upload artifact", status, resp)
-    return False
 
 
 def manager_submit_jobs_bulk(
@@ -1091,33 +1016,6 @@ def metric_keys(
     return sorted({k for row in rows for k, v in row.items() if isinstance(v, (int, float)) and k != "step"})
 
 
-def manager_check_artifact(
-    manager: str,
-    token: str,
-    artifact_id: str,
-) -> bool:
-    """Check if an artifact already exists on the manager via HEAD request.
-
-    Returns True if the artifact exists (HTTP 200), False otherwise.
-    """
-    url = _manager_url(manager, f"/api/artifacts/{artifact_id}")
-    req = Request(url, method="HEAD")
-    req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urlopen(req, timeout=30) as resp:
-            return resp.status == 200  # type: ignore[no-any-return]
-    except HTTPError as e:
-        if e.code == 404:
-            return False
-        sweep_print(f"  {_YELLOW}WARN{_RESET}  HEAD check for artifact failed: {e}")
-        return False
-    except URLError as e:
-        sweep_print(f"  {_YELLOW}WARN{_RESET}  Cannot reach manager for artifact check: {e.reason}")
-        return False
-    except Exception as e:
-        sweep_print(f"  {_YELLOW}WARN{_RESET}  Artifact check error: {e}")
-        return False
-
 
 def manager_local_experiment_dir(manager: str, token: str, experiment_id: str) -> Path | None:
     """The experiment's folder if the manager keeps it on this machine, else None.
@@ -1226,132 +1124,99 @@ def _safe_tar_extract(tar: tarfile.TarFile, dest: str) -> None:
 
 
 # ===============================================================================
-# Artifact packer
+# Code snapshots
 # ===============================================================================
 
-
-class _HashWriter:
-    """Wrap a file object, copying all writes to a hasher for incremental hashing."""
-
-    def __init__(self, f: Any, hasher: Any) -> None:
-        self.f: Any = f
-        self.hasher: Any = hasher
-
-    def write(self, data: bytes) -> int:
-        self.hasher.update(data)
-        return self.f.write(data)  # type: ignore[no-any-return]
-
-    def flush(self) -> None:
-        self.f.flush()
-
-    def close(self) -> None:
-        self.f.close()
+def _fmt_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            break
+        n /= 1024
+    return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
 
 
-def _project_files(root: Path, excludes: set[str], top_level_excludes: frozenset[str] = frozenset()) -> list[Path]:
-    """Directories and regular files under *root*, sorted, without
-    anything that matches an exclude pattern or is a symlink, socket or fifo.
-    A pattern without ``/`` matches any file or directory name at any depth; a pattern
-    with ``/`` matches the path relative to *root* (``runs/old``, ``data/*.bin``; a
-    leading ``/`` is ignored).
-    *top_level_excludes* are directory names skipped directly under *root* only."""
-    name_pats = [p for p in excludes if "/" not in p]
-    path_pats = [p.strip("/") for p in excludes if "/" in p]
-
-    def skipped(path: Path) -> bool:
-        if any(fnmatch.fnmatchcase(path.name, pat) for pat in name_pats):
-            return True
-        if not path_pats:
-            return False
-        rel = path.relative_to(root).as_posix()
-        return any(fnmatch.fnmatchcase(rel, pat) for pat in path_pats)
-
-    out: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        here = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not skipped(here / d) and not (here / d).is_symlink()
-                       and not (here == root and d in top_level_excludes)]
-        out.extend(here / d for d in dirnames)
-        for name in filenames:
-            path = here / name
-            if not skipped(path) and path.is_file() and not path.is_symlink():
-                out.append(path)
-    return sorted(out)
-
-
-def _build_output_dirs(root: Path) -> frozenset[str]:
-    """Top-level directories of *root* that are build output rather than source.
-
-    A project with a virtualenv in its root installs into it, so a top-level
-    ``build/`` there is setuptools' leftover, not code the runs need.  Without
-    a venv, ``build/`` may be the project's own source and is shipped.
-    """
+def _put_object(manager: str, token: str, h: str, path: Path) -> bool:
+    """Upload one file's bytes as object *h*, streamed rather than read into memory."""
     try:
-        has_venv = any((d / "pyvenv.cfg").is_file() for d in root.iterdir() if d.is_dir())
-    except OSError:
-        has_venv = False
-    return frozenset({"build"}) if has_venv else frozenset()
+        size = path.stat().st_size
+        with open(path, "rb") as body:
+            status, resp = _http_request("PUT", _manager_url(manager, f"/api/objects/{h}"), token,
+                                         data=body, headers={"Content-Length": str(size)}, timeout=600)
+    except OSError as e:
+        sweep_print(f"  {_RED}FAIL{_RESET}  Cannot read {path}: {e}")
+        return False
+    if status in (200, 201):
+        return True
+    _report_failure(f"Upload {path}", status, resp)
+    return False
 
 
-def _pack_project(
-    project_root: str | Path,
-    *,
-    exclude_patterns: list[str] | None = None,
-) -> tuple[str, str]:
-    """Create a tar.gz of the project directory.
+def upload_snapshot(
+    manager: str,
+    token: str,
+    tree: ScannedTree,
+) -> tuple[str, dict[str, int]] | None:
+    """Send the manager the files of *tree* it does not have, then register the snapshot.
 
-    Returns (tarball_path, sha256_hex).
-    Skips common VCS and cache directories, matching each path component
-    against shell-style patterns.  Skipped directories are not walked, so a
-    large ``.venv`` costs nothing.  Packing is deterministic: the same tree
-    gives the same sha256, which is what lets the manager dedupe artifacts.
+    Returns (snapshot ID, counts of new and reused files and bytes), or None
+    after reporting why it failed.
     """
-    root = Path(project_root).resolve()
-    if exclude_patterns is None:
-        exclude_patterns = []
-
-    excludes: set[str] = {
-        ".git", ".svn", ".hg",
-        "__pycache__", "*.pyc", "*.pyo",
-        ".mypy_cache", ".pytest_cache", ".ruff_cache",
-        "node_modules",
-        "outputs",
-        ".venv", "venv", ".env",
-        "*.egg-info", "*.dist-info",
-        ".DS_Store",
-        ".mlsweep",
+    manifest = tree.manifest
+    status, resp = _http_request("POST", _manager_url(manager, "/api/objects/missing"), token,
+                                 json_data={"hashes": sorted(manifest.hashes())}, timeout=120)
+    if status == 404:
+        sweep_print(f"  {_RED}FAIL{_RESET}  The manager does not take code snapshots; it is older than "
+                    "this mlsweep. Restart it with this version.")
+        return None
+    if status != 200 or not isinstance(resp, dict):
+        _report_failure("Check stored code", status, resp)
+        return None
+    missing: list[str] = resp.get("missing", [])
+    cap = int(resp.get("max_new_bytes") or 0)
+    sizes = {f.hash: f.size for f in manifest.files}
+    new_bytes = sum(sizes[h] for h in missing)
+    missing_set = set(missing)
+    if cap and new_bytes > cap:
+        biggest = sorted((f for f in manifest.files if f.hash in missing_set), key=lambda f: -f.size)[:8]
+        sweep_print(f"  {_RED}FAIL{_RESET}  {_fmt_bytes(new_bytes)} of new files to upload; the manager "
+                    f"takes at most {_fmt_bytes(cap)} per submission. Largest new files:")
+        for f in biggest:
+            sweep_print(f"          {_fmt_bytes(f.size):>9}  {f.path}")
+        sweep_print("        Leave out what the runs don't need with UPLOAD_EXCLUDE in the sweep file "
+                    "or --exclude. Files the manager already has don't count.")
+        return None
+    for h in missing:
+        src = tree.sources[h]
+        if sizes[h] >= 16 << 20:
+            sweep_print(f"  Uploading {src.relative_to(tree.root)} ({_fmt_bytes(sizes[h])})")
+        if not _put_object(manager, token, h, src):
+            return None
+    status, resp = _http_request("POST", _manager_url(manager, "/api/snapshots"), token,
+                                 json_data={"manifest": manifest.to_json()},
+                                 timeout=120)
+    if status != 201 or not isinstance(resp, dict):
+        _report_failure("Register code snapshot", status, resp)
+        return None
+    return resp["artifact_id"], {
+        "files": len(manifest.files), "bytes": manifest.total_bytes,
+        "new_files": sum(f.hash in missing_set for f in manifest.files), "new_bytes": new_bytes,
     }
-    for pat in exclude_patterns:
-        excludes.add(pat)
 
-    # Build tar in memory, then write to temp file
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz", prefix="mlsweep_artifact_")
-    os.close(tmp_fd)
 
-    sha = hashlib.sha256()
-
-    try:
-        with open(tmp_path, "wb") as raw_f:
-            hw = _HashWriter(raw_f, sha)
-            # Compress level 1: large ML projects ship tensors that are already
-            # incompressible, where level 9 is ~40x slower for ~10% less size.
-            # mtime=0 makes the gzip header fixed, so packing the same tree
-            # twice yields the same hash and the manager can dedupe artifacts.
-            with gzip.GzipFile(fileobj=hw, mode="wb", compresslevel=1, mtime=0) as gz:
-                with tarfile.TarFile(fileobj=gz, mode="w") as tar:
-                    for entry in _project_files(root, excludes, _build_output_dirs(root)):
-                        try:
-                            tar.add(str(entry), arcname=str(entry.relative_to(root)), recursive=False)
-                        except (PermissionError, OSError):
-                            continue
-
-        # SHA-256 is computed incrementally during the write above
-
-    except Exception:
-        os.unlink(tmp_path)
-        raise
-
-    return (tmp_path, sha.hexdigest())
+def _print_snapshot_summary(snapshot_id: str, stats: dict[str, int], provenance: dict[str, Any],
+                            tree: ScannedTree) -> None:
+    sweep_print(f"  {_GREEN}OK{_RESET}    Code {short_id(snapshot_id)}: {stats['files']} files, "
+                f"{_fmt_bytes(stats['bytes'])}")
+    reused_files = stats["files"] - stats["new_files"]
+    sweep_print(f"          new: {stats['new_files']} files, {_fmt_bytes(stats['new_bytes'])} · "
+                f"reused: {reused_files} files, {_fmt_bytes(stats['bytes'] - stats['new_bytes'])}")
+    vcs = provenance.get("vcs")
+    if vcs and vcs.get("commit"):
+        dirty = f" +{len(vcs.get('changed_files') or [])} uncommitted" if vcs.get("dirty") else ""
+        sweep_print(f"          git: {vcs['commit'][:10]} {vcs.get('branch') or '(detached)'}{dirty}")
+    big = [(p, b) for p, b in untracked_summary(vcs, tree.manifest) if b >= 1 << 20]
+    if big:
+        sweep_print("          not tracked by git: " + ", ".join(f"{p} ({_fmt_bytes(b)})" for p, b in big))
 
 
 # ===============================================================================
@@ -2128,48 +1993,24 @@ def main() -> None:
         sweep_print(f"{_GREEN}{var['name']}{_RESET}: {' '.join(colored)}")
         sweep_print(f"{' '.join(list(command) + var['overrides'] + list(extra))}\n")
 
-    # ── 1. Pack and upload artifact ────────────────────────────────────────
-    sweep_print("Packing project artifact...")
+    # ── 1. Snapshot the code, uploading only what the manager lacks ────────
+    sweep_print("Snapshotting project code...")
+    upload_exclude = info["upload_exclude"] + args.exclude
+    if upload_exclude:
+        sweep_print(f"  Leaving out: {', '.join(upload_exclude)}")
     try:
-        upload_exclude = info["upload_exclude"] + args.exclude
-        if upload_exclude:
-            sweep_print(f"  Leaving out: {', '.join(upload_exclude)}")
-        tarball_path, artifact_hash = _pack_project(_PROJECT_ROOT, exclude_patterns=upload_exclude)
-        sweep_print(f"  Artifact created: {os.path.basename(tarball_path)} "
-                    f"({os.path.getsize(tarball_path)} bytes, sha256={artifact_hash[:16]}...)")
-    except Exception as e:
-        sweep_print(f"  {_RED}FAIL{_RESET}  Cannot pack project: {e}")
+        tree = scan_tree(_PROJECT_ROOT, exclude_patterns=upload_exclude,
+                         cache_path=_mlsweep_dir() / "hashcache.db")
+    except OSError as e:
+        sweep_print(f"  {_RED}FAIL{_RESET}  Cannot read the project: {e}")
         sys.exit(1)
-
-    artifact_id = f"sha256:{artifact_hash}"
-
-    # Check if artifact already exists on manager
-    if manager_check_artifact(manager, token, artifact_id):
-        sweep_print(f"  {_GREEN}OK{_RESET}    Artifact already on manager, skipping upload")
-        try:
-            os.unlink(tarball_path)
-        except OSError:
-            pass
-    else:
-        # Register artifact
-        if not manager_register_artifact(
-            manager, token, artifact_id,
-            size_bytes=os.path.getsize(tarball_path),
-            setup_command=args.setup_command,
-        ):
-            os.unlink(tarball_path)
-            sys.exit(1)
-
-        # Upload artifact data
-        if not manager_upload_artifact_data(manager, token, artifact_id, tarball_path):
-            os.unlink(tarball_path)
-            sys.exit(1)
-
-        # Clean up tarball
-        try:
-            os.unlink(tarball_path)
-        except OSError:
-            pass
+    uploaded = upload_snapshot(manager, token, tree)
+    if uploaded is None:
+        sys.exit(1)
+    artifact_id, snap_stats = uploaded
+    provenance = submit_provenance(root=Path(_PROJECT_ROOT), manifest=tree.manifest,
+                                   snapshot_id=artifact_id, sweep_file=args.sweep_file)
+    _print_snapshot_summary(artifact_id, snap_stats, provenance, tree)
 
     # ── 2. Build job payloads ───────────────────────────────────────────────
     job_payloads = _build_job_payloads(
@@ -2204,6 +2045,7 @@ def main() -> None:
         campaign=campaign or DEFAULT_CAMPAIGN,
         jobs=job_payloads,
         optimize=spec,
+        code=provenance,
     ):
         sys.exit(1)
 

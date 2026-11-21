@@ -89,10 +89,23 @@ function bindActions(actions, eventName = "click") {
   });
 }
 
+// Small monochrome glyphs for the nav tabs and the row menus' View entries,
+// drawn with the text colour.  Keyed by page, except files.html is "artifacts".
+const VIEW_ICONS = {
+  experiments: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 1.5h5M6.5 1.5v4.3l-3.8 6.6a1.4 1.4 0 0 0 1.2 2.1h8.2a1.4 1.4 0 0 0 1.2-2.1L9.5 5.8V1.5"/><path d="M4.6 9.5h6.8"/></svg>',
+  results: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 13.5V2.5M2 13.5h12"/><path d="m4.5 10 3-3.5 2.5 2 3.5-5"/></svg>',
+  logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h6"/></svg>',
+  artifacts: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.5 14 4.5v7L8 14.5 2 11.5v-7z"/><path d="M2 4.5 8 7.5l6-3M8 7.5v7"/></svg>',
+  notes: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="m2.5 13.5.8-3.2 7.4-7.4 2.4 2.4-7.4 7.4z"/><path d="m9.5 3.7 2.4 2.4"/></svg>',
+  code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/></svg>',
+  export: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7.5"/><path d="m4.8 6.5 3.2 3.2 3.2-3.2"/><path d="M3 13.5h10"/></svg>',
+  system: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.6 4.75h.01M4.6 11.25h.01M7 4.75h.01M7 11.25h.01" stroke-width="2"/></svg>',
+};
+
 const MLChrome = (() => {
   const PAGES = [
     ["experiments", "Experiments"], ["results", "Results"], ["logs", "Logs"], ["files", "Artifacts"],
-    ["notes", "Notes"], ["export", "Export"], ["system", "System"],
+    ["code", "Code"], ["notes", "Notes"], ["export", "Export"], ["system", "System"],
   ];
   const root = document.documentElement;
 
@@ -120,9 +133,14 @@ const MLChrome = (() => {
     const extras = [...bar.children];
     const logo = make("img", { src: "/static/favicon.ico", width: 28, height: 28, alt: "",
                                style: "border-radius:3px;flex-shrink:0;margin-left:-8px;margin-right:4px" });
-    const links = PAGES.map(([page, label]) => page === bar.dataset.page
-      ? make("a", { className: "nav-link active", href: "#", textContent: label })
-      : make("a", { className: "nav-link", id: `nav-${page}`, href: pageHref(`${page}.html`), textContent: label }));
+    const links = PAGES.map(([page, label]) => {
+      const a = page === bar.dataset.page
+        ? make("a", { className: "nav-link active", href: "#" })
+        : make("a", { className: "nav-link", id: `nav-${page}`, href: pageHref(`${page}.html`) });
+      a.innerHTML = VIEW_ICONS[page === "files" ? "artifacts" : page];
+      a.append(label);
+      return a;
+    });
     const btn = make("button", { id: "theme-toggle" });
     const searchBtn = make("button", { id: "palette-open", className: "nav-search-btn", type: "button",
                                        title: "Search runs, experiments, notes and docs" });

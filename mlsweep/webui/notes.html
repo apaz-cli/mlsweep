@@ -303,6 +303,40 @@ body.wide-doc .doc { max-width: none; }
 .doc a.metric-ev.ev-unknown .ev-mark { color: var(--text-muted); }
 
 .doc .nb-block { border: 1px solid var(--border); border-radius: 6px; margin: 1.2em 0; background: var(--surface); overflow: hidden; }
+.doc a.code-ref { font-family: ui-monospace, monospace; font-size: .9em; text-decoration: none; border-bottom: 1px dotted var(--border-input); }
+.doc a.code-ref:hover { border-bottom-style: solid; }
+.doc a.code-ref.code-bad { color: var(--bad); border-bottom-color: var(--bad); }
+.doc a.code-ref .ev-mark { font-size: .78em; margin-left: 2px; }
+.doc .nb-open { text-decoration: none; }
+.doc .nb-block.nb-code .nb-body, .doc .nb-block.nb-diff .nb-body { padding: 0; }
+.doc .nb-src-lines { display: flex; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.55; max-height: 36em; overflow: auto; padding: 8px 0; }
+.doc .nb-src-lines pre { margin: 0; padding: 0; background: none; border: 0; border-radius: 0; font-size: inherit; line-height: inherit; overflow: visible; }
+.doc .nb-src-lines .nb-gutter { color: var(--text-muted); text-align: right; padding: 0 10px 0 12px; border-right: 1px solid var(--border); user-select: none; flex-shrink: 0; position: sticky; left: 0; background: var(--surface); }
+.doc .nb-src-lines .nb-src { flex: 1; min-width: 0; padding: 0 14px 0 12px; }
+.doc .nb-src-lines .nb-src code { background: none; border: 0; padding: 0; white-space: pre; display: block; font-size: inherit; line-height: inherit; }
+.doc .nb-diff-sum { font-size: 11.5px; color: var(--text-muted); padding: 7px 12px; }
+.doc .nb-diff-file { border-top: 1px solid var(--border); }
+.doc .nb-diff-file > summary { cursor: pointer; padding: 6px 12px; font-family: ui-monospace, monospace; font-size: 12.5px; display: flex; gap: 10px; align-items: baseline; list-style-position: inside; }
+.doc .nb-diff-file > summary:hover { background: var(--accent-soft); }
+.doc .nb-diff-status { font-family: system-ui, sans-serif; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px; border-radius: 3px; color: var(--text-muted); border: 1px solid var(--border); min-width: 4.5em; text-align: center; }
+.doc .nb-diff-status.st-a { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.doc .nb-diff-status.st-d { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.doc .nb-diff-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-strong); }
+.doc .nb-diff-n { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.doc .nb-diff-n.add { color: var(--ok); }
+.doc .nb-diff-n.del { color: var(--bad); }
+.doc .nb-diff-note { font-size: 12px; color: var(--text-muted); padding: 4px 12px 10px; }
+.doc .nb-diff-body { max-height: 36em; overflow: auto; border-top: 1px solid var(--border); }
+.doc .nb-diff-table { border-collapse: collapse; width: 100%; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5; margin: 0; }
+.doc .nb-diff-table td { border: 0; padding: 0; vertical-align: top; background: none; }
+.doc .nb-diff-table tr:nth-child(even) td, .doc .nb-diff-table tr:hover td { background: none; }
+.doc .nb-diff-table td.ln { width: 1%; min-width: 3.2em; padding: 0 8px; text-align: right; color: var(--text-muted); user-select: none; white-space: nowrap; font-size: 11px; }
+.doc .nb-diff-table td.dl { padding: 0 12px 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
+.doc .nb-diff-table tr.add td { background: var(--add-bg); }
+.doc .nb-diff-table tr.add td.dl { color: var(--add-fg); }
+.doc .nb-diff-table tr.del td { background: var(--del-bg); }
+.doc .nb-diff-table tr.del td.dl { color: var(--del-fg); }
+.doc .nb-diff-table tr.hunk td { background: var(--code-bg); color: var(--text-muted); font-size: 11px; padding: 3px 12px; font-family: system-ui, sans-serif; }
 .doc figure.note-fig > .nb-block { margin: 0; }
 .doc .nb-head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 10px; color: var(--text-muted); border-bottom: 1px solid var(--border); background: var(--code-bg); }
 .doc .nb-title { font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-label); font-family: ui-monospace, monospace; }

@@ -416,6 +416,7 @@ function renderRunBar() {
   document.getElementById("run-bar-links").innerHTML =
     `<a class="btn-link" href="${escHtml(runLink("logs", r.hash))}">Logs</a>`
     + `<a class="btn-link" href="${escHtml(runLink("files", r.hash))}">Artifacts</a>`
+    + `<a class="btn-link" href="${escHtml(runLink("code", r.hash))}" title="The code this run used">Code</a>`
     + `<button class="btn-link" title="Hide this run from the charts" ${act("hideRun", r.hash)}>Hide</button>`
     + `<button class="btn-link" title="Clear the highlight (Esc)" ${act("setSelectedRun", null)}>✕</button>`;
   MLStepTimer.tick();

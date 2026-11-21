@@ -323,7 +323,7 @@ function lvMouseDown(L, e) {
   if (e.target.closest("textarea")) return;
   // Links, experiment chips, checkboxes and the chart itself act; the rest
   // edits.  A chart's header is still inside the block, so clicking it edits.
-  if (e.target.closest("a, input, button, .nb-legend, .nb-table, .embed-note .embed-title, .nb-chart")) return;
+  if (e.target.closest("a, input, button, .nb-legend, .nb-table, .embed-note .embed-title, .nb-chart, .nb-srcbox, .nb-diffbox")) return;
   const blk = e.target.closest(".lv-block");
   if (blk) {
     e.preventDefault();
@@ -501,7 +501,16 @@ function linkHintTextarea(ta) {
   ta.addEventListener("input", () => {
     const before = ta.value.slice(0, ta.selectionStart);
     const m = /\[\[([^\]\[|#\n]*)$/.exec(before);
-    if (!m) { hideTaHint(ta); return; }
+    if (!m) {
+      // Not a [[link: maybe an experiment ID (see expContext in notes-view.js).
+      const line = before.slice(before.lastIndexOf("\n") + 1);
+      const typed = expContext(line, /(^|\n)\s*(```|~~~)\s*mlsweep-(chart|table|code|diff)\b/.test(before));
+      const items = typed === null ? [] : expMatches(typed, 12).filter(it => it.id !== typed);
+      if (!items.length) { hideTaHint(ta); return; }
+      showTaHint(ta, items.map(it => ({ insert: it.id, label: it.name || it.id,
+                                         note: (it.name && it.name !== it.id ? it.id + " · " : "") + (it.status || "") })), typed.length);
+      return;
+    }
     const items = rankPaths(m[1], S.files.map(f => f.path), 12);
     if (!items.length) { hideTaHint(ta); return; }
     showTaHint(ta, items, m[1].length);
@@ -535,6 +544,19 @@ function showTaHint(ta, items, typed) {
   h.style.top = Math.min(innerHeight - 220, r.bottom + 2) + "px";
   items.forEach((p, k) => {
     const li = el("li", "CodeMirror-hint" + (k === 0 ? " CodeMirror-hint-active" : ""));
+    if (typeof p === "object") {
+      // An experiment ID: insert it as it is.
+      li.append(document.createTextNode(p.label));
+      if (p.note) li.append(el("span", "hp", p.note));
+      li.onmousedown = e => {
+        e.preventDefault();
+        ta.setSelectionRange(ta.selectionStart - typed, ta.selectionStart);
+        document.execCommand("insertText", false, p.insert);
+        hideTaHint(ta);
+      };
+      h.append(li);
+      return;
+    }
     li.append(document.createTextNode(titleFor(p)));
     if (dirname(p)) li.append(el("span", "hp", dirname(p)));
     li.onmousedown = e => {

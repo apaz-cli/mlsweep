@@ -350,6 +350,9 @@ matches the path from the project root (`/runs` is only the top-level `runs`,
 `data/*.bin` only those files). `mlsweep run --exclude PATTERN` adds more for one
 submission; the run prints what it leaves out.
 
+The manager stores each file's content once and takes only what it doesn't already have,
+up to 512 MB of new files per submission. See "Code snapshots" in `mlsweep docs mlsweep`.
+
 ```python
 UPLOAD_EXCLUDE = ["/runs", "/swarm_run", "*.ckpt"]
 ```

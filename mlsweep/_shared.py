@@ -190,7 +190,7 @@ def line_chunks(data: bytes) -> list[bytes]:
 # to reach it.  tests/test_worker_update.py checks this against what importing
 # the worker loads.  Edits to other modules (manager, notes, CLI) leave the
 # fingerprint alone, so they do not mark workers outdated.
-WORKER_MODULES = ("__init__.py", "_colors.py", "_env.py", "_shared.py", "_topology.py",
+WORKER_MODULES = ("__init__.py", "_colors.py", "_env.py", "_shared.py", "_snapshot.py", "_topology.py",
                   "logger.py", "worker.py")
 
 
@@ -231,7 +231,7 @@ _fingerprint_cache: dict[tuple[str, tuple[Any, ...]], str] = {}
 # ── Protocol messages ──────────────────────────────────────────────────────────
 # Each message is a length-prefixed JSON object with a "t" field.  A worker
 # whose PROTOCOL_VERSION differs from the manager's is refused at hello.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3  # 3: code arrives as a snapshot (manifest + objects), see mlsweep._snapshot
 # A run is identified by (experiment, run_id).  Run names are derived from the
 # sweep, so two experiments of the same sweep use the same run_ids.
 # Each dispatch of a run is a new attempt, numbered from 1.  MsgRun carries it
@@ -271,10 +271,10 @@ class MsgRun:
     # Workspace-relative paths copied into artifacts/ after the run,
     # before the normal artifact rsync.
     artifact_id: str = ""
-    # Opaque identifier for the artifact tarball (used as download subpath).
+    # The run's code: a snapshot ("snap:...") or a legacy tarball ("sha256:...").
     artifact_url: str = ""
-    # Base URL of the artifact manager (e.g. "http://host:port").
-    # Worker fetches {artifact_url}/{artifact_id}.tar.gz if both are set.
+    # Where to get it: for a snapshot, its manifest URL (objects come from
+    # /api/objects/ on the same manager); for a tarball, the tarball itself.
     setup_command: list[str] = field(default_factory=list)
     # Command list executed in the workspace after artifact extraction
     # and before training. Run without shell for safety.

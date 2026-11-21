@@ -563,7 +563,7 @@ function countFigures(text) {
   for (const line of text.split("\n")) {
     if (fence) {
       if (line.trim().startsWith(fence) && line.trim().replace(/[`~]/g, "") === "") {
-        if (/^mlsweep-(chart|table)$/.test(lang) && hasCaption) {
+        if (/^mlsweep-(chart|table|code|diff)$/.test(lang) && hasCaption) {
           if (lang === "mlsweep-table") table++; else fig++;
         }
         fence = null; lang = ""; hasCaption = false;
@@ -694,8 +694,9 @@ function decorateFigures(root, figState) {
       const code = node.firstElementChild;
       if (!code || code.tagName !== "CODE") continue;
       const lang = (code.dataset.lang || "").toLowerCase();
-      if (lang !== "mlsweep-chart" && lang !== "mlsweep-table") continue;
-      nbBlock(node, lang === "mlsweep-table" ? "table" : "chart", code.textContent, state);
+      const kind = NB_BLOCK_KINDS[lang];
+      if (!kind) continue;
+      nbBlock(node, kind, code.textContent, state);
       continue;
     }
     const parts = nbCaptionParts(node);
@@ -814,6 +815,15 @@ function postProcess(root, srcPath, depth, opts = {}) {
   root.querySelectorAll("a[href]").forEach(a => {
     if (a.classList.contains("wikilink") || a.dataset.path) return;
     const href = a.getAttribute("href");
+    if (/^mlsweep:code\//i.test(href) && typeof annotateCode === "function") {
+      // A file (and lines) as an experiment ran it: opens the code page.
+      const ref = href.slice("mlsweep:".length);
+      a.dataset.codeRef = ref;
+      a.classList.add("code-ref");
+      a.href = codeHref(ref);
+      a.title = "Checking the code link…";
+      return;
+    }
     if (/^mlsweep:/i.test(href) && typeof annotateEvidence === "function") {
       a.dataset.evRef = href.slice("mlsweep:".length);
       a.classList.add("metric-ev");
@@ -845,6 +855,7 @@ function postProcess(root, srcPath, depth, opts = {}) {
   decorateFigures(root, opts.figBase);
   linkExperiments(root);
   if (typeof annotateEvidence === "function") annotateEvidence(root);
+  if (typeof annotateCode === "function") annotateCode(root);
   renderMath(root);
 }
 
@@ -1016,7 +1027,7 @@ function makeEditor(group) { return {
         "Ctrl-S": () => saveActiveNow(), "Cmd-S": () => saveActiveNow(),
         "Ctrl-B": cm => wrapSel(cm, "**"), "Cmd-B": cm => wrapSel(cm, "**"),
         "Ctrl-I": cm => wrapSel(cm, "*"), "Cmd-I": cm => wrapSel(cm, "*"),
-        "Ctrl-Space": cm => linkHint(cm, true),
+        "Ctrl-Space": cm => (expHint(cm) || linkHint(cm, true)),
         "Esc": cm => { if (cm.state.completionActive) return CodeMirror.Pass; const t = this.tab; if (t && t.kind === "md") { focusGroup(this.group.id); setMode("live"); } else cm.getInputField().blur(); },
       },
     });
@@ -1071,6 +1082,11 @@ function makeEditor(group) { return {
     this.cm.on("changes", debounce(() => this.decorateBlocks(this.tab), 200));
     // Typing "[[" opens link completion (autoCloseBrackets inserts brackets
     // itself, so this listens for changes rather than inputRead).
+    // Experiment IDs complete where a note names one: after mlsweep: and in data blocks.
+    this.cm.on("change", (cm, ch) => {
+      if (ch.origin !== "+input" || cm.state.completionActive) return;
+      if (/^[\w\-/:, ]$/.test(ch.text.join(""))) setTimeout(() => expHint(cm), 0);
+    });
     this.cm.on("change", (cm, ch) => {
       if (ch.origin === "setValue" || !ch.text || !ch.text.join("").includes("[")) return;
       if (cm.state.completionActive) return;
@@ -1207,6 +1223,62 @@ function wrapSel(cm, m) {
   if (s) cm.replaceSelection(m + s + m);
   else { const c = cm.getCursor(); cm.replaceRange(m + m, c); cm.setCursor({ line: c.line, ch: c.ch + m.length }); }
 }
+// ── experiment ID completion ──────────────────────────────────────────────────
+// Where a note names an experiment, offer the IDs instead of making the writer
+// look one up: after `mlsweep:` or `mlsweep:code/`, and on the experiment
+// lines of mlsweep-chart / -table / -code / -diff blocks.  *before* is the line
+// up to the cursor; *inBlock* says whether that line is inside such a block.
+const EXP_KEY_RE = /^\s*(?:experiments?|from|to)\s*:\s*(?:\[?[^\n]*,\s*)?\[?\s*([A-Za-z0-9_\-]*)$/i;
+function expContext(before, inBlock) {
+  const m = /mlsweep:(?:code\/)?([A-Za-z0-9_\-]*)$/.exec(before) || (inBlock && EXP_KEY_RE.exec(before));
+  return m ? m[1] : null;
+}
+function expMatches(typed, limit = 30) {
+  const q = typed.toLowerCase();
+  const scored = [];
+  for (const [id, m] of S.experiments) {
+    const name = (m.name || "").toLowerCase(), lid = id.toLowerCase();
+    const score = !q ? 1 : lid.startsWith(q) || name.startsWith(q) ? 3 : lid.includes(q) || name.includes(q) ? 2 : 0;
+    if (score) scored.push([score, id, m]);
+  }
+  // Better matches first, then the newest: generated IDs carry their date and time.
+  const stamp = id => (id.match(/\d{8}_\d{4}/) || [""])[0];
+  scored.sort((a, b) => b[0] - a[0] || stamp(b[1]).localeCompare(stamp(a[1])) || a[1].localeCompare(b[1]));
+  return scored.slice(0, limit).map(([, id, m]) => ({ id, name: m.name, status: m.status }));
+}
+function inDataBlock(cm, line) {
+  for (let i = line - 1; i >= 0 && i >= line - 60; i--) {
+    const t = cm.getLine(i).trim();
+    if (/^(```|~~~)/.test(t)) return /^(```|~~~)\s*mlsweep-(chart|table|code|diff)\b/.test(t);
+  }
+  return false;
+}
+// Show the completion if the cursor is where an experiment ID goes.  Returns whether it did.
+function expHint(cm) {
+  const cur = cm.getCursor();
+  const before = cm.getLine(cur.line).slice(0, cur.ch);
+  const typed = expContext(before, inDataBlock(cm, cur.line));
+  if (typed === null || !S.experiments.size) return false;
+  const items = expMatches(typed);
+  if (!items.length || (items.length === 1 && items[0].id === typed)) return false;
+  cm.showHint({
+    completeSingle: false,
+    hint() {
+      return {
+        from: { line: cur.line, ch: cur.ch - typed.length }, to: cur,
+        list: items.map(it => ({
+          text: it.id, displayText: it.name || it.id,
+          render(elt) {
+            elt.append(document.createTextNode(it.name || it.id));
+            elt.append(el("span", "hp", (it.name && it.name !== it.id ? it.id + " · " : "") + (it.status || "")));
+          },
+        })),
+      };
+    },
+  });
+  return true;
+}
+
 function linkHint(cm, force = false) {
   cm.showHint({
     completeSingle: false,

@@ -1,22 +1,13 @@
 // Row menus, shared by the Experiments and System pages.
 // Each row has one menu of places to go ("View") and one of things to change
 // ("Manage"), so a row costs two controls however many pages and verbs exist.
-// Needs chrome.js (act, escHtml, pageHref, apiFetch) loaded first.
+// Needs chrome.js (act, escHtml, pageHref, apiFetch, VIEW_ICONS) loaded first.
 // notes are optional: with no notes folder there is no Notes entry at all.
 let notesEnabled = false;
 let noteMentions = {};      // experiment id -> [note paths] (its own or its runs')
 let noteRunMentions = {};   // experiment id -> {run id: [note paths]}
 
 let rowMenu = null;
-
-// Small monochrome glyphs for the View menu, drawn with the text colour.
-const VIEW_ICONS = {
-  results: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 13.5V2.5M2 13.5h12"/><path d="m4.5 10 3-3.5 2.5 2 3.5-5"/></svg>',
-  logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h6"/></svg>',
-  artifacts: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.5 14 4.5v7L8 14.5 2 11.5v-7z"/><path d="M2 4.5 8 7.5l6-3M8 7.5v7"/></svg>',
-  notes: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="m2.5 13.5.8-3.2 7.4-7.4 2.4 2.4-7.4 7.4z"/><path d="m9.5 3.7 2.4 2.4"/></svg>',
-  export: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7.5"/><path d="m4.8 6.5 3.2 3.2 3.2-3.2"/><path d="M3 13.5h10"/></svg>',
-};
 
 // POST a run verb (cancel, retry) and report a failure; the caller refreshes.
 async function postRunAction(expId, runId, action) {
@@ -83,6 +74,7 @@ function toggleRunView(expId, runId) {
     { label: "Results", icon: "results", href: pageHref("results.html", { experiment: expId }) },
     { label: "Artifacts", icon: "artifacts", href: pageHref("files.html", { experiment: expId, run: runId }) },
     { label: "Logs", icon: "logs", href: pageHref("logs.html", { experiment: expId, run: runId }) },
+    { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId, run: runId }) },
     notesItem(expId, runId),
   ].filter(Boolean));
 }

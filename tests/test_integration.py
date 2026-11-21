@@ -59,12 +59,15 @@ def _run(
         cmd += ["--manager", manager_url, "--token", _TOKEN]
     cmd.extend(extra_args)
 
+    # The client's own state (its file hash cache) goes beside the output, not in ~/.mlsweep.
+    env = {**os.environ, "MLSWEEP_DIR": str(Path(output_dir).parent / "client-mlsweep")}
     result = subprocess.run(
         cmd,
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     if not expect_failure and result.returncode != 0:
         print(f"STDERR:\n{result.stderr}", file=sys.stderr)
@@ -449,55 +452,46 @@ def test_artifact_sweep_end_to_end(manager_with_worker, tmp_path):
         assert (run_dir / "training.csv").exists(), f"Missing training.csv for {job['run_id']}"
 
 
-def test_pack_project_skips_caches_venvs_and_build_metadata(tmp_path):
+def _snapshot_paths(root):  # type: ignore[no-untyped-def]
+    from mlsweep._snapshot import scan_tree
+    m = scan_tree(root).manifest
+    return {f.path for f in m.files} | set(m.dirs)
+
+
+def test_snapshot_skips_caches_venvs_and_build_metadata(tmp_path):
     """Excludes match each path component as a pattern (``*.egg-info``,
     ``*.pyc``), and excluded directories are not shipped."""
-    import tarfile
-    from mlsweep.run_sweep import _pack_project
     for rel in ("train.py", "pkg/mod.py", "pkg/__pycache__/mod.cpython-313.pyc", "stray.pyc",
                 "proj.egg-info/PKG-INFO", ".venv/lib/site.py", ".git/HEAD", "data/empty/.keep"):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_text("x")
     (tmp_path / "link.py").symlink_to(tmp_path / "train.py")
-    tarball, _ = _pack_project(tmp_path)
-    try:
-        names = set(tarfile.open(tarball).getnames())
-    finally:
-        os.unlink(tarball)
-    assert names == {"train.py", "pkg", "pkg/mod.py", "data", "data/empty", "data/empty/.keep"}
+    (tmp_path / "outputs_not" / "empty").mkdir(parents=True)
+    assert _snapshot_paths(tmp_path) == {"train.py", "pkg/mod.py", "data/empty/.keep", "outputs_not/empty"}
 
 
-def test_pack_project_is_deterministic(tmp_path):
-    """The same tree packs to the same sha, so the manager can dedupe artifacts."""
-    from mlsweep.run_sweep import _pack_project
+def test_snapshot_id_is_deterministic(tmp_path):
+    """The same tree gives the same snapshot ID, so nothing is stored twice."""
+    from mlsweep._snapshot import scan_tree
     (tmp_path / "train.py").write_text("x")
-    first, h1 = _pack_project(tmp_path)
-    second, h2 = _pack_project(tmp_path)
-    try:
-        assert h1 == h2
-        assert Path(first).read_bytes() == Path(second).read_bytes()
-    finally:
-        os.unlink(first)
-        os.unlink(second)
+    first = scan_tree(tmp_path).manifest.snapshot_id()
+    os.utime(tmp_path / "train.py", (1, 1))  # timestamps are not part of the ID
+    assert scan_tree(tmp_path).manifest.snapshot_id() == first
+    (tmp_path / "train.py").write_text("y")
+    assert scan_tree(tmp_path).manifest.snapshot_id() != first
 
 
 @pytest.mark.parametrize("venv", [True, False], ids=["with-venv", "without-venv"])
-def test_pack_project_skips_top_level_build_only_next_to_a_venv(tmp_path, venv):
+def test_snapshot_skips_top_level_build_only_next_to_a_venv(tmp_path, venv):
     """With a venv in the project root, a top-level build/ is setuptools output;
     without one it may be source.  A nested build/ is always shipped."""
-    import tarfile
-    from mlsweep.run_sweep import _pack_project
     for rel in ("train.py", "build/lib/train.py", "pkg/build/gen.py"):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_text("x")
     if venv:
         (tmp_path / ".venv").mkdir()
         (tmp_path / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
-    tarball, _ = _pack_project(tmp_path)
-    try:
-        names = set(tarfile.open(tarball).getnames())
-    finally:
-        os.unlink(tarball)
+    names = _snapshot_paths(tmp_path)
     assert "pkg/build/gen.py" in names
     assert ("build/lib/train.py" in names) is not venv
 

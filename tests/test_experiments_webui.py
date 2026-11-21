@@ -125,7 +125,7 @@ def test_menus_and_citation_counts(notes_mgr):
         b.eval(f"document.querySelector('#exp-row-{eid} .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", "2"], ["Logs", "2"], ["Artifacts", "0"],
-                                  ["Notes", "1"], ["Export", "2"]]
+                                  ["Code", None], ["Notes", "1"], ["Export", "2"]]
         hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
         assert any("results.html?experiment=" + eid in h for h in hrefs), hrefs
         assert any("logs.html?experiment=" + eid in h for h in hrefs), hrefs
@@ -144,7 +144,7 @@ def test_menus_and_citation_counts(notes_mgr):
         b.eval(f"document.querySelector('#exp-row-{other} .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", "1"], ["Logs", "1"], ["Artifacts", "0"],
-                                  ["Notes", "0"], ["Export", "1"]]
+                                  ["Code", None], ["Notes", "0"], ["Export", "1"]]
         assert b.eval("""(() => { const it = [...document.querySelectorAll('.row-menu-item')]
             .find(x => x.querySelector('.mi-label').textContent === 'Notes');
             return it.tagName === 'SPAN' && it.classList.contains('disabled')
@@ -157,7 +157,7 @@ def test_menus_and_citation_counts(notes_mgr):
         b.eval(f"document.querySelector('#exp-tbody tr[data-runs-of={eid}] .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", None], ["Artifacts", None], ["Logs", None],
-                                  ["Notes", "1"]]
+                                  ["Code", None], ["Notes", "1"]]
         run_hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
         # Results goes to the run's experiment; the other pages carry the run.
         results_hrefs = [h for h in run_hrefs if h.startswith("results.html")]

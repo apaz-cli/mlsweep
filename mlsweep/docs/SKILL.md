@@ -9,7 +9,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 
 - Never start a CUDA process yourself (smoke tests included) on GPUs a worker owns. Running jobs then OOM or fail with `CUDA-capable device(s) is/are busy`. Submit a 1-run sweep instead.
 - `retry` and `resume` rerun the code submitted with the experiment. After fixing a bug, submit a new sweep with `mlsweep run`. Use `retry` for failures outside the code, such as a lost worker or a full disk.
-- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv`, `outputs` and caches are skipped; symlinks are not followed). Do not commit just to submit. Leave large local folders (old runs, checkpoints) out with `UPLOAD_EXCLUDE = ["/runs"]` in the sweep file or `--exclude`; the run prints the upload size.
+- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv`, `outputs` and caches are skipped; symlinks are not followed). Do not commit just to submit. Leave large local folders (old runs, checkpoints) out with `UPLOAD_EXCLUDE = ["/runs"]` in the sweep file or `--exclude`; the run prints how much of the upload was new. `mlsweep code EXP [PATH]` shows the code an experiment ran, and `mlsweep code diff A B` what changed between two.
 - `logger.log()` without `step=` advances the step on every call. Log train and val metrics in one dict, or pass `step=`. Logging a step lower than the last one, or the same key twice at one step, raises `ValueError` (it would overwrite data).
 - A run that exits with an error is not retried automatically. Only runs lost with their worker are, up to `max_retries` (default 2). `retry` re-queues any finished run with a fresh budget, so read its log first.
 
@@ -18,7 +18,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 - Your own experiments, meaning the ones you submitted: `cancel`, `stop`, `pause` and `retry` are yours to use. Abort a sweep you can see is broken rather than letting it use the cluster.
 - Anyone else's experiments: leave them alone unless the user asks. If one you did not start looks broken, ask.
 - `purge`, `delete` and `gc --yes` destroy data, and `export wandb` publishes it. Run them only when the user asks.
-- `workers add`, `workers rm`, `workers set` and `scheduler --placement` change the cluster for everyone. Ask first.
+- `workers add`, `workers rm`, `workers set`, `workers update` and `scheduler --placement` change the cluster for everyone. Ask first.
 - If the manager is unreachable, check the URL and token, then ask. Start a manager only if you were told to. Its worker takes every visible GPU, and a manager started from your session can die with that session.
 - For anything else, use your judgment and ask the user when in doubt.
 

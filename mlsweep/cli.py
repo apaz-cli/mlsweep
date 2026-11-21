@@ -116,6 +116,7 @@ def _build_help(include_banner: bool = False) -> str:
             ("logs RUN", "tail a run's training.log"),
             ("metrics", "print runs' logged metrics as tables (--keys, --json, --csv)"),
             ("export tensorboard|wandb", "export finished runs (one experiment, a campaign, or all)"),
+            ("code EXP [PATH]", "the code an experiment ran (diff A B, checkout EXP DIR)"),
         ]),
         ("Control", [
             ("cancel EXP", "cancel runs (--running/--pending/--all)"),
@@ -483,6 +484,7 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 _CTL_CMDS = frozenset({
     "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "optimize", "stop", "pause", "unpause", "best",
     "wait", "campaign", "move", "purge", "gc", "delete", "export", "workers", "scheduler", "reschedule",
+    "code",
 })
 
 

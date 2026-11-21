@@ -24,6 +24,7 @@ const logDlBtn     = document.getElementById("log-dl-btn");
 const expDlAllBtn  = document.getElementById("exp-dl-all");
 const refreshBtn   = document.getElementById("refresh-btn");
 const renameBtn    = document.getElementById("rename-btn");
+const codeBtn      = document.getElementById("code-btn");
 
 // ── Auto-scroll ───────────────────────────────────────────────────────────────
 logOutput.addEventListener("scroll", () => {
@@ -149,6 +150,8 @@ async function selectJob(job) {
   logDlBtn.href            = authURL(`/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`);
   logDlBtn.download        = `${job.run_id}.log`;
   logDlBtn.style.display   = "";
+  codeBtn.href = pageHref("code.html", { experiment: job.experiment_id, run: job.run_id });
+  codeBtn.style.display = job.artifact_id ? "" : "none";
 
   // Highlight in sidebar.
   jobListEl.querySelectorAll(".job-item").forEach(el => {
