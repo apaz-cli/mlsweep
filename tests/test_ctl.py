@@ -6,13 +6,17 @@ real manager subprocess via the ``manager_server`` fixture.
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
 from conftest import _api_get, _api_post, _api_request
+from recording_server import RecordingServer
 
 from mlsweep import ctl
 from mlsweep import run_sweep
@@ -582,24 +586,22 @@ def test_wait_timeout_exits_two(manager_server):
     assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
 
 
-def test_wait_stalled_exits_three(monkeypatch, manager_server):
-    server, url = manager_server
+def _no_experiment():
+    raise AssertionError("the experiment should not be needed")
+
+
+def test_wait_stalled_exits_three():
     jobs = [{"run_id": "r1", "status": "running", "stall_seconds": 120.0, "stalled": False}]
-    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
-    with pytest.raises(SystemExit) as exc:
-        ctl.wait_cmd(_base(url, server) + ["e", "--until", "stalled", "--stalled-after", "60"])
-    assert exc.value.code == ctl.WAIT_EXIT_STALLED
+    code, message = ctl.wait_outcome("e", jobs, "stalled", 60, _no_experiment)
+    assert code == ctl.WAIT_EXIT_STALLED and "r1" in message
 
 
-def test_wait_stalled_ignores_fresh_runs(monkeypatch, manager_server):
-    server, url = manager_server
+def test_wait_stalled_ignores_fresh_runs():
     jobs = [{"run_id": "r1", "status": "running", "stall_seconds": 5.0, "stalled": False}]
-    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
-    with pytest.raises(SystemExit) as exc:
-        ctl.wait_cmd(_base(url, server) + ["e", "--until", "stalled",
-                                           "--stalled-after", "900", "--timeout", "0.1",
-                                           "--interval", "0.05"])
-    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+    assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment) is None
+    # The manager's own flag counts when it sends no stall_seconds.
+    jobs = [{"run_id": "r1", "status": "running", "stalled": True}]
+    assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment)[0] == ctl.WAIT_EXIT_STALLED
 
 
 def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
@@ -661,7 +663,7 @@ def test_fetch_wait_exits_nonzero_on_failure(manager_server, capsys):
 
 
 class _FakeWS:
-    """Stand-in for run_sweep._WebSocket that replays a fixed event list."""
+    """An event stream for ``_watch_cmd`` that replays a fixed event list."""
 
     def __init__(self, url, token, timeout=10.0):
         self.url = url
@@ -681,15 +683,14 @@ class _FakeWS:
         pass
 
 
-def test_watch_events_machine_readable(monkeypatch, capsys):
-    monkeypatch.setattr(run_sweep, "_WebSocket", _FakeWS)
-    run_sweep._watch_cmd(["e", "--events", "--manager", "http://x", "--token", "t"])
+def test_watch_events_machine_readable(capsys):
+    run_sweep._watch_cmd(["e", "--events", "--manager", "http://x", "--token", "t"], connect=_FakeWS)
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     events = [json.loads(line) for line in lines]
     assert [e["type"] for e in events] == ["job_started", "job_done", "experiment_done"]
 
 
-def test_watch_json_alias_and_failure_exit(monkeypatch, capsys):
+def test_watch_json_alias_and_failure_exit(capsys):
     class _FailWS(_FakeWS):
         def __init__(self, url, token, timeout=10.0):
             super().__init__(url, token, timeout)
@@ -698,9 +699,8 @@ def test_watch_json_alias_and_failure_exit(monkeypatch, capsys):
                 {"type": "experiment_done", "experiment_id": "e"},
             ]
 
-    monkeypatch.setattr(run_sweep, "_WebSocket", _FailWS)
     with pytest.raises(SystemExit) as exc:
-        run_sweep._watch_cmd(["e", "--json", "--manager", "http://x", "--token", "t"])
+        run_sweep._watch_cmd(["e", "--json", "--manager", "http://x", "--token", "t"], connect=_FailWS)
     assert exc.value.code == 1
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     events = [json.loads(line) for line in lines]
@@ -827,12 +827,12 @@ def test_wait_unknown_experiment_is_not_success(manager_server):
     assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
 
 
-def test_wait_unreachable_manager_is_not_a_run_failure(monkeypatch, manager_server):
-    server, url = manager_server
-    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: None)
+def test_wait_unreachable_manager_is_not_a_run_failure():
+    # Nothing listens on the discard port.
     with pytest.raises(SystemExit) as exc:
-        ctl.wait_cmd(_base(url, server) + ["e"])
+        ctl.wait_cmd(["e", "--manager", "http://127.0.0.1:9", "--token", "t", "--campaign", "default"])
     assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
+    assert ctl.wait_outcome("e", None, "done", 900, _no_experiment)[0] == ctl.WAIT_EXIT_UNKNOWN
 
 
 def test_wait_cancelled_runs_are_not_a_clean_finish(manager_server):
@@ -863,22 +863,20 @@ def test_leaderboard_names_the_runs_it_leaves_out(capsys):
     assert "1 failed" in out and "1 without this metric" in out and "best step" in out
 
 
-def test_run_reads_manager_from_env_with_no_flag(monkeypatch):
-    import argparse
-    monkeypatch.setenv("MLSWEEP_MANAGER", "http://elsewhere:1")
-    parser = argparse.ArgumentParser()
-    run_sweep._add_connection_args(parser)
-    assert parser.parse_args([]).manager == "http://elsewhere:1"
+def test_run_reads_manager_from_env_with_no_flag(tmp_path):
+    code = ("import argparse\nfrom mlsweep import run_sweep\np = argparse.ArgumentParser()\n"
+            "run_sweep._add_connection_args(p)\nprint(p.parse_args([]).manager)")
+    env = {**os.environ, "MLSWEEP_MANAGER": "http://elsewhere:1"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "http://elsewhere:1"
 
 
-def test_wait_does_not_call_an_unfinished_bayesian_budget_done(monkeypatch, manager_server):
-    server, url = manager_server
+def test_wait_does_not_call_an_unfinished_bayesian_budget_done():
     jobs = [{"run_id": "r1", "status": "done"}]
-    monkeypatch.setattr(ctl, "manager_list_experiment_jobs", lambda *a, **k: jobs)
-    monkeypatch.setattr(ctl, "awaits_more_runs", lambda *a, **k: True)
-    with pytest.raises(SystemExit) as exc:
-        ctl.wait_cmd(_base(url, server) + ["e", "--timeout", "0.1", "--interval", "0.05"])
-    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+    running_bayes = {"status": "running", "optimize": '{"budget": 4}'}
+    assert ctl.wait_outcome("e", jobs, "done", 900, lambda: running_bayes) is None
+    finished = {"status": "completed", "optimize": '{"budget": 4}'}
+    assert ctl.wait_outcome("e", jobs, "done", 900, lambda: finished)[0] == ctl.WAIT_EXIT_SETTLED
 
 
 def test_wait_after_stop_does_not_wait_for_pending_runs_forever(manager_server):
@@ -914,15 +912,10 @@ def test_workers_update_and_export_cancel_report_unknown_ids(manager_server, cap
     (["workers", "update", "w0"], "/api/workers/w0/update", 202),
     (["export", "cancel", "x1"], "/api/exports/x1/cancel", 200),
 ])
-def test_workers_update_and_export_cancel_post(monkeypatch, capsys, argv, path, status):
-    calls = []
-
-    def fake(method, url, token, **kw):
-        calls.append((method, url))
-        return status, {"worker_id": "w0", "status": "updating"}
-
-    monkeypatch.setattr(ctl, "_http_request", fake)
-    cmd = ctl.workers_cmd if argv[0] == "workers" else ctl.export_cmd
-    cmd(argv[1:] + ["--manager", "http://m:1", "--token", "t"])
-    assert calls == [("POST", "http://m:1" + path)]
+def test_workers_update_and_export_cancel_post(capsys, argv, path, status):
+    with RecordingServer(status, {"worker_id": "w0", "status": "updating"}) as server:
+        cmd = ctl.workers_cmd if argv[0] == "workers" else ctl.export_cmd
+        cmd(argv[1:] + ["--manager", server.url, "--token", "t"])
+    assert server.calls == [("POST", path)]
     assert ("updating" if argv[0] == "workers" else "cancelling") in capsys.readouterr().out
+

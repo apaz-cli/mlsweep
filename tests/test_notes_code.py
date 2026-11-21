@@ -237,7 +237,7 @@ def test_code_page_shows_the_file_with_the_lines_highlighted(page, mgr, exps) ->
     assert page.eval("[...document.querySelectorAll('tr.hl td.n')].map(t => t.textContent).join(',')") == "3,4"
     assert "min(1, step / 100)" in page.eval("document.querySelectorAll('table.src td.c')[3].textContent")
     assert page.eval("document.getElementById('sel').textContent") == "lines 3–4"
-    assert page.eval("document.querySelectorAll('#file-tree .file-row:not(.dir)').length") == 4
+    assert page.eval("document.querySelectorAll('#file-tree .tnode.file').length") == 4
     assert page.eval("document.getElementById('exp-select').value") == exps["b"]
     assert "train.py" in page.eval("document.getElementById('hdr-meta').textContent")
     # Clicking a line number selects it and updates the address.
@@ -355,7 +355,7 @@ def test_code_page_opens_a_directory(page, mgr, exps) -> None:  # type: ignore[n
     page.goto(static_url(mgr, "code.html", ref=f"code/{exps['a']}/data"))
     page.wait_for("document.querySelector('table.dirlist') !== null")
     assert page.eval("[...document.querySelectorAll('table.dirlist td.name')].map(t => t.textContent)") == ["blob.bin"]
-    assert page.eval("document.querySelector('#file-tree .file-row.selected').dataset.path") == "data"
+    assert page.eval("document.querySelector('#file-tree .tnode.active').dataset.path") == "data"
     # The breadcrumb's first part goes back to the top.
     page.eval("document.querySelector('#crumbs a').click()")
     page.wait_for("[...document.querySelectorAll('table.dirlist td.name')].some(t => t.textContent === 'data/')")
@@ -373,7 +373,7 @@ def test_code_page_versions_and_compare(page, mgr, exps) -> None:  # type: ignor
     page.eval("[...document.querySelectorAll('.ml-pick-item')].find(x => x.textContent.startsWith('v1')).click()")
     page.wait_for("document.getElementById('compare-bar').classList.contains('on')")
     page.wait_for("document.querySelector('table.src.diff') !== null")
-    marks = page.eval("Object.fromEntries([...document.querySelectorAll('#file-tree .file-row:not(.dir)')]"
+    marks = page.eval("Object.fromEntries([...document.querySelectorAll('#file-tree .tnode.file')]"
                       ".map(r => [r.dataset.path, r.querySelector('.mark').textContent]))")
     assert marks == {"train.py": "M", "warmup.py": "A"}
     assert page.eval("document.querySelectorAll('table.src.diff tr.add').length") == 1
@@ -415,7 +415,7 @@ def test_code_page_right_click_menus(page, mgr, exps) -> None:  # type: ignore[n
     page.goto(static_url(mgr, "code.html", experiment=exps["multi"], path="train.py"))
     page.wait_for("document.querySelectorAll('table.src tr').length === 6")
     # A file in the tree.
-    _right_click(page, '#file-tree .file-row[data-path="train.py"]')
+    _right_click(page, '#file-tree .tnode[data-path="train.py"]')
     labels = _ctx_labels(page)
     assert "Compare with the previous version" in labels and "Copy note link" in labels and "Download file" in labels
     page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent.startsWith('Compare with the previous')).click()")

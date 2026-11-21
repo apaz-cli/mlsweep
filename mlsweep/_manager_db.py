@@ -41,12 +41,13 @@ from mlsweep._sweep import SkipIndex
 
 _T = TypeVar("_T")
 
-JobStatus = Literal["pending", "dispatched", "running", "done", "failed", "xfailed", "cancelled"]
+# "pruned": stopped early by the sweep's PRUNE rule (a result, not a failure).
+JobStatus = Literal["pending", "dispatched", "running", "done", "failed", "xfailed", "cancelled", "pruned"]
 ExperimentStatus = Literal["running", "paused", "completed", "aborted"]
 
 JOB_STATUSES: tuple[JobStatus, ...] = get_args(JobStatus)
 ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
-FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled")
+FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled", "pruned")
 
 
 def _marks(values: Sequence[Any]) -> str:
@@ -91,6 +92,7 @@ class ExperimentRecord:
     metric: str | None = None  # ranking metric for this sweep (e.g. "val_loss")
     goal: str | None = None  # ranking direction: "minimize" | "maximize"
     optimize: str | None = None  # JSON spec of a Bayesian sweep the manager runs (see _sweep.py)
+    controls: str | None = None  # JSON MAX_RUNTIME / PRUNE / METRIC_CHECK settings (see _sweep.py)
 
 
 @dataclass(order=False)
@@ -147,6 +149,7 @@ class JobRecord:
     label: str | None = None
     job_key: int = 0  # integer id used by the logs and metrics tables
     attempt: int = 0  # number of times the job has been dispatched
+    reason: str | None = None  # why the manager ended or flagged the run (timeout, pruned, missing metric)
 
     @property
     def key(self) -> tuple[str, str]:
@@ -215,6 +218,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         label=row["label"],
         job_key=row["job_key"],
         attempt=row["attempt"],
+        reason=row["reason"],
     )
 
 
@@ -235,6 +239,7 @@ def _row_to_experiment(row: sqlite3.Row) -> ExperimentRecord:
         metric=row["metric"],
         goal=row["goal"],
         optimize=row["optimize"],
+        controls=row["controls"],
     )
 
 
@@ -370,6 +375,7 @@ _JOBS_TABLE = """
         dispatched_gpu_ids TEXT,
         label              TEXT,
         attempt            INTEGER NOT NULL DEFAULT 0,
+        reason             TEXT,
         UNIQUE (experiment_id, run_id)
     )
 """
@@ -585,14 +591,15 @@ async def init_db(db: aiosqlite.Connection) -> None:
             skip_rules     TEXT NOT NULL DEFAULT '{}',
             metric         TEXT,
             goal           TEXT,
-            optimize       TEXT
+            optimize       TEXT,
+            controls       TEXT
         );
     """)
     # Idempotent migration for databases created before metric/goal/campaign
     # existed.  Experiments from before campaigns land in the default one.
     await _add_missing_columns(db, "experiments", {
         "metric": "TEXT", "goal": "TEXT", "campaign": "TEXT NOT NULL DEFAULT 'default'",
-        "optimize": "TEXT",
+        "optimize": "TEXT", "controls": "TEXT",
     })
 
     # ── workers ─────────────────────────────────────────────────────
@@ -649,6 +656,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_code_submissions_experiment ON code_submissions(experiment_id)")
 
     await db.execute(_JOBS_TABLE)
+    await _add_missing_columns(db, "jobs", {"reason": "TEXT"})
     await db.execute(_METRICS_TABLE)
     await db.commit()
     # The rebuild leaves the old table's pages free; VACUUM returns them.
@@ -741,6 +749,7 @@ async def create_experiment(
     goal: str | None = None,
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
+    controls: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row.
@@ -758,8 +767,8 @@ async def create_experiment(
         """
         INSERT INTO experiments (experiment_id, name, campaign, submit_time, controller_id, note,
                                  status, expected_jobs, singular_dims, max_concurrent,
-                                 skip_rules, metric, goal, optimize)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 skip_rules, metric, goal, optimize, controls)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (experiment_id) DO UPDATE SET
             -- appending to an experiment keeps its name and note (rename changes the name; a note is only filled in
             -- if the experiment had none)
@@ -773,12 +782,15 @@ async def create_experiment(
             skip_rules = EXCLUDED.skip_rules,
             metric = COALESCE(EXCLUDED.metric, experiments.metric),
             goal = COALESCE(EXCLUDED.goal, experiments.goal),
-            optimize = COALESCE(EXCLUDED.optimize, experiments.optimize)
+            optimize = COALESCE(EXCLUDED.optimize, experiments.optimize),
+            -- an append that declares controls replaces them; one that declares none keeps them
+            controls = COALESCE(EXCLUDED.controls, experiments.controls)
         RETURNING *;
         """,
         (experiment_id, name, campaign, now, controller_id, note, status, expected_jobs,
          singular_dims_json, max_concurrent, json.dumps(skip_rules or {}), metric, goal,
-         json.dumps(optimize) if optimize is not None else None),
+         json.dumps(optimize) if optimize is not None else None,
+         json.dumps(controls) if controls is not None else None),
     )
     if code is not None:
         await insert_code_submission(db, experiment_id, code, commit=False)
@@ -985,6 +997,56 @@ async def update_experiment_optimize(
     await db.commit()
 
 
+async def update_experiment_controls(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    controls: dict[str, Any],
+) -> None:
+    """Store an experiment's ``controls`` (see ``_sweep.py``)."""
+    await db.execute(
+        "UPDATE experiments SET controls = ? WHERE experiment_id = ?",
+        (json.dumps(controls), experiment_id),
+    )
+    await db.commit()
+
+
+async def list_controlled_experiments(db: aiosqlite.Connection) -> list[ExperimentRecord]:
+    """Running and paused experiments with ``controls``: their runs in flight are still held to them."""
+    rows = await _exec_all(
+        db, "SELECT * FROM experiments WHERE status IN ('running', 'paused') AND controls IS NOT NULL",
+    )
+    return [_row_to_experiment(r) for r in rows]
+
+
+async def running_jobs_started_before(
+    db: aiosqlite.Connection, experiment_id: str, cutoff: float,
+) -> list[JobRecord]:
+    """Jobs of *experiment_id* whose process has been running since before *cutoff*."""
+    rows = await _exec_all(
+        db,
+        "SELECT * FROM jobs WHERE experiment_id = ? AND status = 'running' AND start_time < ?",
+        (experiment_id, cutoff),
+    )
+    return [_row_to_job(r) for r in rows]
+
+
+async def missing_metric_counts(db: aiosqlite.Connection, experiment_id: str) -> tuple[int, int]:
+    """``(missing, done)``: finished-successfully runs that logged no declared metric, of all of them."""
+    row = await _exec_one(
+        db,
+        f"""
+        SELECT SUM(CASE WHEN reason LIKE '{MISSING_METRIC_REASON}%' THEN 1 ELSE 0 END), COUNT(*)
+        FROM jobs WHERE experiment_id = ? AND status = 'done'
+        """,
+        (experiment_id,),
+    )
+    return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
+
+
+# A ``reason`` starting with this marks a run that logged no declared metric.
+MISSING_METRIC_REASON = "missing metric"
+
+
 async def list_optimizer_experiments(db: aiosqlite.Connection) -> list[ExperimentRecord]:
     """Running experiments whose runs the manager chooses."""
     rows = await _exec_all(
@@ -1050,7 +1112,7 @@ async def update_experiment_campaign(
 
 
 # Statuses broken out in ``job_counts``, plus "total".
-_JOB_COUNT_STATUSES = ("done", "failed", "xfailed", "cancelled", "running", "pending", "dispatched")
+_JOB_COUNT_STATUSES = ("done", "failed", "xfailed", "cancelled", "pruned", "running", "pending", "dispatched")
 _JOB_COUNT_COLUMNS = ",\n               ".join(
     ["COUNT(j.run_id) AS total_jobs"]
     + [f"SUM(CASE WHEN j.status = '{st}' THEN 1 ELSE 0 END) AS {st}_jobs" for st in _JOB_COUNT_STATUSES]
@@ -1195,6 +1257,19 @@ async def update_worker_status(
     )
     await db.commit()
     return _row_to_worker(row) if row else None
+
+
+async def update_worker_health(
+    db: aiosqlite.Connection,
+    worker_id: str,
+    unhealthy_devices: str,
+) -> None:
+    """Persist the GPUs a worker's health probe currently excludes."""
+    await db.execute(
+        "UPDATE workers SET unhealthy_devices = ? WHERE worker_id = ?",
+        (unhealthy_devices, worker_id),
+    )
+    await db.commit()
 
 
 async def touch_worker(
@@ -1848,6 +1923,47 @@ async def finish_job(
     return _row_to_job(row) if row else None
 
 
+async def end_jobs(
+    db: aiosqlite.Connection,
+    keys: Sequence[tuple[str, str]],
+    status: JobStatus,
+    reason: str,
+) -> list[JobRecord]:
+    """Finish in-flight jobs the manager stopped (pruned, timed out) as *status*.
+
+    Only dispatched/running jobs change.  ``elapsed`` runs from the process
+    start, like a result's.  Returns the rows that changed.
+    """
+    if not keys:
+        return []
+    where, params = _keys_clause(keys)
+    now = _now_epoch()
+    rows = await _exec_all(
+        db,
+        f"""
+        UPDATE jobs SET status = ?, reason = ?, finish_time = ?,
+                        elapsed = ? - COALESCE(start_time, dispatch_time, ?)
+        WHERE {where} AND {_ACTIVE_IN}
+        RETURNING *
+        """,
+        (status, reason, now, now, now, *params),
+    )
+    await db.execute(f"DELETE FROM job_nodes WHERE {where}", params)
+    await db.commit()
+    return [_row_to_job(r) for r in rows]
+
+
+async def set_job_reason(
+    db: aiosqlite.Connection, run_id: str, experiment_id: str, reason: str | None,
+) -> None:
+    """Record why the manager flagged a job, e.g. that it logged no declared metric."""
+    await db.execute(
+        "UPDATE jobs SET reason = ? WHERE run_id = ? AND experiment_id = ?",
+        (reason, run_id, experiment_id),
+    )
+    await db.commit()
+
+
 # Columns cleared whenever a job goes back to 'pending'.
 _CLEAR_DISPATCH = """
     dispatch_time = NULL,
@@ -1856,7 +1972,8 @@ _CLEAR_DISPATCH = """
     elapsed = NULL,
     exit_code = NULL,
     worker_id = NULL,
-    dispatched_gpu_ids = NULL
+    dispatched_gpu_ids = NULL,
+    reason = NULL
 """
 
 
@@ -2026,7 +2143,7 @@ async def apply_result_rules(
             for r in await _exec_all(
                 db,
                 "SELECT run_id, status, exit_code, combo FROM jobs WHERE experiment_id = ? "
-                "AND status IN ('pending', 'done', 'failed', 'xfailed')",
+                "AND status IN ('pending', 'done', 'pruned', 'failed', 'xfailed')",
                 (experiment_id,),
             )]
 
@@ -2043,14 +2160,15 @@ async def apply_result_rules(
             ]
             if success:
                 xfail += [rid for rid, status in siblings if status == "failed"]
-            elif any(status == "done" for _, status in siblings):
+            elif any(status in ("done", "pruned") for _, status in siblings):
                 # Probes can run at once, so this one may fail after another already won.
                 xfail.append(run_id)
     if relevant:
         # A job skipped earlier (xfailed with no exit code) never ran, so it is not a failure.
         failed = [c for _, status, code, c in rows
                   if status == "failed" or (status == "xfailed" and code is not None)]
-        succeeded = [c for _, status, _, c in rows if status == "done"]
+        # A pruned run ran fine; it was only worse than the others.
+        succeeded = [c for _, status, _, c in rows if status in ("done", "pruned")]
         index = SkipIndex(failed, succeeded, rules)
         xfail += [rid for rid, status, _, combo in rows if status == "pending" and index.skips(combo)]
     if not xfail:
@@ -2264,6 +2382,7 @@ async def experiment_summary(
         "submit_time": exp.submit_time.isoformat() if exp else None,
         "metric": exp.metric if exp else None,
         "goal": exp.goal if exp else None,
+        "controls": json.loads(exp.controls) if exp and exp.controls else None,
         "job_counts": counts,
     }
 
@@ -2510,6 +2629,26 @@ async def metric_rows_by_experiment(
     out: dict[str, list[tuple[int, str | bytes]]] = {}
     for run_id, step, data in rows:
         out.setdefault(run_id, []).append((step, data))
+    return out
+
+
+async def latest_metric_rows(
+    db: aiosqlite.Connection, experiment_id: str,
+) -> dict[str, tuple[int, list[tuple[int, str | bytes]]]]:
+    """``{run_id: (attempt, rows)}``: each run's latest attempt's metric rows, still packed."""
+    rows = await _exec_all(
+        db,
+        """
+        SELECT j.run_id, m.attempt, m.step, m.data FROM metrics m JOIN jobs j ON m.job_key = j.job_key
+        WHERE j.experiment_id = ?
+          AND m.attempt = (SELECT MAX(attempt) FROM metrics WHERE job_key = j.job_key)
+        ORDER BY j.run_id, m.step
+        """,
+        (experiment_id,),
+    )
+    out: dict[str, tuple[int, list[tuple[int, str | bytes]]]] = {}
+    for run_id, attempt, step, data in rows:
+        out.setdefault(run_id, (attempt, []))[1].append((step, data))
     return out
 
 
@@ -2813,6 +2952,7 @@ class DbWriter:
         goal: str | None = None,
         optimize: dict[str, Any] | None = None,
         code: dict[str, Any] | None = None,
+        controls: dict[str, Any] | None = None,
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
@@ -2821,7 +2961,7 @@ class DbWriter:
             status=status, expected_jobs=expected_jobs,
             singular_dims=singular_dims, max_concurrent=max_concurrent,
             skip_rules=skip_rules, metric=metric, goal=goal, optimize=optimize,
-            code=code,
+            code=code, controls=controls,
         ))
 
     async def create_experiment_with_jobs(
@@ -2923,6 +3063,10 @@ class DbWriter:
     async def update_worker_devices(self, worker_id: str, devices: str) -> None:
         db = self._db
         await self._enqueue(lambda: update_worker_devices(db, worker_id, devices))
+
+    async def update_worker_health(self, worker_id: str, unhealthy_devices: str) -> None:
+        db = self._db
+        await self._enqueue(lambda: update_worker_health(db, worker_id, unhealthy_devices))
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
@@ -3030,6 +3174,20 @@ class DbWriter:
     async def cancel_jobs(self, keys: Sequence[tuple[str, str]]) -> list[JobRecord]:
         db = self._db
         return await self._enqueue(lambda: cancel_jobs(db, keys))
+
+    async def end_jobs(
+        self, keys: Sequence[tuple[str, str]], status: JobStatus, reason: str,
+    ) -> list[JobRecord]:
+        db = self._db
+        return await self._enqueue(lambda: end_jobs(db, keys, status, reason))
+
+    async def set_job_reason(self, run_id: str, experiment_id: str, reason: str | None) -> None:
+        db = self._db
+        await self._enqueue(lambda: set_job_reason(db, run_id, experiment_id, reason))
+
+    async def update_experiment_controls(self, experiment_id: str, controls: dict[str, Any]) -> None:
+        db = self._db
+        await self._enqueue(lambda: update_experiment_controls(db, experiment_id, controls))
 
     async def requeue_jobs(
         self, keys: Sequence[tuple[str, str]], *, spend_retry: bool

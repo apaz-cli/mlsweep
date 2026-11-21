@@ -231,7 +231,8 @@ _fingerprint_cache: dict[tuple[str, tuple[Any, ...]], str] = {}
 # ── Protocol messages ──────────────────────────────────────────────────────────
 # Each message is a length-prefixed JSON object with a "t" field.  A worker
 # whose PROTOCOL_VERSION differs from the manager's is refused at hello.
-PROTOCOL_VERSION = 3  # 3: code arrives as a snapshot (manifest + objects), see mlsweep._snapshot
+PROTOCOL_VERSION = 4  # 3: code arrives as a snapshot (manifest + objects), see mlsweep._snapshot
+#                      4: GPU health arrives after the hello too (MsgGpuHealth, pending_gpus)
 # A run is identified by (experiment, run_id).  Run names are derived from the
 # sweep, so two experiments of the same sweep use the same run_ids.
 # Each dispatch of a run is a new attempt, numbered from 1.  MsgRun carries it
@@ -239,7 +240,7 @@ PROTOCOL_VERSION = 3  # 3: code arrives as a snapshot (manifest + objects), see 
 # attempt the manager has taken back (an evicted run's result) is not mistaken
 # for the current attempt's.  0 means unknown, from a peer predating the field.
 # Controller → Worker messages use t in {"hello","run","cancel","cleanup","replay","shutdown","ping"}.
-# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong","gpu_stats"}.
+# Worker → Controller messages use t in {"whello","started","log","metric","syncreq","result","cleaned","pong","gpu_stats","gpu_health"}.
 
 # ── Controller → Worker ────────────────────────────────────────────────────────
 
@@ -334,6 +335,12 @@ class MsgWorkerHello:
     # (e.g. a faulted device pending reset).  Informational; the scheduler only sees
     # ``gpus``.  Defaulted, so an older peer that omits it stays compatible.
     unhealthy_gpus: list[int] = field(default_factory=list)
+    # Why each unhealthy GPU was excluded, keyed by str(gpu) (JSON keys are strings):
+    # "cuInit failed: CUDA_ERROR_... (n)" or "CUDA probe timed out after 60s".
+    unhealthy_reasons: dict[str, str] = field(default_factory=dict)
+    # GPUs whose probe had not finished when the hello was sent; a MsgGpuHealth
+    # follows when it does.  Excluded from ``gpus`` until then.
+    pending_gpus: list[int] = field(default_factory=list)
     protocol: int = 0             # PROTOCOL_VERSION of the worker
     code: str = ""                # the worker's CODE_FINGERPRINT; "" from older workers
     t: str = "whello"
@@ -409,6 +416,17 @@ class MsgGpuStats:
     t: str = "gpu_stats"
 
 
+@dataclass
+class MsgGpuHealth:
+    """The worker's GPU health changed after its hello: a pending probe finished,
+    or a GPU that had failed passed a later probe.  Same fields as the hello's."""
+    gpus: list[int] = field(default_factory=list)
+    unhealthy_gpus: list[int] = field(default_factory=list)
+    unhealthy_reasons: dict[str, str] = field(default_factory=dict)
+    pending_gpus: list[int] = field(default_factory=list)
+    t: str = "gpu_health"
+
+
 _MSG_TYPES: dict[str, type] = {
     "hello": MsgHello,
     "run": MsgRun,
@@ -426,6 +444,7 @@ _MSG_TYPES: dict[str, type] = {
     "cleaned": MsgCleaned,
     "pong": MsgPong,
     "gpu_stats": MsgGpuStats,
+    "gpu_health": MsgGpuHealth,
 }
 _MSG_FIELDS: dict[type, frozenset[str]] = {
     cls: frozenset(f.name for f in fields(cls)) for cls in _MSG_TYPES.values()

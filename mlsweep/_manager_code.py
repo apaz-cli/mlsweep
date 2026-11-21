@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 import time
 import zipfile
 from collections import OrderedDict
@@ -52,6 +54,7 @@ from mlsweep._manager_http import (
     _not_found,
     _not_found_exc,
 )
+from mlsweep._inspect_model import InspectError, inspect_file
 from mlsweep._manager_state import ManagerState
 from mlsweep._snapshot import (
     SNAP_PREFIX,
@@ -292,6 +295,56 @@ async def handle_get_snapshot_file(request: web.Request) -> web.StreamResponse:
     if entry is None:
         return _not_found("file")
     return await _stream_object(request, _store(request), entry.hash)
+
+
+# Model summaries keyed by object hash: content named by its hash never changes.
+_INSPECT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_INSPECT_CACHE_SIZE = 64
+
+
+def _inspect_object(store: ObjectStore, h: str, name: str) -> dict[str, Any]:
+    """``inspect_file`` on object *h*, seen under its file *name*.
+
+    The reader goes by the extension too, so it gets a path with the file's
+    name: a link to the object, or a decompressed copy of a compressed one.
+    """
+    src = store.locate(h)
+    if src is None:
+        raise FileNotFoundError(h)
+    with tempfile.TemporaryDirectory(prefix="mlsweep-inspect-") as tmp:
+        dest = Path(tmp) / (Path(name).name or "file")
+        if src.suffix == ".z":
+            store.copy_to(h, dest)
+        else:
+            os.symlink(src, dest)
+        return inspect_file(dest)
+
+
+@code_routes.get("/api/snapshots/{artifact_id}/file-info/{path:.+}")
+async def handle_inspect_snapshot_file(request: web.Request) -> web.Response:
+    """Describe a model or array file in a snapshot, as ``artifact-info`` does
+    for a run's artifacts.  A 422 means the format is not one it reads."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    _, manifest = await _manifest_or_404(db, request.match_info["artifact_id"])
+    entry = next((f for f in manifest.files if f.path == request.match_info["path"]), None)
+    if entry is None:
+        return _not_found("file")
+    info = _INSPECT_CACHE.get(entry.hash)
+    if info is None:
+        try:
+            info = await asyncio.to_thread(_inspect_object, _store(request), entry.hash, entry.path)
+        except InspectError as exc:
+            return _error_response(str(exc), status=422)
+        except FileNotFoundError:
+            return _not_found("object")
+        except OSError as exc:
+            return _error_response(f"could not read file: {exc.strerror or exc}", status=500)
+        _INSPECT_CACHE[entry.hash] = info
+        while len(_INSPECT_CACHE) > _INSPECT_CACHE_SIZE:
+            _INSPECT_CACHE.popitem(last=False)
+    else:
+        _INSPECT_CACHE.move_to_end(entry.hash)
+    return _json_response(info)
 
 
 @code_routes.get("/api/code/diff")

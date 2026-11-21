@@ -107,25 +107,18 @@ def test_snapshot_id_covers_content_paths_and_modes_only(tmp_path: Path) -> None
     assert [n.path for _, n in d.changed] == ["train.py"] and not d.added and not d.removed
 
 
-def test_hash_cache_skips_unchanged_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import mlsweep._snapshot as snap
+def test_hash_cache_skips_unchanged_files(tmp_path: Path) -> None:
     root = _tree(tmp_path / "p", {"a.py": "a", "b.py": "b"})
-    old = time.time() - 60
-    for p in root.iterdir():
-        os.utime(p, (old, old))
-    calls: list[str] = []
-    real = snap.hash_file
-    monkeypatch.setattr(snap, "hash_file", lambda p: calls.append(str(p)) or real(p))
-    monkeypatch.setattr(HashCache, "RACY_SECS", -1e9)  # ctime is now; trust it for the test
+    # The cache only trusts a file that has not changed for RACY_SECS, ctime included.
+    time.sleep(HashCache.RACY_SECS + 0.1)
     cache = tmp_path / "cache.db"
-    first = scan_tree(root, cache_path=cache).manifest
-    assert len(calls) == 2
-    calls.clear()
-    assert scan_tree(root, cache_path=cache).manifest.snapshot_id() == first.snapshot_id()
-    assert calls == []
+    first = scan_tree(root, cache_path=cache)
+    assert sorted(first.hashed) == ["a.py", "b.py"]
+    again = scan_tree(root, cache_path=cache)
+    assert again.manifest.snapshot_id() == first.manifest.snapshot_id()
+    assert again.hashed == []
     (root / "a.py").write_text("changed")
-    scan_tree(root, cache_path=cache)
-    assert calls == [str(root / "a.py")]
+    assert scan_tree(root, cache_path=cache).hashed == ["a.py"]
 
 
 def test_materialize_fetches_only_missing_objects(tmp_path: Path) -> None:
@@ -183,6 +176,30 @@ def test_upload_sends_only_new_files(manager_server, tmp_path: Path) -> None:  #
     assert _raw(url, f"/api/snapshots/{sid2}/files/nope.py")[0] == 404
     # A unique prefix resolves.
     assert _api_get(url, TOKEN, f"/api/snapshots/{sid2[:17]}")["artifact_id"] == sid2
+
+
+def _safetensors(shape: list[int], data: bytes) -> bytes:
+    header = json.dumps({"w": {"dtype": "F32", "shape": shape, "data_offsets": [0, len(data)]}}).encode()
+    return len(header).to_bytes(8, "little") + header + data
+
+
+def test_snapshot_model_file_is_summarized(manager_server, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    # As artifact-info does for a run's artifacts.  Zeros are stored compressed
+    # and random bytes raw, so both ways of reading an object are covered.
+    _, url = manager_server
+    root = _tree(tmp_path / "p", {
+        "zeros.safetensors": _safetensors([4, 8], bytes(128)),
+        "weights/noise.safetensors": _safetensors([64, 64], os.urandom(64 * 64 * 4)),
+        "train.py": "print('hi')\n",
+    })
+    _, (sid, _) = _upload(url, root)
+    for path, shape in (("zeros.safetensors", [4, 8]), ("weights/noise.safetensors", [64, 64])):
+        status, body = _raw(url, f"/api/snapshots/{sid}/file-info/{path}")
+        info = json.loads(body)
+        assert status == 200 and info["format"] == "safetensors", body
+        assert [t["shape"] for t in info["tensors"]] == [shape]
+    assert _raw(url, f"/api/snapshots/{sid}/file-info/train.py")[0] == 422
+    assert _raw(url, f"/api/snapshots/{sid}/file-info/nope.pt")[0] == 404
 
 
 def test_snapshot_refused_until_its_objects_are_uploaded(manager_server) -> None:  # type: ignore[no-untyped-def]

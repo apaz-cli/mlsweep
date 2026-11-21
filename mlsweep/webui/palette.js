@@ -1,8 +1,6 @@
 // Command palette — search, resolve, preview, and act.
 // Uses MLSearch (search-core.js) for the actual index.
 (function () {
-  const RECENT_KEY = "mlsweep_palette_recent";
-  const VIEWS_KEY = "mlsweep_saved_views";
   const PAGES = [
     ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
     ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"], ["export", "Export", "⇩"],
@@ -14,28 +12,26 @@
 
   let overlay, input, listEl, footEl, previewEl, scopeSel;
   let query = "";
-  let scope = localStorage.getItem("mlsweep_search_scope") || "all";
+  let scope = MLPrefs.get("search_scope") || "all";
   let items = [], selected = 0, actionMode = false, actionIndex = 0;
   let searchSeq = 0, debounceTimer = 0, lastFocus = null;
   const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  const read = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) || "") ?? fallback; } catch { return fallback; } };
-  const write = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
   const mark = (text, q) => {
     if (!q) return esc(text);
     const i = text.toLowerCase().indexOf(q.toLowerCase());
     if (i < 0) return esc(text);
     return esc(text.slice(0, i)) + "<mark>" + esc(text.slice(i, i + q.length)) + "</mark>" + esc(text.slice(i + q.length));
   };
-  const recent = () => read(RECENT_KEY, []).filter(x => x && x.href);
-  const views = () => read(VIEWS_KEY, []).filter(x => x && x.href && x.title);
+  const recent = () => MLPrefs.get("palette_recent", []).filter(x => x && x.href);
+  const views = () => MLPrefs.get("saved_views", []).filter(x => x && x.href && x.title);
   const searches = () => window.MLSearch ? MLSearch.savedSearches() : [];
 
   function remember(item) {
     if (!item || !item.href || item.run) return;
     const list = recent().filter(x => x.href !== item.href);
     list.unshift({ title: item.title, sub: item.sub, href: item.href, icon: item.icon, kind: item.kind });
-    write(RECENT_KEY, list.slice(0, 8));
+    MLPrefs.set("palette_recent", list.slice(0, 8));
   }
 
   function pageItems() {
@@ -63,7 +59,7 @@
     const href = location.pathname + location.search + location.hash;
     const list = views().filter(v => v.href !== href);
     list.unshift({ title: name.trim(), href });
-    write(VIEWS_KEY, list.slice(0, 30));
+    MLPrefs.set("saved_views", list.slice(0, 30));
     render();
   }
 
@@ -109,7 +105,7 @@
   function setScope(v) {
     scope = v || "all";
     scopeSel.value = scope;
-    try { localStorage.setItem("mlsweep_search_scope", scope); } catch {}
+    MLPrefs.set("search_scope", scope);
   }
 
   function setQuery(q) {
@@ -260,7 +256,7 @@
     input.addEventListener("input", () => { query = input.value; selected = 0; actionMode = false; runSearch(); });
     scopeSel.addEventListener("change", () => {
       scope = scopeSel.value;
-      try { localStorage.setItem("mlsweep_search_scope", scope); } catch {}
+      MLPrefs.set("search_scope", scope);
       runSearch();
     });
     listEl.addEventListener("click", e => {

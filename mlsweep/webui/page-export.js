@@ -1,8 +1,7 @@
 const params = new URLSearchParams(location.search);
 
 const esc = s => escHtml(s ?? "");
-function store(key, value) { try { localStorage.setItem(key, value); } catch {} }
-function recall(key) { try { return localStorage.getItem(key) || ""; } catch { return ""; } }
+const recall = name => { const v = MLPrefs.get(name); return v == null ? "" : String(v); };
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
 
 
@@ -23,7 +22,7 @@ const exportList     = document.getElementById("export-list");
 
 const SCOPES = ["experiment", "campaign", "all"];
 let scope = params.get("experiment") ? "experiment"
-          : SCOPES.includes(recall("mlsweep_export_scope")) ? recall("mlsweep_export_scope") : "experiment";
+          : SCOPES.includes(recall("export_scope")) ? recall("export_scope") : "experiment";
 let allExps = [];
 let currentExpId = null;
 let onlyDone = false;
@@ -31,8 +30,8 @@ let wandbAvailable = false;
 let pollTimer = null;
 let firstLoad = true;
 
-wbProject.value = recall("mlsweep_wandb_project");
-wbEntity.value  = recall("mlsweep_wandb_entity");
+wbProject.value = recall("wandb_project");
+wbEntity.value  = recall("wandb_entity");
 
 // ── Scope ─────────────────────────────────────────────────────────────────────
 // The experiments the current scope covers.
@@ -67,7 +66,7 @@ function fillCampaigns() {
 }
 
 function showScope(prefer) {
-  store("mlsweep_export_scope", scope);
+  MLPrefs.set("export_scope", scope);
   document.querySelectorAll("#scope-toggle button").forEach(b => b.classList.toggle("active", b.dataset.scope === scope));
   document.getElementById("campaign-field").classList.toggle("hidden", scope === "all");
   document.getElementById("experiment-field").classList.toggle("hidden", scope !== "experiment");
@@ -171,8 +170,8 @@ wbSubmit.addEventListener("click", async () => {
   if (!scopeReady()) return;
   const project = wbProject.value.trim();
   const entity  = wbEntity.value.trim();
-  store("mlsweep_wandb_project", project);
-  store("mlsweep_wandb_entity", entity);
+  MLPrefs.set("wandb_project", project);
+  MLPrefs.set("wandb_entity", entity);
   wbError.classList.add("hidden");
   wbSubmit.disabled = true;
   try {
@@ -211,7 +210,7 @@ function renderExports(exports) {
         <span class="badge badge-${esc(e.status)}">${esc(e.status)}</span>
         <span class="export-dest" title="${esc(e.scope_label)} → ${esc(dest)}">${esc(e.scope_label)} → <code>${esc(dest)}</code></span>
         <span class="card-note">${e.done}/${e.total}</span>
-        ${e.status === "running" ? `<button class="btn-small" data-cancel="${esc(e.export_id)}">Cancel</button>` : ""}
+        ${e.status === "running" ? `<button class="btn-sm" data-cancel="${esc(e.export_id)}">Cancel</button>` : ""}
       </div>
       <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
       ${e.error ? `<div class="error">${esc(e.error)}</div>` : ""}

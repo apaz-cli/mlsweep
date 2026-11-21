@@ -12,6 +12,8 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
+from typing import Any
 
 
 def visible_devices() -> list[int]:
@@ -43,12 +45,13 @@ def visible_devices() -> list[int]:
     return []
 
 
-# Try to create and release a CUDA primary context on the single device exposed via
+# Create and release a CUDA primary context on the single device exposed via
 # CUDA_VISIBLE_DEVICES.  This is the exact operation that fails when a GPU is in a
 # bad state (e.g. "GPU Recovery Action: Reset" after a fault) even though
-# `nvidia-smi` lists it as idle with no processes.  Any non-zero exit (1 = context
-# creation failed, 3 = cuInit failed) marks the device unhealthy.  If libcuda is absent (CPU-only / AMD host) it exits 0 so
-# the device is treated as usable and nothing is excluded by accident.
+# `nvidia-smi` lists it as idle with no processes.  On failure it prints the failing
+# call and CUDA error ("cuInit failed: CUDA_ERROR_SYSTEM_NOT_READY (802)") and exits 1.  If
+# libcuda is absent (CPU-only / AMD host) it exits 0 so the device is treated as
+# usable and nothing is excluded by accident.
 _CUDA_PROBE = """\
 import ctypes, ctypes.util, sys
 name = ctypes.util.find_library("cuda") or "libcuda.so.1"
@@ -61,54 +64,91 @@ try:
     release = lib.cuDevicePrimaryCtxRelease
 except AttributeError:
     sys.exit(0)
-if lib.cuInit(0) != 0:
-    sys.exit(3)
-ctx = ctypes.c_void_p()
-if retain(ctypes.byref(ctx), 0) != 0:
+def fail(call, rc):
+    s = ctypes.c_char_p()
+    try:
+        lib.cuGetErrorName(rc, ctypes.byref(s))
+    except AttributeError:
+        pass
+    print("%s failed: %s (%d)" % (call, (s.value or b"CUDA error").decode(), rc), flush=True)
     sys.exit(1)
+rc = lib.cuInit(0)
+if rc != 0:
+    fail("cuInit", rc)
+ctx = ctypes.c_void_p()
+rc = retain(ctypes.byref(ctx), 0)
+if rc != 0:
+    fail("context creation", rc)
 release(0)
 sys.exit(0)
 """
 
+# Default deadline for one probe round.  The driver serialises context creation, so
+# N concurrent probes take about N times one probe (~0.7s each on an idle B300,
+# several times that on a loaded shared host).
+PROBE_TIMEOUT = 60.0
 
-def probe_usable_devices(
-    devices: list[int], timeout: float = 10.0,
-) -> tuple[list[int], list[int]]:
-    """Split *devices* into ``(usable, unhealthy)`` by creating a real CUDA context.
+
+def probe_devices(
+    devices: list[int],
+    timeout: float = PROBE_TIMEOUT,
+    *,
+    popen: Callable[..., Any] = subprocess.Popen,
+    env: Mapping[str, str] | None = None,
+) -> dict[int, str | None]:
+    """Probe each of *devices* by creating a real CUDA context on it.
+
+    Returns ``{device: None}`` for a usable device and ``{device: reason}`` for one
+    that is not, where *reason* names the CUDA error ("cuInit failed:
+    CUDA_ERROR_NO_DEVICE (100)") or says the probe timed out.
 
     Enumerating a device (``nvidia-smi --query-gpu=index``) is not enough: a device
     that has faulted still enumerates and shows 0% utilization, but every CUDA
     context creation on it fails.  A worker that advertises such a device gets jobs
     that die in their first ``.cuda()`` call, spending retries.  Each probe runs in an
-    isolated subprocess so the worker process itself never holds a context, and
-    all probes run concurrently so the hello waits for the slowest one only.
+    isolated subprocess so the worker process itself never holds a context.  They
+    run concurrently against one deadline, so a device that hangs costs *timeout*
+    once rather than once per device.
+
+    *popen* starts each probe (like ``subprocess.Popen``), in *env* (default
+    this process's environment) with only device *d* visible.
     """
-    procs: dict[int, subprocess.Popen[bytes] | None] = {}
+    base = dict(os.environ if env is None else env)
+    procs: dict[int, Any] = {}
     for d in devices:
-        env = dict(os.environ)
-        env["CUDA_VISIBLE_DEVICES"] = str(d)
-        env.pop("HIP_VISIBLE_DEVICES", None)
+        probe_env = dict(base)
+        probe_env["CUDA_VISIBLE_DEVICES"] = str(d)
+        probe_env.pop("HIP_VISIBLE_DEVICES", None)
         try:
-            procs[d] = subprocess.Popen(
-                [sys.executable, "-c", _CUDA_PROBE], env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            procs[d] = popen(
+                [sys.executable, "-c", _CUDA_PROBE], env=probe_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-        except OSError:
-            procs[d] = None
-    # The probes are independent, so run them concurrently against one deadline.
+        except OSError as e:
+            procs[d] = f"probe could not start: {e}"
     deadline = time.monotonic() + timeout
-    usable: list[int] = []
-    unhealthy: list[int] = []
+    out: dict[int, str | None] = {}
     for d, proc in procs.items():
-        ok = False
-        if proc is not None:
-            try:
-                ok = proc.wait(max(0.0, deadline - time.monotonic())) == 0
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        (usable if ok else unhealthy).append(d)
-    return usable, unhealthy
+        if isinstance(proc, str):
+            out[d] = proc
+            continue
+        try:
+            stdout, stderr = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            out[d] = f"CUDA probe timed out after {timeout:g}s"
+            continue
+        if proc.returncode == 0:
+            out[d] = None
+            continue
+        detail = stdout.decode(errors="replace").strip()
+        if detail:  # "cuInit failed: CUDA_ERROR_... (n)" from the probe itself
+            out[d] = detail.splitlines()[-1]
+        else:  # the interpreter itself failed; its last stderr line says why
+            lines = stderr.decode(errors="replace").strip().splitlines()
+            out[d] = f"CUDA probe exited with code {proc.returncode}" + (f": {lines[-1]}" if lines else "")
+    return out
 
 
 def _topo_score(conn_type: str) -> int:

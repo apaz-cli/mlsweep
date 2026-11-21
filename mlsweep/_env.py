@@ -142,14 +142,18 @@ def _link_mlsweep(venv_dir: str) -> None:
             os.replace(pth + tmp_suffix, pth)
 
 
-def ensure(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log) -> str:
-    """Return a venv satisfying *spec*, building it if needed, with the worker's mlsweep importable."""
-    venv_dir = _ensure_venv(spec, project_dir, run_dir, run, log)
+def ensure(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log,
+           cache_dir: str | None = None) -> str:
+    """Return a venv satisfying *spec*, building it if needed, with the worker's mlsweep importable.
+
+    Cached venvs live in *cache_dir*, by default ``cache_root()``.
+    """
+    venv_dir = _ensure_venv(spec, project_dir, run_dir, run, log, cache_dir or cache_root())
     _link_mlsweep(venv_dir)
     return venv_dir
 
 
-def _ensure_venv(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log) -> str:
+def _ensure_venv(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log: Log, root: str) -> str:
     """Return a venv satisfying *spec*, building it if needed.
 
     Cacheable specs share one venv per machine, built once under a file lock so
@@ -163,7 +167,6 @@ def _ensure_venv(spec: EnvSpec, project_dir: str, run_dir: str, run: RunCmd, log
         _build(venv_dir, spec, project_dir, run)
         return venv_dir
 
-    root = cache_root()
     os.makedirs(root, exist_ok=True)
     venv_dir = os.path.join(root, spec.cache_key)
     marker = os.path.join(venv_dir, MARKER)

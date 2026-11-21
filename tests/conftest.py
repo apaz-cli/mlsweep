@@ -17,6 +17,12 @@ import urllib.error
 
 import pytest
 
+# Keep the developer's own client settings (``mlsweep context``, a campaign in
+# their shell) out of every test, and out of every process a test starts.
+os.environ["MLSWEEP_CONFIG"] = os.path.join(os.devnull, "no-client-config.toml")
+os.environ.pop("MLSWEEP_CONTEXT", None)
+os.environ.pop("MLSWEEP_CAMPAIGN", None)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -836,27 +836,32 @@ const Graph = {
 };
 
 // ── Resizers ───────────────────────────────────────────────────────────────────
+// The shared drag handle (MLChrome.resizable), setting the width variable the
+// panel's CSS reads, so its cap on a narrow window still applies.
 function setupResizer(id, side) {
-  const r = $(id);
-  const key = side === "left" ? "leftW" : "rightW";
-  const w = store.get(key, null);
-  if (w) document.body.style.setProperty(side === "left" ? "--left-w" : "--right-w", w + "px");
-  r.addEventListener("mousedown", e => {
-    e.preventDefault(); r.classList.add("dragging");
-    const startX = e.clientX, start = (side === "left" ? $("left") : $("right")).getBoundingClientRect().width;
-    const move = ev => {
-      const nw = Math.max(180, Math.min(560, start + (side === "left" ? ev.clientX - startX : startX - ev.clientX)));
-      document.body.style.setProperty(side === "left" ? "--left-w" : "--right-w", nw + "px");
-      store.set(key, nw);
-      eachEditor(ed => ed.cm.refresh());
-    };
-    const up = () => { r.classList.remove("dragging"); window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
-    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  const prop = side === "left" ? "--left-w" : "--right-w";
+  MLChrome.resizable($(side), {
+    name: side === "left" ? "notes_leftW" : "notes_rightW", side, min: 180, max: 560, handle: $(id),
+    apply: w => w == null ? document.body.style.removeProperty(prop) : document.body.style.setProperty(prop, w + "px"),
+    onResize: () => eachEditor(ed => ed.cm.refresh()),
   });
 }
 setupResizer("resize-left", "left");
 setupResizer("resize-right", "right");
-if (store.get("rightCollapsed", false)) document.body.classList.add("right-collapsed");
+// On a narrow window (half a monitor) the right panel folds away so the document
+// keeps the room, and comes back as it was when the window widens.  Its button
+// still opens it meanwhile.
+const narrowWindow = matchMedia("(max-width: 1100px)");
+function fitRightPanel() {
+  const c = narrowWindow.matches || store.get("rightCollapsed", false);
+  document.body.classList.toggle("right-collapsed", c);
+  return c;
+}
+fitRightPanel();
+narrowWindow.addEventListener("change", () => {
+  if (!fitRightPanel()) refreshRight();
+  eachEditor(ed => ed.cm.refresh());
+});
 if (store.get("leftCollapsed", false)) document.body.classList.add("left-collapsed");
 if (store.get("wide", false)) document.body.classList.add("wide-doc");
 

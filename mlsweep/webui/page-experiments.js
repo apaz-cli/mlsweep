@@ -15,7 +15,7 @@ function expCounts(expId) {
   const c = exp.job_counts || {};
   return {
     total: c.total || exp.expected_jobs || 0,
-    finished: (c.done || 0) + (c.failed || 0) + (c.xfailed || 0),
+    finished: (c.done || 0) + (c.pruned || 0) + (c.failed || 0) + (c.xfailed || 0),
     withArtifacts: c.with_artifacts || 0,
   };
 }
@@ -71,7 +71,7 @@ async function deleteExperiment(expId) {
   }
 }
 
-const FINISHED_RUN = new Set(["done", "failed", "xfailed", "cancelled"]);
+const FINISHED_RUN = new Set(["done", "pruned", "failed", "xfailed", "cancelled"]);
 const ACTIVE_RUN = ["pending", "dispatched", "running"];
 const RETRYABLE_RUN = ["failed", "cancelled"];        // what "Retry failed" re-queues
 const UNSUCCESSFUL_RUN = ["failed", "cancelled", "xfailed"];
@@ -277,7 +277,7 @@ function runsHtml(expId) {
     const isOpen = expandedJobs.has(key);
     return `<tr class="run-row" style="cursor:pointer" ${act("toggleJobDetail", expId, j.run_id)}>
       <td class="mono"><span class="job-toggle" id="${escHtml(`job-toggle-${expId}-${j.run_id}`)}">${isOpen ? "▼" : "▶"}</span>${runNameHtml(j)}</td>
-      <td>${badge(j.status)}</td>
+      <td${j.reason ? ` title="${escHtml(j.reason)}"` : ""}>${badge(j.status)}</td>
       <td colspan="2">${j.worker_id ? escHtml(j.worker_id.split(":")[0]) : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
@@ -511,11 +511,11 @@ function renderExperiments(exps) {
         </div>
       </td>
       <td>${badge(exp.status || "unknown")}</td>
-      <td class="count-cell">${c.done || 0}</td>
+      <td class="count-cell">${c.done || 0}${c.pruned ? ` <span style="color:var(--text-muted)" title="stopped early by PRUNE">+${c.pruned} pruned</span>` : ""}</td>
       <td class="count-cell">${c.failed ? `<span style="color:var(--bad)">${c.failed}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${c.xfailed || (done ? "0" : "—")}</td>
       <td class="count-cell">${running ? `<span style="color:var(--ok)">${running}</span>` : (done ? "0" : "—")}</td>
-      <td class="count-cell">${total ? `${(c.done||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
+      <td class="count-cell">${total ? `${(c.done||0)+(c.pruned||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
       <td class="notes-cell">${noteRefHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">

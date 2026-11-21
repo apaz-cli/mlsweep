@@ -71,8 +71,6 @@
       run: u.searchParams.get("run") || "",
     };
   };
-  const readJSON = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) || "") ?? fallback; } catch { return fallback; } };
-  const writeJSON = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
 
   async function getExperiments(force = false) {
     if (!force && exps && Date.now() - expsAt < 60000) return exps;
@@ -540,13 +538,13 @@
     };
   }
 
-  function savedSearches() { return readJSON("mlsweep_saved_searches", []); }
+  function savedSearches() { return MLPrefs.get("saved_searches", []); }
   function saveSearch(query, title, scope) {
     const all = savedSearches().filter(s => s.query !== query);
     all.unshift({ query, title: title || query, scope: scope || "all", at: Date.now() });
-    writeJSON("mlsweep_saved_searches", all.slice(0, 30));
+    MLPrefs.set("saved_searches", all.slice(0, 30));
   }
-  function removeSearch(query) { writeJSON("mlsweep_saved_searches", savedSearches().filter(s => s.query !== query)); }
+  function removeSearch(query) { MLPrefs.set("saved_searches", savedSearches().filter(s => s.query !== query)); }
 
   window.MLSearch = {
     search, parseQuery, searchNotes, savedSearches, saveSearch, removeSearch,

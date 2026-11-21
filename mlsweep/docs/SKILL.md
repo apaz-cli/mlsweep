@@ -27,7 +27,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 Do what the user asked: keep going through steps 2 to 6 if they said to, otherwise record what you have and finish. If budget, cluster conflicts or anything else is unclear, ask them.
 
 1. Orient. Run `mlsweep status` and `mlsweep ls`. Run `mlsweep notes clone ~/notes`, which is safe to repeat, then `git -C ~/notes pull`. Read `AGENTS.md` and `STATUS.md` there if it exists, and search the notes for what is already known, dead ends included.
-2. Write a sweep file, then run `mlsweep run sweeps/my_sweep.py --validate` and check the combo count.
+2. Write a sweep file, then run `mlsweep run sweeps/my_sweep.py --validate` and check the combo count. It refuses a file with lint errors, such as a misspelled setting (`mlsweep lint` runs the checks alone); read the warnings too.
 3. Submit with `mlsweep run sweeps/my_sweep.py`. It prints the experiment ID. Put the ID in `STATUS.md` and push, so that another session can pick up from there.
 4. Monitor. Run `mlsweep wait <id> --until any-failure --timeout 300` to catch early crashes, then `mlsweep wait <id> --until stalled --timeout 300`. Repeat while it exits 2. Keep `--timeout` below any command limit you have, or run `wait` in the background.
 5. Handle failures. Read `mlsweep logs <run_id> --experiment <id>`. If the code was wrong, fix it, stop the old sweep if it is still running, and go back to step 2. If the code was fine, use `mlsweep retry <id> --failed`. If the cause is unclear, for example a worker error, work it out with the user.
@@ -38,7 +38,7 @@ Do what the user asked: keep going through steps 2 to 6 if they said to, otherwi
 | Exit | Meaning | Next |
 |---|---|---|
 | 0 | every run succeeded | compare and record |
-| 1 | a run failed | read its log |
+| 1 | a run failed, or the manager paused the sweep (it prints `PAUSED` and why) | read its log; for a pause, usually METRIC names a key the script doesn't log |
 | 2 | timed out, runs still active | wait again; if runs stay pending, check `mlsweep status` and `mlsweep ls <id>` |
 | 3 | a running run logged nothing for `--stalled-after` seconds (default 900) | read its log; raise this if the script is quiet for long stretches |
 | 4 | no answer: manager unreachable, wrong ID, or no runs | check the ID and `mlsweep status`; the runs may be fine |
@@ -61,6 +61,10 @@ GOAL = "minimize"
 ```
 
 `fetch`/`best` default `--metric`/`--goal` to the experiment's stored values, then `loss`/`minimize`. `best` exits 1 if no finished run logged the metric.
+
+- When `METRIC` is set, the manager pauses the sweep if its first 2 finished runs never logged it (`METRIC_CHECK`). `mlsweep ls <id>` shows each run's reason with the keys it did log.
+- `MAX_RUNTIME = "2h"` stops and fails runs that run longer.
+- `PRUNE = {"min_steps": 500}` stops runs worse than the median of the others at step 500, 1000, and so on (`"strategy": "asha"` keeps the best third instead). Pruned runs have status `pruned`; they are results, not failures.
 
 The training script logs with:
 

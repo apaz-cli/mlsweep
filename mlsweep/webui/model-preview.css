@@ -1,0 +1,48 @@
+/* Model and array previews (model-preview.js), on the artifacts and code pages. */
+.mp-root { width: 100%; display: flex; flex-direction: column; gap: 10px; font-size: 12px; }
+.mp-compact { gap: 6px; font-size: 11px; align-self: flex-start; }
+.mp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.mp-chip { font-size: 11px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text-label); white-space: nowrap; }
+.mp-compact .mp-chip { font-size: 10px; padding: 1px 6px; }
+.mp-chip.mp-format { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.mp-chip.mp-dtype { font-family: var(--font-mono); }
+.mp-section { border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
+.mp-section > summary { cursor: pointer; padding: 6px 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); user-select: none; }
+.mp-section > :not(summary) { margin: 0 10px 10px; }
+.mp-subtitle { font-size: 11px; font-weight: 600; color: var(--text-label); margin: 6px 0 3px; }
+.mp-kv { border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; max-width: 100%; }
+.mp-kv td { padding: 2px 0; vertical-align: top; overflow-wrap: anywhere; }
+.mp-kv td:first-child { color: var(--text-dim); padding-right: 24px; max-width: 24em; }
+.mp-filterbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.mp-filter { flex: 1; max-width: 320px; padding: 4px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
+.mp-filter:focus { outline: none; border-color: var(--accent); }
+.mp-note { font-size: 11px; color: var(--text-muted); padding: 2px 0; }
+.mp-tlist { font-family: var(--font-mono); font-size: 11px; max-height: 60vh; overflow: auto; }
+.mp-compact .mp-tlist { max-height: none; }
+.mp-trow { display: grid; grid-template-columns: minmax(120px, 26em) 9em 12em 5em; gap: 8px; padding: 1px 0 1px 16px; align-items: baseline; }
+.mp-compact .mp-trow { grid-template-columns: minmax(0, 1fr) auto auto; padding-left: 0; }
+.mp-compact .mp-tdtype { display: none; }
+.mp-trow:hover { background: var(--btn-hover); }
+.mp-tname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.mp-tdtype { color: var(--info); white-space: nowrap; }
+.mp-kind { color: var(--text-muted); font-size: 10px; }
+.mp-tshape { color: var(--text-label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mp-tnumel { color: var(--text-muted); text-align: right; white-space: nowrap; }
+.mp-vals { grid-column: 1 / -1; padding-left: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mp-group > summary { cursor: pointer; padding: 1px 0; }
+.mp-group > summary::marker, .mp-snode > summary::marker { color: var(--text-muted); }
+.mp-group > summary:hover, .mp-snode > summary:hover { background: var(--btn-hover); }
+.mp-gname { color: var(--text-strong); font-weight: 600; }
+.mp-gmeta { color: var(--text-muted); font-size: 10px; margin-left: 10px; }
+.mp-gbody { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 4px; }
+.mp-struct { font-family: var(--font-mono); font-size: 11px; max-height: 50vh; overflow: auto; }
+.mp-snode > summary { cursor: pointer; }
+.mp-sbody { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 4px; }
+.mp-sleaf { padding: 1px 0 1px 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mp-skey { color: var(--text-dim); margin-right: 8px; }
+.mp-skey::after { content: ":"; }
+.mp-stag { color: var(--text-muted); }
+.mp-stensor { color: var(--info); }
+.mp-sstr { color: var(--ok); }
+.mp-snum { color: var(--warn); }
+@media (max-width: 920px) { .mp-trow { grid-template-columns: minmax(0, 1fr) auto auto; } .mp-tdtype { display: none; } }

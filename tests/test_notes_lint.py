@@ -122,40 +122,31 @@ def test_cli_mv_links_mentions(tmp_path: Path) -> None:
     assert json.loads(run("mentions", EXP, "--json").stdout) == {"b/src.md": [1]}
 
 
-def test_index_cache_rereads_only_changed_files(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_index_cache_rereads_only_changed_files(tmp_path: Path) -> None:
     (tmp_path / "a.md").write_text("see [[c]]\n")
     (tmp_path / "b.md").write_text(f"{EXP}\n")
-    reads: list[str] = []
-    real = _notes.read_text
-
-    def counting(path: Path, limit: int = _notes.MAX_TEXT_BYTES) -> str | None:
-        reads.append(path.name)
-        return real(path, limit)
-    monkeypatch.setattr(_notes, "read_text", counting)
     cache = _notes.ParseCache()
     first = _notes.build_index(tmp_path, {EXP}, cache)
-    assert sorted(reads) == ["a.md", "b.md"]
+    assert sorted(cache.reads) == ["a.md", "b.md"]
 
     # A new file is read, and an unchanged note's link now finds it.  The Index
     # already handed out keeps what it said.
-    reads.clear()
     (tmp_path / "c.md").write_text("new\n")
     second = _notes.build_index(tmp_path, {EXP}, cache)
-    assert reads == ["c.md"]
+    assert cache.reads == ["c.md"]
     assert second.links["a.md"][0].resolved == "c.md"
     assert first.links["a.md"][0].resolved is None
     assert second.mentions["b.md"] == {EXP: [1]}
 
     # Forgetting an ID drops its mentions without reading anything.
-    reads.clear()
     assert _notes.build_index(tmp_path, set(), cache).mentions == {}
-    assert reads == []
+    assert cache.reads == []
 
     # A new ID is found in notes that have not changed, and in text files.
     (tmp_path / "data.txt").write_text(f"x\n{EXP}\n")
     third = _notes.build_index(tmp_path, {EXP}, cache)
     assert third.mentions == {"b.md": {EXP: [1]}, "data.txt": {EXP: [2]}}
-    assert reads == ["data.txt"]
+    assert cache.reads == ["data.txt"]
 
 
 def test_move_folder_updates_links_to_every_moved_note(tmp_path: Path) -> None:

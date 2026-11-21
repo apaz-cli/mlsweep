@@ -10,6 +10,7 @@
 body { display: flex; flex-direction: column; height: 100vh; }
 
 #content { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 24px; }
+@media (max-width: 920px) { #content { padding: 14px; } }
 
 h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); margin-bottom: 12px; }
 h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
@@ -24,7 +25,7 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .worker-card.offline .gpu-grid { opacity: .55; }
 
 /* GPU tiles */
-.gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+.gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
 .gpu-tile { border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); padding: 7px 8px 8px; display: flex; flex-direction: column; gap: 6px; cursor: pointer; min-width: 0; transition: border-color .1s, background .1s; }
 .gpu-tile:hover { border-color: var(--border-strong); }
 .gpu-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
@@ -32,12 +33,13 @@ h3 { font-size: 12px; font-weight: 700; color: var(--text-dim); text-transform: 
 .gpu-tile.st-out { background: transparent; border-style: dashed; }
 .gpu-tile.st-out .gt-bars, .gpu-tile.st-out .gt-id { opacity: .55; }
 .gpu-tile.st-unhealthy { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); cursor: default; }
+.gpu-tile.st-probing { border-style: dashed; cursor: default; }
 body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--accent-border); }
 .gpu-tile.drop-ok { background: var(--accent-soft) !important; border: 1px solid var(--accent) !important; }
 .gt-head { display: flex; align-items: center; gap: 6px; }
-.gt-id { font-family: var(--font-mono); font-size: 12px; font-weight: 650; color: var(--text-strong); }
+.gt-id { white-space: nowrap; flex-shrink: 0; font-family: var(--font-mono); font-size: 12px; font-weight: 650; color: var(--text-strong); }
 .gt-name { font-size: 11px; color: var(--text-label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.gt-state { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); }
+.gt-state { white-space: nowrap; flex-shrink: 0; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); }
 .st-pool .gt-state { color: var(--ok); }
 .st-draining .gt-state { color: var(--warn); }
 .st-unhealthy .gt-state { color: var(--bad); }

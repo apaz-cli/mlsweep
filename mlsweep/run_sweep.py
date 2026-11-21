@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -37,7 +37,6 @@ from mlsweep._sweep import (
     build_job_payloads as _build_job_payloads,
     count_expected,
     generate_variations,
-    load_sweep_file,
     metric_values,
     options_to_wire,
     singular_dims,
@@ -103,32 +102,94 @@ def _add_manager_args(parser: argparse.ArgumentParser) -> None:
     _add_campaign_args(parser)
 
 
+def _active_context() -> tuple[Any, bool]:
+    """The context in force before any --context flag (see ``_context``).  Exits on a bad one."""
+    from mlsweep._context import ContextError, active_context
+
+    try:
+        return active_context()
+    except ContextError as e:
+        sweep_print(f"{_RED}Error: {e}{_RESET}")
+        sys.exit(2)
+
+
+class _ContextAction(argparse.Action):
+    """``--context NAME``: take the manager, token and campaign from a named context.
+
+    Flags given on the command line still win, wherever they appear: a value
+    that differs from its default was given explicitly (or comes after, and
+    overwrites this).
+    """
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: Any, option_string: str | None = None) -> None:
+        from mlsweep._context import ContextError, get_context
+
+        try:
+            ctx = get_context(values)
+        except ContextError as e:
+            parser.error(str(e))
+        setattr(namespace, self.dest, values)
+        token = ctx.token()
+        # What the context doesn't set falls back as if no context were in force, never to
+        # the values of the one this replaces.
+        manager = ctx.manager or os.environ.get("MLSWEEP_MANAGER") or DEFAULT_MANAGER_URL
+        for dest, value in (("manager", manager), ("token", token), ("campaign", ctx.campaign)):
+            if getattr(namespace, dest, None) == parser.get_default(dest):
+                setattr(namespace, dest, value)
+        if token is None and (ctx.token_file or ctx.token_env) \
+                and getattr(namespace, "token", None) == parser.get_default("token"):
+            setattr(namespace, "token", "")  # the context's token is missing: don't fall back to another's
+            where = ctx.token_file or f"${ctx.token_env}"
+            print(f"mlsweep: warning: context {ctx.name!r} names a token in {where}, which is missing or empty",
+                  file=sys.stderr)
+
+
 def _add_connection_args(parser: argparse.ArgumentParser) -> None:
-    """Add --manager and --token."""
-    parser.add_argument("--manager", default=os.environ.get("MLSWEEP_MANAGER", DEFAULT_MANAGER_URL),
+    """Add --manager, --token and --context."""
+    ctx, explicit = _active_context()
+    manager = os.environ.get("MLSWEEP_MANAGER") or DEFAULT_MANAGER_URL
+    token = None
+    if ctx is not None:
+        manager = ctx.manager or manager
+        token = ctx.token()
+    parser.add_argument("--manager", default=manager,
                         help=f"Manager URL (env: MLSWEEP_MANAGER, default: {DEFAULT_MANAGER_URL})")
-    parser.add_argument("--token", default=None,
+    parser.add_argument("--token", default=token,
                         help="Manager auth token (or set MLSWEEP_TOKEN env)")
+    parser.add_argument("--context", default=ctx.name if ctx else None, metavar="NAME", action=_ContextAction,
+                        help="Use a named context's manager, token and campaign (env: MLSWEEP_CONTEXT; "
+                             "see `mlsweep context`)")
+
+
+def _context_campaign() -> str | None:
+    """The campaign the active context sets, where it outranks $MLSWEEP_CAMPAIGN."""
+    ctx, explicit = _active_context()
+    if ctx is None or (not explicit and os.environ.get("MLSWEEP_CAMPAIGN")):
+        return None
+    return str(ctx.campaign) if ctx.campaign else None
 
 
 def _add_campaign_args(parser: argparse.ArgumentParser) -> None:
     """Add --campaign NAME and --all-campaigns (also spelled --all_campaigns)."""
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--campaign", default=None, metavar="NAME",
+    group.add_argument("--campaign", default=_context_campaign(), metavar="NAME",
                        help=f"Campaign to work in (env: MLSWEEP_CAMPAIGN, default: {DEFAULT_CAMPAIGN})")
     group.add_argument("--all-campaigns", "--all_campaigns", dest="all_campaigns",
                        action="store_true", help="Work across every campaign")
 
 
-def _resolve_campaign(args: argparse.Namespace) -> str | None:
+def _resolve_campaign(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> str | None:
     """The campaign a command works in, or None for --all-campaigns.
 
-    Order: --all-campaigns, --campaign, $MLSWEEP_CAMPAIGN, then the default.
-    Exits with an error on an invalid name.
+    Order: --all-campaigns, --campaign, $MLSWEEP_CAMPAIGN (in *env*, by default
+    the process environment), then the default.  Exits with an error on an
+    invalid name.
     """
     if getattr(args, "all_campaigns", False):
         return None
-    name = getattr(args, "campaign", None) or os.environ.get("MLSWEEP_CAMPAIGN") or DEFAULT_CAMPAIGN
+    env = os.environ if env is None else env
+    name = getattr(args, "campaign", None) or env.get("MLSWEEP_CAMPAIGN") or DEFAULT_CAMPAIGN
     try:
         return validate_campaign(name)
     except ValueError as e:
@@ -505,6 +566,7 @@ def manager_create_experiment(
     jobs: list[dict[str, Any]] | None = None,
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
+    controls: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Create an experiment in *campaign* on the manager. Returns the response dict or None.
 
@@ -534,6 +596,7 @@ def manager_create_experiment(
             **({"jobs": jobs} if jobs else {}),
             **({"optimize": optimize} if optimize else {}),
             **({"code": code} if code else {}),
+            **({"controls": controls} if controls else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -789,7 +852,8 @@ def manager_get_job_logs(
 
 
 _ACTIVE_JOB_STATUSES = ("pending", "dispatched", "running")
-_STATUS_ORDER = {"pending": 0, "dispatched": 1, "running": 2, "failed": 3, "cancelled": 4, "done": 5, "xfailed": 6}
+_STATUS_ORDER = {"pending": 0, "dispatched": 1, "running": 2, "failed": 3, "cancelled": 4, "done": 5, "xfailed": 6,
+                 "pruned": 7}
 
 
 def _parse_combo(raw: Any) -> dict[str, Any] | None:
@@ -995,6 +1059,19 @@ def experiment_status(manager: str, token: str, experiment_id: str, campaign: st
     return _get_experiment(manager, token, experiment_id, campaign).get("status")
 
 
+def manager_note(exp: dict[str, Any]) -> str | None:
+    """Why the manager paused or completed an experiment (a run control, or a Bayesian sweep's optimizer)."""
+    for field in ("controls", "optimize"):
+        raw = exp.get(field)
+        try:
+            spec = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            continue
+        if isinstance(spec, dict) and spec.get("note"):
+            return str(spec["note"])
+    return None
+
+
 def awaits_more_runs(manager: str, token: str, experiment_id: str, campaign: str | None = None) -> bool:
     """True if the manager still expects runs here, so no active runs doesn't mean finished.
 
@@ -1027,6 +1104,11 @@ def manager_local_experiment_dir(manager: str, token: str, experiment_id: str) -
                                    timeout=10, quiet=True)
     if status != 200 or not isinstance(health, dict):
         return None
+    return local_experiment_dir(health, experiment_id)
+
+
+def local_experiment_dir(health: dict[str, Any], experiment_id: str) -> Path | None:
+    """The experiment's folder, if the manager whose ``/api/health`` is *health* keeps it here."""
     remote_dir, remote_id = health.get("mlsweep_dir"), health.get("mlsweep_dir_id")
     if not isinstance(remote_dir, str) or not isinstance(remote_id, str) or not remote_id:
         return None
@@ -1527,6 +1609,54 @@ def _skip_rules(options: dict[str, Any]) -> dict[str, Any]:
     return rules
 
 
+def describe_controls(controls: dict[str, Any] | None) -> list[str]:
+    """One line per run control the manager will enforce."""
+    from mlsweep._sweep import format_duration
+
+    if not controls:
+        return []
+    out = []
+    if controls.get("max_runtime"):
+        out.append(f"runs that take longer than {format_duration(controls['max_runtime'])} are stopped "
+                   "and marked failed (MAX_RUNTIME)")
+    prune = controls.get("prune")
+    if prune:
+        if prune["strategy"] == "asha":
+            at = f"steps {prune['min_steps']}, x{prune['reduction_factor']} after"
+            rule = f"outside the best 1/{prune['reduction_factor']}"
+        else:
+            at = f"step {prune['min_steps']}, then every {prune['every']}"
+            rule = "worse than the median"
+        out.append(f"PRUNE ({prune['strategy']}): at {at}, a run whose best {prune['metric']} is {rule} "
+                   f"of the runs that reached that step is stopped, once {prune['n_warmup']} have")
+    check = controls.get("metric_check")
+    if check:
+        out.append(f"the sweep pauses if its first {check['runs']} finished run(s) all log no "
+                   f"{check['metric']!r} (METRIC_CHECK)")
+    return out
+
+
+def _load_and_lint(sweep_file: str) -> dict[str, Any]:
+    """Load a sweep file, print its lint findings, and exit on an error."""
+    from mlsweep._lint import Finding, lint_module
+    from mlsweep._sweep import _load_module, sweep_info
+
+    try:
+        mod = _load_module(sweep_file)
+    except Exception as e:
+        sweep_print(f"{_RED}Error: cannot load {sweep_file}: {e!r}{_RESET}")
+        sys.exit(1)
+    findings: list[Finding] = lint_module(mod, sweep_file)
+    for f in findings:
+        color = _RED if f.severity == "error" else _YELLOW
+        sweep_print(f"{color}{f.severity}:{_RESET} {f.message}")
+    if any(f.severity == "error" for f in findings):
+        sweep_print(f"{_RED}{sweep_file} has errors; nothing was submitted.{_RESET} "
+                    "(`mlsweep lint` checks a sweep file on its own.)")
+        sys.exit(1)
+    return sweep_info(mod, sweep_file)
+
+
 def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
     """Exit if two runs would share a name (jobs require unique names per experiment)."""
     counts = collections.Counter(v["name"] for v in variations)
@@ -1547,8 +1677,11 @@ def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
 # ===============================================================================
 
 
-def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
-    """Watch an experiment's progress via WebSocket event stream."""
+def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch", connect: Any = None) -> None:
+    """Watch an experiment's progress via WebSocket event stream.
+
+    *connect* makes the event stream from ``(url, token, timeout=)``; by default a ``_WebSocket``.
+    """
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Watch experiment progress via WebSocket",
@@ -1579,7 +1712,7 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch") -> None:
     else:
         ws_url += f"?since={since}"
 
-    ws = _WebSocket(ws_url, token, timeout=10.0)
+    ws = (connect or _WebSocket)(ws_url, token, timeout=10.0)
     try:
         ws.connect()
     except Exception as e:
@@ -1842,8 +1975,8 @@ def main() -> None:
             factories.append(TensorBoardWriterFactory(tb_dir=args.tensorboard_dir))
         writer_factory = MultiWriterFactory(factories)
 
-    # ── Load sweep ─────────────────────────────────────────────────────────
-    info = load_sweep_file(args.sweep_file)
+    # ── Load and lint the sweep ─────────────────────────────────────────────
+    info = _load_and_lint(args.sweep_file)
     sweep_name = info["name"]
     options = info["options"]
     command = info["command"]
@@ -1947,6 +2080,8 @@ def main() -> None:
             sweep_print(f"{_BOLD}Sweep:{_RESET} {_CYAN}{sweep_name}{_RESET} ({n_probes} runs)")
     sweep_print(f"{_BOLD}Experiment:{_RESET} {_CYAN}{experiment_id}{_RESET}")
     sweep_print(f"{_BOLD}Campaign:{_RESET} {_CYAN}{campaign or 'any (--all-campaigns)'}{_RESET}")
+    for line in describe_controls(info.get("controls")):
+        sweep_print(f"{_BOLD}Control:{_RESET} {line}")
     if extra:
         sweep_print(f"{_BOLD}Extra overrides:{_RESET} {' '.join(extra)}")
 
@@ -2046,6 +2181,7 @@ def main() -> None:
         jobs=job_payloads,
         optimize=spec,
         code=provenance,
+        controls=info.get("controls"),
     ):
         sys.exit(1)
 

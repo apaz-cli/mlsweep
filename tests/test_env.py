@@ -86,27 +86,27 @@ def _run(calls):
     return run
 
 
-def test_ensure_builds_once_and_reuses(tmp_path, monkeypatch):
-    monkeypatch.setenv("MLSWEEP_ENV_CACHE", str(tmp_path / "cache"))
+def test_ensure_builds_once_and_reuses(tmp_path):
+    cache = str(tmp_path / "cache")
     _write(tmp_path, "pyproject.toml", _PYPROJECT)
     spec = _env.detect(str(tmp_path))
     calls, logs = [], []
-    first = _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), logs.append)
-    second = _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), logs.append)
+    first = _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), logs.append, cache)
+    second = _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), logs.append, cache)
     assert first == second and first.startswith(str(tmp_path / "cache"))
     assert os.path.isfile(os.path.join(first, "bin", "python"))
     assert len(calls) == 1  # venv creation only; nothing to pip install
     assert "building cached env" in logs[0] and "using cached env" in logs[1]
 
 
-def test_ensure_concurrent_runs_build_once(tmp_path, monkeypatch):
-    monkeypatch.setenv("MLSWEEP_ENV_CACHE", str(tmp_path / "cache"))
+def test_ensure_concurrent_runs_build_once(tmp_path):
+    cache = str(tmp_path / "cache")
     _write(tmp_path, "pyproject.toml", _PYPROJECT)
     spec = _env.detect(str(tmp_path))
     calls, results = [], []
     threads = [
         threading.Thread(target=lambda: results.append(
-            _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), lambda _: None)))
+            _env.ensure(spec, str(tmp_path), str(tmp_path), _run(calls), lambda _: None, cache)))
         for _ in range(4)
     ]
     for t in threads:
@@ -116,26 +116,26 @@ def test_ensure_concurrent_runs_build_once(tmp_path, monkeypatch):
     assert len(set(results)) == 1 and len(calls) == 1
 
 
-def test_ensure_discards_partial_build(tmp_path, monkeypatch):
-    monkeypatch.setenv("MLSWEEP_ENV_CACHE", str(tmp_path / "cache"))
+def test_ensure_discards_partial_build(tmp_path):
+    cache = str(tmp_path / "cache")
     _write(tmp_path, "pyproject.toml", _PYPROJECT)
     spec = _env.detect(str(tmp_path))
     partial = tmp_path / "cache" / spec.cache_key
     partial.mkdir(parents=True)
     (partial / "junk").write_text("left by a build that died")
-    venv = _env.ensure(spec, str(tmp_path), str(tmp_path), _run([]), lambda _: None)
+    venv = _env.ensure(spec, str(tmp_path), str(tmp_path), _run([]), lambda _: None, cache)
     assert not os.path.exists(os.path.join(venv, "junk"))
     assert os.path.isfile(os.path.join(venv, _env.MARKER))
 
 
-def test_ensure_uncacheable_builds_in_run_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("MLSWEEP_ENV_CACHE", str(tmp_path / "cache"))
+def test_ensure_uncacheable_builds_in_run_dir(tmp_path):
+    cache = str(tmp_path / "cache")
     _write(tmp_path, "requirements.txt", "-r other.txt\n")
     _write(tmp_path, "other.txt", "")
     spec = _env.detect(str(tmp_path))
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    venv = _env.ensure(spec, str(tmp_path), str(run_dir), _run([]), lambda _: None)
+    venv = _env.ensure(spec, str(tmp_path), str(run_dir), _run([]), lambda _: None, cache)
     assert venv == str(run_dir / "venv")
     assert not (tmp_path / "cache").exists()
 

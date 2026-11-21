@@ -66,18 +66,45 @@ def test_token_leaves_the_address_bar_but_keeps_the_query(browser, mgr) -> None:
     assert browser.eval("apiFetch('/api/workers').then(r => r.status)") == 200
 
 
+def test_page_scripts_share_settings_helpers_and_styles() -> None:
+    # Settings go through MLPrefs, elements through el(), and badges and drag
+    # handles look the same everywhere: all in chrome.js and common.css.
+    for path in sorted(WEBUI.glob("*.js")) + sorted(WEBUI.glob("*.html")):
+        if path.name.startswith(("vendor", "cm-", "ansi_up", "plotly")) or path.name in ("chrome.js", "index-redirect.js"):
+            continue
+        text = path.read_text()
+        if path.name != "palette.js":   # it forgets two keys from older versions
+            assert "localStorage" not in text, path.name
+        assert not re.search(r"^(?:function el\b|const el =)", text, re.M), path.name
+        assert not re.search(r"^\.(?:badge|resizer)\s*\{", text, re.M), path.name
+
+
+def test_settings_from_before_the_scheme_carry_over(browser, mgr) -> None:  # type: ignore[no-untyped-def]
+    browser.goto(static_url(mgr, "system.html"))
+    browser.eval("localStorage.clear(); localStorage.setItem('theme', 'light');"
+                 " localStorage.setItem('notes.openDirs', JSON.stringify(['a', 'b']));"
+                 " localStorage.setItem('sidebarCollapsed:logs', '1');"
+                 " localStorage.setItem('mlsweep_log_collapse_json', '0')")
+    browser.goto(static_url(mgr, "logs.html"))
+    assert browser.eval("[MLPrefs.get('theme'), MLPrefs.get('notes_openDirs'), MLPrefs.get('sidebar_collapsed_logs'),"
+                        " document.getElementById('collapse-json').checked]") == ["light", ["a", "b"], True, False]
+    assert browser.eval("['theme', 'notes.openDirs', 'sidebarCollapsed:logs'].map(k => localStorage.getItem(k))") == [None] * 3
+    assert browser.eval("document.getElementById('sidebar').classList.contains('collapsed')")
+    browser.eval("localStorage.clear()")
+
+
 def test_theme_toggle_persists_and_announces(browser, mgr) -> None:  # type: ignore[no-untyped-def]
     browser.goto(static_url(mgr, "system.html"))
-    browser.eval("localStorage.removeItem('theme')")
+    browser.eval("MLPrefs.remove('theme')")
     browser.goto(f"{mgr.url}/static/system.html")
     assert browser.eval("document.documentElement.getAttribute('data-theme')") == "dark"
     browser.eval("window._told = 0; document.addEventListener('mlthemechange', () => window._told++);"
                  "document.getElementById('theme-toggle').click()")
-    assert browser.eval("[document.documentElement.getAttribute('data-theme'), localStorage.getItem('theme'),"
+    assert browser.eval("[document.documentElement.getAttribute('data-theme'), MLPrefs.get('theme'),"
                         " document.getElementById('theme-toggle').textContent, window._told]") == [None, "light", "☾", 1]
     browser.goto(f"{mgr.url}/static/logs.html")
     assert browser.eval("document.documentElement.getAttribute('data-theme')") is None
-    browser.eval("localStorage.removeItem('theme')")
+    browser.eval("MLPrefs.remove('theme')")
 
 
 def test_conn_status(browser, mgr) -> None:  # type: ignore[no-untyped-def]

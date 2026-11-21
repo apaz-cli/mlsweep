@@ -7,7 +7,7 @@ so they can seed metrics directly and swap in a fake ``wandb`` module.
 import asyncio
 import io
 import json
-import sys
+import os
 import threading
 import types
 import zipfile
@@ -17,7 +17,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 import mlsweep._manager_http as http
-from mlsweep._export import _crc32c, experiment_labels, tfevents_for_run
+from mlsweep._export import WandbSource, _crc32c, experiment_labels, tfevents_for_run, wandb_mode
 from mlsweep._manager_db import (
     create_experiment,
     init_db,
@@ -141,13 +141,14 @@ async def _seed_collisions(db):
         await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 2.0})
 
 
-def _with_client(fn, seed=_seed):
+def _with_client(fn, seed=_seed, wandb=None):
     async def run():
         db = await aiosqlite.connect(":memory:")
         try:
             await init_db(db)
             await seed(db)
-            app = http.create_app(db, ManagerState(token=TOKEN), TOKEN, mlsweep_dir="/nonexistent")
+            app = http.create_app(db, ManagerState(token=TOKEN), TOKEN, mlsweep_dir="/nonexistent",
+                                  wandb=wandb)
             async with TestClient(TestServer(app)) as client:
                 await fn(client)
         finally:
@@ -248,10 +249,11 @@ class _FakeRun:
 class _Runs(list):
     gate: threading.Event
     fail_names: set[str]
+    source: WandbSource
 
 
 @pytest.fixture
-def fake_wandb(monkeypatch):
+def fake_wandb():
     runs = _Runs()
     mod = types.ModuleType("wandb")
     mod.Settings = lambda **kw: kw
@@ -267,8 +269,8 @@ def fake_wandb(monkeypatch):
         return runs[-1]
 
     mod.init = init
-    monkeypatch.setitem(sys.modules, "wandb", mod)
-    monkeypatch.setattr(http, "wandb_info", lambda: {"available": True, "version": "fake", "env_key": False})
+    mod.__version__ = "fake"
+    runs.source = WandbSource(module=mod)
     return runs
 
 
@@ -309,7 +311,7 @@ def test_wandb_export_uploads_each_run(fake_wandb):
 
         r = await client.get("/api/exports?experiment_id=e1", headers=AUTH)
         assert [x["export_id"] for x in await r.json()] == [started["export_id"]]
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 def test_wandb_export_cancel(fake_wandb):
@@ -343,7 +345,7 @@ def test_wandb_export_cancel(fake_wandb):
             await asyncio.sleep(0.01)
         assert fake_wandb[0].logged == []
         assert fake_wandb[0].exit_code == 1
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 def test_wandb_export_run_failure(fake_wandb):
@@ -360,16 +362,18 @@ def test_wandb_export_run_failure(fake_wandb):
         assert "simulated upload failure" in by_run["r2"]["error"]
         assert by_run["r3"]["status"] == "skipped"
         assert [run.kwargs["name"] for run in fake_wandb] == ["r1"]
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
-@pytest.mark.parametrize("env,expected", [(None, "online"), ("offline", "offline"),
-                                          ("disabled", "disabled")])
-def test_wandb_export_honors_wandb_mode(fake_wandb, monkeypatch, env, expected):
-    if env is None:
-        monkeypatch.delenv("WANDB_MODE", raising=False)
-    else:
-        monkeypatch.setenv("WANDB_MODE", env)
+@pytest.mark.parametrize("env,expected", [({}, "online"), ({"WANDB_MODE": ""}, "online"),
+                                          ({"WANDB_MODE": "offline"}, "offline"),
+                                          ({"WANDB_MODE": "disabled"}, "disabled")])
+def test_wandb_mode_follows_the_environment(env, expected):
+    assert wandb_mode(env) == expected
+
+
+def test_wandb_export_passes_the_mode_to_wandb(fake_wandb):
+    expected = wandb_mode(os.environ)
 
     async def body(client):
         r = await client.post("/api/experiments/e1/export/wandb", headers=AUTH,
@@ -377,7 +381,7 @@ def test_wandb_export_honors_wandb_mode(fake_wandb, monkeypatch, env, expected):
         done = await _wait_export(client, (await r.json())["export_id"])
         assert done["status"] == "done"
         assert [run.kwargs["mode"] for run in fake_wandb] == [expected]
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 def test_wandb_export_only_done(fake_wandb):
@@ -387,7 +391,7 @@ def test_wandb_export_only_done(fake_wandb):
         done = await _wait_export(client, (await r.json())["export_id"])
         assert [x["run_id"] for x in done["runs"]] == ["r1", "r3"]
         assert [run.kwargs["name"] for run in fake_wandb] == ["r1"]
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 def test_wandb_export_campaign_and_all(fake_wandb):
@@ -409,7 +413,7 @@ def test_wandb_export_campaign_and_all(fake_wandb):
         assert [x["scope"] for x in await r.json()] == ["campaign"]
         r = await client.get("/api/exports?experiment_id=e1", headers=AUTH)
         assert [x["scope"] for x in await r.json()] == ["all"]
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 def test_wandb_export_refuses_overlap(fake_wandb):
@@ -425,7 +429,7 @@ def test_wandb_export_refuses_overlap(fake_wandb):
             fake_wandb.gate.set()
         for x in await (await client.get("/api/exports", headers=AUTH)).json():
             await _wait_export(client, x["export_id"])
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
 @pytest.mark.parametrize("path,payload,status", [
@@ -437,14 +441,12 @@ def test_wandb_export_rejects(fake_wandb, path, payload, status):
     async def body(client):
         r = await client.post(path, headers=AUTH, json=payload)
         assert r.status == status
-    _with_client(body)
+    _with_client(body, wandb=fake_wandb.source)
 
 
-def test_wandb_export_without_wandb(monkeypatch):
-    monkeypatch.setattr(http, "wandb_info", lambda: {"available": False, "version": None, "env_key": False})
-
+def test_wandb_export_without_wandb():
     async def body(client):
         r = await client.post("/api/experiments/e1/export/wandb", headers=AUTH, json={"project": "p"})
         assert r.status == 501
         assert "pip install" in (await r.json())["error"]
-    _with_client(body)
+    _with_client(body, wandb=WandbSource(missing=True))

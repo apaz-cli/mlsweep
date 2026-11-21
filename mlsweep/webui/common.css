@@ -61,21 +61,21 @@ nav { background: var(--chrome); border-bottom: 1px solid var(--border); display
 .code-btn svg { flex-shrink: 0; }
 .code-btn .snap { font-family: monospace; font-size: 10px; color: var(--text-muted); }
 
-/* Status badges: jobs and experiments.  A page may resize .badge. */
-.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.03em; }
+/* Status badges: jobs, experiments and workers, the same size on every page. */
+.badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 9px; letter-spacing: 0.03em; white-space: nowrap; flex-shrink: 0; }
 .badge-pending { background: #eef0f3; color: #5b6472; border: 1px solid #dde1e6; }
 .badge-dispatched, .badge-connecting, .badge-updating { background: #e8f1fe; color: #1d4ed8; border: 1px solid #c7dcff; }
 .badge-running, .badge-connected { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
 .badge-done, .badge-completed { background: #e0f2fe; color: #075985; border: 1px solid #bae6fd; }
 .badge-failed, .badge-dead { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
-.badge-xfailed, .badge-cancelled, .badge-aborted, .badge-offline { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+.badge-xfailed, .badge-cancelled, .badge-pruned, .badge-aborted, .badge-offline { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
 .badge-paused, .badge-reconnecting { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
 [data-theme=dark] .badge-pending { background: #ffffff0a; color: #9aa4b2; border-color: #ffffff14; }
 [data-theme=dark] .badge-dispatched, [data-theme=dark] .badge-connecting, [data-theme=dark] .badge-updating { background: #3b82f61f; color: #93c5fd; border-color: #3b82f640; }
 [data-theme=dark] .badge-running, [data-theme=dark] .badge-connected { background: #22c55e1f; color: #86efac; border-color: #22c55e40; }
 [data-theme=dark] .badge-done, [data-theme=dark] .badge-completed { background: #0ea5e91f; color: #7dd3fc; border-color: #0ea5e940; }
 [data-theme=dark] .badge-failed, [data-theme=dark] .badge-dead { background: #ef44441f; color: #fca5a5; border-color: #ef444440; }
-[data-theme=dark] .badge-xfailed, [data-theme=dark] .badge-cancelled, [data-theme=dark] .badge-aborted, [data-theme=dark] .badge-offline { background: #ffffff0a; color: #9aa4b2; border-color: #ffffff14; }
+[data-theme=dark] .badge-xfailed, [data-theme=dark] .badge-cancelled, [data-theme=dark] .badge-pruned, [data-theme=dark] .badge-aborted, [data-theme=dark] .badge-offline { background: #ffffff0a; color: #9aa4b2; border-color: #ffffff14; }
 [data-theme=dark] .badge-paused, [data-theme=dark] .badge-reconnecting { background: #f59e0b1f; color: #fcd34d; border-color: #f59e0b40; }
 
 /* Row buttons and their menus (rowmenu.js). */
@@ -109,8 +109,17 @@ nav { background: var(--chrome); border-bottom: 1px solid var(--border); display
 .step-timer .st-wait { color: var(--text-muted); }
 
 /* Nav search button (opens the palette) */
-.nav-search-btn { display: flex; align-items: center; gap: 6px; margin-right: 6px; font: inherit; font-size: 11px; padding: 3px 6px 3px 9px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--text-muted); cursor: pointer; }
+.nav-search-btn { display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap; margin-right: 6px; font: inherit; font-size: 11px; padding: 3px 6px 3px 9px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--text-muted); cursor: pointer; }
 .nav-search-btn:hover { background: var(--btn-hover); color: var(--text-label); }
+.nav-search-btn svg { width: 12px; height: 12px; flex-shrink: 0; }
+/* A window on half a monitor: inactive tabs keep only their icons (the name is
+   in the tooltip) and search keeps only its glyph, so the bar never overflows. */
+@media (max-width: 920px) {
+  nav { padding: 0 10px; gap: 2px; }
+  .nav-link { padding: 4px 8px; }
+  .nav-link:not(.active) .nav-label, .nav-search-btn .nav-label, .nav-search-btn kbd { display: none; }
+  .nav-search-btn { padding: 4px 7px; }
+}
 kbd { font-family: var(--font-mono); font-size: 9.5px; padding: 0 4px; border: 1px solid var(--border-input); border-bottom-width: 2px; border-radius: 3px; background: var(--surface-2); color: var(--text-dim); }
 
 #copy-toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 700; background: var(--text-strong); color: var(--surface); border-radius: 4px; padding: 5px 12px; font-size: 11px; pointer-events: none; }
@@ -161,3 +170,41 @@ kbd { font-family: var(--font-mono); font-size: 9.5px; padding: 0 4px; border: 1
 .pal-footer { display: flex; align-items: center; gap: 14px; padding: 6px 12px; border-top: 1px solid var(--border); background: var(--surface-2); color: var(--text-muted); font-size: 10.5px; }
 .pal-footer span { display: flex; align-items: center; gap: 4px; }
 @media (max-width: 760px) { .pal-preview { display: none; } .palette-list { width: 100%; } }
+
+/* A small bordered button or link (Download, Expand all, export links). */
+.btn-sm { font-size: 11px; padding: 3px 10px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); text-decoration: none; cursor: pointer; }
+.btn-sm:hover { background: var(--btn-hover); }
+
+/* A borderless icon button, for panel headers (tree tools, the sidebar toggle). */
+.ghost-btn { flex-shrink: 0; width: 24px; height: 24px; padding: 0; background: transparent; border: 1px solid transparent; border-radius: 4px; cursor: pointer; color: var(--text-dim); display: inline-flex; align-items: center; justify-content: center; }
+.ghost-btn:hover { background: var(--btn-hover); color: var(--text); }
+.ghost-btn svg { width: 15px; height: 15px; display: block; }
+
+/* File trees (notes, code): one row per folder or file, folders with a chevron. */
+.tnode { display: flex; align-items: center; gap: 5px; height: 25px; padding-right: 8px; cursor: pointer; color: var(--text-label); white-space: nowrap; position: relative; border-left: 2px solid transparent; }
+.tnode:hover { background: var(--btn-hover); color: var(--text); }
+.tnode.selected { background: var(--btn-hover); color: var(--text-strong); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.tnode.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); border-left-color: var(--radio-checked-border); }
+.tnode .chev { width: 12px; flex-shrink: 0; color: var(--text-muted); font-size: 9px; text-align: center; transition: transform .12s; }
+.tnode.open .chev { transform: rotate(90deg); }
+.tnode .ficon { width: 14px; flex-shrink: 0; display: inline-flex; justify-content: center; color: var(--text-dim); }
+.tnode .ficon svg { width: 13px; height: 13px; }
+.tnode.dir .ficon { color: var(--text-muted); }
+.tnode .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tnode .tname .ext { color: var(--text-muted); font-size: 10.5px; margin-left: 2px; }
+.tchildren.closed { display: none; }
+
+/* A sidebar that folds to a rail (MLChrome.collapsibleSidebar).  The button sits
+   in its top corner and stays on the rail. */
+.has-side-toggle { position: relative; }
+.side-toggle { position: absolute; top: 6px; right: 6px; z-index: 2; }
+.has-side-toggle.collapsed { flex: 0 0 34px !important; width: 34px; min-width: 34px; padding: 0 !important; }
+.has-side-toggle.collapsed > :not(.side-toggle) { display: none !important; }
+.has-side-toggle.collapsed .side-toggle { right: 4px; }
+.has-side-toggle.collapsed + .resizer { display: none; }
+
+/* The drag handle between a panel and what is beside it (MLChrome.resizable). */
+.resizer { width: 4px; margin: 0 -2px; cursor: col-resize; z-index: 5; flex-shrink: 0; position: relative; }
+.resizer:hover, .resizer.dragging { background: var(--radio-checked-border); opacity: .6; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing iframe { pointer-events: none; }

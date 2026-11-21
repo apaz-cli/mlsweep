@@ -7,7 +7,6 @@ the worker's jobs-per-GPU cap.  Each test drives a real manager and workers
 """
 
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -108,11 +107,11 @@ def test_reschedule_refuses_gpus_outside_the_pool(cluster):
 
 def test_a_pin_that_no_longer_fits_is_dropped():
     from mlsweep._manager_db import SchedulableJob
-    from mlsweep._manager_state import ManagerState, Pin
+    from mlsweep._manager_state import ManagerState, Pin, WorkerConn
     from mlsweep._manager_workers import _pinned_placement
 
     state = ManagerState()
-    wc = SimpleNamespace(worker_id="w", status="connected", gpus=[0, 1])
+    wc = WorkerConn(worker_id="w", host="h", port=0, status="connected", gpus=[0, 1])
     state.workers["w"] = wc  # type: ignore[assignment]
     job = SchedulableJob("e", "r", gpus_per_run=1, nodes_per_run=1)
     assert _pinned_placement(job, Pin("w", [1]), state) == [(wc, [1])]

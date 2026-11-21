@@ -27,7 +27,6 @@ document.addEventListener("mlthemechange", () => { if (typeof Graph !== "undefin
 
 // ── Small utilities ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
-const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 const esc = escHtml;  // from dialog.js
 const basename = p => p.split("/").pop();
 const dirname = p => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
@@ -84,9 +83,10 @@ function propsEl(lines) {
   }
   return props;
 }
+// This page's remembered settings: MLPrefs (chrome.js) names "notes_<k>".
 const store = {
-  get(k, d) { try { const v = localStorage.getItem("notes." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem("notes." + k, JSON.stringify(v)); } catch {} },
+  get: (k, d) => MLPrefs.get("notes_" + k, d),
+  set: (k, v) => MLPrefs.set("notes_" + k, v),
 };
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 function ago(ts) {
@@ -121,28 +121,16 @@ function toast(msg, kind = "") {
 }
 
 const ICONS = {
-  md: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M5.5 8h5M5.5 10.5h5M5.5 5.5h2.5"/></svg>',
-  image: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><circle cx="5.5" cy="6" r="1.3"/><path d="m2 12 4-4 3 3 2-2 3.5 3.5"/></svg>',
-  pdf: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M5.3 11.5V8.2h1.1a1 1 0 0 1 0 2H5.3M8.6 11.5V8.2h.8c.9 0 1.3.7 1.3 1.65s-.4 1.65-1.3 1.65z"/></svg>',
-  text: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="m6.5 7.5-1.5 1.5 1.5 1.5M9.5 7.5l1.5 1.5-1.5 1.5"/></svg>',
-  binary: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></svg>',
-  dir: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M1.5 4.5v8a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-6a1 1 0 0 0-1-1H8L6.5 3.5h-4a1 1 0 0 0-1 1z"/></svg>',
+  ...FILE_ICONS,   // chrome.js: md, image, pdf, text, binary, dir
   graph: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="7" cy="12.5" r="2"/><path d="M5.8 4.3 10 4.8M5 5.8l1.4 4.9M10.8 6.6 8.3 11"/></svg>',
   diff: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 2v8M1 6h6M9 12h6"/><circle cx="12" cy="4" r="2"/></svg>',
   term: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="m4.5 6 2 2-2 2M8.5 10.5h3"/></svg>',
 };
 // The tree's own `kind` (from the server's _notes.kind_of) when the file is
-// known; the extension rules below only cover paths not in the tree yet.
+// known; chrome.js's extension rules cover paths not in the tree yet.
 function kindOf(path) {
   const known = S.fileMap.get(path);
-  if (known) return known.kind;
-  const e = extOf(path);
-  if (e === "md" || e === "markdown") return "md";
-  if (/^(png|jpe?g|gif|webp|avif|bmp|ico|svg)$/.test(e)) return "image";
-  if (e === "pdf") return "pdf";
-  if (/^(txt|log|json|jsonl|ya?ml|toml|ini|cfg|conf|csv|tsv|py|sh|bash|zsh|js|ts|css|html?|xml|tex|bib|rst|c|h|cc|cpp|hpp|cu|rs|go|java|lua|sql|r|jl|ipynb|diff|patch|env|mk|cmake|gitignore|gitattributes)$/.test(e)) return "text";
-  if (/^(Makefile|Dockerfile|LICENSE|README|TODO|\.gitignore|\.gitattributes)$/.test(basename(path))) return "text";
-  return "binary";
+  return known ? known.kind : fileKindOf(path);
 }
 const iconFor = path => ICONS[kindOf(path)] || ICONS.binary;
 

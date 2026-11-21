@@ -219,8 +219,8 @@ def test_layout_and_sizes_survive_a_reload(mgr, page) -> None:
 
 
 def test_old_saved_tabs_become_one_group(mgr, page) -> None:
-    page.eval("localStorage.clear(); localStorage.setItem('notes.tabs', JSON.stringify([{type:'file',path:'ga.md',mode:'live'},{type:'file',path:'gd.txt',mode:'source'}]));"
-              " localStorage.setItem('notes.activeTab', JSON.stringify({type:'file',path:'gd.txt'}))")
+    page.eval("localStorage.clear(); localStorage.setItem('mlsweep_notes_tabs', JSON.stringify([{type:'file',path:'ga.md',mode:'live'},{type:'file',path:'gd.txt',mode:'source'}]));"
+              " localStorage.setItem('mlsweep_notes_activeTab', JSON.stringify({type:'file',path:'gd.txt'}))")
     page.goto(static_url(mgr, "notes.html"))
     page.wait_for("S.tabs.length === 2 && S.tabs.every(t => t.meta)", timeout=20)
     assert strips(page) == [["ga", "gd.txt"]]
@@ -264,7 +264,7 @@ def test_opening_a_file_open_in_another_group_focuses_it(page) -> None:
 
 def test_a_file_opened_before_the_layout_is_restored_is_kept(page) -> None:
     # As if gc had been clicked while the page was still starting: the saved layout lacks it.
-    page.eval("localStorage.setItem('notes.layout', JSON.stringify({ tree: { kind: 'group', tabs: [{ type: 'file', path: 'ga.md', mode: 'live' }], active: 0 }, focus: 0 }))")
+    page.eval("localStorage.setItem('mlsweep_notes_layout', JSON.stringify({ tree: { kind: 'group', tabs: [{ type: 'file', path: 'ga.md', mode: 'live' }], active: 0 }, focus: 0 }))")
     page.eval("activate(S.tabs.find(t => t.path === 'gc.md').id)")
     page.eval("restoreLayout()")
     page.wait_for("S.tabs.length === 3 && S.tabs.every(t => t.meta)")

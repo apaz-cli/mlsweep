@@ -9,6 +9,10 @@ let _initDone = false;
 
 
 
+MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
+MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_files", min: 180, max: 520 });
+MLChrome.resizable(document.getElementById("file-tree"), { name: "artifacts_tree_width", min: 140, max: 520 });
+
 // ── State ──────────────────────────────────────────────────────────────────────
 let jobs        = [];           // JobRecord[] for current experiment
 let fileCache   = {};           // run_id → [{path, size, modified}]
@@ -34,7 +38,7 @@ function comboStr(job) {
 function fileIcon(p) {
   const e = (p.split(".").pop()||"").toLowerCase();
   if (/^(png|jpg|jpeg|gif|svg|webp|bmp)$/.test(e)) return "🖼";
-  if (/^(pth|pt|ckpt|safetensors|bin|npz|npy)$/.test(e)) return "🧠";
+  if (/^(pth|pt|ckpt|safetensors|bin|npz|npy|gguf|onnx|pkl|pickle)$/.test(e)) return "🧠";
   if (/^(json|yaml|yml|toml|cfg|ini|conf)$/.test(e)) return "⚙";
   if (/^(csv|tsv)$/.test(e)) return "📊";
   if (/^(py|sh|bash)$/.test(e)) return "📝";
@@ -252,6 +256,8 @@ function renderPreviewInto(eid, runId, filePath, el, compact) {
       pre.textContent = lines.slice(0, maxL).join("\n") + (lines.length > maxL ? `\n… (${lines.length} lines)` : "");
       el.innerHTML = ""; el.appendChild(pre);
     }).catch(() => { el.innerHTML = `<span class="no-file">Error loading file</span>`; });
+  } else if (MLModelPreview.isModel(filePath)) {
+    MLModelPreview.render(url, el, compact);
   } else {
     el.innerHTML = `<span class="no-file" style="font-size:11px">Binary — use Download</span>`;
   }
@@ -390,7 +396,7 @@ async function loadExperiment(eid) {
   }
 
   // Eagerly fetch file lists for terminal runs, then populate selector + grid
-  const doneIds = jobs.filter(j => ["done","failed","xfailed","cancelled"].includes(j.status)).map(j => j.run_id);
+  const doneIds = jobs.filter(j => ["done","pruned","failed","xfailed","cancelled"].includes(j.status)).map(j => j.run_id);
   fetchFileLists(doneIds).then(() => {
     rebuildFileSel();
     if (activeTab === "compare") {

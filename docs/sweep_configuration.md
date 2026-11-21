@@ -17,7 +17,7 @@ and, for pairs that don't fit a tree, [`EXCLUDE`](#exclude-predicate-static-filt
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, `RUN_FROM`, and `UPLOAD_EXCLUDE`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, `RUN_FROM`, `UPLOAD_EXCLUDE`, `SETUP_COMMAND`, and the [run controls](#run-controls) `MAX_RUNTIME`, `PRUNE` and `METRIC_CHECK`:
 
 ```python
 COMMAND = ["python", "train.py"]
@@ -30,10 +30,16 @@ SET_DIST_ENV = False  # (default: False) auto-set standard dist env vars
 RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git root)
 UPLOAD_EXCLUDE = ["/runs", "*.ckpt"]  # leave these out of the uploaded project
 EXTRA_FLAGS = ["--seed", "42"]
+SETUP_COMMAND = "pip install -e ."  # shell command run in the workspace before each run
 
 # Optional ranking defaults (stored on the experiment; see below)
 METRIC = "val_loss"   # metric name used to rank runs
 GOAL = "minimize"     # "minimize" or "maximize"
+
+# Optional run controls, enforced by the manager (see Run Controls)
+MAX_RUNTIME = "2h"    # stop and fail a run that runs longer
+PRUNE = {"strategy": "asha", "min_steps": 500}  # stop runs that fall behind
+METRIC_CHECK = True   # (default) pause if the first runs never log METRIC
 
 def EXCLUDE(combo: dict) -> bool: ...
 ```
@@ -55,6 +61,11 @@ GOAL = "minimize"   # or "maximize"
 If `OPTIMIZE` is also present it takes precedence: its `metric`/`goal` are used
 (and required, for `method="bayes"`). Top-level `METRIC`/`GOAL` are then only a
 fallback for sweeps that do not declare `OPTIMIZE`.
+
+Upper-case names that `mlsweep` does not know are ignored, so a sweep file can
+keep its own constants (`BASE_LR = 3e-4`). A name that looks like a misspelled
+setting, such as `OPTIMZE`, is an error; see [Checking a sweep file](#checking-a-sweep-file).
+Start your own constant with `_` if it happens to look like one.
 
 ### `COMMAND`
 
@@ -442,6 +453,79 @@ These address different situations and are not meant to be combined:
 
 If you combine them, `singular` fires on the first success (the first value tried, if it works) and `monotonic` fires on the first failure — whichever comes first ends the search. In practice, `singular` alone is simpler and sufficient for the "find and commit" use case.
 
+## Run Controls
+
+Three settings make the manager act on runs while a sweep runs. They are stored
+on the experiment, so they keep working after `mlsweep run` exits or the manager
+restarts, and they apply to grid and Bayesian sweeps alike. Each run the manager
+stops or flags gets a `reason`, which `mlsweep ls EXP` prints under the run and
+the dashboard shows when you hover over its status.
+
+### `MAX_RUNTIME`
+
+```python
+MAX_RUNTIME = "2h"      # or "90m", "1h30m", "1d", or a number of seconds
+```
+
+A run whose process has run longer than this is killed and marked `failed`, with
+the reason `timed out: ran longer than MAX_RUNTIME (2h)`. The clock starts when
+the process starts, so setup and waiting in the queue don't count. A timed-out
+run is a failure like any other: it counts toward monotonic skipping and a
+Bayesian sweep's failure streak, and `mlsweep retry` reruns it.
+
+### `PRUNE`
+
+Early stopping: a run that is clearly behind the others is stopped so its GPU goes
+to the next run.
+
+```python
+PRUNE = {
+    "strategy": "median",   # "median" (default) or "asha"
+    "min_steps": 500,       # the first step runs are compared at (required)
+    "every": 500,           # median: compare again every N steps (default: min_steps)
+    "reduction_factor": 3,  # asha: compare at min_steps * 3**k, keep the best 1/3 (default: 3)
+    "n_warmup": 5,          # how many other runs must reach a step before anything is pruned there
+    "metric": "val_loss",   # default: METRIC (or OPTIMIZE's metric)
+    "goal": "minimize",     # default: GOAL
+}
+```
+
+Runs are compared at fixed steps, called rungs. A run's value at a rung is the best
+value of the metric it logged up to the first step at or past the rung, so the
+metric only needs to be logged now and then (an eval every 500 steps is fine). Once
+`n_warmup` other runs have a value at a rung, a run reaching it is stopped:
+
+- with `median`, if its value is worse than the median of theirs;
+- with `asha`, if it is not among the best `1/reduction_factor` of all the runs at that rung, itself included.
+
+A stopped run is marked `pruned`, with a reason such as `pruned at step 1000: best
+val_loss 0.92 is worse than the median 0.71 of 6 other runs there`. Its metrics
+stay, so its curve still shows in Results. A pruned run did not fail. It
+counts as finished for completion and `mlsweep wait`, as a success for skip rules,
+and toward a Bayesian sweep's `budget`. Optuna is told the trial was pruned and how
+far it got.
+
+The first `n_warmup` runs to reach a rung are never pruned there, since there is
+little to compare them with. The rung values are rebuilt from the stored metrics
+after a manager restart.
+
+### `METRIC_CHECK`
+
+If the sweep declares a metric (`METRIC` or `OPTIMIZE`'s), the manager checks that
+runs actually log it. A run that finishes without logging it, or with every value
+NaN, gets a reason naming the keys it did log: `missing metric 'val_loss': the run
+logged train_loss, val/loss; did you mean 'val/loss'?`. When the first two finished
+runs both lack it, the manager pauses the sweep and keeps its queued runs, so a
+misspelled metric doesn't use up the cluster. `mlsweep wait` exits `1` and prints
+the reason. Fix `METRIC` or the training script, or `mlsweep unpause EXP` to carry
+on as it is. The check fires once per sweep.
+
+```python
+METRIC_CHECK = True    # (default) judge by the first 2 finished runs
+METRIC_CHECK = 5       # judge by the first 5
+METRIC_CHECK = False   # don't check
+```
+
 ## Bayesian Mode
 
 By default, mlsweep runs an exhaustive grid search over all combinations. Add an `OPTIMIZE` dict to your sweep file to use Bayesian optimization (TPE via optuna) instead, which intelligently samples the hyperparameter space to find good configs faster and supports continuous parameter ranges.
@@ -733,18 +817,40 @@ mlsweep wait EXP --until stalled --stalled-after 900
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Every run finished successfully. |
-| `1` | At least one run finished as `failed`. |
+| `1` | At least one run finished as `failed`, or the manager paused the sweep for a [run control](#metric_check). |
 | `2` | `--timeout` elapsed with work outstanding (`0` = wait forever). Waiting again is safe. |
 | `3` | `--until stalled` and a running run made no log/metric progress for `--stalled-after` seconds (default `900`). |
 | `4` | No answer: the manager is unreachable, the ID is unknown, or the experiment has no runs. |
 | `5` | No failures, but some runs were cancelled or the sweep was stopped, so the results are partial. |
 
 `--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs
-stuck in `pending`. A running Bayesian sweep is not settled, even with no active runs, because the manager is about to add more.
+stuck in `pending`. Pruned runs count as finished; the summary line says how many there were. A running Bayesian sweep is not settled, even with no active runs, because the manager is about to add more.
 
 `--interval` controls the poll period (default `10` seconds). `mlsweep fetch
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
 with failures.
+
+### Checking a sweep file
+
+`mlsweep lint SWEEP.py ...` reports mistakes that would otherwise pass silently.
+`mlsweep run` runs the same checks first, refuses a file with errors (even with
+`--validate` or `--dry-run`), and prints the warnings.
+
+Errors:
+
+- an upper-case name close to a setting, such as `OPTIMZE` or `GPUS_PER_RUNN`
+- an unknown key in `OPTIMIZE` or `PRUNE`, with the likely one
+- `OPTIMIZE` with a `budget` but no `method="bayes"`, which would run as a grid
+- a dim whose `values` repeat, run names that collide, or no runs at all
+
+Warnings:
+
+- a flag passed twice in one run, by two dims or by a dim and `EXTRA_FLAGS`
+- `flags` given for values that are not in the dim's `values`
+- `METRIC` without `GOAL`, or `GOAL` without `METRIC`
+- a grid of more than 2000 runs
+
+`--strict` also exits `1` on warnings, and `--json` prints the findings for scripts.
 
 ## Campaigns
 
@@ -835,6 +941,7 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `manager` | Start the manager daemon (alias of `mlsweep_manager`). |
 | `run` | Submit a sweep (alias of `mlsweep_run`). |
 | `worker` | Start a worker daemon (alias of `mlsweep_worker`). |
+| `lint SWEEP.py...` | Check sweep files (see [Checking a sweep file](#checking-a-sweep-file)). `--strict`, `--json`. |
 | `gen_makefile` | Write a standard `Makefile` (adds `make sweep-*` targets). |
 | `watch <exp_id>` | Live terminal status for an experiment (`--events` / `--json` stream one JSON event per line). |
 | `fetch` | Download + summarize + rank an experiment's results (leaderboard). |
@@ -853,6 +960,8 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `unpause <exp_id>` | Resume dispatching. |
 | `campaign [ls]` | List campaigns with experiment and job counts (`--json`). |
 | `campaign move <exp_id> <name>` | Move an experiment to another campaign. |
+| `context [ls\|show\|add\|use\|rm]` | Named client contexts (see [Contexts](#contexts)). |
+| `completion bash\|zsh\|fish` | Print a shell completion script. |
 | `docs [topic]` | Print the bundled runbook. |
 | `version` | Print the mlsweep version. |
 
@@ -867,7 +976,48 @@ to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`) and finally
 scripts can detect partial failures.
 
 Every subcommand that talks to the manager takes `--campaign NAME` and
-`--all-campaigns` (see [Campaigns](#campaigns)).
+`--all-campaigns` (see [Campaigns](#campaigns)), and `--context NAME`.
+
+### Contexts
+
+A context names a manager, where its token is, and a campaign, so switching
+between a local manager and a lab cluster is one flag:
+
+```bash
+mlsweep context add lab --manager http://lab-box:7891 --token-file ~/.mlsweep/lab.token --campaign lr-study
+mlsweep context add local --manager http://localhost:7891
+mlsweep context use lab          # the current context, for every command
+mlsweep ls --context local       # or one command at a time (or MLSWEEP_CONTEXT=local)
+mlsweep context                  # list them; * marks the current one
+mlsweep context show             # the one in force, and whether its token is readable
+```
+
+Contexts are kept in `~/.config/mlsweep/config.toml` (`$XDG_CONFIG_HOME` is honored,
+and `$MLSWEEP_CONFIG` names another file). A token is never written there.
+`--token-file` names a file holding it and `--token-env` an environment variable.
+
+Where a setting comes from, first match wins:
+
+1. `--manager`, `--token`, `--campaign` on the command line.
+2. A context named by `--context NAME` or `$MLSWEEP_CONTEXT`.
+3. `$MLSWEEP_MANAGER`, `$MLSWEEP_TOKEN`, `$MLSWEEP_CAMPAIGN`.
+4. The current context, unless `$MLSWEEP_MANAGER` is set, since its token and campaign belong to its own manager.
+5. Otherwise the manager is `http://localhost:7891`, the token is in `$MLSWEEP_DIR/manager.token`, and the campaign is `default`.
+
+What a named context leaves out falls through to the steps below it, never to the
+current context's values.
+
+### Shell completion
+
+```bash
+eval "$(mlsweep completion bash)"   # in ~/.bashrc
+eval "$(mlsweep completion zsh)"    # in ~/.zshrc, after compinit
+mlsweep completion fish > ~/.config/fish/completions/mlsweep.fish
+```
+
+It completes subcommands, each subcommand's flags, sweep files, context names, and
+experiment IDs and campaigns from the manager in force. A manager that is down
+only means no IDs are offered.
 
 ### `mlsweep_manager`
 

@@ -38,12 +38,10 @@ button { font-family: inherit; }
 
 /* ── Layout ──────────────────────────────────────────────────────────────── */
 #layout { flex: 1; display: flex; min-height: 0; }
-#left { width: var(--left-w, 270px); flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
-#right { width: var(--right-w, 280px); flex-shrink: 0; background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+#left { width: min(var(--left-w, 270px), 32vw); flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
+#right { width: min(var(--right-w, 280px), 36vw); flex-shrink: 0; background: var(--surface); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 body.right-collapsed #right, body.right-collapsed #resize-right { display: none; }
 body.left-collapsed #left, body.left-collapsed #resize-left { display: none; }
-.resizer { width: 4px; margin: 0 -2px; cursor: col-resize; z-index: 5; flex-shrink: 0; position: relative; }
-.resizer:hover, .resizer.dragging { background: var(--radio-checked-border); opacity: .6; }
 #center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--doc-bg); }
 
 /* ── Left: header, tabs, panes ───────────────────────────────────────────── */
@@ -72,23 +70,12 @@ body.left-collapsed #left, body.left-collapsed #resize-left { display: none; }
 .mini-btn.primary { border-color: var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); font-weight: 600; }
 
 /* File tree */
+/* Tree rows (.tnode) are in common.css, shared with the code page. */
 #tree { padding: 4px 0 30px; font-size: 12.5px; user-select: none; min-height: 100%; }
-.tnode { display: flex; align-items: center; gap: 5px; height: 25px; padding-right: 8px; cursor: pointer; color: var(--text-label); white-space: nowrap; position: relative; border-left: 2px solid transparent; }
-.tnode:hover { background: var(--btn-hover); color: var(--text); }
-.tnode.selected { background: var(--btn-hover); color: var(--text-strong); box-shadow: inset 0 0 0 1px var(--border-strong); }
-.tnode.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); border-left-color: var(--radio-checked-border); }
 .tnode.drop-target { background: var(--accent-soft); outline: 1px dashed var(--radio-checked-border); outline-offset: -1px; }
-.tnode .chev { width: 12px; flex-shrink: 0; color: var(--text-muted); font-size: 9px; text-align: center; transition: transform .12s; }
-.tnode.open .chev { transform: rotate(90deg); }
-.tnode .ficon { width: 14px; flex-shrink: 0; display: inline-flex; justify-content: center; color: var(--text-dim); }
-.tnode .ficon svg { width: 13px; height: 13px; }
-.tnode.dir .ficon { color: var(--text-muted); }
-.tnode .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.tnode .tname .ext { color: var(--text-muted); font-size: 10.5px; margin-left: 2px; }
 .tnode .lock { color: var(--text-muted); font-size: 10px; flex-shrink: 0; }
 .tnode .fresh { width: 6px; height: 6px; border-radius: 50%; background: var(--radio-checked-border); flex-shrink: 0; }
 .tnode input.rename { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 1px 4px; border: 1px solid var(--radio-checked-border); border-radius: 3px; background: var(--btn-bg); color: var(--text); outline: none; }
-.tchildren.closed { display: none; }
 .tree-empty { padding: 30px 18px; font-size: 12px; color: var(--text-muted); text-align: center; line-height: 1.6; }
 
 /* Search pane */
@@ -227,6 +214,7 @@ mark { background: #f0c00055; color: inherit; border-radius: 2px; padding: 0 1px
 /* Reading view */
 .doc { max-width: var(--doc-w, 780px); margin: 0 auto; padding: 34px 48px 120px; font-size: 15px; line-height: 1.68; color: var(--text); word-wrap: break-word; }
 body.wide-doc .doc { max-width: none; }
+@media (max-width: 920px) { .doc { padding: 26px 24px 120px; } }
 .doc > :first-child { margin-top: 0 !important; }
 .doc h1, .doc h2, .doc h3, .doc h4, .doc h5, .doc h6 { color: var(--text-strong); line-height: 1.3; margin: 1.5em 0 .55em; font-weight: 700; scroll-margin-top: 16px; }
 .doc h1 { font-size: 1.85em; margin-top: .2em; letter-spacing: -.01em; }
@@ -256,6 +244,10 @@ body.wide-doc .doc { max-width: none; }
 .doc img { max-width: 100%; border-radius: 4px; cursor: zoom-in; }
 .doc .table-wrap { overflow-x: auto; margin: 1em 0; }
 .doc table { border-collapse: collapse; font-size: .9em; min-width: 40%; }
+/* As wide as its content, so a narrow pane scrolls the table instead of squeezing
+   every column to its longest word; a long cell still wraps past 28em. */
+.doc .table-wrap > table { width: max-content; }
+.doc .table-wrap > table :is(td, th) { max-width: 28em; }
 .doc th, .doc td { border: 1px solid var(--border); padding: 5px 11px; text-align: left; }
 .doc th { background: var(--code-bg); font-weight: 600; color: var(--text-strong); }
 .doc tr:nth-child(even) td { background: color-mix(in srgb, var(--code-bg) 45%, transparent); }
@@ -463,13 +455,12 @@ kbd { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 1px 6px;
 .exp-row { display: flex; align-items: center; gap: 7px; padding: 4px 12px; font-size: 11.5px; text-decoration: none; color: var(--text-label); }
 .exp-row:hover { background: var(--btn-hover); color: var(--text); }
 .exp-row .id { font-family: ui-monospace, monospace; font-size: 11px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { display: inline-block; font-size: 9.5px; font-weight: 600; padding: 1px 6px; border-radius: 8px; letter-spacing: .03em; flex-shrink: 0; }
 .hist-item { padding: 5px 12px; font-size: 11.5px; cursor: pointer; display: flex; gap: 7px; align-items: flex-start; }
 .hist-item:hover { background: var(--btn-hover); }
 .hist-item .body { flex: 1; min-width: 0; }
 .hist-item .who { font-weight: 600; color: var(--text-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hist-item .when { color: var(--text-muted); font-size: 10.5px; }
-.file-info { padding: 0 12px 6px; font-size: 11.5px; color: var(--text-label); display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; }
+.file-info { padding: 0 12px 6px; font-size: 11.5px; color: var(--text-label); display: grid; grid-template-columns: max-content minmax(0, 1fr); overflow-wrap: anywhere; gap: 3px 12px; }
 .file-info .k { color: var(--text-muted); }
 
 /* ── Overlays ────────────────────────────────────────────────────────────── */

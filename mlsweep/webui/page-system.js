@@ -250,14 +250,17 @@ function gpuState(w, g) {
   const inPool = (w.gpus || []).includes(g);
   const runs = (w.gpu_runs || {})[g] || [];
   if ((w.unhealthy_gpus || []).includes(g)) return "unhealthy";
+  if ((w.pending_gpus || []).includes(g)) return "probing";
   if (inPool) return "pool";
   return runs.length ? "draining" : "out";
 }
 
-const STATE_LABEL = { pool: "in pool", draining: "draining", out: "out of pool", unhealthy: "unhealthy" };
+const STATE_LABEL = { pool: "in pool", draining: "draining", out: "out of pool", unhealthy: "unhealthy", probing: "probing" };
+// Tile states the user cannot select or toggle: the worker's health probe holds them.
+const HELD = new Set(["unhealthy", "probing"]);
 
 function allGpusOf(w) {
-  const ids = new Set([...(w.gpus || []), ...(w.unhealthy_gpus || [])]);
+  const ids = new Set([...(w.gpus || []), ...(w.unhealthy_gpus || []), ...(w.pending_gpus || [])]);
   for (const k of Object.keys(w.gpu_stats || {})) ids.add(+k);
   for (const k of Object.keys(w.gpu_runs || {})) ids.add(+k);
   return [...ids].sort((a, b) => a - b);
@@ -306,12 +309,16 @@ function gpuTile(w, g) {
     ? (cap ? `<span class="gt-slots${runs.length > cap ? " over" : runs.length === cap ? " full" : ""}" title="${runs.length} of ${cap} jobs on this GPU${runs.length > cap ? " (over the limit: a run was moved here by hand)" : ""}">${runs.length}/${cap}</span>`
            : `<span class="gt-slots${runs.length ? " full" : ""}" title="No per-GPU limit">${runs.length}/∞</span>`)
     : "";
-  const toggle = live && st !== "unhealthy"
+  const toggle = live && !HELD.has(st)
     ? `<label class="gt-switch" title="${st === "pool" ? "Take out of the pool; its runs keep going" : "Put back in the pool"}" data-act="">
          <input type="checkbox" ${st === "pool" ? "checked" : ""} ${act("toggleGpuPool", w.worker_id, g, st === "pool")}><span></span></label>`
     : "";
+  const held = st === "unhealthy"
+    ? (w.unhealthy_reasons || {})[g] || "Failed the worker's CUDA probe"
+    : st === "probing" ? "The worker is still checking this GPU can create a CUDA context" : "";
   return `<div class="gpu-tile st-${st}${sel ? " selected" : ""}" data-worker="${escHtml(w.worker_id)}" data-gpu="${g}"
-      ${live && st !== "unhealthy" ? act("toggleGpuSelect", w.worker_id, g) : ""}>
+      ${held ? `title="${escHtml(held)}"` : ""}
+      ${live && !HELD.has(st) ? act("toggleGpuSelect", w.worker_id, g) : ""}>
     <div class="gt-head">
       <span class="gt-id">GPU ${g}</span>
       ${stat?.name ? `<span class="gt-name" title="${escHtml(stat.name)}">${escHtml(shortGpuName(stat.name))}</span>` : ""}
@@ -355,12 +362,13 @@ function selectionBar(w) {
 
 function poolSummary(w) {
   const all = allGpusOf(w);
-  const n = { pool: 0, draining: 0, out: 0, unhealthy: 0 };
+  const n = { pool: 0, draining: 0, out: 0, unhealthy: 0, probing: 0 };
   for (const g of all) n[gpuState(w, g)]++;
   const runs = new Set(Object.values(w.gpu_runs || {}).flat().map(r => r.experiment_id + "/" + r.run_id)).size;
   const parts = [`${n.pool} of ${all.length} GPU${all.length === 1 ? "" : "s"} in pool`];
   if (n.draining) parts.push(`${n.draining} draining`);
   if (n.unhealthy) parts.push(`${n.unhealthy} unhealthy`);
+  if (n.probing) parts.push(`${n.probing} probing`);
   parts.push(`${runs} run${runs === 1 ? "" : "s"}`);
   return parts.join(" · ");
 }

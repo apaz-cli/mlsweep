@@ -148,6 +148,7 @@ The token is also saved to `~/.mlsweep/manager.token` so local workers find it a
 ```sh
 mlsweep run sweeps/my_sweep.py --manager http://localhost:7891 --stream   # submit + live status
 mlsweep run sweeps/my_sweep.py --validate                                # print all combos, no submission
+mlsweep lint sweeps/my_sweep.py                                          # check for misspelled settings and flag clashes
 mlsweep run sweeps/my_sweep.py --dry-run                                 # print commands, no submission
 ```
 

@@ -178,15 +178,18 @@ def test_logger_noop_without_env():
             os.environ["MLSWEEP_WORKER_SOCKET"] = env_saved
 
 
-def test_logger_times_steps(monkeypatch):
+def test_logger_times_steps(tmp_path):
     """step_seconds is the wall time per step over the last step advance."""
-    import mlsweep.logger as logger_mod
-    monkeypatch.delenv("MLSWEEP_WORKER_SOCKET", raising=False)
+    import socket as socket_mod
+
+    from mlsweep.logger import MLSweepLogger
+
+    path = str(tmp_path / "w.sock")
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
     clock = iter([100.0, 110.0, 114.0])
-    monkeypatch.setattr(logger_mod.time, "monotonic", lambda: next(clock))
-    sent: list[dict] = []
-    logger = logger_mod.MLSweepLogger()
-    monkeypatch.setattr(logger, "_send", sent.append)
+    logger = MLSweepLogger(socket_path=path, clock=lambda: next(clock))
 
     logger.log({"loss": 1.0}, step=1)           # t=100
     logger.log({"val_loss": 1.0}, step=1)       # same step: no clock read
@@ -195,4 +198,14 @@ def test_logger_times_steps(monkeypatch):
     assert logger.step_seconds == 2.0
     logger.log({"loss": 0.8})                   # t=114, one step
     assert logger.step_seconds == 4.0
-    assert [m["step_seconds"] for m in sent] == [None, None, 2.0, 4.0]
+    logger.close()
+
+    conn, _ = server.accept()
+    data = b""
+    while chunk := conn.recv(65536):
+        data += chunk
+    conn.close()
+    server.close()
+    sent = [json.loads(line) for line in data.decode().splitlines()]
+    metrics = [m for m in sent if "step_seconds" in m]
+    assert [m["step_seconds"] for m in metrics] == [None, None, 2.0, 4.0]

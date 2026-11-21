@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 import shlex
 import sys
 import types
@@ -50,9 +51,32 @@ def _load_module(path: str | Path) -> types.ModuleType:
     return mod
 
 
+# Every top-level name a sweep file may set.  ``mlsweep lint`` flags a name
+# close to one of these, since a misspelled setting is otherwise ignored.
+SWEEP_SETTINGS = frozenset({
+    "COMMAND", "OPTIONS", "EXCLUDE", "EXTRA_FLAGS", "GPUS_PER_RUN", "NODES_PER_RUN", "RUN_FROM",
+    "SET_DIST_ENV", "METRIC", "GOAL", "OPTIMIZE", "SETUP_COMMAND", "UPLOAD_EXCLUDE",
+    "MAX_RUNTIME", "PRUNE", "METRIC_CHECK",
+})
+
+# The keys each dict setting accepts.
+OPTIMIZE_KEYS = frozenset({"method", "metric", "goal", "budget", "n_initial", "max_failures"})
+PRUNE_KEYS = frozenset({"metric", "goal", "strategy", "min_steps", "every", "reduction_factor", "n_warmup"})
+PRUNE_STRATEGIES = ("median", "asha")
+
+# How many finished runs without the declared metric pause a sweep, by default.
+DEFAULT_METRIC_CHECK_RUNS = 2
+
+
 def load_sweep_file(path: str | Path) -> dict[str, Any]:
     """Load a single sweep .py file, returning a sweep-info dict."""
-    mod = _load_module(path)
+    return sweep_info(_load_module(path), path)
+
+
+def sweep_info(mod: types.ModuleType, path: str | Path) -> dict[str, Any]:
+    """The sweep-info dict of an already loaded sweep module.  Raises ValueError."""
+    if not hasattr(mod, "OPTIONS"):
+        raise ValueError(f"{path}: OPTIONS is required (a dict of dimensions, or {{}} for one run)")
     command = getattr(mod, "COMMAND", None)
     if command is None:
         raise ValueError(f"{path}: COMMAND is required (e.g. COMMAND = ['python', 'train.py'])")
@@ -86,6 +110,9 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     if optimize is not None:
         if not isinstance(optimize, dict):
             raise ValueError(f"{path}: OPTIMIZE must be a dict")
+        unknown = sorted(set(optimize) - OPTIMIZE_KEYS)
+        if unknown:
+            raise ValueError(f"{path}: OPTIMIZE has unknown key(s) {unknown}; it takes {sorted(OPTIMIZE_KEYS)}")
         method = optimize.get("method", "grid")
         if method not in ("grid", "bayes"):
             raise ValueError(f"{path}: OPTIMIZE method must be 'grid' or 'bayes'")
@@ -104,6 +131,13 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
     if not isinstance(upload_exclude, (list, tuple)) or not all(isinstance(p, str) and p for p in upload_exclude):
         raise ValueError(f"{path}: UPLOAD_EXCLUDE must be a list of non-empty str patterns")
 
+    controls = build_controls(
+        max_runtime=getattr(mod, "MAX_RUNTIME", None),
+        prune=getattr(mod, "PRUNE", None),
+        metric_check=getattr(mod, "METRIC_CHECK", True),
+        metric=metric, goal=goal, where=str(path),
+    )
+
     return {
         "name": Path(path).stem,
         "options": mod.OPTIONS,
@@ -120,11 +154,148 @@ def load_sweep_file(path: str | Path) -> dict[str, Any]:
         "goal": goal,
         "setup_command": setup_command,
         "upload_exclude": list(upload_exclude),
+        "controls": controls,
     }
 
 
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+# ── Run controls: MAX_RUNTIME, PRUNE, METRIC_CHECK ─────────────────────────────
+#
+# The manager enforces these while a sweep runs, so they are stored on the
+# experiment as one JSON object, ``controls``:
+#
+#   max_runtime   seconds a run may run before it is stopped and failed
+#   prune         {metric, goal, strategy, min_steps, every, reduction_factor, n_warmup}
+#   metric_check  {metric, runs}: pause the sweep when its first ``runs``
+#                 finished runs all logged no ``metric``
+#
+# The manager also keeps ``note`` in it: why it paused the sweep.
+
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([dhms])")
+_DURATION_UNITS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
+
+
+def parse_duration(value: Any, where: str = "duration") -> float:
+    """Seconds in *value*: a number of seconds, or a string such as "90m" or "1h30m"."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = float(value)
+    elif isinstance(value, str):
+        text = value.strip().lower()
+        parts = _DURATION_RE.findall(text)
+        if not parts or _DURATION_RE.sub("", text).strip():
+            raise ValueError(f"{where}: {value!r} is not a duration (use seconds, or e.g. '90m', '1h30m')")
+        seconds = sum(float(n) * _DURATION_UNITS[u] for n, u in parts)
+    else:
+        raise ValueError(f"{where} must be a number of seconds or a string like '2h'")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{where} must be positive")
+    return seconds
+
+
+def format_duration(seconds: float) -> str:
+    """*seconds* as e.g. "2h", "1h30m" or "45s"."""
+    s = int(round(seconds))
+    out = ""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            out += f"{s // size}{unit}"
+            s %= size
+    return out + (f"{s}s" if s or not out else "")
+
+
+def _check_prune(prune: Any, where: str, metric: str | None, goal: str | None) -> dict[str, Any]:
+    if not isinstance(prune, dict):
+        raise ValueError(f"{where}: PRUNE must be a dict")
+    unknown = sorted(set(prune) - PRUNE_KEYS)
+    if unknown:
+        raise ValueError(f"{where}: PRUNE has unknown key(s) {unknown}; it takes {sorted(PRUNE_KEYS)}")
+    p_metric = prune.get("metric", metric)
+    p_goal = prune.get("goal", goal)
+    if not isinstance(p_metric, str) or not p_metric:
+        raise ValueError(f"{where}: PRUNE needs a metric (its own 'metric', or the sweep's METRIC)")
+    if p_goal not in _GOALS:
+        raise ValueError(f"{where}: PRUNE needs a goal of 'minimize' or 'maximize' (its own 'goal', or GOAL)")
+    strategy = prune.get("strategy", "median")
+    if strategy not in PRUNE_STRATEGIES:
+        raise ValueError(f"{where}: PRUNE strategy must be one of {list(PRUNE_STRATEGIES)}")
+    if not _positive_int(prune.get("min_steps")):
+        raise ValueError(f"{where}: PRUNE needs 'min_steps', a positive int (the first step runs are compared at)")
+    out: dict[str, Any] = {"metric": p_metric, "goal": p_goal, "strategy": strategy,
+                           "min_steps": prune["min_steps"]}
+    every = prune.get("every", prune["min_steps"])
+    if not _positive_int(every):
+        raise ValueError(f"{where}: PRUNE 'every' must be a positive int")
+    rf = prune.get("reduction_factor", 3)
+    if not isinstance(rf, int) or isinstance(rf, bool) or rf < 2:
+        raise ValueError(f"{where}: PRUNE 'reduction_factor' must be an int >= 2")
+    n_warmup = prune.get("n_warmup", 5)
+    if not isinstance(n_warmup, int) or isinstance(n_warmup, bool) or n_warmup < 1:
+        raise ValueError(f"{where}: PRUNE 'n_warmup' must be a positive int")
+    if strategy == "median":
+        if "reduction_factor" in prune:
+            raise ValueError(f"{where}: PRUNE 'reduction_factor' is for strategy 'asha'")
+        out["every"] = every
+    else:
+        if "every" in prune:
+            raise ValueError(f"{where}: PRUNE 'every' is for strategy 'median'; asha compares at "
+                             "min_steps * reduction_factor**k")
+        out["reduction_factor"] = rf
+    out["n_warmup"] = n_warmup
+    return out
+
+
+def build_controls(
+    *, max_runtime: Any = None, prune: Any = None, metric_check: Any = True,
+    metric: str | None = None, goal: str | None = None, where: str = "sweep",
+) -> dict[str, Any] | None:
+    """The ``controls`` object for a sweep's settings, or None when it has none.  Raises ValueError."""
+    out: dict[str, Any] = {}
+    if max_runtime is not None:
+        out["max_runtime"] = parse_duration(max_runtime, f"{where}: MAX_RUNTIME")
+    if prune is not None:
+        out["prune"] = _check_prune(prune, where, metric, goal)
+    if metric_check is not True and metric_check is not False and not _positive_int(metric_check):
+        raise ValueError(f"{where}: METRIC_CHECK must be True, False, or a positive int (runs to judge by)")
+    if metric_check is not False and metric:
+        runs = DEFAULT_METRIC_CHECK_RUNS if metric_check is True else metric_check
+        out["metric_check"] = {"metric": metric, "runs": runs}
+    return out or None
+
+
+def validate_controls(raw: Any) -> dict[str, Any] | None:
+    """Check a submitted ``controls`` object.  Returns it normalized; raises ValueError."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("'controls' must be an object")
+    unknown = sorted(set(raw) - {"max_runtime", "prune", "metric_check"})
+    if unknown:
+        raise ValueError(f"controls has unknown key(s) {unknown}")
+    check = raw.get("metric_check")
+    if check is not None and (not isinstance(check, dict) or not isinstance(check.get("metric"), str)
+                              or not _positive_int(check.get("runs"))):
+        raise ValueError("controls.metric_check must be {metric: str, runs: positive int}")
+    prune = raw.get("prune")
+    return build_controls(
+        max_runtime=raw.get("max_runtime"),
+        prune=prune, metric_check=check["runs"] if check else False,
+        metric=check["metric"] if check else None,
+        goal=prune.get("goal") if isinstance(prune, dict) else None, where="controls",
+    )
+
+
+def prune_rungs(prune: dict[str, Any]) -> Generator[int, None, None]:
+    """The steps a PRUNE spec compares runs at, in order (an endless generator)."""
+    step = prune["min_steps"]
+    while True:
+        yield step
+        if prune["strategy"] == "asha":
+            step *= prune["reduction_factor"]
+        else:
+            step += prune["every"]
 
 
 def validate_optimize_config(optimize: dict[str, Any], where: str = "OPTIMIZE") -> None:

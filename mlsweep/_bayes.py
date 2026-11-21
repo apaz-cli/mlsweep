@@ -26,10 +26,11 @@ warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning
 # reached when few combos are left.
 _MAX_DRAWS_PER_TRIAL = 50
 
-TrialOutcome = Literal["complete", "failed", "running", "abandoned"]
+TrialOutcome = Literal["complete", "pruned", "failed", "running", "abandoned"]
 
 _OPTUNA_STATE: dict[TrialOutcome, TrialState] = {
     "complete": TrialState.COMPLETE,
+    "pruned": TrialState.PRUNED,
     "failed": TrialState.FAIL,
     "abandoned": TrialState.FAIL,
     "running": TrialState.RUNNING,
@@ -38,11 +39,16 @@ _OPTUNA_STATE: dict[TrialOutcome, TrialState] = {
 
 @dataclass
 class PastTrial:
-    """A trial the study should know about.  *value* is set only if complete."""
+    """A trial the study should know about.
+
+    *value* is set if it is complete, or pruned after logging the metric; a
+    pruned trial's value is its best up to *step*, where it was stopped.
+    """
 
     combo: dict[str, Any]
     outcome: TrialOutcome
     value: float | None = None
+    step: int = 0
 
 
 def _build_lex_combo(
@@ -218,9 +224,13 @@ def suggest(
             _build_lex_combo(fixed, lex_options)
         except ValueError:
             continue  # a run that isn't one of these trials, added to the experiment by hand
+        # TPE ranks a pruned trial by how far it got, then by its value there.
+        pruned_at = {past.step: past.value} if past.outcome == "pruned" and past.value is not None else None
         study.add_trial(create_trial(
             params=fixed.params, distributions=fixed.distributions,
-            state=_OPTUNA_STATE[past.outcome], value=past.value,
+            state=_OPTUNA_STATE[past.outcome],
+            value=past.value if past.outcome == "complete" else None,
+            intermediate_values=pruned_at,
         ))
         if past.outcome != "abandoned":
             seen.add(lex_key(past.combo, singular))

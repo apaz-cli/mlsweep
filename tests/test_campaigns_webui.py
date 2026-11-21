@@ -137,7 +137,7 @@ def test_experiments_page_filters_on_change(page, seeded):
     _choose(page, "campaign-select", "alpha")
     _wait_rows(page, _ids(seeded, "a1", "a2"))
     assert _campaign_param(page) == "alpha"
-    assert page.eval("localStorage.getItem('mlsweep_campaign')") == "alpha"
+    assert page.eval("MLPrefs.get('campaign')") == "alpha"
     _choose(page, "campaign-select", "beta")
     _wait_rows(page, _ids(seeded, "b1"))
 
@@ -346,7 +346,7 @@ def test_sidebar_campaign_change_reloads(page, seeded, name):
     _wait_exp_options(page, exp, _ids(seeded, "b1"))
     _wait_shown(page, name, seeded["b1"])
     assert _campaign_param(page) == "beta"
-    assert page.eval("localStorage.getItem('mlsweep_campaign')") == "beta"
+    assert page.eval("MLPrefs.get('campaign')") == "beta"
 
 
 @pytest.mark.parametrize("name", sorted(_SIDEBARS))

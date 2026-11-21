@@ -11,15 +11,16 @@ body { display: flex; flex-direction: column; height: 100vh; }
 
 /* Content */
 #content { flex: 1; overflow-y: auto; padding: 18px 24px; }
+#table-scroll { overflow-x: auto; }
 
 h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
-#exp-header { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+#exp-header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-bottom: 14px; }
 #campaign-bar { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-label); }
 #campaign-select { font-size: 12px; padding: 3px 6px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--text); }
-#exp-search { font-size: 12px; padding: 3px 8px; width: 220px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--text); }
+#exp-search { font-size: 12px; padding: 3px 8px; flex: 0 1 220px; min-width: 140px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--text); }
 #exp-search:focus { outline: none; border-color: var(--accent); }
 #exp-filters { display: flex; gap: 4px; }
-.filter-chip { font-size: 11px; padding: 2px 9px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; font-family: inherit; }
+.filter-chip { white-space: nowrap; font-size: 11px; padding: 2px 9px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; font-family: inherit; }
 .filter-chip:hover { background: var(--btn-hover); }
 .filter-chip.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
 .filter-chip .n { color: var(--text-muted); font-variant-numeric: tabular-nums; margin-left: 2px; }
@@ -37,6 +38,12 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .exp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .exp-table th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
 .exp-row td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+/* Half a monitor: tighter cells, so the table fits beside the other window. */
+@media (max-width: 920px) {
+  #content { padding: 14px; }
+  .exp-table th { letter-spacing: 0; font-size: 9.5px; }
+  .exp-table th, .exp-row td { padding-left: 5px; padding-right: 5px; }
+}
 .exp-row:hover td { background: var(--btn-hover); }
 .exp-row.expanded td { background: var(--btn-hover); }
 .exp-toggle { cursor: pointer; font-size: 11px; color: var(--text-dim); user-select: none; margin-right: 6px; }
@@ -62,6 +69,11 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .combo-cell { color: var(--text-dim); }
 /* Zero width so a long combo ends in an ellipsis instead of widening the columns it spans. */
 .combo-clip { width: 0; min-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Half a monitor: the run rows tighten like the experiment rows. */
+@media (max-width: 920px) {
+  .runs-head td, .run-row td, .runs-empty td { padding-left: 5px; padding-right: 5px; }
+  .runs-head td:first-child, .run-row td:first-child, .runs-empty td { padding-left: 16px; }
+}
 
 /* Job detail expand */
 .job-toggle { cursor: pointer; font-size: 10px; color: var(--text-dim); user-select: none; margin-right: 5px; }
@@ -104,6 +116,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
   </div>
   <div id="error-msg" style="display:none"></div>
   <div id="empty-msg" style="display:none"></div>
+  <div id="table-scroll">
   <table class="exp-table" id="exp-table">
     <thead>
       <tr>
@@ -121,6 +134,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
     </thead>
     <tbody id="exp-tbody"></tbody>
   </table>
+  </div>
 </div>
 
 <script src="rowmenu.js"></script>

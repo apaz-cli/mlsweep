@@ -1,20 +1,20 @@
 // Campaign selection shared by the dashboard pages.
 //
 // The selected campaign comes from ?campaign= in the URL, else the last one
-// picked (localStorage), else "default".  "*" selects every campaign.  The
-// choice is written back to the URL and to localStorage, and links to other
+// picked (MLPrefs), else "default".  "*" selects every campaign.  The
+// choice is written back to the URL and to MLPrefs, and links to other
 // dashboard pages carry it along.
 const MLCampaign = (function () {
   const ALL = "*";
   const DEFAULT = "default";
-  const KEY = "mlsweep_campaign";
   const PAGES = new RegExp(`(^|/)(${[...MLChrome.PAGES, "index"].join("|")})\\.html$`);
 
   function load() {
-    try { return localStorage.getItem(KEY); } catch { return null; }
+    const c = MLPrefs.get("campaign");
+    return c == null ? null : String(c);
   }
   function save(c) {
-    try { localStorage.setItem(KEY, c); } catch {}
+    MLPrefs.set("campaign", c);
   }
 
   let current = new URLSearchParams(location.search).get("campaign") || load() || DEFAULT;

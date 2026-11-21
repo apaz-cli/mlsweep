@@ -57,6 +57,7 @@ class InFlightRun:
     last_step: int | None = None  # newest metric step this session
     last_step_time: float = 0.0  # epoch seconds when last_step first arrived here
     step_seconds: float | None = None  # the logger's wall seconds per step, if it sent one
+    metric_seen: bool = False  # it logged its sweep's METRIC_CHECK metric this session
 
     def note_step(self, step: int, step_seconds: float | None, now: float) -> None:
         """Record a metric for *step* that arrived at *now*.
@@ -108,8 +109,13 @@ class WorkerConn:
     host: str
     port: int
     writer: asyncio.StreamWriter | None = None  # the current connection's stream
+    # The pool: GPUs the scheduler may use on this worker, editable through the API.
+    # Health is kept apart from it, so a GPU that recovers needs no pool edit and
+    # a health report never undoes one; placement uses ``usable_gpus``.
     gpus: list[int] = field(default_factory=list)
-    unhealthy_gpus: list[int] = field(default_factory=list)  # enumerated but failed the CUDA probe
+    unhealthy_gpus: list[int] = field(default_factory=list)  # failed the worker's CUDA probe
+    unhealthy_reasons: dict[str, str] = field(default_factory=dict)  # str(gpu) -> why
+    pending_gpus: list[int] = field(default_factory=list)  # probe not finished yet
     topo: dict[str, int] = field(default_factory=dict)
     gpu_stats: dict[int, dict[str, Any]] = field(default_factory=dict)
     max_jobs_per_gpu: int = 1
@@ -126,6 +132,12 @@ class WorkerConn:
     venv: str | None = None
     tunnel_proc: Any = None  # asyncio.subprocess.Process keeping the reverse tunnel alive
     tunnel_task: Any = None  # asyncio.Task of _tunnel_monitor_task, cancelled on retirement
+
+    @property
+    def usable_gpus(self) -> list[int]:
+        """Pool GPUs that passed the worker's health probe."""
+        bad = set(self.unhealthy_gpus) | set(self.pending_gpus)
+        return [g for g in self.gpus if g not in bad]
 
 
 @dataclass
@@ -172,6 +184,11 @@ class ManagerState:
         self.placement: Placement = DEFAULT_PLACEMENT
         # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.
         self.run_values: dict[tuple[int, int], float | None] = {}
+        self.pruned_points: dict[tuple[int, int], tuple[int, float | None]] = {}  # likewise, of pruned runs
+        # Run controls of running and paused experiments, by experiment id, reloaded by
+        # each scheduler pass, and the pruning state of those that prune.  See _manager_controls.
+        self.controls: dict[str, dict[str, Any]] = {}
+        self.prune: dict[str, Any] = {}  # experiment id → PruneTracker
         self.subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
         self.lock: asyncio.Lock = asyncio.Lock()
         self.schedule_event: asyncio.Event = asyncio.Event()

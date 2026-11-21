@@ -3,6 +3,9 @@ document.addEventListener("mlthemechange", () => { if (DATA) buildActiveChart();
 const INIT_EXP = _urlParams.get("experiment") || "";
 const INIT_RUN = _urlParams.get("run") || "";
 
+MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
+MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_results", min: 180, max: 520 });
+
 // ── Constants & state (from visualize.py verbatim) ────────────────────────────
 
 const PALETTE_LIGHT = [
@@ -411,7 +414,7 @@ function renderRunBar() {
   document.getElementById("run-bar-main").innerHTML =
     `<span class="color-swatch" style="background:${escHtml(color)}"></span>`
     + `<span class="rb-name" title="${escHtml(r.hash)}">${escHtml(r.name)}</span>`
-    + (job ? badge(job.status) : "")
+    + (job ? `<span${job.reason ? ` title="${escHtml(job.reason)}"` : ""}>${badge(job.status)}</span>` : "")
     + `<span class="rb-pills">${pills}</span>`;
   document.getElementById("run-bar-links").innerHTML =
     `<a class="btn-link" href="${escHtml(runLink("logs", r.hash))}">Logs</a>`

@@ -459,16 +459,20 @@ class ParseCache:
     files: dict[str, _Parsed] = field(default_factory=dict)
     paths: list[str] = field(default_factory=list)
     resolver: Resolver | None = None
+    reads: list[str] = field(default_factory=list)  # files the last build_index read from disk
 
 
-def _update_mentions(p: _Parsed, path: Path, known: set[str], added: set[str]) -> _Parsed:
+def _update_mentions(p: _Parsed, path: Path, known: set[str], added: set[str], reads: list[str]) -> _Parsed:
     """*p* for a file that has not changed, now that the known IDs have.
 
     IDs that are gone are dropped.  Only a file containing a new ID is tokenized
     again, because rescanning the whole folder for each new experiment is slow.
     """
     mentions = {exp: lines for exp, lines in p.mentions.items() if exp in known}
-    text = p.text if p.text is not None or not added else read_text(path)
+    text = p.text
+    if text is None and added:
+        text = read_text(path)
+        reads.append(path.name)
     new_here = {exp for exp in added if text and exp in text}
     if new_here and text:
         mentions.update(find_mentions(text, new_here))
@@ -501,6 +505,7 @@ def build_index(root: Path, known_experiments: set[str] | None = None,
     links: dict[str, list[Link]] = {}
     mentions: dict[str, dict[str, list[int]]] = {}
     texts: dict[str, str] = {}
+    reads: list[str] = []
     for f in files:
         is_md = f.kind == "md"
         if not is_md and not (f.kind == "text" and known and f.size <= 512 * 1024):
@@ -509,11 +514,12 @@ def build_index(root: Path, known_experiments: set[str] | None = None,
         p = previous.get(f.path)
         if p is None or p.stamp != stamp:
             text = read_text(root / f.path)
+            reads.append(f.path)
             p = _Parsed(stamp, text if is_md else None,
                         extract_links(text) if is_md and text is not None else [],
                         find_mentions(text, known) if text else {})
         elif known_changed:
-            p = _update_mentions(p, root / f.path, known, added)
+            p = _update_mentions(p, root / f.path, known, added, reads)
         parsed[f.path] = p
         if p.text is not None:
             texts[f.path] = p.text
@@ -527,6 +533,7 @@ def build_index(root: Path, known_experiments: set[str] | None = None,
             mentions[f.path] = p.mentions
     if cache is not None:
         cache.known, cache.files, cache.paths, cache.resolver = set(known), parsed, paths, resolver
+        cache.reads = reads
     return Index(files=files, links=links, mentions=mentions, texts=texts)
 
 

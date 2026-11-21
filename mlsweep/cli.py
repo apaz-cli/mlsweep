@@ -103,6 +103,7 @@ def _build_help(include_banner: bool = False) -> str:
         ("Run", [
             ("manager [args...]", "start the manager daemon (mlsweep_manager)"),
             ("run SWEEP.py [flags]", "submit a sweep (mlsweep_run)"),
+            ("lint SWEEP.py...", "check sweep files for misspelled settings and flag clashes"),
             ("worker [args...]", "start a worker daemon (mlsweep_worker)"),
             ("gen_makefile", "write a standard Makefile into the current directory"),
         ]),
@@ -145,6 +146,10 @@ def _build_help(include_banner: bool = False) -> str:
             ("notes clone DIR", "clone the shared research notes from the manager, then use git"),
             ("notes lint [DIR]", "check links, experiment IDs and conflict markers"),
         ]),
+        ("Client", [
+            ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),
+            ("completion bash|zsh|fish", "print a shell completion script"),
+        ]),
         ("Docs", [
             ("docs [topic]", "read the bundled runbook (README by default)"),
             ("version", "print the version"),
@@ -163,7 +168,8 @@ def _build_help(include_banner: bool = False) -> str:
         lines.append(_align(rows))
         lines.append("")
     lines += [
-        "Every command defaults --manager to $MLSWEEP_MANAGER, then http://localhost:7891.",
+        "Every command defaults --manager to $MLSWEEP_MANAGER, then http://localhost:7891,",
+        "unless a context says otherwise (--context NAME, $MLSWEEP_CONTEXT, `mlsweep context use`).",
         "Each command works in the campaign named by --campaign, else $MLSWEEP_CAMPAIGN, else",
         "`default`. --all-campaigns covers every campaign (not allowed when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
@@ -387,10 +393,17 @@ def _status_cmd(argv: list[str]) -> None:
             wstatus = w.get("status", "?")
             wgpus = w.get("gpus") or []
             bad = w.get("unhealthy_gpus") or []
+            pending = w.get("pending_gpus") or []
             line = f"{_CONT}{host}  {wstatus}  gpus={wgpus}  jobs/GPU={w.get('max_jobs_per_gpu', '?')}"
             if bad:
                 line += f"  {_YELLOW}unhealthy={bad}{_RESET}"
+            if pending:
+                line += f"  probing={pending}"
             print(line)
+            reasons = w.get("unhealthy_reasons") or {}
+            for why in sorted(set(reasons.values())):
+                gs = sorted(int(g) for g, r in reasons.items() if r == why)
+                print(f"{_CONT}  {_YELLOW}GPU{'s' if len(gs) > 1 else ''} {gs}: {why}{_RESET}")
 
     if manager_up and experiments:
         print(f"  {_label('recent:')}{len(experiments)} experiments; latest:")
@@ -477,6 +490,149 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
     ]))
 
 
+# ── lint ───────────────────────────────────────────────────────────────────────
+
+
+def _lint_cmd(argv: list[str]) -> None:
+    from mlsweep._lint import lint_file
+
+    parser = argparse.ArgumentParser(
+        prog="mlsweep lint",
+        description="Check sweep files for mistakes that would otherwise pass silently: misspelled "
+                    "settings, unknown OPTIMIZE/PRUNE keys, flags passed twice, colliding run names. "
+                    "`mlsweep run` runs the same checks and refuses a file with errors.",
+    )
+    parser.add_argument("sweep_files", nargs="+", metavar="SWEEP.py")
+    parser.add_argument("--strict", action="store_true", help="Exit 1 on warnings too")
+    parser.add_argument("--json", action="store_true", help="Emit JSON")
+    args = parser.parse_args(argv)
+
+    report = {path: lint_file(path) for path in args.sweep_files}
+    if args.json:
+        print(json.dumps({p: [{"severity": f.severity, "message": f.message} for f in fs]
+                          for p, fs in report.items()}, indent=2))
+    else:
+        for path, findings in report.items():
+            if not findings:
+                print(f"{_GREEN}ok{_RESET}     {path}")
+            for f in findings:
+                color = _RED if f.severity == "error" else _YELLOW
+                print(f"{color}{f.severity}{_RESET}  {path}: {f.message}")
+    bad = {"error", "warning"} if args.strict else {"error"}
+    sys.exit(1 if any(f.severity in bad for fs in report.values() for f in fs) else 0)
+
+
+# ── context ────────────────────────────────────────────────────────────────────
+
+
+def _context_cmd(argv: list[str]) -> None:
+    from mlsweep import _context as cx
+
+    parser = argparse.ArgumentParser(
+        prog="mlsweep context",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Named contexts: a manager URL, where its token is, and a campaign, so switching between "
+            "managers is one flag (--context NAME) or one command (context use NAME).\n\n"
+            f"They are kept in {cx.config_path()} ($MLSWEEP_CONFIG to move it). A token is never "
+            "written there: --token-file or --token-env says where to read it.\n\n"
+            "Precedence: flags, then --context / $MLSWEEP_CONTEXT, then $MLSWEEP_MANAGER / $MLSWEEP_TOKEN / "
+            "$MLSWEEP_CAMPAIGN, then the current context (skipped when $MLSWEEP_MANAGER is set)."
+        ),
+    )
+    as_json = argparse.ArgumentParser(add_help=False)
+    as_json.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="Emit JSON")
+    sub = parser.add_subparsers(dest="action")
+    sub.add_parser("list", aliases=["ls"], parents=[as_json], help="List contexts (the default action)")
+    show = sub.add_parser("show", parents=[as_json],
+                          help="Show one context (default: the one in force) and what it resolves to")
+    show.add_argument("name", nargs="?")
+    add = sub.add_parser("add", help="Add or replace a context")
+    add.add_argument("name")
+    add.add_argument("--manager", required=True, help="Manager URL, e.g. http://lab-box:7891")
+    tok = add.add_mutually_exclusive_group()
+    tok.add_argument("--token-file", help="File holding the manager token")
+    tok.add_argument("--token-env", metavar="VAR", help="Environment variable holding the manager token")
+    add.add_argument("--campaign", help="Campaign to work in")
+    add.add_argument("--use", action="store_true", help="Make it the current context")
+    use = sub.add_parser("use", help="Make a context current (--none: no current context)")
+    use.add_argument("name", nargs="?")
+    use.add_argument("--none", action="store_true")
+    rm = sub.add_parser("rm", aliases=["remove"], help="Remove a context")
+    rm.add_argument("name")
+    parser.add_argument("--json", action="store_true", help="Emit JSON")
+    args = parser.parse_args(argv)
+
+    try:
+        config = cx.load_config()
+        found = cx.contexts(config)
+        action = args.action or "list"
+        if action in ("list", "ls"):
+            current = config.get("current")
+            if args.json:
+                print(json.dumps({"config": str(cx.config_path()), "current": current,
+                                  "contexts": [c.as_dict() for c in found.values()]}, indent=2))
+                return
+            if not found:
+                print(f"No contexts in {cx.config_path()}. Add one: mlsweep context add NAME --manager URL")
+                return
+            for name, c in sorted(found.items()):
+                mark = f"{_GREEN}*{_RESET}" if name == current else " "
+                extra = f"  campaign={c.campaign}" if c.campaign else ""
+                print(f"{mark} {_BOLD}{name}{_RESET}  {c.manager or '(default manager)'}{extra}")
+            return
+        if action == "show":
+            ctx = cx.get_context(args.name, config) if args.name else cx.active_context()[0]
+            if ctx is None:
+                print("No context in force (none current, or $MLSWEEP_MANAGER is set).")
+                return
+            view = {**ctx.as_dict(), "token": "present" if ctx.token() else "missing"}
+            if args.json:
+                print(json.dumps(view, indent=2))
+            else:
+                print("\n".join(f"{k}: {v}" for k, v in view.items()))
+            return
+        if action == "add":
+            cx.validate_context_name(args.name)
+            if args.campaign:
+                from mlsweep._shared import validate_campaign
+                validate_campaign(args.campaign)
+            entry = {k: v for k, v in (("manager", args.manager.rstrip("/")), ("token_file", args.token_file),
+                                       ("token_env", args.token_env), ("campaign", args.campaign)) if v}
+            if args.token_file:
+                entry["token_file"] = str(Path(args.token_file).expanduser().resolve())
+            config.setdefault("contexts", {})[args.name] = entry
+            if args.use:
+                config["current"] = args.name
+            path = cx.save_config(config)
+            print(f"{_GREEN}Saved{_RESET} context {args.name} in {path}" + (" (current)" if args.use else ""))
+            if not (args.token_file or args.token_env):
+                print(f"{_DIM}No token source given: it uses $MLSWEEP_TOKEN or ~/.mlsweep/manager.token.{_RESET}")
+            return
+        if action == "use":
+            if args.none:
+                config.pop("current", None)
+            elif args.name:
+                cx.get_context(args.name, config)
+                config["current"] = args.name
+            else:
+                parser.error("context use needs a NAME (or --none)")
+            cx.save_config(config)
+            print(f"Current context: {config.get('current') or 'none'}")
+            return
+        if action in ("rm", "remove"):
+            cx.get_context(args.name, config)
+            del config["contexts"][args.name]
+            if config.get("current") == args.name:
+                config.pop("current")
+            cx.save_config(config)
+            print(f"Removed context {args.name}")
+            return
+    except (cx.ContextError, ValueError) as e:
+        print(f"{_RED}Error: {e}{_RESET}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── dispatch ───────────────────────────────────────────────────────────────────
 
 
@@ -550,6 +706,24 @@ def main(argv: list[str] | None = None) -> None:
 
     if cmd == "docs":
         _docs_cmd(rest)
+        return
+
+    if cmd == "lint":
+        _lint_cmd(rest)
+        return
+
+    if cmd == "context":
+        _context_cmd(rest)
+        return
+
+    if cmd == "completion":
+        from mlsweep._completion import completion_cmd
+        completion_cmd(rest)
+        return
+
+    if cmd == "__complete":
+        from mlsweep._completion import complete_cmd
+        complete_cmd(rest)
         return
 
     if cmd == "gen_makefile":

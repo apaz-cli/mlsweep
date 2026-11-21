@@ -9,7 +9,8 @@ moved or purged run just changes what the next pass sees.
 
 A trial is one combo of the non-singular dims, and may have several runs (one per
 singular probe).  Its result is the best logged value of the metric in the first
-of its runs that logged one.
+of its runs that logged one.  A trial whose run was pruned (see
+``_manager_controls``) counts toward the budget, and optuna is told how far it got.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ class Trial:
     active: bool = False  # a run of it is pending or running
     all_cancelled: bool = True
     finished_at: float = 0.0
+    pruned: tuple[int, float | None] | None = None  # (last step, best value) of a pruned run
 
     @property
     def outcome(self) -> str:
@@ -53,6 +55,8 @@ class Trial:
             return "complete"
         if self.active:
             return "running"
+        if self.pruned is not None:
+            return "pruned"
         return "abandoned" if self.all_cancelled else "failed"
 
 
@@ -70,9 +74,9 @@ class Progress:
     def failure_streak(self, cleared_at: float) -> int:
         """Failed trials since the last result (or since *cleared_at*), by finish time."""
         streak = 0
-        finished = [t for t in self.trials if t.outcome in ("complete", "failed")]
+        finished = [t for t in self.trials if t.outcome in ("complete", "pruned", "failed")]
         for t in sorted(finished, key=lambda t: t.finished_at, reverse=True):
-            if t.outcome == "complete" or t.finished_at <= cleared_at:
+            if t.outcome in ("complete", "pruned") or t.finished_at <= cleared_at:
                 break
             streak += 1
         return streak
@@ -96,6 +100,18 @@ async def _run_value(
     return state.run_values[key]
 
 
+async def _pruned_point(
+    db: aiosqlite.Connection, state: ManagerState, exp_id: str, spec: dict[str, Any], row: Any,
+) -> tuple[int, float | None]:
+    """A pruned run's last metric step and best value up to it.  Cached like ``_run_value``."""
+    key = (row["job_key"], row["attempt"])
+    if key not in state.pruned_points:
+        metrics = await get_metrics_for_run(db, row["run_id"], exp_id)
+        steps = [int(r["step"]) for r in metrics if spec["metric"] in r]
+        state.pruned_points[key] = (max(steps, default=0), best_metric(metrics, spec["metric"], spec["goal"]))
+    return state.pruned_points[key]
+
+
 async def read_progress(
     db: aiosqlite.Connection, state: ManagerState, experiment_id: str, spec: dict[str, Any],
 ) -> Progress:
@@ -116,6 +132,8 @@ async def read_progress(
         elif status == "done" and trial.value is None:
             trial.value = await _run_value(db, state, experiment_id, spec, row)
             trial.best_run = row["run_id"] if trial.value is not None else None
+        elif status == "pruned" and trial.pruned is None:
+            trial.pruned = await _pruned_point(db, state, experiment_id, spec, row)
     progress.trials = list(trials.values())
     return progress
 
@@ -132,6 +150,7 @@ def status_view(exp: ExperimentRecord, spec: dict[str, Any], progress: Progress)
         "goal": spec["goal"],
         "budget": spec["budget"],
         "told": len(complete),
+        "pruned": progress.count("pruned"),
         "running": progress.count("running"),
         "failed": progress.count("failed"),
         "abandoned": progress.count("abandoned"),
@@ -176,7 +195,9 @@ async def advance_optimizer_locked(
     assert exp.optimize is not None
     spec: dict[str, Any] = json.loads(exp.optimize)
     progress = await read_progress(db, state, exp.experiment_id, spec)
-    told, running = progress.count("complete"), progress.count("running")
+    # A pruned trial spent its share of the budget too.
+    told = progress.count("complete") + progress.count("pruned")
+    running = progress.count("running")
 
     want = 0
     if not spec.get("finishing"):
@@ -186,14 +207,15 @@ async def advance_optimizer_locked(
     if want > 0:
         streak = progress.failure_streak(spec.get("failures_cleared_at", 0.0))
         if streak >= spec["max_failures"]:
-            await _give_up_locked(db, state, exp, spec, f"{streak} trials in a row failed or logged no "
+            await give_up_locked(db, state, exp, spec, f"{streak} trials in a row failed or logged no "
                                                         f"{spec['metric']!r}. Unpause to try again.")
             return
 
     added = False
     note = spec.get("note")
     if want > 0:
-        history = [bayes.PastTrial(t.combo, t.outcome, t.value) for t in progress.trials]
+        history = [bayes.PastTrial(t.combo, t.outcome, t.pruned[1] if t.pruned else t.value,
+                                   t.pruned[0] if t.pruned else 0) for t in progress.trials]
         variations = await asyncio.to_thread(bayes.suggest, spec, history, want, progress.next_number())
         if variations:
             await state.db_writer.insert_jobs_bulk(
@@ -209,7 +231,7 @@ async def advance_optimizer_locked(
         })
 
 
-async def _give_up_locked(
+async def give_up_locked(
     db: aiosqlite.Connection, state: ManagerState, exp: ExperimentRecord, spec: dict[str, Any], why: str,
 ) -> None:
     """Pause a sweep that isn't working.  Runs already going may finish.
@@ -238,7 +260,7 @@ async def advance_optimizers_locked(db: aiosqlite.Connection, state: ManagerStat
             print(f"  {_RED}ERROR{_RESET} optimizer of {exp.experiment_id} failed: {e!r}")
             traceback.print_exc()
             assert exp.optimize is not None
-            await _give_up_locked(db, state, exp, json.loads(exp.optimize), f"optimizer error: {e!r}")
+            await give_up_locked(db, state, exp, json.loads(exp.optimize), f"optimizer error: {e!r}")
 
 
 def cleared_for_running(spec: dict[str, Any]) -> dict[str, Any]:

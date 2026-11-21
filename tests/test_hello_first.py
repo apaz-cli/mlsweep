@@ -4,73 +4,61 @@ The manager drops a connection whose first message is anything else.  Building
 the hello can take seconds (nvidia-smi topology, device probes), and the GPU
 stats thread and run traffic used to reach a connection during that window, so
 on slow hosts every connection was dropped and the worker relaunched forever.
-"""
-import queue
-import socket
-import threading
 
-from mlsweep import worker
+This runs a real worker whose ``nvidia-smi`` (first on its PATH) answers the
+topology query only after the stats thread has broadcast at least once.
+"""
+import os
+import socket
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+from conftest import _find_free_port
 from mlsweep._shared import MsgGpuStats, MsgHello, MsgWorkerHello, decode, encode, read_msg
 
+STATS_INTERVAL = 5.0  # the worker's _gpu_stats_thread period
 
-class _FastEvent:
-    """Stand-in for ``_shutdown_event``: ``wait`` returns at once, ``n`` times."""
-
-    def __init__(self, n: int) -> None:
-        self.n = n
-
-    def wait(self, timeout: float | None = None) -> bool:
-        self.n -= 1
-        return self.n < 0
-
-
-def _broadcast_stats_once(monkeypatch):
-    """Run one iteration of the GPU stats thread."""
-    real = worker._shutdown_event
-    monkeypatch.setattr(worker, "_shutdown_event", _FastEvent(1))
-    worker._gpu_stats_thread()
-    monkeypatch.setattr(worker, "_shutdown_event", real)
+FAKE_NVIDIA_SMI = textwrap.dedent("""\
+    #!/bin/sh
+    case "$*" in
+      *topo*) sleep {topo_seconds}; exit 0 ;;
+      *--query-gpu=index,utilization.gpu*) echo "0, 0, 0, 1, Fake GPU"; exit 0 ;;
+    esac
+    exit 1
+""")
 
 
-def test_stats_and_run_traffic_wait_for_hello(monkeypatch):
-    topo_started = threading.Event()
-    stats_sent = threading.Event()
-
-    def slow_topology():
-        topo_started.set()
-        assert stats_sent.wait(5.0)
-        return {}
-
-    monkeypatch.setattr(worker, "visible_devices", lambda: [0])
-    monkeypatch.setattr(worker, "_device_probe", False)
-    monkeypatch.setattr(worker, "_gpu_topology", slow_topology)
-    monkeypatch.setattr(worker, "_query_gpu_stats",
-                        lambda: [{"gpu": 0, "util_pct": 0, "mem_used_mb": 0, "mem_total_mb": 1}])
-    monkeypatch.setattr(worker, "_token", "tok")
-    monkeypatch.setattr(worker, "_connections", [])
-    monkeypatch.setattr(worker, "_shutdown_event", threading.Event())
-
-    mgr, wrk = socket.socketpair()
-    conn = worker.ConnState(sock=wrk, send_queue=queue.Queue())
-    worker._connections.append(conn)
-    threading.Thread(target=worker._write_thread, args=(conn,), daemon=True).start()
-    mgr.sendall(encode(MsgHello(token="tok", controller_id="manager")))
-    reader = threading.Thread(target=worker._read_thread, args=(conn,), daemon=True)
-    reader.start()
-
-    # Mid-handshake: a stats broadcast and run traffic must not reach this connection.
-    assert topo_started.wait(5.0)
-    _broadcast_stats_once(monkeypatch)
-    assert worker._current_connection() is None
-    stats_sent.set()
-
-    mgr.settimeout(5.0)
-    assert isinstance(decode(read_msg(mgr)), MsgWorkerHello)
-    assert worker._current_connection() is conn
-
-    # After the hello, stats flow as before.
-    _broadcast_stats_once(monkeypatch)
-    assert isinstance(decode(read_msg(mgr)), MsgGpuStats)
-
-    mgr.close()
-    reader.join(5.0)
+@pytest.mark.xdist_group("timing")
+def test_stats_and_run_traffic_wait_for_hello(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    smi = bin_dir / "nvidia-smi"
+    smi.write_text(FAKE_NVIDIA_SMI.format(topo_seconds=STATS_INTERVAL + 2))
+    smi.chmod(0o755)
+    port = _find_free_port()
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "CUDA_VISIBLE_DEVICES": "0"}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mlsweep.worker", "--token", "tok", "--port", str(port), "--no-device-probe",
+         "--scratch-dir", str(tmp_path / "scratch"), "--remote-dir", str(tmp_path)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        assert proc.stdout is not None and proc.stdout.readline().strip() == f"PORT={port}"
+        mgr = socket.create_connection(("127.0.0.1", port), timeout=30)
+        mgr.sendall(encode(MsgHello(token="tok", controller_id="manager")))
+        # The hello waits on the slow topology query, while the stats thread
+        # broadcasts; the hello still comes first.
+        assert isinstance(decode(read_msg(mgr)), MsgWorkerHello)
+        # After the hello, stats flow as before.
+        mgr.settimeout(STATS_INTERVAL * 3)
+        assert isinstance(decode(read_msg(mgr)), MsgGpuStats)
+        mgr.close()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

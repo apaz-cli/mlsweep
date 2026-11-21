@@ -4,7 +4,8 @@ Each command works in the campaign named by ``--campaign``, else
 ``$MLSWEEP_CAMPAIGN``, else ``default``; ``--all-campaigns`` covers every
 campaign.  A command naming an experiment from another campaign exits 1 with a
 hint and changes nothing.  Commands run in-process against a real manager,
-except ``mlsweep run``, which runs as a subprocess from the repo root.
+except ``mlsweep run``, which runs as a subprocess from the repo root, and the
+cases about ``$MLSWEEP_CAMPAIGN``, which run as a subprocess with it set.
 """
 
 import json
@@ -17,6 +18,7 @@ import pytest
 
 from campaign_helpers import TOKEN, call, ok, q, seed, shared_manager, snapshot, uid
 from conftest import _wait_for_experiment_complete
+from recording_server import RecordingServer
 
 from mlsweep import cli, ctl, run_sweep
 from mlsweep.run_sweep import (
@@ -30,11 +32,6 @@ REPO_ROOT = Path(__file__).parent.parent
 MLSWEEP_RUN = [sys.executable, "-m", "mlsweep.run_sweep"]
 
 
-@pytest.fixture(autouse=True)
-def _no_campaign_env(monkeypatch):
-    monkeypatch.delenv("MLSWEEP_CAMPAIGN", raising=False)
-
-
 @pytest.fixture(scope="module")
 def mgr(tmp_path_factory):
     yield from shared_manager(tmp_path_factory, "campaigns_cli")
@@ -44,14 +41,31 @@ def _base(server):
     return ["--manager", server.url, "--token", TOKEN]
 
 
-def _run_cli(argv, capsys):
-    """Run ``mlsweep *argv*`` in-process; return ``(exit code, stdout)``."""
+def _run_cli(argv, capsys, campaign_env=None):
+    """Run ``mlsweep *argv*``; return ``(exit code, stdout)``.
+
+    In-process, unless *campaign_env* is given: then in a subprocess with
+    ``$MLSWEEP_CAMPAIGN`` set to it.  ``watch`` in-process reads its events from
+    ``_FakeWS``.
+    """
+    if campaign_env is not None:
+        r = subprocess.run([sys.executable, "-m", "mlsweep", *argv], capture_output=True, text=True,
+                           env={**_ENV, "MLSWEEP_CAMPAIGN": campaign_env}, timeout=120)
+        return r.returncode, r.stdout
     code = 0
     try:
-        cli.main(argv)
+        if argv[0] == "watch":
+            run_sweep._watch_cmd(argv[1:], prog="mlsweep watch", connect=_FakeWS)
+        else:
+            cli.main(argv)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 1
     return code, capsys.readouterr().out
+
+
+# The environment of subprocesses, without a campaign of its own.
+_ENV = {k: v for k, v in os.environ.items() if k != "MLSWEEP_CAMPAIGN"}
+_NO_ENV: dict[str, str] = {}
 
 
 def _parse(argv):
@@ -64,28 +78,24 @@ def _parse(argv):
 
 
 def test_resolve_defaults_to_default():
-    assert _resolve_campaign(_parse([])) == "default"
+    assert _resolve_campaign(_parse([]), _NO_ENV) == "default"
 
 
-def test_resolve_reads_env(monkeypatch):
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", "from_env")
-    assert _resolve_campaign(_parse([])) == "from_env"
+def test_resolve_reads_env():
+    assert _resolve_campaign(_parse([]), {"MLSWEEP_CAMPAIGN": "from_env"}) == "from_env"
 
 
-def test_resolve_flag_beats_env(monkeypatch):
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", "from_env")
-    assert _resolve_campaign(_parse(["--campaign", "from_flag"])) == "from_flag"
+def test_resolve_flag_beats_env():
+    assert _resolve_campaign(_parse(["--campaign", "from_flag"]), {"MLSWEEP_CAMPAIGN": "from_env"}) == "from_flag"
 
 
-def test_resolve_empty_env_means_default(monkeypatch):
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", "")
-    assert _resolve_campaign(_parse([])) == "default"
+def test_resolve_empty_env_means_default():
+    assert _resolve_campaign(_parse([]), {"MLSWEEP_CAMPAIGN": ""}) == "default"
 
 
 @pytest.mark.parametrize("flag", ["--all-campaigns", "--all_campaigns"])
-def test_resolve_all_campaigns(monkeypatch, flag):
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", "from_env")
-    assert _resolve_campaign(_parse([flag])) is None
+def test_resolve_all_campaigns(flag):
+    assert _resolve_campaign(_parse([flag]), {"MLSWEEP_CAMPAIGN": "from_env"}) is None
 
 
 def test_campaign_and_all_campaigns_are_exclusive(capsys):
@@ -103,10 +113,9 @@ def test_resolve_rejects_invalid_flag(capsys, bad):
     assert "campaign must be" in capsys.readouterr().out
 
 
-def test_resolve_rejects_invalid_env(monkeypatch, capsys):
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", "not valid")
+def test_resolve_rejects_invalid_env(capsys):
     with pytest.raises(SystemExit):
-        _resolve_campaign(_parse([]))
+        _resolve_campaign(_parse([]), {"MLSWEEP_CAMPAIGN": "not valid"})
     assert "campaign must be" in capsys.readouterr().out
 
 
@@ -125,9 +134,10 @@ def test_campaign_argv():
     assert _campaign_argv(None) == ["--all-campaigns"]
 
 
-def test_require_campaign_none_makes_no_request(monkeypatch):
-    monkeypatch.setattr(run_sweep, "_http_request", lambda *a, **k: pytest.fail("no request expected"))
-    require_campaign("http://unused", "t", "e", None)
+def test_require_campaign_none_makes_no_request():
+    with RecordingServer(200, {}) as server:
+        require_campaign(server.url, "t", "e", None)
+    assert server.calls == []
 
 
 def test_require_campaign_passes_for_match_and_unknown(mgr):
@@ -196,26 +206,24 @@ class _FakeWS:
 
 
 @pytest.fixture
-def fake_ws(monkeypatch):
+def fake_ws():
     _FakeWS.urls = []
-    monkeypatch.setattr(run_sweep, "_WebSocket", _FakeWS)
     return _FakeWS
 
 
 @pytest.mark.parametrize("how", ["default", "flag", "env"])
 @pytest.mark.parametrize("name", sorted(_COMMANDS))
-def test_command_refuses_other_campaign(mgr, capsys, monkeypatch, fake_ws, name, how):
+def test_command_refuses_other_campaign(mgr, capsys, fake_ws, name, how):
     eid = seed(mgr, "alpha")
     before = snapshot(mgr, eid)
     argv = _argv(name, eid) + _base(mgr)
-    wanted = "default"
+    wanted, env = "default", None
     if how == "flag":
         argv += ["--campaign", "beta"]
         wanted = "beta"
     elif how == "env":
-        monkeypatch.setenv("MLSWEEP_CAMPAIGN", "beta")
-        wanted = "beta"
-    code, out = _run_cli(argv, capsys)
+        wanted = env = "beta"
+    code, out = _run_cli(argv, capsys, env)
     assert code == 1, out
     assert f"is in campaign 'alpha', not '{wanted}'" in out
     assert "Pass --campaign alpha or --all-campaigns." in out
@@ -262,19 +270,22 @@ def _expect(name, mgr, eid, code, out, campaign):
 
 @pytest.mark.parametrize("how", ["flag", "env", "all", "all_underscore"])
 @pytest.mark.parametrize("name", sorted(_COMMANDS))
-def test_command_works_in_its_campaign(mgr, capsys, monkeypatch, fake_ws, name, how):
+def test_command_works_in_its_campaign(mgr, capsys, fake_ws, name, how):
+    if name == "watch" and how != "flag":
+        pytest.skip("watch runs in-process only, where its events can be replayed; "
+                    "the env and --all-campaigns cases of resolving are covered above")
     eid = seed(mgr, "alpha")
     argv = _argv(name, eid) + _base(mgr)
-    campaign = "alpha"
+    campaign, env = "alpha", None
     if how == "flag":
         argv += ["--campaign", "alpha"]
     elif how == "env":
-        monkeypatch.setenv("MLSWEEP_CAMPAIGN", "alpha")
+        env = "alpha"
     else:
-        monkeypatch.setenv("MLSWEEP_CAMPAIGN", "beta")  # --all-campaigns overrides it
+        env = "beta"  # --all-campaigns overrides it
         argv += ["--all-campaigns" if how == "all" else "--all_campaigns"]
         campaign = None
-    code, out = _run_cli(argv, capsys)
+    code, out = _run_cli(argv, capsys, env)
     assert "is in campaign" not in out
     _expect(name, mgr, eid, code, out, campaign)
 
@@ -325,11 +336,10 @@ def test_ls_json_is_filtered(mgr, capsys):
     assert all(r["campaign"] == cx for r in rows)
 
 
-def test_ls_runs_of_experiment_in_env_campaign(mgr, capsys, monkeypatch):
+def test_ls_runs_of_experiment_in_env_campaign(mgr, capsys):
     cx = uid("cx")
     eid = seed(mgr, cx)
-    monkeypatch.setenv("MLSWEEP_CAMPAIGN", cx)
-    code, out = _run_cli(["ls", eid, "--json"] + _base(mgr), capsys)
+    code, out = _run_cli(["ls", eid, "--json"] + _base(mgr), capsys, cx)
     assert code == 0 and sorted(j["run_id"] for j in json.loads(out)) == ["r1", "r2"]
 
 

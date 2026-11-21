@@ -15,12 +15,6 @@
 const MAX_TEXT_BYTES = 4 << 20;
 
 const $ = id => document.getElementById(id);
-function el(tag, cls, text) {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (text != null) e.textContent = text;
-  return e;
-}
 const short = sid => (sid || "").slice(0, 17);
 
 const S = {
@@ -38,6 +32,11 @@ const S = {
 const manifests = new Map();
 const fileCache = new Map();          // snapshot + path -> text (content never changes)
 const openDirs = new Set();
+const TREE_ORDER = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });   // as the notes tree sorts
+
+MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
+MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_code", min: 180, max: 520 });
+MLChrome.resizable(document.getElementById("tree-pane"), { name: "code_tree_width", min: 150, max: 560 });
 
 // ── the URL ──────────────────────────────────────────────────────────────────
 
@@ -516,55 +515,94 @@ function treeFiles() {
 
 function renderTree() {
   const tree = $("file-tree");
+  const scroll = tree.scrollTop;
   tree.replaceChildren();
   const files = treeFiles();
+  const title = $("tree-title");
+  title.replaceChildren(S.diff && S.changedOnly ? "Changed files" : "Files", el("span", "count", String(files.length)));
   const expandAll = !!S.filter.trim() || (S.diff && S.changedOnly);
   if (!files.length) {
     tree.append(el("div", "tree-msg", S.filter ? "No file matches." : S.diff ? "Nothing changed." : "No files."));
     return;
   }
-  const parts = S.path.split("/");
-  for (let i = 1; i <= parts.length; i++) openDirs.add(parts.slice(0, i).join("/"));
   const changedDirs = new Set();
   for (const f of files) if (f.status) {
     const ps = f.path.split("/");
     for (let i = 1; i < ps.length; i++) changedDirs.add(ps.slice(0, i).join("/"));
   }
+  // The rows are the notes tree's: a chevron on folders, a glyph per file type,
+  // the extension dimmed.
   const draw = (node, prefix, depth, host) => {
-    for (const name of [...node.dirs.keys()].sort((a, b) => a.localeCompare(b))) {
+    for (const name of [...node.dirs.keys()].sort(TREE_ORDER.compare)) {
       const p = prefix ? `${prefix}/${name}` : name;
       const open = expandAll || openDirs.has(p);
-      const row = el("div", "file-row dir" + (p === S.path ? " selected" : ""));
-      row.style.paddingLeft = (6 + depth * 14) + "px";
+      const row = el("div", "tnode dir" + (open ? " open" : "") + (p === S.path ? " active" : ""));
+      row.style.paddingLeft = (8 + depth * 14) + "px";
       row.dataset.path = p;
-      const caret = el("span", "caret", open ? "▾" : "▸");
-      row.append(caret, el("span", "fname", name));
-      if (changedDirs.has(p)) row.append(el("span", "dot"));
-      const kids = el("div", "kids" + (open ? "" : " closed"));
-      caret.onclick = e => {
-        e.stopPropagation();
-        const closed = kids.classList.toggle("closed");
-        caret.textContent = closed ? "▸" : "▾";
-        if (closed) openDirs.delete(p); else openDirs.add(p);
+      const chev = el("span", "chev", "▶");
+      const icon = el("span", "ficon"); icon.innerHTML = FILE_ICONS.dir;
+      row.append(chev, icon, el("span", "tname", name));
+      if (changedDirs.has(p)) { const dot = el("span", "dot"); dot.title = "Something in here changed"; row.append(dot); }
+      const kids = el("div", "tchildren" + (open ? "" : " closed"));
+      const setOpen = want => {
+        row.classList.toggle("open", want); kids.classList.toggle("closed", !want);
+        if (want) openDirs.add(p); else openDirs.delete(p);
       };
-      row.onclick = () => { openDirs.add(p); openPath(p, { push: true }); };
+      chev.onclick = e => { e.stopPropagation(); setOpen(!row.classList.contains("open")); };
+      // A click shows the folder's listing and opens it; a click on the folder
+      // already shown folds it.
+      row.onclick = () => {
+        if (p === S.path && row.classList.contains("open")) { setOpen(false); return; }
+        setOpen(true); openPath(p, { push: true });
+      };
       row.oncontextmenu = e => treeMenu(e, p, true);
       host.append(row, kids);
       draw(node.dirs.get(name), p, depth + 1, kids);
     }
-    for (const f of node.files.sort((a, b) => a.name.localeCompare(b.name))) {
-      const row = el("div", "file-row" + (f.status ? " ch-" + f.status : "") + (f.path === S.path ? " selected" : ""));
-      row.style.paddingLeft = (6 + depth * 14) + "px";
+    for (const f of node.files.sort((a, b) => TREE_ORDER.compare(a.name, b.name))) {
+      const row = el("div", "tnode file" + (f.status ? " ch-" + f.status : "") + (f.path === S.path ? " active" : ""));
+      row.style.paddingLeft = (8 + depth * 14 + 17) + "px";
       row.dataset.path = f.path;
-      row.append(el("span", "mark", f.status === "mode" ? "M" : f.status), el("span", "fname", f.name),
-                 el("span", "fsize", f.size == null ? "" : fmtSize(f.size)));
+      row.title = f.size == null ? f.path : `${f.path}\n${fmtSize(f.size)}`;
+      const icon = el("span", "ficon"); icon.innerHTML = FILE_ICONS[fileKindOf(f.name)] || FILE_ICONS.binary;
+      const name = el("span", "tname");
+      const dot = f.name.lastIndexOf(".");
+      if (dot > 0) name.append(f.name.slice(0, dot), el("span", "ext", f.name.slice(dot)));
+      else name.textContent = f.name;
+      row.append(icon, name);
+      if (f.status) row.append(el("span", "mark", f.status === "mode" ? "M" : f.status));
       row.onclick = () => openPath(f.path, { push: true });
       row.oncontextmenu = e => treeMenu(e, f.path, false);
       host.append(row);
     }
   };
   draw(buildTree(files, S.diff && S.changedOnly ? [] : S.manifest.dirs), "", 0, tree);
+  tree.scrollTop = scroll;
 }
+
+// Opens the folders down to *path*, marks its row and scrolls it into view.
+function revealInTree(path) {
+  const parts = path.split("/");
+  let added = false;
+  for (let i = 1; i <= parts.length; i++) {
+    const p = parts.slice(0, i).join("/");
+    if (i < parts.length || isDir(path)) { if (!openDirs.has(p)) { openDirs.add(p); added = true; } }
+  }
+  if (added) renderTree();
+  const rows = document.querySelectorAll("#file-tree .tnode");
+  rows.forEach(r => r.classList.toggle("active", r.dataset.path === path));
+  [...rows].find(r => r.dataset.path === path)?.scrollIntoView({ block: "nearest" });
+}
+
+// "Wrap" folds long lines in the file and diff views instead of scrolling sideways.
+$("wrap-lines").checked = !!MLPrefs.get("code_wrap", false);
+$("view").classList.toggle("wrap", $("wrap-lines").checked);
+$("wrap-lines").addEventListener("change", e => {
+  MLPrefs.set("code_wrap", e.target.checked);
+  $("view").classList.toggle("wrap", e.target.checked);
+});
+
+$("tree-collapse").onclick = () => { openDirs.clear(); renderTree(); };
 
 // ── highlighting ─────────────────────────────────────────────────────────────
 
@@ -743,7 +781,8 @@ async function fileText(path, entry) {
 async function openPath(path, { keepLines = false, push = false } = {}) {
   S.path = path || "";
   if (!keepLines) S.start = S.end = null;
-  document.querySelectorAll("#file-tree .file-row").forEach(r => r.classList.toggle("selected", r.dataset.path === S.path));
+  if (S.path) revealInTree(S.path);
+  else document.querySelectorAll("#file-tree .tnode.active").forEach(r => r.classList.remove("active"));
   renderCrumbs();
   syncUrl(push);
   const view = $("view"), meta = $("file-meta"), raw = $("raw-link");
@@ -770,6 +809,24 @@ async function openPath(path, { keepLines = false, push = false } = {}) {
   }
   const url = `/api/snapshots/${encodeURIComponent(S.snapshot)}/files/${S.path.split("/").map(encodeURIComponent).join("/")}`;
   raw.href = authURL(url);
+  // As on the artifacts page: models and arrays get the manager's summary,
+  // images are shown.  (An SVG is source here, so it stays text.)
+  if (MLModelPreview.isModel(S.path)) {
+    meta.textContent = fmtSize(entry[2]);
+    const box = el("div", "file-preview");
+    view.replaceChildren(box);
+    MLModelPreview.render(url, box, false, { info: url.replace("/files/", "/file-info/") });
+    return;
+  }
+  if (fileKindOf(S.path) === "image" && !/\.svg$/i.test(S.path)) {
+    meta.textContent = fmtSize(entry[2]);
+    const img = el("img");
+    img.src = authURL(url); img.alt = S.path;
+    const box = el("div", "file-preview");
+    box.append(img);
+    view.replaceChildren(box);
+    return;
+  }
   if (entry[2] > MAX_TEXT_BYTES) {
     meta.textContent = fmtSize(entry[2]);
     view.replaceChildren(el("div", "msg", `${fmtSize(entry[2])}, too large to show here. The download button next to the path has it.`));

@@ -21,9 +21,9 @@ from mlsweep._manager_state import ManagerState, WorkerConn
 from mlsweep._shared import WORKER_MODULES, PROTOCOL_VERSION, MsgWorkerHello, code_fingerprint
 
 
-def _outdated_after_hello(tmp_path, host: str, code: str, after=None) -> bool:
-    """Whether the worker is listed as outdated after a hello reporting *code*.
-    *after()* runs between the hello and the check."""
+def _outdated_after_hello(tmp_path, host: str, code: str, on_disk: str | None = None) -> bool:
+    """Whether the worker is listed as outdated after a hello reporting *code*,
+    with *on_disk* as the worker code on disk by then (default: as it is)."""
     async def body():
         db = await aiosqlite.connect(tmp_path / "manager.db")
         await init_db(db)
@@ -39,9 +39,7 @@ def _outdated_after_hello(tmp_path, host: str, code: str, after=None) -> bool:
                                    protocol=PROTOCOL_VERSION, code=code)
             await mw._handle_worker_hello(db, state, wc, wc.conn_gen, hello)
             assert wc.status == "connected"
-            if after is not None:
-                after()
-            return mw.worker_outdated(state, "w")
+            return mw.worker_outdated(state, "w", on_disk)
         finally:
             writer_task.cancel()
             await db.close()
@@ -61,13 +59,10 @@ def test_a_remote_worker_with_the_code_on_disk_is_current(tmp_path):
     assert not _outdated_after_hello(tmp_path, "user@gpu1", code_fingerprint())
 
 
-def test_a_worker_code_edit_after_the_hello_marks_the_worker_outdated(tmp_path, monkeypatch):
+def test_a_worker_code_edit_after_the_hello_marks_the_worker_outdated(tmp_path):
     """The comparison is with the code on disk when listed, not with what the manager
     loaded: an update installs the code on disk, so it must clear the flag."""
-    current = code_fingerprint()
-    assert _outdated_after_hello(
-        tmp_path, "user@gpu1", current,
-        after=lambda: monkeypatch.setattr(mw, "code_fingerprint", lambda: "edited-since"))
+    assert _outdated_after_hello(tmp_path, "user@gpu1", code_fingerprint(), on_disk="edited-since")
 
 
 def test_only_worker_modules_change_the_fingerprint(tmp_path):
@@ -128,14 +123,12 @@ def test_retiring_a_worker_closes_its_tunnel(tmp_path):
     assert asyncio.run(body()) == (True, None)
 
 
-def test_a_worker_that_fails_to_launch_is_listed_and_not_flagged(tmp_path, monkeypatch):
+def test_a_worker_that_fails_to_launch_is_listed_and_not_flagged(tmp_path):
     """A worker from the workers file has no row until something creates one.
     One that cannot start must still be listed, with the reason, and a failed
     ssh or install is not a sign of old code."""
     async def failing_launch(**kwargs):
         raise mw.BootstrapError("copying the wheel failed on user@gpu1: Connection refused")
-
-    monkeypatch.setattr(mw, "launch_worker", failing_launch)
 
     async def body():
         db = await aiosqlite.connect(tmp_path / "manager.db")
@@ -147,7 +140,8 @@ def test_a_worker_that_fails_to_launch_is_listed_and_not_flagged(tmp_path, monke
             state.db_writer = writer
             state.reserve_worker_id("user@gpu1:7890")
             wc = await mw.connect_single_worker(
-                db, state, "user@gpu1", "/proj", worker_id="user@gpu1:7890", port=7890)
+                db, state, "user@gpu1", "/proj", worker_id="user@gpu1:7890", port=7890,
+                launch=failing_launch)
             record = await mw.get_worker(db, "user@gpu1:7890")
             return wc, record, mw.worker_outdated(state, "user@gpu1:7890")
         finally:

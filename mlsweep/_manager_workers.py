@@ -35,22 +35,32 @@ from typing import Any, Callable, Sequence
 
 import aiosqlite
 
-from mlsweep._manager_optimizer import advance_optimizers_locked
+from mlsweep._manager_controls import PruneTracker, metric_value, missing_metric_reason
+from mlsweep._manager_optimizer import advance_optimizers_locked, give_up_locked
 from mlsweep._manager_db import (
+    MISSING_METRIC_REASON,
     JobRecord,
+    JobStatus,
     SchedulableJob,
     WorkerRecord,
     count_jobs_by_status,
     experiment_concurrency_caps,
     get_experiment,
+    get_metrics_for_run,
     get_worker,
     last_log_seq,
+    latest_metric_rows,
     list_active_jobs,
+    list_controlled_experiments,
     list_job_nodes,
     list_schedulable_jobs,
     list_workers,
+    missing_metric_counts,
     multinode_progress,
+    parse_metric_rows,
+    running_jobs_started_before,
 )
+from mlsweep._sweep import format_duration
 from mlsweep._manager_state import (
     PIN_TTL_SECONDS, InFlightRun, ManagerState, Pin, Placement, RunKey, WorkerConn,
 )
@@ -60,6 +70,7 @@ from mlsweep._shared import (
     DEFAULT_SCRATCH_DIR,
     MsgCancel,
     MsgCleanup,
+    MsgGpuHealth,
     MsgGpuStats,
     MsgHello,
     MsgLog,
@@ -194,52 +205,107 @@ def _worker_shell_cmd(candidates: list[str], worker_args: list[str]) -> str:
     )
 
 
-# The wheel shipped to remote workers, built or fetched at manager startup.
-_WHEELS_DIR = Path(__file__).resolve().parent / "_wheels"
+class WheelCache:
+    """The worker wheel shipped to remote workers, built or fetched at manager startup.
 
-
-def _ensure_worker_wheels() -> None:
-    """Build or fetch the local mlsweep wheel into ``_wheels/`` at startup.
-
-    Runs synchronously at manager startup (before the event loop).  Remote
-    workers are bootstrapped by SCPing this wheel and pip-installing it there;
-    pip resolves mlsweep's dependencies on the remote, against the remote's
-    own Python and platform.  We deliberately do not pre-download dependency
-    wheels: a wheel for the manager's Python may not fit the remote's Python.
-
-    The ``.complete`` sentinel stores the mlsweep version and the worker
-    code's ``code_fingerprint()`` the wheel was built from, so a version bump
-    or a worker-code change in a source checkout (which keeps its version)
-    invalidates the cache.  Without this, a stale wheel would be shipped to
-    remote workers and install an ``mlsweep_worker`` that lacks flags the
-    manager passes (e.g. ``--jobs``).
-
-    Managers starting at the same time from one install build one at a time,
-    under a lock in the wheels directory; the others then reuse the result.
+    *dir* holds the wheel and a ``.complete`` sentinel; *run* runs pip (like
+    ``subprocess.run``).
     """
-    local_version = importlib.metadata.version("mlsweep")
-    if _wheel_is_current(local_version):
-        return
-    _WHEELS_DIR.mkdir(exist_ok=True)
-    with open(_WHEELS_DIR / ".lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not _wheel_is_current(local_version):  # not built while we waited
-            _build_worker_wheel(local_version)
 
+    def __init__(self, dir: Path, run: Callable[..., "subprocess.CompletedProcess[bytes]"] = subprocess.run):
+        self.dir = dir
+        self.run = run
 
-def _read_stamp() -> str | None:
-    """The stamp the last finished wheel build left, or None if there is none."""
-    try:
-        return (_WHEELS_DIR / ".complete").read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
+    def ensure(self) -> None:
+        """Build or fetch the local mlsweep wheel into *dir*, unless it is current.
 
+        Remote workers are bootstrapped by SCPing this wheel and pip-installing
+        it there; pip resolves mlsweep's dependencies on the remote, against the
+        remote's own Python and platform.  We deliberately do not pre-download
+        dependency wheels: a wheel for the manager's Python may not fit the
+        remote's Python.
 
-def _wheel_is_current(local_version: str) -> bool:
-    """Whether the sentinel matches the version and code we are about to ship
-    *and* a wheel for that version is actually present."""
-    return _read_stamp() == _wheel_stamp(local_version) and bool(
-        list(_WHEELS_DIR.glob(f"mlsweep-{local_version}-*.whl")))
+        The ``.complete`` sentinel stores the mlsweep version and the worker
+        code's ``code_fingerprint()`` the wheel was built from, so a version bump
+        or a worker-code change in a source checkout (which keeps its version)
+        invalidates the cache.  Without this, a stale wheel would be shipped to
+        remote workers and install an ``mlsweep_worker`` that lacks flags the
+        manager passes (e.g. ``--jobs``).
+
+        Managers starting at the same time from one install build one at a time,
+        under a lock in the wheels directory; the others then reuse the result.
+        """
+        local_version = importlib.metadata.version("mlsweep")
+        if self.is_current(local_version):
+            return
+        self.dir.mkdir(exist_ok=True)
+        with open(self.dir / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not self.is_current(local_version):  # not built while we waited
+                self.build(local_version)
+
+    def read_stamp(self) -> str | None:
+        """The stamp the last finished wheel build left, or None if there is none."""
+        try:
+            return (self.dir / ".complete").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+
+    def is_current(self, local_version: str) -> bool:
+        """Whether the sentinel matches the version and code we are about to ship
+        *and* a wheel for that version is actually present."""
+        return self.read_stamp() == _wheel_stamp(local_version) and bool(
+            list(self.dir.glob(f"mlsweep-{local_version}-*.whl")))
+
+    def shipped_stamp(self, local_version: str) -> str:
+        """Version and code fingerprint of the wheel a bootstrap would install.
+
+        An installed worker prints the same pair after its name for ``--version``.
+        """
+        return self.read_stamp() or _wheel_stamp(local_version)
+
+    def wheels(self) -> list[Path]:
+        return sorted(self.dir.glob("*.whl"))
+
+    def build(self, local_version: str) -> None:
+        """Replace the cached wheel with one for *local_version*.  Caller holds the lock."""
+        complete = self.dir / ".complete"
+        stamp = _wheel_stamp(local_version)  # before the build, so a later edit invalidates it
+        print("[wheels] Building worker wheel...", flush=True)
+
+        # Drop stale mlsweep wheels from older versions.  We install the wheel
+        # file directly on the remote, so leave exactly one candidate behind.
+        for w in self.dir.glob("mlsweep-*.whl"):
+            w.unlink(missing_ok=True)
+
+        # From a source checkout (plain or editable), build the wheel from the
+        # tree so local changes ship to workers.  From a regular install the
+        # package's parent is site-packages, which pip cannot build, so fetch the
+        # published wheel for the exact installed version instead.
+        repo_root = Path(__file__).resolve().parent.parent
+        if (repo_root / "pyproject.toml").exists():
+            action = "wheel"
+            args = ["--wheel-dir", str(self.dir), str(repo_root)]
+        else:
+            action = "download"
+            args = ["--only-binary=:all:", "--dest", str(self.dir),
+                    f"mlsweep=={local_version}"]
+        r = self.run([sys.executable, "-m", "pip", action, "--no-deps", *args], capture_output=True)
+        if r.returncode != 0:
+            print(
+                f"[wheels] pip {action} failed:\n{r.stderr.decode(errors='replace')}",
+                file=sys.stderr,
+            )
+            return
+
+        # Record version and code so the sentinel self-invalidates the moment
+        # either changes.
+        try:
+            complete.write_text(stamp, encoding="utf-8")
+        except OSError:
+            pass
+
+        print(f"[wheels] Ready ({len(self.wheels())} wheel)", flush=True)
 
 
 def _wheel_stamp(local_version: str) -> str:
@@ -247,61 +313,26 @@ def _wheel_stamp(local_version: str) -> str:
     return f"{local_version} {code_fingerprint()}"
 
 
-def _shipped_stamp(local_version: str) -> str:
-    """Version and code fingerprint of the wheel a bootstrap would install.
-
-    An installed worker prints the same pair after its name for ``--version``.
-    """
-    return _read_stamp() or _wheel_stamp(local_version)
+# The manager's own wheel cache, next to the package.
+WHEELS = WheelCache(Path(__file__).resolve().parent / "_wheels")
 
 
-def _build_worker_wheel(local_version: str) -> None:
-    """Replace the cached wheel with one for *local_version*.  Caller holds the lock."""
-    complete = _WHEELS_DIR / ".complete"
-    stamp = _wheel_stamp(local_version)  # before the build, so a later edit invalidates it
-    print("[wheels] Building worker wheel...", flush=True)
+def _ensure_worker_wheels() -> None:
+    """Build or fetch the worker wheel at startup (see ``WheelCache.ensure``)."""
+    WHEELS.ensure()
 
-    # Drop stale mlsweep wheels from older versions.  We install the wheel
-    # file directly on the remote, so leave exactly one candidate behind.
-    for w in _WHEELS_DIR.glob("mlsweep-*.whl"):
-        w.unlink(missing_ok=True)
 
-    # From a source checkout (plain or editable), build the wheel from the
-    # tree so local changes ship to workers.  From a regular install the
-    # package's parent is site-packages, which pip cannot build, so fetch the
-    # published wheel for the exact installed version instead.
-    repo_root = Path(__file__).resolve().parent.parent
-    if (repo_root / "pyproject.toml").exists():
-        action = "wheel"
-        args = ["--wheel-dir", str(_WHEELS_DIR), str(repo_root)]
-    else:
-        action = "download"
-        args = ["--only-binary=:all:", "--dest", str(_WHEELS_DIR),
-                f"mlsweep=={local_version}"]
-    r = subprocess.run([sys.executable, "-m", "pip", action, "--no-deps", *args],
-                       capture_output=True)
-    if r.returncode != 0:
-        print(
-            f"[wheels] pip {action} failed:\n{r.stderr.decode(errors='replace')}",
-            file=sys.stderr,
-        )
-        return
-
-    # Record version and code so the sentinel self-invalidates the moment
-    # either changes.
-    try:
-        complete.write_text(stamp, encoding="utf-8")
-    except OSError:
-        pass
-
-    wheels = [p.name for p in _WHEELS_DIR.glob("*.whl")]
-    print(f"[wheels] Ready ({len(wheels)} wheel)", flush=True)
+# How the manager starts ssh, scp and local workers: ``asyncio.create_subprocess_exec``.
+Spawn = Callable[..., Any]
 
 
 async def _bootstrap_worker_venv(
     host: str,
     ssh_key: str | None = None,
     password: str | None = None,
+    *,
+    wheels: WheelCache | None = None,
+    spawn: Spawn | None = None,
 ) -> None:
     """Ensure ``/tmp/mlsweep_venv/bin/mlsweep_worker`` on *host* runs this manager's worker code.
 
@@ -315,8 +346,13 @@ async def _bootstrap_worker_venv(
     matters for a source checkout, which changes code without changing its
     version.
 
+    *wheels* is the wheel cache to ship from (default ``WHEELS``), and *spawn*
+    starts ssh and scp (default ``asyncio.create_subprocess_exec``).
+
     Raises ``BootstrapError`` naming the step that failed and why.
     """
+    wheels = wheels or WHEELS
+    spawn = spawn or asyncio.create_subprocess_exec
     key_args = ["-i", ssh_key] if ssh_key else []
     ssh_opts = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
     sshpass_args, sshpass_env = _sshpass_args(password)
@@ -325,7 +361,7 @@ async def _bootstrap_worker_venv(
 
     async def run(step: str, argv: list[str], timeout: float) -> str:
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await spawn(
                 *sshpass_args, *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -338,12 +374,12 @@ async def _bootstrap_worker_venv(
             err = stderr.decode(errors="replace")
             print(f"[bootstrap] {step} failed for {host}:\n{err}", file=sys.stderr)
             raise BootstrapError(f"{step} failed on {host}: {_error_summary(err)}")
-        return stdout.decode(errors="replace").strip()
+        return str(stdout.decode(errors="replace")).strip()
 
     # 1. Quick check: is the binary already present and up to date?
-    await asyncio.to_thread(_ensure_worker_wheels)
+    await asyncio.to_thread(wheels.ensure)
     local_version = importlib.metadata.version("mlsweep")
-    expected = _shipped_stamp(local_version)
+    expected = wheels.shipped_stamp(local_version)
     check_cmd = (
         "if [ -x /tmp/mlsweep_venv/bin/mlsweep_worker ]; then "
         "/tmp/mlsweep_venv/bin/mlsweep_worker --version 2>/dev/null; "
@@ -366,14 +402,14 @@ async def _bootstrap_worker_venv(
     # 2. Ship the bundled wheel into an emptied /tmp/mlsweep_wheels, so wheels
     # from older managers do not pile up there.  Step 3 names the wheels it
     # installs, since pip refuses two versions of mlsweep at once.
-    wheels = sorted(_WHEELS_DIR.glob("*.whl"))
-    if not wheels:
-        raise BootstrapError(f"no mlsweep wheel in {_WHEELS_DIR}; the manager failed to build it "
+    shipped = wheels.wheels()
+    if not shipped:
+        raise BootstrapError(f"no mlsweep wheel in {wheels.dir}; the manager failed to build it "
                              "(its log has pip's error)")
     await run("preparing /tmp/mlsweep_wheels",
               [*ssh, "rm -rf /tmp/mlsweep_wheels && mkdir -p /tmp/mlsweep_wheels"], 30.0)
     await run("copying the wheel",
-              ["scp", *ssh_opts, *key_args, "--", *map(str, wheels), f"{host}:/tmp/mlsweep_wheels/"],
+              ["scp", *ssh_opts, *key_args, "--", *map(str, shipped), f"{host}:/tmp/mlsweep_wheels/"],
               120.0)
 
     # 3. Remove any stale venv, then create a fresh one and install the
@@ -381,7 +417,7 @@ async def _bootstrap_worker_venv(
     # against its own Python/platform.  The rm -rf matters: python3 -m venv
     # on an existing dir does not purge an old mlsweep install, and pip would
     # leave the stale worker's console script in place alongside the new one.
-    remote_wheels = " ".join(shlex.quote(f"/tmp/mlsweep_wheels/{w.name}") for w in wheels)
+    remote_wheels = " ".join(shlex.quote(f"/tmp/mlsweep_wheels/{w.name}") for w in shipped)
     await run("installing mlsweep", [*ssh, (
         "rm -rf /tmp/mlsweep_venv && "
         "python3 -m venv /tmp/mlsweep_venv && "
@@ -471,6 +507,8 @@ async def launch_worker(
     ssh_key: str | None = None,
     venv: str | None = None,
     port: int = 0,
+    wheels: WheelCache | None = None,
+    spawn: Spawn | None = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, int]:
     """Launch a worker process and return connected streams + port.
 
@@ -479,8 +517,10 @@ async def launch_worker(
     ``mlsweep_worker`` binary.
 
     Returns ``(reader, writer, port)`` where *reader* and *writer* are
-    asyncio stream objects connected to the worker's TCP port.
+    asyncio stream objects connected to the worker's TCP port.  *wheels* and
+    *spawn* are as for ``_bootstrap_worker_venv``.
     """
+    spawn = spawn or asyncio.create_subprocess_exec
     validate_worker_host(host)
     connect_host = _bare_host(host)
     devices_args = (
@@ -499,7 +539,7 @@ async def launch_worker(
     # ── Launch a fresh worker ────────────────────────────────────────────
     if host == "localhost":
         # Local: spawn python -m mlsweep.worker
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn(
             sys.executable,
             "-m",
             "mlsweep.worker",
@@ -515,7 +555,7 @@ async def launch_worker(
     else:
         # Remote: bootstrap venv if needed, then SSH and run worker binary
         sshpass_args, sshpass_env = _sshpass_args(password)
-        await _bootstrap_worker_venv(host, ssh_key=ssh_key, password=password)
+        await _bootstrap_worker_venv(host, ssh_key=ssh_key, password=password, wheels=wheels, spawn=spawn)
         worker_args = [
             "--token", token,
             "--remote-dir", remote_dir,
@@ -531,7 +571,7 @@ async def launch_worker(
             *key_args,
             "--", host, shell_cmd,
         ]
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn(
             *ssh_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -777,7 +817,7 @@ async def _reconnect_worker(
         try:
             reader, writer, _ = await launch_worker(
                 host=wc.host, remote_dir=wc.remote_dir, token=state.token,
-                scratch_dir=wc.scratch_dir, devices=sorted(wc.gpus + wc.unhealthy_gpus), max_jobs_per_gpu=wc.max_jobs_per_gpu,
+                scratch_dir=wc.scratch_dir, devices=wc.gpus, max_jobs_per_gpu=wc.max_jobs_per_gpu,
                 password=wc.password, ssh_key=wc.ssh_key, venv=wc.venv, port=wc.port,
             )
         except Exception:
@@ -878,10 +918,12 @@ async def _handle_worker_hello(
         if wc.conn_gen != gen:
             return
         if not wc.hello_seen:
-            wc.gpus = msg.gpus
+            # Every GPU the worker offers joins the pool; the unhealthy and pending
+            # ones are skipped by placement until the worker reports them usable.
+            wc.gpus = sorted(set(msg.gpus) | set(msg.unhealthy_gpus) | set(msg.pending_gpus))
             wc.max_jobs_per_gpu = msg.max_jobs_per_gpu
             wc.hello_seen = True
-        wc.unhealthy_gpus = msg.unhealthy_gpus
+        _set_health(wc, msg)
         wc.topo = msg.topo
         wc.scratch_dir = msg.scratch_dir
 
@@ -930,17 +972,14 @@ async def _handle_worker_hello(
             port=wc.port,
             ssh_key=wc.ssh_key,
             venv=wc.venv,
-            # Persist probe-excluded GPUs too: a manager restart relaunches the
-            # worker with --devices from this column, and a GPU that is reset
+            # The pool includes probe-excluded GPUs: a manager restart relaunches
+            # the worker with --devices from this column, and a GPU that is reset
             # later must still be a candidate for the next probe.
-            devices=json.dumps(sorted(wc.gpus + wc.unhealthy_gpus)),
+            devices=json.dumps(wc.gpus),
             unhealthy_devices=json.dumps(wc.unhealthy_gpus),
             status="connected",
         )
-        n_gpus = len(wc.gpus)
-        extra = (f"  {_YELLOW}{len(wc.unhealthy_gpus)} unhealthy GPU(s) "
-                 f"excluded: {wc.unhealthy_gpus}{_RESET}") if wc.unhealthy_gpus else ""
-        print(f"  {_GREEN}OK{_RESET}    {wc.host}: {n_gpus} GPU{'s' if n_gpus != 1 else ''} available{extra}")
+        print(f"  {_GREEN}OK{_RESET}    {wc.host}: {_health_summary(wc)}")
         n_resumed = len(resuming.keys() & expected.keys())
         if n_resumed:
             print(f"  {_GREEN}RESUME{_RESET} {wc.host}: {n_resumed} run(s) still active")
@@ -948,6 +987,27 @@ async def _handle_worker_hello(
     for result in results:
         await _handle_result(db, state, wc, result)
     state.request_schedule()
+
+
+def _set_health(wc: WorkerConn, msg: MsgWorkerHello | MsgGpuHealth) -> None:
+    wc.unhealthy_gpus = list(msg.unhealthy_gpus)
+    wc.unhealthy_reasons = dict(msg.unhealthy_reasons)
+    wc.pending_gpus = list(msg.pending_gpus)
+
+
+def _health_summary(wc: WorkerConn) -> str:
+    """"3 GPUs available  5 unhealthy GPU(s) excluded: [0, 1] cuInit failed: ..." for logs."""
+    n = len(wc.usable_gpus)
+    out = f"{n} GPU{'s' if n != 1 else ''} available"
+    if wc.unhealthy_gpus:
+        by_reason: dict[str, list[int]] = {}
+        for g in wc.unhealthy_gpus:
+            by_reason.setdefault(wc.unhealthy_reasons.get(str(g), "failed the CUDA probe"), []).append(g)
+        why = "; ".join(f"{gs} {r}" for r, gs in by_reason.items())
+        out += f"  {_YELLOW}{len(wc.unhealthy_gpus)} unhealthy GPU(s) excluded: {why}{_RESET}"
+    if wc.pending_gpus:
+        out += f"  {len(wc.pending_gpus)} GPU(s) still probing: {wc.pending_gpus}"
+    return out
 
 
 async def _adopt_run_locked(
@@ -1042,6 +1102,11 @@ async def _handle_metric(
         "type": "metric", "run_id": run.run_id, "step": msg.step, "data": msg.data,
         "step_seconds": msg.step_seconds,
     })
+    why = _apply_metric_controls(state, run, msg.step, msg.data)
+    if why is not None:
+        async with state.lock:
+            if state.runs.get(run.key) is run:
+                await end_runs_locked(db, state, [run.key], "pruned", why)
 
 
 async def _handle_sync_req(
@@ -1127,6 +1192,9 @@ async def _handle_result(
                 "success": success, "elapsed": elapsed, "exit_code": msg.exit_code,
                 "xfailed": xfailed,
             })
+            check = state.controls.get(eid, {}).get("metric_check")
+            if success and check and not run.metric_seen:
+                await _check_run_metric_locked(db, state, eid, rid, check)
             await _check_experiments_complete_locked(db, state, {eid})
     state.request_schedule()
     # The outputs are safe on the manager; the worker may delete its scratch.
@@ -1180,6 +1248,17 @@ async def _handle_pong(
     await state.db_writer.touch_worker(wc.worker_id)
 
 
+async def _handle_gpu_health(
+    db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgGpuHealth,
+) -> None:
+    """A probe finished after the hello, or a failed GPU recovered."""
+    async with state.lock:
+        _set_health(wc, msg)
+        await state.db_writer.update_worker_health(wc.worker_id, json.dumps(wc.unhealthy_gpus))
+    print(f"  {_GREEN}GPUS{_RESET}  {wc.host}: {_health_summary(wc)}")
+    state.request_schedule()
+
+
 async def _handle_gpu_stats(
     db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgGpuStats,
 ) -> None:
@@ -1195,6 +1274,7 @@ _HANDLERS: dict[type, Any] = {
     MsgResult: _handle_result,
     MsgPong: _handle_pong,
     MsgGpuStats: _handle_gpu_stats,
+    MsgGpuHealth: _handle_gpu_health,
 }
 
 
@@ -1290,11 +1370,166 @@ async def _check_experiments_complete_locked(
             continue
         if counts.get("pending", 0) + counts.get("dispatched", 0) + counts.get("running", 0):
             continue
-        done = counts.get("done", 0)
+        done = counts.get("done", 0) + counts.get("pruned", 0)
         if exp.expected_jobs and done < exp.expected_jobs:
             continue
         await state.db_writer.update_experiment_status(eid, "completed")
         state.broadcast(eid, {"type": "experiment_done", "experiment_id": eid, "submitted_count": done})
+
+
+# ── Run controls: MAX_RUNTIME, PRUNE, METRIC_CHECK (see _manager_controls) ──────
+
+
+async def end_runs_locked(
+    db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey], status: JobStatus, reason: str,
+) -> list[JobRecord]:
+    """Stop in-flight runs and finish their jobs as *status* ("pruned", or "failed" for a timeout).
+
+    The worker kills the process; its late result is only acknowledged, as for
+    a cancel.  The metrics already stored are kept and packed.
+    """
+    for key in keys:
+        state.pins.pop(key, None)
+    runs = [r for k in keys if (r := state.runs.get(k)) is not None]
+    _detach_locked(state, keys)
+    ended = await state.db_writer.end_jobs(keys, status, reason)
+    for run in runs:
+        await state.db_writer.pack_metrics(run.job_key, run.attempt)
+    word = "PRUNE" if status == "pruned" else "STOP "
+    for job in ended:
+        print(f"  {_YELLOW}{word}{_RESET} {job.experiment_id}/{job.run_id}: {reason}")
+        # A pruned run ran fine, so for skip rules it is a success.
+        xfailed = await state.db_writer.apply_result_rules(job.experiment_id, job.run_id, status == "pruned")
+        state.broadcast(job.experiment_id, {
+            "type": "job_done", "run_id": job.run_id, "status": status, "success": False,
+            "elapsed": job.elapsed, "exit_code": None, "reason": reason, "xfailed": xfailed,
+        })
+    await _check_experiments_complete_locked(db, state, {j.experiment_id for j in ended})
+    state.request_schedule()
+    return ended
+
+
+def _apply_metric_controls(state: ManagerState, run: InFlightRun, step: int, data: dict[str, Any]) -> str | None:
+    """Note a metric row against its sweep's controls.  Returns why to prune the run, or None."""
+    controls = state.controls.get(run.experiment_id)
+    if not controls:
+        return None
+    check = controls.get("metric_check")
+    if check and metric_value(data, check["metric"]) is not None:
+        run.metric_seen = True
+    tracker: PruneTracker | None = state.prune.get(run.experiment_id)
+    if tracker is None:
+        return None
+    value = metric_value(data, tracker.spec["metric"])
+    if value is None:
+        return None
+    if not tracker.loaded:
+        tracker.buffered.append((run.run_id, run.attempt, step, value))
+        return None
+    return tracker.observe(run.run_id, run.attempt, step, value)
+
+
+async def _load_prune_tracker_locked(
+    db: aiosqlite.Connection, state: ManagerState, experiment_id: str, tracker: PruneTracker,
+) -> list[tuple[RunKey, str]]:
+    """Fill *tracker* from the stored metrics.  Returns the in-flight runs to prune, with why."""
+    stored = await latest_metric_rows(db, experiment_id)
+    parsed = await asyncio.to_thread(
+        lambda: {rid: (attempt, parse_metric_rows(rows)) for rid, (attempt, rows) in stored.items()})
+    in_flight = {r.run_id: r for r in state.runs.values() if r.experiment_id == experiment_id}
+    metric = tracker.spec["metric"]
+    stop: dict[RunKey, str] = {}
+    # Finished runs first, so a running one is judged against all of them.
+    for rid in sorted(parsed, key=lambda rid: rid in in_flight):
+        attempt, rows = parsed[rid]
+        run = in_flight.get(rid)
+        live = run is not None and run.attempt == attempt
+        for row in rows:
+            value = metric_value(row, metric)
+            if value is not None:
+                why = tracker.observe(rid, run.attempt if live and run else -attempt, row["step"], value,
+                                      judge=live)
+                if why is not None and run is not None:
+                    stop.setdefault(run.key, why)
+    for rid, attempt, step, value in tracker.buffered:
+        run = in_flight.get(rid)
+        why = tracker.observe(rid, attempt, step, value)
+        if why is not None and run is not None and run.attempt == attempt:
+            stop.setdefault(run.key, why)
+    tracker.buffered.clear()
+    tracker.loaded = True
+    return list(stop.items())
+
+
+async def enforce_controls_locked(db: aiosqlite.Connection, state: ManagerState) -> None:
+    """Reload the run controls, then stop runs past MAX_RUNTIME and prune what is behind."""
+    state.controls = {e.experiment_id: json.loads(e.controls) for e in await list_controlled_experiments(db)
+                      if e.controls}
+    for eid in list(state.prune):
+        if state.controls.get(eid, {}).get("prune") != state.prune[eid].spec:
+            del state.prune[eid]
+    now = time.time()
+    for eid, controls in state.controls.items():
+        if controls.get("prune") and eid not in state.prune:
+            state.prune[eid] = PruneTracker(controls["prune"])
+        tracker = state.prune.get(eid)
+        if tracker is not None and not tracker.loaded:
+            for key, why in await _load_prune_tracker_locked(db, state, eid, tracker):
+                if key in state.runs:
+                    await end_runs_locked(db, state, [key], "pruned", why)
+        limit = controls.get("max_runtime")
+        if limit:
+            late = [j.key for j in await running_jobs_started_before(db, eid, now - limit) if j.key in state.runs]
+            if late:
+                await end_runs_locked(db, state, late, "failed",
+                                      f"timed out: ran longer than MAX_RUNTIME ({format_duration(limit)})")
+
+
+async def _check_run_metric_locked(
+    db: aiosqlite.Connection, state: ManagerState, experiment_id: str, run_id: str, check: dict[str, Any],
+) -> None:
+    """A run finished without (live) logging its sweep's metric: record that, and pause a sweep
+    whose first finished runs all did the same."""
+    metric = check["metric"]
+    rows = await get_metrics_for_run(db, run_id, experiment_id)
+    if any(metric_value(r, metric) is not None for r in rows):
+        return  # it was logged, just not while this manager was watching (e.g. before a restart)
+    logged = {k for r in rows for k in r}
+    if metric in logged:
+        reason = f"{MISSING_METRIC_REASON} {metric!r}: every value it logged was NaN or infinite"
+    else:
+        reason = missing_metric_reason(metric, logged)
+    print(f"  {_YELLOW}WARN{_RESET}  {experiment_id}/{run_id}: {reason}")
+    await state.db_writer.set_job_reason(run_id, experiment_id, reason)
+    state.broadcast(experiment_id, {"type": "job_updated", "run_id": run_id, "reason": reason})
+    missing, done = await missing_metric_counts(db, experiment_id)
+    if missing >= check["runs"] and missing == done:
+        await _pause_for_controls_locked(
+            db, state, experiment_id,
+            f"paused by METRIC_CHECK: the first {done} finished run(s) logged no {metric!r} "
+            f"(last one: {reason.removeprefix(MISSING_METRIC_REASON + ' ' + repr(metric) + ': ')}). "
+            "Fix METRIC or the training script; unpause to carry on regardless.",
+        )
+
+
+async def _pause_for_controls_locked(
+    db: aiosqlite.Connection, state: ManagerState, experiment_id: str, why: str,
+) -> None:
+    """Pause a running sweep for a run control, noting why.  The check fires once, so unpausing carries on."""
+    exp = await get_experiment(db, experiment_id)
+    if exp is None or exp.status != "running":
+        return
+    controls = json.loads(exp.controls or "{}")
+    controls.pop("metric_check", None)
+    controls["note"] = why
+    await state.db_writer.update_experiment_controls(experiment_id, controls)
+    state.controls[experiment_id] = controls
+    if exp.optimize is not None:
+        await give_up_locked(db, state, exp, json.loads(exp.optimize), why)
+        return
+    print(f"  {_YELLOW}PAUSE{_RESET} {experiment_id}: {why}")
+    await state.db_writer.update_experiment_status(experiment_id, "paused")
+    state.broadcast(experiment_id, {"type": "status_updated", "status": "paused", "note": why})
 
 
 async def requeue_jobs_of_unknown_workers(db: aiosqlite.Connection, state: ManagerState) -> None:
@@ -1421,13 +1656,14 @@ async def connect_single_worker(
     devices: list[int] | None = None,
     max_jobs_per_gpu: int = 1,
     manager_port: int = 0,
+    launch: Callable[..., Any] | None = None,
 ) -> WorkerConn | None:
     """Launch and connect to a worker, register it, and start its tasks.
 
     The caller has claimed *worker_id* with ``state.reserve_worker_id``; the
     claim is released here.  Returns ``None`` if the launch failed (the worker
     is then marked dead with the reason, and jobs the database had running on
-    it are requeued).
+    it are requeued).  *launch* starts the worker (default ``launch_worker``).
     """
     reader: asyncio.StreamReader | None
     writer: asyncio.StreamWriter | None
@@ -1442,7 +1678,7 @@ async def connect_single_worker(
                 devices=json.dumps(devices) if devices else None, status="offline",
             )
         try:
-            reader, writer, actual_port = await launch_worker(
+            reader, writer, actual_port = await (launch or launch_worker)(
                 host=host,
                 remote_dir=remote_dir,
                 token=state.token,
@@ -1495,7 +1731,7 @@ async def connect_single_worker(
     return wc
 
 
-def worker_outdated(state: ManagerState, worker_id: str) -> bool:
+def worker_outdated(state: ManagerState, worker_id: str, on_disk: str | None = None) -> bool:
     """Whether *worker_id* runs other worker code than updating it would install.
 
     True for a worker refused at its hello for speaking another protocol (a
@@ -1503,13 +1739,14 @@ def worker_outdated(state: ManagerState, worker_id: str) -> bool:
     connected remote worker whose fingerprint differs from the worker modules
     on disk here (an older worker sends none).  A local worker runs this
     manager's own interpreter, so a restart of the manager, not an update, is
-    what changes its code.
+    what changes its code.  *on_disk* is the fingerprint of the worker code
+    on disk, read now if not given.
     """
     if worker_id in state.outdated:
         return True
     wc = state.workers.get(worker_id)
     return (wc is not None and wc.status == "connected" and wc.host != "localhost"
-            and wc.code != code_fingerprint())
+            and wc.code != (on_disk if on_disk is not None else code_fingerprint()))
 
 
 async def _try_connect(
@@ -1610,6 +1847,7 @@ async def scheduler_loop(db: aiosqlite.Connection, state: ManagerState) -> None:
         state.schedule_event.clear()
         try:
             async with state.lock:
+                await enforce_controls_locked(db, state)
                 await advance_optimizers_locked(db, state)
                 await _schedule_pass_locked(db, state)
         except Exception as e:
@@ -1685,7 +1923,7 @@ def _pinned_placement(
     wc = state.workers.get(pin.worker_id)
     if wc is None or wc.status != "connected" or job.nodes_per_run > 1:
         return None
-    if len(pin.gpus) != job.gpus_per_run or not set(pin.gpus) <= set(wc.gpus):
+    if len(pin.gpus) != job.gpus_per_run or not set(pin.gpus) <= set(wc.usable_gpus):
         return None
     return [(wc, list(pin.gpus))]
 
@@ -1725,7 +1963,7 @@ def _place(
         if gpus is None:
             continue
         gpu_load = max((occ[g] for g in gpus), default=0)
-        worker_load = on_worker[wc.worker_id] / max(1, len(wc.gpus))
+        worker_load = on_worker[wc.worker_id] / max(1, len(wc.usable_gpus))
         offers.append(((gpu_load, worker_load), wc, gpus))
     n_nodes = max(1, job.nodes_per_run)
     if len(offers) < n_nodes:
@@ -1823,7 +2061,7 @@ def _find_gpu_group(
     if gpus_needed == 0:
         return []
     cap = wc.max_jobs_per_gpu
-    free = [g for g in wc.gpus if cap <= 0 or occupancy[g] < cap]
+    free = [g for g in wc.usable_gpus if cap <= 0 or occupancy[g] < cap]
     if len(free) < gpus_needed:
         return None
     # Sorting is stable, so GPUs at the same load stay in device order.
@@ -2088,6 +2326,8 @@ async def _tunnel_monitor_task(
     wc: WorkerConn,
     manager_port: int,
     shutdown_event: asyncio.Event,
+    launch: Callable[..., Any] | None = None,
+    sleep: Callable[[float], Any] = asyncio.sleep,
 ) -> None:
     """Keep the SSH reverse tunnel alive, restarting with backoff if it dies.
 
@@ -2096,6 +2336,9 @@ async def _tunnel_monitor_task(
     the remote port is taken, typically by a stale sshd session left over from
     a manager that died without closing its connection.  Those are reaped via
     the records written by ``_tunnel_remote_cmd`` before retrying.
+
+    *launch* starts a tunnel (default ``_launch_tunnel``), and *sleep* waits out
+    the backoff between attempts.
 
     Retiring the worker cancels this task (see ``_close_tunnel``).
     """
@@ -2141,18 +2384,18 @@ async def _tunnel_monitor_task(
         )
         healthy = False
         failed = True
-        await asyncio.sleep(backoff)
+        await sleep(backoff)
         backoff = min(backoff * 2, 60.0)
         if shutdown_event.is_set():
             return
 
         # Shielded: a cancel mid-spawn would otherwise lose the new ssh process.
-        launch = asyncio.ensure_future(_launch_tunnel(
+        launching = asyncio.ensure_future((launch or _launch_tunnel)(
             wc.host, manager_port, ssh_key=wc.ssh_key, password=wc.password))
         try:
-            new_proc = await asyncio.shield(launch)
+            new_proc = await asyncio.shield(launching)
         except asyncio.CancelledError:
-            launch.add_done_callback(_terminate_launched)
+            launching.add_done_callback(_terminate_launched)
             raise
         if new_proc is not None:
             wc.tunnel_proc = new_proc

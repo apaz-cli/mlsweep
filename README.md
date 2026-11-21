@@ -148,6 +148,7 @@ The token is also saved to `~/.mlsweep/manager.token` so local workers find it a
 ```sh
 mlsweep run sweeps/my_sweep.py --manager http://localhost:7891 --stream   # submit + live status
 mlsweep run sweeps/my_sweep.py --validate                                # print all combos, no submission
+mlsweep lint sweeps/my_sweep.py                                          # check for misspelled settings and flag clashes
 mlsweep run sweeps/my_sweep.py --dry-run                                 # print commands, no submission
 ```
 
@@ -267,7 +268,7 @@ Subcommands (`mlsweep <subcommand>`, or `mlsweep --help` for the full grouped li
 
 ```sh
 # run
-mlsweep manager / run / worker / gen_makefile
+mlsweep manager / run / worker / lint / gen_makefile
 
 # monitor
 mlsweep watch EXP_ID                 mlsweep fetch --experiment EXP_ID
@@ -299,6 +300,23 @@ mlsweep notes lint                   mlsweep notes links|mentions|search|history
 # docs
 mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, notes, skill
 ```
+
+### Shell completion
+
+```sh
+# bash (~/.bashrc)
+eval "$(mlsweep completion bash)"
+
+# zsh (~/.zshrc, after `autoload -U compinit && compinit`)
+eval "$(mlsweep completion zsh)"
+
+# fish
+mlsweep completion fish > ~/.config/fish/completions/mlsweep.fish
+```
+
+Completion covers subcommands, each subcommand's flags, sweep files, context
+names, and experiment IDs and campaigns from the manager in force. A manager
+that is down only means no IDs are offered.
 
 ### Using with W&B
 

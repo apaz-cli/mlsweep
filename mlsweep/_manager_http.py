@@ -24,7 +24,6 @@ import contextlib
 import dataclasses
 import hashlib
 import hmac
-import importlib
 import importlib.metadata
 import ipaddress
 import itertools
@@ -40,6 +39,7 @@ import sqlite3
 import tempfile
 import time
 import zipfile
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncContextManager, Callable, Awaitable, TypeGuard
@@ -55,8 +55,10 @@ from mlsweep._export import (
     tfevents_for_run,
     tfevents_name,
     upload_wandb_run,
-    wandb_info,
+    WandbSource,
+    wandb_mode,
 )
+from mlsweep._inspect_model import InspectError, inspect_file
 from mlsweep._manager_db import (
     ACTIVE_JOB_STATUSES,
     FINISHED_JOB_STATUSES,
@@ -100,7 +102,7 @@ from mlsweep._manager_workers import (
     validate_worker_host,
     worker_id_for,
 )
-from mlsweep._sweep import spec_singular_dims
+from mlsweep._sweep import spec_singular_dims, validate_controls
 from mlsweep._shared import (
     DEFAULT_CAMPAIGN,
     _dir_size,
@@ -119,6 +121,7 @@ _VERSION = importlib.metadata.version("mlsweep")
 # aiohttp warns when application config uses plain strings; AppKey also gives
 # each lookup a type instead of Any.
 DB_KEY: web.AppKey[aiosqlite.Connection] = web.AppKey("mlsweep_db", aiosqlite.Connection)
+WANDB_KEY: web.AppKey[WandbSource] = web.AppKey("mlsweep_wandb", WandbSource)
 STATE_KEY: web.AppKey[ManagerState] = web.AppKey("mlsweep_state", ManagerState)
 TOKEN_KEY: web.AppKey[str] = web.AppKey("mlsweep_token", str)
 DIR_KEY: web.AppKey[Path] = web.AppKey("mlsweep_dir", Path)
@@ -771,6 +774,10 @@ async def _experiment_fields(
             return _error_response("'code' must be an object naming its 'snapshot'")
         if len(_json_dumps(code)) > _MAX_CODE_META_BYTES:
             return _error_response(f"'code' is larger than {_MAX_CODE_META_BYTES // (1024 * 1024)} MB")
+    try:
+        controls = validate_controls(body.get("controls"))
+    except ValueError as exc:
+        return _error_response(f"bad run controls: {exc}")
     optimizer: dict[str, Any] = {}
     if body.get("optimize") is not None:
         if existing is not None:
@@ -799,6 +806,7 @@ async def _experiment_fields(
         "metric": body.get("metric"),
         "goal": goal,
         "code": code,
+        "controls": controls,
         **optimizer,
     }
 
@@ -880,6 +888,10 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
         if status == "running" and exp.optimize is not None:
             await state.db_writer.update_experiment_optimize(
                 experiment_id, cleared_for_running(json.loads(exp.optimize)))
+        if status == "running" and exp.controls is not None:
+            controls = json.loads(exp.controls)
+            if controls.pop("note", None) is not None:  # why the manager paused it
+                await state.db_writer.update_experiment_controls(experiment_id, controls)
         # Aborting stops the sweep for good, so cancel everything unfinished.
         if status == "aborted":
             pending = await list_jobs_by_experiment(db, experiment_id, status="pending")
@@ -1478,6 +1490,9 @@ async def handle_reschedule_job(request: web.Request) -> web.Response:
                 return _error_response(f"worker {worker_id} is not connected", status=409)
             if not set(gpus) <= set(wc.gpus):
                 return _error_response(f"GPUs {sorted(set(gpus) - set(wc.gpus))} are not in {worker_id}'s pool")
+            if not_usable := sorted(set(gpus) - set(wc.usable_gpus)):
+                return _error_response(f"GPUs {not_usable} on {worker_id} have not passed the health probe",
+                                       status=409)
             if len(set(gpus)) > job.gpus_per_run:
                 return _error_response(f"the job uses {job.gpus_per_run} GPU(s)")
             occ = state.occupancy(wc)
@@ -1486,10 +1501,10 @@ async def handle_reschedule_job(request: web.Request) -> web.Response:
                 if g in occ:
                     occ[g] -= 1
             chosen = sorted(set(gpus))
-            others = sorted((g for g in wc.gpus if g not in chosen), key=lambda g: occ[g])
+            others = sorted((g for g in wc.usable_gpus if g not in chosen), key=lambda g: occ[g])
             chosen += others[:job.gpus_per_run - len(chosen)]
             if len(chosen) < job.gpus_per_run:
-                return _error_response(f"{worker_id} has only {len(wc.gpus)} GPU(s) in its pool")
+                return _error_response(f"{worker_id} has only {len(wc.usable_gpus)} usable GPU(s) in its pool")
             pin = Pin(worker_id=worker_id, gpus=sorted(chosen))
         requeued = key in state.runs
         if requeued:
@@ -2018,6 +2033,50 @@ async def handle_get_job_artifact(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(file_path, headers=untrusted_file_headers(file_path.name, as_text=as_text))
 
 
+# Summaries keyed by (path, size, mtime): the Compare grid asks for the same
+# checkpoint once per run card, and a big pickle takes a moment to walk.
+_INSPECT_CACHE: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+_INSPECT_CACHE_SIZE = 64
+
+
+@routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifact-info/{path:.*}")
+async def handle_inspect_job_artifact(request: web.Request) -> web.Response:
+    """Describe a model or array artifact: tensor names, dtypes, shapes and metadata.
+
+    The file is parsed without torch or numpy and never unpickled for real
+    (see ``_inspect_model``).  A 422 means the format is not one it reads.
+    """
+    mlsweep_dir: Path = request.config_dict[DIR_KEY]
+    try:
+        root = mlsweep_dir / "experiments" / request.match_info["experiment_id"] / request.match_info["run_id"] / "artifacts"
+        file_path = Path(_resolve_safe_subpath(root, request.match_info["path"]))
+    except ValueError:
+        return _error_response("path traversal denied", status=403)
+    except (OSError, TypeError):
+        return _error_response("invalid path", status=400)
+    try:
+        st = file_path.stat()
+    except OSError:
+        return _not_found("artifact file")
+    if not file_path.is_file():
+        return _not_found("artifact file")
+    key = (str(file_path), st.st_size, st.st_mtime_ns)
+    info = _INSPECT_CACHE.get(key)
+    if info is None:
+        try:
+            info = await asyncio.to_thread(inspect_file, file_path)
+        except InspectError as exc:
+            return _error_response(str(exc), status=422)
+        except OSError as exc:
+            return _error_response(f"could not read file: {exc.strerror or exc}", status=500)
+        _INSPECT_CACHE[key] = info
+        while len(_INSPECT_CACHE) > _INSPECT_CACHE_SIZE:
+            _INSPECT_CACHE.popitem(last=False)
+    else:
+        _INSPECT_CACHE.move_to_end(key)
+    return _json_response(info)
+
+
 # ── Export (TensorBoard / W&B) ─────────────────────────────────────────────────
 #
 # Each export covers a scope: one experiment (``/api/experiments/{id}/...`` or
@@ -2165,7 +2224,7 @@ async def handle_export_tensorboard(request: web.Request) -> web.StreamResponse:
 @routes.get("/api/export/wandb")
 async def handle_wandb_info(request: web.Request) -> web.Response:
     """Whether the manager can upload to W&B (wandb installed, key in env)."""
-    return _json_response(wandb_info())
+    return _json_response(request.config_dict[WANDB_KEY].info())
 
 
 def _exports(request: web.Request) -> dict[str, WandbExport]:
@@ -2205,13 +2264,15 @@ async def _run_wandb_export(
     jobs: list[Any],
     api_key: str | None,
     background: set[asyncio.Task[Any]],
+    source: WandbSource,
 ) -> None:
     """Upload *jobs* one at a time, recording progress on *export*."""
     loop = asyncio.get_running_loop()
     work_dir = tempfile.mkdtemp(prefix="mlsweep_wandb_")
     abandoned: list[asyncio.Future[Any]] = []
     try:
-        wandb = await loop.run_in_executor(None, importlib.import_module, "wandb")
+        wandb = await loop.run_in_executor(None, source.load)
+        mode = wandb_mode(os.environ)
         for job, run in zip(jobs, export.runs):
             if export.cancel.is_set():
                 break
@@ -2228,7 +2289,7 @@ async def _run_wandb_export(
                 wandb, export=export, run_id=job.run_id, rows=rows,
                 config=_job_combo(job), summary=summary, group=run.experiment,
                 tags=[export.scope.campaign_of[job.experiment_id]], api_key=api_key,
-                work_dir=work_dir,
+                work_dir=work_dir, mode=mode,
             ))
             try:
                 while True:
@@ -2296,7 +2357,8 @@ async def handle_export_wandb(request: web.Request) -> web.Response:
     scope = await _export_scope(request)
     if isinstance(scope, web.Response):
         return scope
-    if not wandb_info()["available"]:
+    source = request.config_dict[WANDB_KEY]
+    if not source.info()["available"]:
         return _error_response(
             "wandb is not installed in the manager's environment "
             "(pip install 'mlsweep[wandb]' there and restart the manager)",
@@ -2317,7 +2379,7 @@ async def handle_export_wandb(request: web.Request) -> web.Response:
     _forget_old_exports(exports)
     exports[export.export_id] = export
     tasks = request.config_dict[EXPORT_TASKS_KEY]
-    task = asyncio.create_task(_run_wandb_export(db, export, jobs, api_key, tasks))
+    task = asyncio.create_task(_run_wandb_export(db, export, jobs, api_key, tasks, source))
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     return _json_response(export.to_dict(), status=202)
@@ -2379,8 +2441,12 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
 
     wc = state.workers.get(wr.worker_id)
     if wc is not None:
-        d["gpus"] = wc.gpus
+        # "gpus" is what the scheduler can use now; pool GPUs held back by the
+        # health probe are listed under unhealthy_gpus / pending_gpus instead.
+        d["gpus"] = wc.usable_gpus
         d["unhealthy_gpus"] = wc.unhealthy_gpus
+        d["unhealthy_reasons"] = wc.unhealthy_reasons
+        d["pending_gpus"] = wc.pending_gpus
         d["gpu_occupancy"] = state.occupancy(wc)
         d["gpu_stats"] = wc.gpu_stats
         d["max_jobs_per_gpu"] = wc.max_jobs_per_gpu
@@ -2390,6 +2456,8 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         unhealthy = _json_list(d["unhealthy_devices"])
         d["gpus"] = [g for g in _json_list(d["devices"]) if g not in unhealthy]
         d["unhealthy_gpus"] = unhealthy
+        d["unhealthy_reasons"] = {}
+        d["pending_gpus"] = []
         d["gpu_occupancy"] = {}
         d["gpu_stats"] = {}
         d["max_jobs_per_gpu"] = 1
@@ -3027,6 +3095,7 @@ def create_app(
     token: str,
     *,
     mlsweep_dir: str | Path = "~/.mlsweep",
+    wandb: WandbSource | None = None,
 ) -> web.Application:
     """Create and return an aiohttp ``Application``.
 
@@ -3042,6 +3111,8 @@ def create_app(
     mlsweep_dir:
         Root directory of mlsweep data.  Static web UI is served from
         ``<mlsweep_dir>/webui/`` if it exists.
+    wandb:
+        Where W&B exports get wandb; by default the installed package.
     """
     app = web.Application(
         middlewares=[audit_middleware, error_middleware, auth_middleware, id_middleware, campaign_middleware],
@@ -3055,6 +3126,7 @@ def create_app(
     app[DIR_KEY] = Path(mlsweep_dir).expanduser().resolve()
     app[EXPORTS_KEY] = {}
     app[EXPORT_TASKS_KEY] = set()
+    app[WANDB_KEY] = wandb or WandbSource()
     app[THROTTLE_KEY] = _AuthThrottle()
 
     # Register REST routes

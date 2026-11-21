@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -51,6 +51,7 @@ from mlsweep._shared import (
     MsgCancel,
     MsgCleaned,
     MsgCleanup,
+    MsgGpuHealth,
     MsgGpuStats,
     MsgHello,
     MsgLog,
@@ -77,7 +78,7 @@ from mlsweep._shared import (
     set_color,
 )
 from mlsweep._snapshot import ObjectStore, fetch_object, is_snapshot_id, materialize, parse_manifest
-from mlsweep._topology import _gpu_topology, probe_usable_devices, visible_devices
+from mlsweep._topology import _gpu_topology, probe_devices, visible_devices
 from mlsweep import _env
 
 # Taken at import, so a worker reports the code it runs, not what is on disk later.
@@ -156,8 +157,6 @@ _token: str = ""
 _MAX_HELLO_BYTES = 1 << 20
 _HELLO_TIMEOUT_SECS = 30.0
 _device_override: list[int] | None = None  # None = use all visible
-_device_probe: bool = True  # probe each visible GPU with a real CUDA context at hello
-_probed_ok: set[int] = set()  # GPUs that passed the probe once; not re-probed on reconnect
 _max_jobs_per_gpu: int = 1  # per-GPU packing cap reported to the manager (0 = unlimited)
 _ipc_sock_path: str = ""  # set to the port-specific path at startup
 
@@ -356,23 +355,16 @@ def _read_thread(conn: ConnState) -> None:
         return
 
     # Build and send MsgWorkerHello
-    gpus = visible_devices()
-    if _device_override is not None:
-        gpus = [g for g in _device_override if g in gpus]
-    # Drop GPUs that enumerate but cannot create a CUDA context (e.g. faulted devices
-    # pending reset).  Without this the scheduler keeps dispatching to them and every
-    # job dies in its first .cuda() call, burning retries.
-    # GPUs that already passed are skipped: on reconnect they may be running jobs,
-    # and a failed GPU is re-probed each hello so a reset brings it back.
-    unhealthy: list[int] = []
-    to_probe = [g for g in gpus if g not in _probed_ok]
-    if _device_probe and to_probe:
-        _, unhealthy = probe_usable_devices(to_probe)
-        _probed_ok.update(g for g in to_probe if g not in unhealthy)
-        gpus = [g for g in gpus if g not in unhealthy]
-        for d in unhealthy:
-            print(f"  WARNING  GPU {d} is visible but cannot create a CUDA context; "
-                  f"excluding it from scheduling", file=sys.stderr)
+    # GPU health comes from _probe_thread.  Wait a bounded time for GPUs it has not
+    # finished with; those still unprobed go out as pending and a MsgGpuHealth
+    # follows.
+    gpus = _health.candidates()
+    if _health.enabled:
+        with _health.cond:
+            if any(g not in _health.health for g in gpus):
+                _health.wake.set()
+                _health.cond.wait_for(lambda: all(g in _health.health for g in gpus),
+                                      timeout=_HELLO_PROBE_WAIT)
     topo_internal = _gpu_topology()
     topo_wire: dict[str, int] = {
         f"{a},{b}": score for (a, b), score in topo_internal.items()
@@ -389,20 +381,26 @@ def _read_thread(conn: ConnState) -> None:
             for rs in _in_flight.values()
         ]
         completed = [dataclasses.asdict(res) for res in _unacked_results.values()]
-    hello_resp = MsgWorkerHello(
-        gpus=gpus,
-        topo=topo_wire,
-        resuming=resuming,
-        scratch_dir=_scratch_dir,
-        max_jobs_per_gpu=_max_jobs_per_gpu,
-        completed=completed,
-        unhealthy_gpus=unhealthy,
-        protocol=PROTOCOL_VERSION,
-        code=CODE_FINGERPRINT,
-    )
-    with _lock:
-        conn.send_queue.put(encode(hello_resp))
-        conn.ready = True
+    # Health is read and the connection made ready under _health.cond, so a probe
+    # result lands either in this hello or in a MsgGpuHealth sent on this connection.
+    with _health.cond:
+        usable, unhealthy, reasons, pending = _health.split_locked(gpus)
+        hello_resp = MsgWorkerHello(
+            gpus=usable,
+            topo=topo_wire,
+            resuming=resuming,
+            scratch_dir=_scratch_dir,
+            max_jobs_per_gpu=_max_jobs_per_gpu,
+            completed=completed,
+            unhealthy_gpus=unhealthy,
+            unhealthy_reasons=reasons,
+            pending_gpus=pending,
+            protocol=PROTOCOL_VERSION,
+            code=CODE_FINGERPRINT,
+        )
+        with _lock:
+            conn.send_queue.put(encode(hello_resp))
+            conn.ready = True
 
     # Main message loop
     while not _shutdown_event.is_set():
@@ -1318,6 +1316,127 @@ def _gpu_stats_thread() -> None:
                     pass
 
 
+# ── GPU health probe ───────────────────────────────────────────────────────────
+#
+# A GPU can enumerate but fail every CUDA context creation (a fault pending reset),
+# and jobs placed there die in their first .cuda() call.  _probe_thread checks each
+# candidate GPU from worker start-up, off the hello path: the manager allows the
+# hello only _HELLO_TIMEOUT (30s) and on a loaded host a round of probes can take
+# longer.  The hello waits up to _HELLO_PROBE_WAIT for results, reports GPUs still
+# being probed as pending, and a MsgGpuHealth follows whenever health changes.
+
+_HELLO_PROBE_WAIT = 15.0
+_REPROBE_INTERVAL = 300.0
+
+
+class GpuHealth:
+    """What the CUDA probe found for each GPU, and the thread that keeps it current.
+
+    ``health``: absent = not probed yet, None = usable, str = why the GPU is
+    excluded.  A GPU that passed is never probed again (it may be running our
+    jobs); one that failed or timed out is probed every _REPROBE_INTERVAL, so a
+    reset brings it back without a reconnect.  Guarded by ``cond``, which is
+    taken before _lock, never after.
+
+    *enabled* False trusts every GPU without probing (--no-device-probe).
+    *candidates* lists the GPUs to offer and *probe* checks some of them
+    (``probe_devices``).
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        candidates: Callable[[], list[int]] | None = None,
+        probe: Callable[[list[int]], dict[int, str | None]] = probe_devices,
+    ) -> None:
+        self.enabled = enabled
+        self.health: dict[int, str | None] = {}
+        self.cond = threading.Condition()
+        self.wake = threading.Event()  # set when a hello finds a GPU nobody has probed
+        self.candidates = candidates or _candidate_gpus
+        self.probe = probe
+
+    def split_locked(self, gpus: list[int]) -> tuple[list[int], list[int], dict[str, str], list[int]]:
+        """Split *gpus* into ``(usable, unhealthy, reasons, pending)``.  Holds ``cond``."""
+        if not self.enabled:
+            return list(gpus), [], {}, []
+        usable: list[int] = []
+        unhealthy: list[int] = []
+        pending: list[int] = []
+        reasons: dict[str, str] = {}
+        for g in gpus:
+            if g not in self.health:
+                pending.append(g)
+            elif (why := self.health[g]) is None:
+                usable.append(g)
+            else:
+                unhealthy.append(g)
+                reasons[str(g)] = why
+        return usable, unhealthy, reasons, pending
+
+    def run(self, shutdown: threading.Event, connections: Callable[[], list[ConnState]]) -> None:
+        """Probe candidate GPUs that have not passed yet, and report changes to *connections*."""
+        while not shutdown.is_set():
+            self.wake.clear()
+            candidates = self.candidates()
+            with self.cond:
+                todo = [g for g in candidates if self.health.get(g, "") is not None]
+            if todo:
+                results = self.probe(todo)
+                with self.cond:
+                    before = {g: self.health.get(g, "") for g in todo}
+                    self.health.update(results)
+                    self.cond.notify_all()
+                    changed = any(before[g] != results[g] for g in todo)
+                    if changed:
+                        # Sent under cond so a hello cannot snapshot the old health
+                        # and become ready after this broadcast has already gone out.
+                        usable, unhealthy, reasons, pending = self.split_locked(candidates)
+                        wire = encode(MsgGpuHealth(gpus=usable, unhealthy_gpus=unhealthy,
+                                                   unhealthy_reasons=reasons, pending_gpus=pending))
+                        for conn in connections():
+                            try:
+                                conn.send_queue.put_nowait(wire)
+                            except Exception:
+                                pass
+                _print_probe_changes(before, results)
+            with self.cond:
+                failing = any(self.health.get(g) is not None for g in candidates)
+            self.wake.wait(_REPROBE_INTERVAL if failing else None)
+
+
+def _candidate_gpus() -> list[int]:
+    """The GPUs this worker offers: those visible, narrowed by --devices."""
+    gpus = visible_devices()
+    if _device_override is not None:
+        gpus = [g for g in _device_override if g in gpus]
+    return gpus
+
+
+_health = GpuHealth()
+
+
+def _probe_thread() -> None:
+    _health.run(_shutdown_event, _live_connections)
+
+
+def _print_probe_changes(before: dict[int, str | None], after: dict[int, str | None]) -> None:
+    """Log GPUs that started failing (grouped by reason) or recovered."""
+    newly_bad: dict[str, list[int]] = {}
+    for g, why in after.items():
+        if why is not None and before[g] != why:
+            newly_bad.setdefault(why, []).append(g)
+    for why, gs in newly_bad.items():
+        print(f"  WARNING  GPU{'s' if len(gs) > 1 else ''} {', '.join(map(str, gs))}: {why}; "
+              f"excluding from scheduling, probing again every {_REPROBE_INTERVAL:g}s",
+              file=sys.stderr, flush=True)
+    recovered = [g for g, why in after.items() if why is None and before[g] not in ("", None)]
+    if recovered:
+        print(f"  GPU{'s' if len(recovered) > 1 else ''} {', '.join(map(str, recovered))} "
+              f"now pass{'' if len(recovered) > 1 else 'es'} the CUDA probe; back in scheduling",
+              file=sys.stderr, flush=True)
+
+
 # ── Accept loop ────────────────────────────────────────────────────────────────
 
 
@@ -1349,7 +1468,7 @@ def _accept_loop(server_sock: socket.socket) -> None:
 
 def main() -> None:
     try:
-        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu, _device_probe
+        global _scratch_dir, _remote_dir, _token, _device_override, _max_jobs_per_gpu
 
         parser = argparse.ArgumentParser(description="mlsweep worker daemon")
         parser.add_argument("--token", default="", help="Authentication token")
@@ -1361,8 +1480,8 @@ def main() -> None:
                             help="Comma-separated GPU device IDs to expose, e.g. 4,5,6,7 "
                                  "(default: all visible)")
         parser.add_argument("--no-device-probe", action="store_true",
-                            help="Skip the per-GPU CUDA-context health probe at worker "
-                                 "registration (by default faulted GPUs are excluded)")
+                            help="Skip the per-GPU CUDA-context health probe "
+                                 "(by default faulted GPUs are excluded)")
         parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
                             help="Max concurrent jobs per GPU on this worker "
                                  "(0 = unlimited, default: 1)")
@@ -1381,7 +1500,7 @@ def main() -> None:
         _remote_dir = args.remote_dir or os.getcwd()
         _token = args.token
         _max_jobs_per_gpu = args.jobs
-        _device_probe = not args.no_device_probe
+        _health.enabled = not args.no_device_probe
         if args.devices:
             _device_override = [int(x) for x in args.devices.split(",")]
 
@@ -1440,6 +1559,9 @@ def main() -> None:
 
         gpu_t = threading.Thread(target=_gpu_stats_thread, daemon=True)
         gpu_t.start()
+        if _health.enabled:
+            # Started before the accept loop, so the probes run while the manager connects.
+            threading.Thread(target=_probe_thread, daemon=True).start()
         threading.Thread(target=_log_flush_thread, daemon=True).start()
 
         # Enter accept loop (blocks until _shutdown_event is set)

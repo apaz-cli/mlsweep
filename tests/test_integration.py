@@ -343,9 +343,9 @@ def test_fetch_subcommand(manager_with_worker, tmp_path):
     assert not (client_dir / "downloads").exists()
 
 
-def test_local_experiment_dir_needs_matching_id(manager_server, monkeypatch):
+def test_local_experiment_dir_needs_matching_id(manager_server):
     """The manager's folder counts as local only when its ID file matches."""
-    from mlsweep.run_sweep import manager_local_experiment_dir
+    from mlsweep.run_sweep import local_experiment_dir, manager_local_experiment_dir
 
     server, url = manager_server
     (server.mlsweep_dir / "experiments" / "e1").mkdir(parents=True)
@@ -353,11 +353,10 @@ def test_local_experiment_dir_needs_matching_id(manager_server, monkeypatch):
     assert found == server.mlsweep_dir.resolve() / "experiments" / "e1"
     assert manager_local_experiment_dir(url, server.token, "missing") is None
 
-    # Another machine with a folder at the same path has a different ID there.
-    import mlsweep.run_sweep as rs
-    monkeypatch.setattr(rs, "mlsweep_dir_id", lambda d, create=False: "other-machine")
-    assert manager_local_experiment_dir(url, server.token, "e1") is None
-    monkeypatch.undo()
+    # A manager on another machine, with a folder at the same path, reports a
+    # different ID than the one here.
+    elsewhere = {"mlsweep_dir": str(server.mlsweep_dir), "mlsweep_dir_id": "other-machine"}
+    assert local_experiment_dir(elsewhere, "e1") is None
 
     # A broken ID file makes the manager report no ID, so nothing counts as local.
     (server.mlsweep_dir / "manager.id").unlink()

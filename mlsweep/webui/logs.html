@@ -14,7 +14,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #layout { flex: 1; display: flex; min-height: 0; }
 
 /* Sidebar */
-#sidebar { width: 270px; min-width: 270px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+#sidebar { flex: 0 0 clamp(200px, 28vw, 270px); min-width: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
 #sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .sb-section { display: flex; flex-direction: column; gap: 6px; }
 .sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
@@ -36,7 +36,7 @@ select:focus { outline: none; border-color: var(--accent); }
 
 /* Main */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
-#log-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 7px 14px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+#log-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 7px 14px; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; flex-shrink: 0; }
 .log-run-id { font-family: monospace; font-size: 11px; color: var(--text-strong); }
 .hdr-spacer { flex: 1; }
 .autoscroll-label { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-label); cursor: pointer; white-space: nowrap; user-select: none; }
@@ -55,6 +55,7 @@ select:focus { outline: none; border-color: var(--accent); }
   white-space: pre-wrap;
   word-break: break-all;
 }
+#log-output.nowrap { white-space: pre; word-break: normal; }
 
 #jump-btn {
   position: absolute; bottom: 14px; right: 20px;
@@ -135,6 +136,9 @@ select:focus { outline: none; border-color: var(--accent); }
       <span class="hdr-spacer"></span>
       <label class="autoscroll-label" title="Show each line that is a JSON object as one row you can expand">
         <input type="checkbox" id="collapse-json" checked> Collapse JSON
+      </label>
+      <label class="autoscroll-label" title="Wrap long lines; off keeps each line, progress bars and all, on one row">
+        <input type="checkbox" id="wrap-lines" checked> Wrap lines
       </label>
       <label class="autoscroll-label">
         <input type="checkbox" id="auto-scroll" checked> Auto-scroll

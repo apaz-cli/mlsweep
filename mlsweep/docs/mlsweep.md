@@ -347,14 +347,27 @@ mlsweep_manager --workers workers.toml
 
 The manager bootstraps mlsweep on remote machines automatically; no manual install is needed. Requires passwordless SSH. Test with `ssh -o BatchMode=yes user@host1 nvidia-smi`.
 
-At registration a worker probes each candidate GPU by actually creating a CUDA
-context on it. A device can enumerate in `nvidia-smi` (`0%` util, compute mode
-`Default`) while being unusable for compute — typically after a fault that leaves
-`GPU Recovery Action: Reset`. Such devices are excluded before the worker reports
-its GPUs, so the scheduler never dispatches to them; `mlsweep status` lists them
-as `unhealthy=[...]` on the worker's line and `/api/workers` exposes the same as
-`unhealthy_gpus`. Pass `--no-device-probe` to a worker to skip the probe (e.g. on
-a host where creating a context is itself restricted).
+When a worker starts, it probes each candidate GPU by creating a real CUDA
+context on it. A device can show up in `nvidia-smi` as idle and still be unusable
+for compute. This usually happens after a fault that leaves `GPU Recovery Action:
+Reset`. The scheduler skips any GPU that fails the probe. The GPU stays in the
+worker's pool, and the worker probes it again every 5 minutes. When a probe
+passes, for example after a reset, the GPU goes back into scheduling on its own.
+
+Each excluded GPU carries a reason. It is either the failing CUDA call and error
+(`cuInit failed: CUDA_ERROR_SYSTEM_NOT_READY (802)`) or `CUDA probe timed out
+after 60s`. The worker and manager logs print it. `mlsweep status` shows
+`unhealthy=[...]` and the reasons under the worker's line. The System page shows
+the reason as a tooltip on the GPU tile. `/api/workers` returns `unhealthy_gpus`
+and `unhealthy_reasons`.
+
+A timeout does not mean the GPU is broken. The driver creates contexts one at a
+time, so a round of probes takes about as long as all of them run back to back,
+and a busy shared host stretches that further. The hello never waits more than
+15s for the probe. GPUs still being probed at that point are reported as
+`probing` and join scheduling once their result arrives. Pass `--no-device-probe`
+to a worker to skip the probe, for example on a host where creating a context is
+itself restricted.
 
 ## Moving, deleting and cleaning up
 
@@ -382,6 +395,14 @@ for its Artifacts and Logs, `Manage` for Rename, Cancel or Retry, Move and Delet
 page has
 Pause, Unpause, Stop, Retry failed, Cancel active and Delete failed above an expanded
 experiment's runs.
+
+The Artifacts page previews images and text files. For model and array files (safetensors,
+PyTorch `.pt`/`.pth`/`.ckpt`/`.bin`, TorchScript, pickle, NumPy `.npy`/`.npz`, GGUF and
+ONNX) it shows the tensor names, dtypes and shapes grouped by module, along with any
+metadata. For a checkpoint it also shows the values around the weights, such as the epoch
+and the optimizer settings. The manager reads only headers and pickle structure. It never
+imports torch, and a pickle's code is never run. Compare shows the same summary for each
+run, so you can see a checkpoint's epoch or step across runs.
 
 ## Exporting
 
@@ -473,6 +494,9 @@ mlsweep code checkout EXP DIR           # write EXP's code out to DIR
 
 The dashboard's Code tab shows the same. Pick an experiment and a run, as on Logs, to see
 that run's code as a file tree and files with line numbers, and where it came from.
+Model and array files (`.pt`, `.safetensors`, `.npy` and the like) get the same summary of
+tensors and shapes as on Artifacts, and images are shown. The Wrap box beside a file's path
+folds long lines.
 Details shows everything recorded at submit, the uncommitted diff included. The version
 menu picks any version of the experiment's code. Compare picks another version, a run that
 used other code, or any experiment from a list you can search, then marks the tree and
@@ -507,7 +531,7 @@ machines, and lint.
 | Singular/monotonic not skipping | Only jobs still pending when a result arrives are skipped; lower `--max-concurrent` so fewer run at once |
 | Remote not connecting | Test SSH: `ssh -o BatchMode=yes user@host nvidia-smi` |
 | `need at least GPUS_PER_RUN GPUs` | Worker has fewer GPUs than `GPUS_PER_RUN`; adjust worker config or reduce `GPUS_PER_RUN` |
-| `mlsweep status` shows a worker with fewer GPUs than expected, or `unhealthy=[N]` | GPU `N` failed the CUDA-context probe (often `GPU Recovery Action: Reset`). Reset it (`sudo nvidia-smi --gpu-reset -i N`) or drop it from the worker's `devices` list |
+| `mlsweep status` shows a worker with fewer GPUs than expected, or `unhealthy=[N]` | GPU `N` failed the CUDA-context probe. Read the reason printed under the worker. A CUDA error (often after `GPU Recovery Action: Reset`) needs a reset (`sudo nvidia-smi --gpu-reset -i N`), or drop the GPU from the worker's `devices` list. A timeout usually means a loaded host, and the next probe 5 minutes later can clear it |
 | Jobs die with `CUDA error: CUDA-capable device(s) is/are busy or unavailable` | The device could not create a primary context. Reset it and confirm the worker excludes it (`mlsweep status`) |
 | No metrics plots | Script must use `MLSweepLogger`; stdout/stderr are still captured without it |
 

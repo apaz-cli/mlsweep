@@ -1,6 +1,6 @@
 """Tests for mlsweep worker wheel bootstrap logic.
 
-Covers ``_ensure_worker_wheels`` (reusing, building and failing to build the
+Covers ``WheelCache.ensure`` (reusing, building and failing to build the
 worker wheel), the defaults of ``_worker_candidates``, and that
 ``_worker_shell_cmd`` generates valid bash.
 
@@ -21,19 +21,19 @@ import pytest
 
 from mlsweep import _manager_workers
 from mlsweep._shared import code_fingerprint
-from mlsweep._manager_workers import _ensure_worker_wheels, _worker_candidates, _worker_shell_cmd
+from mlsweep._manager_workers import WheelCache, _worker_candidates, _worker_shell_cmd
 
 VERSION = importlib.metadata.version("mlsweep")
 STAMP = f"{VERSION} {code_fingerprint()}"  # the code on disk, which a build ships
 
 
 @pytest.fixture
-def wheels(tmp_path, monkeypatch):
-    """A temporary wheels dir; ``pip(ok)`` installs a fake pip that builds into it
-    (or fails), and ``calls`` collects the pip command lines."""
+def wheels(tmp_path):
+    """A wheel cache in a temporary dir.  ``pip(ok)`` makes its pip a stand-in that
+    builds into it (or fails), and ``calls`` collects the pip command lines."""
     d = tmp_path / "_wheels"
-    monkeypatch.setattr(_manager_workers, "_WHEELS_DIR", d)
     calls: list[list[str]] = []
+    cache = WheelCache(d, run=lambda cmd, **kw: pytest.fail("pip was not expected to run"))
 
     def pip(ok: bool, seconds: float = 0.0) -> None:
         def run(cmd, **kwargs):
@@ -42,16 +42,16 @@ def wheels(tmp_path, monkeypatch):
             if ok:
                 (d / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"wheel")
             return subprocess.CompletedProcess(cmd, 0 if ok else 1, b"", b"" if ok else b"no")
-        monkeypatch.setattr(_manager_workers, "subprocess", SimpleNamespace(run=run))
+        cache.run = run
 
-    return SimpleNamespace(dir=d, calls=calls, pip=pip)
+    return SimpleNamespace(dir=d, calls=calls, pip=pip, cache=cache)
 
 
 def test_ensure_worker_wheels_builds_and_records_the_version(wheels):
     wheels.dir.mkdir()
     (wheels.dir / "mlsweep-0.0.1-py3-none-any.whl").write_bytes(b"old")
     wheels.pip(ok=True)
-    _ensure_worker_wheels()
+    wheels.cache.ensure()
     assert len(wheels.calls) == 1 and "wheel" in wheels.calls[0]
     assert [p.name for p in wheels.dir.glob("*.whl")] == [f"mlsweep-{VERSION}-py3-none-any.whl"]
     assert (wheels.dir / ".complete").read_text() == STAMP
@@ -62,7 +62,7 @@ def test_ensure_worker_wheels_reuses_a_current_wheel(wheels):
     (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"wheel")
     (wheels.dir / ".complete").write_text(STAMP)
     wheels.pip(ok=True)
-    _ensure_worker_wheels()
+    wheels.cache.ensure()
     assert wheels.calls == []
 
 
@@ -71,14 +71,14 @@ def test_ensure_worker_wheels_rebuilds_after_a_version_change(wheels):
     (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"wheel")
     (wheels.dir / ".complete").write_text("0.0.1")
     wheels.pip(ok=True)
-    _ensure_worker_wheels()
+    wheels.cache.ensure()
     assert len(wheels.calls) == 1
     assert (wheels.dir / ".complete").read_text() == STAMP
 
 
 def test_managers_starting_together_build_the_wheel_once(wheels):
     wheels.pip(ok=True, seconds=0.5)
-    threads = [threading.Thread(target=_ensure_worker_wheels) for _ in range(2)]
+    threads = [threading.Thread(target=wheels.cache.ensure) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
@@ -89,7 +89,7 @@ def test_managers_starting_together_build_the_wheel_once(wheels):
 
 def test_ensure_worker_wheels_survives_a_failed_build(wheels):
     wheels.pip(ok=False)
-    _ensure_worker_wheels()
+    wheels.cache.ensure()
     assert not (wheels.dir / ".complete").exists()
     assert list(wheels.dir.glob("mlsweep-*.whl")) == []
 
@@ -132,14 +132,15 @@ def test_a_code_change_rebuilds_a_wheel_of_the_same_version(wheels):
     (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"old code")
     (wheels.dir / ".complete").write_text(f"{VERSION} 0000000000000000")
     wheels.pip(ok=True)
-    _ensure_worker_wheels()
+    wheels.cache.ensure()
     assert len(wheels.calls) == 1
     assert (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").read_bytes() == b"wheel"
 
 
-def _fake_ssh(monkeypatch, version_output: bytes, pip_stderr: bytes | None = None) -> list[str]:
-    """Stand in for ssh/scp; returns the remote commands run, in order.  With
-    *pip_stderr*, the install step fails and prints it."""
+def _fake_ssh(version_output: bytes, pip_stderr: bytes | None = None):
+    """A stand-in for spawning ssh/scp: ``(spawn, remote)``, where *remote* collects
+    the remote commands run, in order.  With *pip_stderr*, the install step fails
+    and prints it."""
     remote: list[str] = []
 
     async def exec_(*argv, **kwargs):
@@ -152,8 +153,7 @@ def _fake_ssh(monkeypatch, version_output: bytes, pip_stderr: bytes | None = Non
             return out, pip_stderr if fail else b""
         proc.communicate = communicate
         return proc
-    monkeypatch.setattr(_manager_workers.asyncio, "create_subprocess_exec", exec_)
-    return remote
+    return exec_, remote
 
 
 def _current_wheel(wheels) -> None:
@@ -163,51 +163,51 @@ def _current_wheel(wheels) -> None:
     (wheels.dir / ".complete").write_text(STAMP)
 
 
-def test_bootstrap_reuses_a_venv_with_the_same_code(wheels, monkeypatch):
+def test_bootstrap_reuses_a_venv_with_the_same_code(wheels):
     _current_wheel(wheels)
-    remote = _fake_ssh(monkeypatch, f"mlsweep_worker {STAMP}".encode())
-    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    spawn, remote = _fake_ssh(f"mlsweep_worker {STAMP}".encode())
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1", wheels=wheels.cache, spawn=spawn))
     assert len(remote) == 1                # only the version check
 
 
-def test_bootstrap_reinstalls_a_venv_of_the_same_version_with_other_code(wheels, monkeypatch):
+def test_bootstrap_reinstalls_a_venv_of_the_same_version_with_other_code(wheels):
     """A source checkout changes code without changing its version."""
     _current_wheel(wheels)
     for reported in (f"mlsweep_worker {VERSION}", f"mlsweep_worker {VERSION} 0000000000000000"):
-        remote = _fake_ssh(monkeypatch, reported.encode())
-        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+        spawn, remote = _fake_ssh(reported.encode())
+        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1", wheels=wheels.cache, spawn=spawn))
         assert any(c.startswith("rm -rf /tmp/mlsweep_venv") for c in remote)
 
 
-def test_bootstrap_rebuilds_a_stale_wheel_before_shipping_it(wheels, monkeypatch):
+def test_bootstrap_rebuilds_a_stale_wheel_before_shipping_it(wheels):
     """Worker code edited after the manager started reaches the next launch."""
     wheels.dir.mkdir()
     (wheels.dir / f"mlsweep-{VERSION}-py3-none-any.whl").write_bytes(b"old code")
     (wheels.dir / ".complete").write_text(f"{VERSION} 0000000000000000")
     wheels.pip(ok=True)
-    _fake_ssh(monkeypatch, b"MISSING")
-    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    spawn, _ = _fake_ssh(b"MISSING")
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1", wheels=wheels.cache, spawn=spawn))
     assert len(wheels.calls) == 1
     assert (wheels.dir / ".complete").read_text() == STAMP
 
 
-def test_bootstrap_installs_only_the_wheel_it_ships(wheels, monkeypatch):
+def test_bootstrap_installs_only_the_wheel_it_ships(wheels):
     """A wheel an older manager left in /tmp/mlsweep_wheels made pip refuse to
     install two versions of mlsweep at once, so every bootstrap failed."""
     _current_wheel(wheels)
-    remote = _fake_ssh(monkeypatch, b"MISSING")
-    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+    spawn, remote = _fake_ssh(b"MISSING")
+    asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1", wheels=wheels.cache, spawn=spawn))
     assert "rm -rf /tmp/mlsweep_wheels && mkdir -p /tmp/mlsweep_wheels" in remote
     [install] = [c for c in remote if "pip install" in c]
     assert install.endswith(f"pip install /tmp/mlsweep_wheels/mlsweep-{VERSION}-py3-none-any.whl")
 
 
-def test_a_failed_install_reports_pips_error(wheels, monkeypatch):
+def test_a_failed_install_reports_pips_error(wheels):
     _current_wheel(wheels)
-    _fake_ssh(monkeypatch, b"MISSING", pip_stderr=(
+    spawn, _ = _fake_ssh(b"MISSING", pip_stderr=(
         b"Processing /tmp/mlsweep_wheels/x.whl\n"
         b"ERROR: Could not find a version that satisfies the requirement aiohttp\n"))
     with pytest.raises(_manager_workers.BootstrapError) as e:
-        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1"))
+        asyncio.run(_manager_workers._bootstrap_worker_venv("gpu1", wheels=wheels.cache, spawn=spawn))
     assert str(e.value) == ("installing mlsweep failed on gpu1: "
                             "ERROR: Could not find a version that satisfies the requirement aiohttp")

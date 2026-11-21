@@ -29,7 +29,7 @@ import os
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 def _as_step(step: Any) -> int:
@@ -65,6 +65,8 @@ class MLSweepLogger:
         hparams: dict[str, Any] | None = None,
         run_name: str | None = None,
         rank_zero_only: bool = True,
+        socket_path: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create a logger.
 
@@ -77,6 +79,9 @@ class MLSweepLogger:
                             unless both ``MLSWEEP_GPU_RANK`` and
                             ``MLSWEEP_NODE_RANK`` are unset or ``"0"``.  Set to
                             ``False`` to log from every rank.
+            socket_path: The worker's socket.  Defaults to
+                         ``MLSWEEP_WORKER_SOCKET``.
+            clock: Seconds, for ``step_seconds``.  Defaults to ``time.monotonic``.
         """
         self._run_id: str = run_name if run_name is not None else os.environ.get("MLSWEEP_RUN_NAME", "")
         self._experiment: str = os.environ.get("EXP_EXPERIMENT", "")
@@ -84,9 +89,9 @@ class MLSweepLogger:
             os.environ.get("MLSWEEP_GPU_RANK", "0") == "0"
             and os.environ.get("MLSWEEP_NODE_RANK", "0") == "0"
         )
-        self._sock_path: str | None = (
-            os.environ.get("MLSWEEP_WORKER_SOCKET") if (not rank_zero_only or _is_lead) else None
-        )
+        sock_path = socket_path if socket_path is not None else os.environ.get("MLSWEEP_WORKER_SOCKET")
+        self._sock_path: str | None = sock_path if (not rank_zero_only or _is_lead) else None
+        self._clock = clock
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self.step: int = 0
@@ -170,7 +175,7 @@ class MLSweepLogger:
         """Update step_seconds when this log() moved to a new step."""
         if prev_step is not None and self.step == prev_step:
             return
-        now = time.monotonic()
+        now = self._clock()
         if prev_step is not None and self._step_clock is not None:
             self.step_seconds = (now - self._step_clock) / (self.step - prev_step)
         self._step_clock = now

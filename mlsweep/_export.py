@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 from mlsweep._manager_db import FINISHED_JOB_STATUSES
@@ -208,6 +209,30 @@ def wandb_info() -> dict[str, Any]:
     }
 
 
+def wandb_mode(env: Mapping[str, str]) -> str:
+    """The W&B mode an upload uses: ``$WANDB_MODE`` (e.g. offline, disabled), else online."""
+    return env.get("WANDB_MODE") or "online"
+
+
+@dataclass
+class WandbSource:
+    """Where the manager gets wandb: the installed package, or a stand-in *module*
+    (anything with ``init`` and ``Settings``), e.g. to test exports without an account."""
+
+    module: Any = None
+    missing: bool = False  # act as if wandb were not installed
+
+    def info(self) -> dict[str, Any]:
+        if self.missing:
+            return {"available": False, "version": None, "env_key": False}
+        if self.module is None:
+            return wandb_info()
+        return {"available": True, "version": getattr(self.module, "__version__", None), "env_key": False}
+
+    def load(self) -> Any:
+        return self.module if self.module is not None else importlib.import_module("wandb")
+
+
 @dataclass
 class ExportScope:
     """What an export covers: one experiment, one campaign, or everything.
@@ -334,8 +359,12 @@ def upload_wandb_run(
     tags: list[str],
     api_key: str | None,
     work_dir: str,
+    mode: str = "online",
 ) -> str | None:
-    """Create one W&B run from stored *rows* and return its URL (blocking)."""
+    """Create one W&B run from stored *rows* and return its URL (blocking).
+
+    *mode* is the W&B mode (see ``wandb_mode``).
+    """
     run = wandb.init(
         project=export.project,
         entity=export.entity,
@@ -344,9 +373,7 @@ def upload_wandb_run(
         tags=tags,
         config=config,
         dir=work_dir,
-        # Honour WANDB_MODE, so ``WANDB_MODE=offline`` (or ``disabled``) works
-        # for testing without an account; otherwise wandb's default is online.
-        mode=os.environ.get("WANDB_MODE") or "online",
+        mode=mode,
         reinit="create_new",
         settings=_wandb_settings(wandb, api_key),
     )

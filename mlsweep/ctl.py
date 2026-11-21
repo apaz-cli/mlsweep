@@ -42,12 +42,12 @@ from mlsweep.run_sweep import (
     _resolve_campaign,
     _wait_until_settled,
     _get_experiment,
+    manager_note,
     build_leaderboard,
     manager_cancel_job,
     manager_get_experiment_summary,
     manager_get_job_logs,
     awaits_more_runs,
-    experiment_status,
     manager_get_job_metrics,
     metric_keys,
     manager_list_campaigns,
@@ -190,14 +190,15 @@ _LS_LIMIT = 20
 
 # Section order: what needs attention first.  Unknown statuses go last.
 _EXP_SECTIONS = ("running", "paused", "aborted", "failed", "done")
-_RUN_SECTIONS = ("running", "dispatched", "pending", "failed", "cancelled", "xfailed", "done")
-_COUNT_ORDER = ("done", "failed", "xfailed", "cancelled", "running", "dispatched", "pending")
+_RUN_SECTIONS = ("running", "dispatched", "pending", "failed", "cancelled", "xfailed", "pruned", "done")
+_COUNT_ORDER = ("done", "pruned", "failed", "xfailed", "cancelled", "running", "dispatched", "pending")
 
 _SECTION_COLORS = {
     **_STATUS_COLORS,
     "aborted": _RED,
     "paused": _YELLOW,
     "xfailed": _YELLOW,
+    "pruned": _DIM,
 }
 
 
@@ -265,7 +266,8 @@ def _exp_section(e: dict[str, Any]) -> str:
     """The heading an experiment goes under.  A done one whose every run failed is failed."""
     status = _exp_status(e.get("status"))
     c = _exp_counts(e)
-    if status == "done" and c.get("failed") and not c.get("done") and not c.get("xfailed"):
+    if status == "done" and c.get("failed") and not c.get("done") and not c.get("xfailed") \
+            and not c.get("pruned"):
         return "failed"
     return status
 
@@ -392,6 +394,8 @@ def _run_bullet(
     if facts or on:
         text += " " + (", ".join(facts) or "Placed") + on + "."
     lines = [text]
+    if j.get("reason"):
+        lines.append(f"  {_paint(j['reason'], _C_WARN if status != 'pruned' else _C_AUX)}")
     if status == "failed":
         lines.append(_logs_hint(run_id, experiment, campaign))
     return lines
@@ -942,7 +946,9 @@ def _print_optimizer(view: dict[str, Any]) -> None:
     sweep_print(f"  {_BOLD}{view.get('experiment_id')}{_RESET}: {view.get('status')}"
                 + (", finishing (no new trials)" if view.get("finishing") else ""))
     sweep_print(f"  metric:     {view.get('metric')} ({view.get('goal')})")
-    sweep_print(f"  budget:     {told} of {budget} trials have results")
+    pruned = view.get("pruned") or 0
+    sweep_print(f"  budget:     {told} of {budget} trials have results"
+                + (f", plus {pruned} pruned" if pruned else ""))
     sweep_print(f"  trials:     {view.get('running')} running, {view.get('failed')} failed, "
                 f"{view.get('abandoned')} cancelled")
     sweep_print(f"  at once:    {view.get('parallel')} (set with --max-concurrent)")
@@ -1058,7 +1064,7 @@ def wait_cmd(argv: list[str]) -> None:
 
     \b
       0  every run finished successfully
-      1  at least one run failed
+      1  at least one run failed, or the manager paused the sweep (METRIC_CHECK)
       2  --timeout elapsed first, and runs are still active
       3  --until stalled and a running run stopped making progress
       4  no answer: manager unreachable, unknown experiment, or no runs
@@ -1071,7 +1077,7 @@ def wait_cmd(argv: list[str]) -> None:
             "Wait until an experiment settles, fails, or stalls.\n\n"
             "Exit codes:\n"
             "  0  every run finished successfully\n"
-            "  1  at least one run failed\n"
+            "  1  at least one run failed, or the manager paused the sweep (METRIC_CHECK)\n"
             "  2  timed out (--timeout), runs still active; waiting again is safe\n"
             "  3  a running run stalled (--until stalled)\n"
             "  4  no answer: manager unreachable, unknown experiment, or no runs\n"
@@ -1103,66 +1109,91 @@ def wait_cmd(argv: list[str]) -> None:
     start = time.monotonic()
     while True:
         jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign)
-        if jobs is None:
-            sweep_print(f"{_RED}FAIL{_RESET}  Cannot list jobs for {args.experiment}")
-            sys.exit(WAIT_EXIT_UNKNOWN)
-        if not jobs:
-            sweep_print(f"{_RED}FAIL{_RESET}  {args.experiment} has no runs. Check the ID with `mlsweep ls`.")
-            sys.exit(WAIT_EXIT_UNKNOWN)
-
-        failed = _wait_failed(jobs)
-        active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
-
-        if args.until == "any-failure" and failed:
-            names = ", ".join(j.get("run_id", "?") for j in failed)
-            sweep_print(f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}")
-            sys.exit(WAIT_EXIT_FAILURE)
-
-        # Runs added after a `stop`, or left by a stop from an older version, never start.
-        if active and all(j.get("status") == "pending" for j in active) \
-                and experiment_status(manager, token, args.experiment, campaign) == "aborted":
-            sweep_print(f"{_YELLOW}STOPPED{_RESET}  {args.experiment} was stopped, leaving "
-                        f"{len(active)} run(s) that will not start.")
-            sys.exit(WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED)
-
-        if not active:
-            # A Bayesian sweep adds runs as results come in, so a gap isn't the end.
-            if awaits_more_runs(manager, token, args.experiment, campaign):
-                if args.timeout and time.monotonic() - start >= args.timeout:
-                    sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
-                                f"but the manager still expects more. `mlsweep optimize "
-                                f"{args.experiment}` shows where a Bayesian sweep stands.")
-                    sys.exit(WAIT_EXIT_TIMEOUT)
-                time.sleep(args.interval)
-                continue
-            # Settled: nothing pending/dispatched/running.
-            if failed:
-                names = ", ".join(j.get("run_id", "?") for j in failed)
-                sweep_print(f"{_RED}FAILURE{_RESET}  {args.experiment} settled with "
-                            f"{len(failed)} failed run(s): {names}")
-                sys.exit(WAIT_EXIT_FAILURE)
-            cancelled = sum(1 for j in jobs if j.get("status") == "cancelled")
-            if cancelled:
-                sweep_print(f"{_YELLOW}CANCELLED{_RESET}  {args.experiment} settled with "
-                            f"{cancelled} of {len(jobs)} run(s) cancelled.")
-                sys.exit(WAIT_EXIT_CANCELLED)
-            sweep_print(f"{_GREEN}DONE{_RESET}  {args.experiment} settled cleanly.")
-            sys.exit(WAIT_EXIT_SETTLED)
-
-        if args.until == "stalled":
-            stalled = _wait_stalled(jobs, args.stalled_after)
-            if stalled:
-                names = ", ".join(j.get("run_id", "?") for j in stalled)
-                sweep_print(f"{_YELLOW}STALLED{_RESET}  {len(stalled)} running run(s) made no "
-                            f"progress in {args.stalled_after:g}s: {names}")
-                sys.exit(WAIT_EXIT_STALLED)
-
+        outcome = wait_outcome(args.experiment, jobs, args.until, args.stalled_after,
+                               lambda: _get_experiment(manager, token, args.experiment, campaign))
+        if outcome is not None:
+            code, message = outcome
+            sweep_print(message)
+            sys.exit(code)
         if args.timeout and time.monotonic() - start >= args.timeout:
-            sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
-                        f"{len(active)} active run(s) after {args.timeout:g}s.")
+            active = [j for j in jobs or [] if j.get("status") in _WAIT_ACTIVE_STATUSES]
+            if active:
+                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
+                            f"{len(active)} active run(s) after {args.timeout:g}s.")
+            else:
+                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
+                            f"but the manager still expects more. `mlsweep optimize "
+                            f"{args.experiment}` shows where a Bayesian sweep stands.")
             sys.exit(WAIT_EXIT_TIMEOUT)
-
         time.sleep(args.interval)
+
+
+def wait_outcome(
+    experiment: str,
+    jobs: list[dict[str, Any]] | None,
+    until: str,
+    stalled_after: float,
+    get_experiment: Callable[[], dict[str, Any]],
+) -> tuple[int, str] | None:
+    """What ``mlsweep wait`` does after one poll: ``(exit code, message)``, or None to keep waiting.
+
+    *jobs* is the experiment's runs (None if the manager did not answer), and
+    *get_experiment* fetches the experiment itself, only when it is needed.
+    """
+    if jobs is None:
+        return WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  Cannot list jobs for {experiment}"
+    if not jobs:
+        return WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  {experiment} has no runs. Check the ID with `mlsweep ls`."
+
+    failed = _wait_failed(jobs)
+    active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
+
+    if until == "any-failure" and failed:
+        names = ", ".join(j.get("run_id", "?") for j in failed)
+        return WAIT_EXIT_FAILURE, f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}"
+
+    if active and all(j.get("status") == "pending" for j in active):
+        exp = get_experiment()
+        # Runs added after a `stop`, or left by a stop from an older version, never start.
+        if exp.get("status") == "aborted":
+            return (WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED,
+                    f"{_YELLOW}STOPPED{_RESET}  {experiment} was stopped, leaving "
+                    f"{len(active)} run(s) that will not start.")
+        # The manager paused it (e.g. METRIC_CHECK); it waits for someone to look.
+        note = manager_note(exp)
+        if exp.get("status") == "paused" and note:
+            return WAIT_EXIT_FAILURE, f"{_RED}PAUSED{_RESET}  {experiment}: {note}"
+
+    if not active:
+        exp = get_experiment()
+        # A Bayesian sweep adds runs as results come in, so a gap isn't the end.
+        if exp.get("status") == "running" and (exp.get("optimize") or exp.get("expected_jobs")):
+            return None
+        # Settled: nothing pending/dispatched/running.
+        note = manager_note(exp)
+        lines = [f"{_YELLOW}NOTE{_RESET}  {note}"] if note else []
+        if failed:
+            names = ", ".join(j.get("run_id", "?") for j in failed)
+            code = WAIT_EXIT_FAILURE
+            lines.append(f"{_RED}FAILURE{_RESET}  {experiment} settled with {len(failed)} failed run(s): {names}")
+        elif cancelled := sum(1 for j in jobs if j.get("status") == "cancelled"):
+            code = WAIT_EXIT_CANCELLED
+            lines.append(f"{_YELLOW}CANCELLED{_RESET}  {experiment} settled with "
+                         f"{cancelled} of {len(jobs)} run(s) cancelled.")
+        else:
+            code = WAIT_EXIT_SETTLED
+            pruned = sum(1 for j in jobs if j.get("status") == "pruned")
+            lines.append(f"{_GREEN}DONE{_RESET}  {experiment} settled cleanly"
+                         + (f" ({pruned} of {len(jobs)} run(s) pruned)." if pruned else "."))
+        return code, "\n".join(lines)
+
+    if until == "stalled":
+        stalled = _wait_stalled(jobs, stalled_after)
+        if stalled:
+            names = ", ".join(j.get("run_id", "?") for j in stalled)
+            return (WAIT_EXIT_STALLED, f"{_YELLOW}STALLED{_RESET}  {len(stalled)} running run(s) made no "
+                                       f"progress in {stalled_after:g}s: {names}")
+    return None
 
 
 # ── resume ─────────────────────────────────────────────────────────────────────

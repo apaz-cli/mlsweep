@@ -9,6 +9,9 @@ function parseJSON(s, fallback) {
 
 
 
+MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
+MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_logs", min: 180, max: 520 });
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const expSelect    = document.getElementById("exp-select");
 const jobListEl    = document.getElementById("job-list");
@@ -49,14 +52,22 @@ let wsExpId       = null;
 let wsReconnTimer = null;
 let loadAbort     = null;   // AbortController for in-flight history fetches
 
+// "Wrap lines" off scrolls long lines sideways instead.
+const wrapCb = document.getElementById("wrap-lines");
+wrapCb.checked = !!MLPrefs.get("log_wrap", true);
+logOutput.classList.toggle("nowrap", !wrapCb.checked);
+wrapCb.addEventListener("change", () => {
+  MLPrefs.set("log_wrap", wrapCb.checked);
+  logOutput.classList.toggle("nowrap", !wrapCb.checked);
+});
+
 // ── Log rendering ─────────────────────────────────────────────────────────────
 // With "Collapse JSON" on, a line that is a whole JSON object shows as one
 // summary row that opens to the pretty-printed object.  Lines are only known to
 // be whole once their newline arrives, so the unfinished last line is drawn in
 // a tail element and redrawn as more of it comes.
 const collapseCb = document.getElementById("collapse-json");
-const COLLAPSE_KEY = "mlsweep_log_collapse_json";
-collapseCb.checked = localStorage.getItem(COLLAPSE_KEY) !== "0";
+collapseCb.checked = !!MLPrefs.get("log_collapse_json", true);
 let logRaw  = "";     // everything shown so far, to redraw when the toggle changes
 let pending = "";     // the last line, until its newline arrives
 let tailEl  = null;
@@ -126,7 +137,7 @@ function resetLog() {
 }
 
 collapseCb.addEventListener("change", () => {
-  try { localStorage.setItem(COLLAPSE_KEY, collapseCb.checked ? "1" : "0"); } catch {}
+  MLPrefs.set("log_collapse_json", collapseCb.checked);
   const text = logRaw, atBottom = autoScrollCb.checked;
   resetLog();
   appendLog(text);
@@ -213,7 +224,7 @@ function renderJobList() {
     return `<div class="job-item${sel ? " selected" : ""}" data-run-id="${escHtml(j.run_id)}" data-exp-id="${escHtml(j.experiment_id)}">
       <div class="job-item-top">
         <span class="job-run-id" title="${escHtml(j.run_id)}">${runNameHtml(j)}</span>
-        <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
+        <span class="badge badge-${escHtml(j.status)}"${j.reason ? ` title="${escHtml(j.reason)}"` : ""}>${escHtml(j.status)}</span>
       </div>
       ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}
     </div>`;

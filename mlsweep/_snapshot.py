@@ -567,6 +567,7 @@ class ScannedTree:
     root: Path
     manifest: Manifest
     sources: dict[str, Path]   # object hash -> one local file with that content
+    hashed: list[str] = field(default_factory=list)  # paths read and hashed, not found in the hash cache
 
 
 def scan_tree(
@@ -582,6 +583,7 @@ def scan_tree(
     files: list[FileEntry] = []
     dir_paths: list[str] = []
     sources: dict[str, Path] = {}
+    hashed: list[str] = []
     try:
         for entry in project_files(root, excludes, build_output_dirs(root)):
             rel = entry.relative_to(root).as_posix()
@@ -599,12 +601,13 @@ def scan_tree(
                     h = hash_file(entry)
                 except OSError:
                     continue
+                hashed.append(rel)
                 cache.put(key, st, h)
             files.append(FileEntry(rel, h, st.st_size, stat.S_IMODE(st.st_mode) & 0o777))
             sources.setdefault(h, entry)
     finally:
         cache.close()
-    return ScannedTree(root, Manifest(files, leaf_dirs(files, dir_paths)), sources)
+    return ScannedTree(root, Manifest(files, leaf_dirs(files, dir_paths)), sources, hashed)
 
 
 def leaf_dirs(files: Iterable[FileEntry], dirs: Iterable[str]) -> list[str]:

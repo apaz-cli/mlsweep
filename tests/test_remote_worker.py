@@ -174,7 +174,7 @@ def test_tunnel_monitor_restarts_dead_proc():
     asyncio.run(_run())
 
 
-def test_retiring_a_worker_stops_its_tunnel_monitor(monkeypatch):
+def test_retiring_a_worker_stops_its_tunnel_monitor():
     """Retirement cancels the monitor, so it does not relaunch the tunnel the
     worker's relaunch needs the port of, even mid-backoff or mid-spawn."""
     from mlsweep import _manager_workers as mw
@@ -190,11 +190,10 @@ def test_retiring_a_worker_stops_its_tunnel_monitor(monkeypatch):
             launched.append(proc)
             return proc
 
-        monkeypatch.setattr(mw, "_launch_tunnel", slow_launch)
-        monkeypatch.setattr(mw.asyncio, "sleep", _fast_sleep(asyncio.sleep))
         wc = _make_wc()
         wc.tunnel_proc = await asyncio.create_subprocess_exec("true")
-        wc.tunnel_task = asyncio.create_task(_tunnel_monitor_task(wc, 7891, asyncio.Event()))
+        wc.tunnel_task = asyncio.create_task(_tunnel_monitor_task(
+            wc, 7891, asyncio.Event(), launch=slow_launch, sleep=_short_sleep))
         await asyncio.wait_for(spawning.wait(), 5)
         task = wc.tunnel_task
         mw._close_tunnel(wc)
@@ -211,11 +210,9 @@ def test_retiring_a_worker_stops_its_tunnel_monitor(monkeypatch):
     asyncio.run(_run())
 
 
-def _fast_sleep(real_sleep):
-    """``asyncio.sleep`` that skips the monitor's backoff but keeps short waits."""
-    async def sleep(delay, *args, **kwargs):
-        return await real_sleep(min(delay, 0.2), *args, **kwargs)
-    return sleep
+async def _short_sleep(delay):
+    """The monitor's backoff, cut to at most 0.2 s."""
+    await asyncio.sleep(min(delay, 0.2))
 
 
 # ── reconnect_known_workers ────────────────────────────────────────────────────
@@ -327,27 +324,42 @@ def test_relay_copies_every_line_including_overlong_ones(capsys):
     assert "".join(ln.removeprefix("[worker h:1] ") for ln in lines[1:-1]) == "x" * 200_000
 
 
-def test_remote_workers_are_given_their_scratch_dir(monkeypatch):
+def test_remote_workers_are_given_their_scratch_dir(tmp_path):
     """The scratch dir reaches a remote worker's command line, as it does a
     local worker's; remote workers used to keep the default regardless."""
-    from mlsweep import _manager_workers as mw
+    import importlib.metadata
+    from types import SimpleNamespace
 
-    async def bootstrapped(*args, **kwargs):
-        return True
+    from mlsweep import _manager_workers as mw
+    from mlsweep._shared import code_fingerprint
+
+    # A current wheel, and a remote venv that already runs it, so the bootstrap
+    # is only its version check.
+    version = importlib.metadata.version("mlsweep")
+    stamp = f"{version} {code_fingerprint()}"
+    wheels = mw.WheelCache(tmp_path)
+    (tmp_path / f"mlsweep-{version}-py3-none-any.whl").write_bytes(b"wheel")
+    (tmp_path / ".complete").write_text(stamp)
 
     launched: list[tuple[str, ...]] = []
 
     class Launched(Exception):
         pass
 
-    async def capture(*cmd, **kwargs):
+    async def spawn(*cmd, **kwargs):
+        if "--version" in cmd[-1]:  # the bootstrap's check
+            proc = SimpleNamespace(returncode=0)
+
+            async def communicate():
+                return f"mlsweep_worker {stamp}".encode(), b""
+            proc.communicate = communicate
+            return proc
         launched.append(cmd)
         raise Launched
 
-    monkeypatch.setattr(mw, "_bootstrap_worker_venv", bootstrapped)
-    monkeypatch.setattr(mw.asyncio, "create_subprocess_exec", capture)
     try:
-        asyncio.run(mw.launch_worker("user@gpu.invalid", "/proj", "tok", scratch_dir="/big/scratch"))
+        asyncio.run(mw.launch_worker("user@gpu.invalid", "/proj", "tok", scratch_dir="/big/scratch",
+                                     wheels=wheels, spawn=spawn))
     except Launched:
         pass
     [cmd] = launched
