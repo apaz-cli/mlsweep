@@ -74,8 +74,9 @@ mlsweep ls --all-campaigns                 # look across every campaign
 ## Campaigns
 
 A campaign groups experiments the way an experiment groups runs. Every command
-works in one campaign, taken from `--campaign NAME`, else `MLSWEEP_CAMPAIGN`,
-else `default`. `--all-campaigns` (or `--all_campaigns`) covers every campaign.
+works in one campaign, taken from `--campaign NAME`, else the context's campaign,
+else `MLSWEEP_CAMPAIGN`. There is no default, so a command that needs a campaign
+exits 1 without one. `--all-campaigns` (or `--all_campaigns`) covers every campaign.
 
 - `mlsweep run` submits the new experiment under the current campaign. It
   refuses `--all-campaigns`, because a new experiment needs one campaign.

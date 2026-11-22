@@ -287,16 +287,16 @@ def test_a_deleted_sweep_does_not_disturb_the_next(cluster):
                                         "flags": "--x", "singular": True}})},
 ])
 def test_a_bad_spec_is_refused(cluster, change):
-    code = cluster.status_code("POST", "/api/experiments", {"experiment_id": "bad", "optimize": {**_spec(), **change}})
+    code = cluster.status_code("POST", "/api/experiments", {"campaign": "test", "experiment_id": "bad", "optimize": {**_spec(), **change}})
     assert code == 400
     assert cluster.status_code("GET", "/api/experiments/bad") == 404
 
 
 def test_a_spec_cannot_be_added_to_an_existing_experiment_or_carry_jobs(cluster):
     eid = cluster.experiment("plain")
-    body = {"experiment_id": eid, "optimize": _spec()}
+    body = {"experiment_id": eid, "campaign": "test", "optimize": _spec()}
     assert cluster.status_code("POST", "/api/experiments", body) == 409
-    bulk = {"optimize": _spec(), "jobs": [cluster.job_body("newone", "r", 1)]}
+    bulk = {"campaign": "test", "optimize": _spec(), "jobs": [cluster.job_body("newone", "r", 1)]}
     assert cluster.status_code("POST", "/api/experiments/newone/jobs/bulk", bulk) == 400
 
 
@@ -327,7 +327,7 @@ def test_wait_exits_only_when_the_manager_completes_it(cluster, capsys):
 
 
 def _cli(c: Cluster, eid: str) -> list[str]:
-    return [eid, "--manager", c.url, "--token", TOKEN]
+    return [eid, "--manager", c.url, "--token", TOKEN, "--campaign", "test"]
 
 
 # ── Choosing trials ───────────────────────────────────────────────────────────

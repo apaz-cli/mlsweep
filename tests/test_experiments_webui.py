@@ -29,7 +29,7 @@ def mgr(tmp_path_factory):
 
 def _experiment(mgr, run_ids, status, name=None):
     eid = uid("layout")
-    ok(mgr, "POST", "/api/experiments", {"experiment_id": eid, "name": name or eid})
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": eid, "name": name or eid})
     for rid in run_ids:
         ok(mgr, "POST", "/api/jobs", {"experiment_id": eid, "run_id": rid, "command": ["echo"]})
         ok(mgr, "PUT", f"/api/jobs/{rid}/status", {"experiment_id": eid, "status": "done", "exit_code": 0})

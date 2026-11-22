@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import sqlite3
 import dataclasses
 import itertools
@@ -32,7 +31,6 @@ from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, Type
 import aiosqlite
 
 from mlsweep._shared import (
-    DEFAULT_CAMPAIGN,
     NON_SCHEDULABLE_EXPERIMENT_STATUSES,
     validate_artifact_id,
     validate_run_id,
@@ -81,7 +79,7 @@ class ExperimentRecord:
     experiment_id: str
     name: str
     submit_time: datetime
-    campaign: str = DEFAULT_CAMPAIGN
+    campaign: str
     controller_id: str | None = None
     note: str | None = None
     status: ExperimentStatus = "running"
@@ -580,7 +578,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS experiments (
             experiment_id  TEXT PRIMARY KEY,
             name           TEXT NOT NULL,
-            campaign       TEXT NOT NULL DEFAULT 'default',
+            campaign       TEXT NOT NULL,
             submit_time    REAL NOT NULL,
             controller_id  TEXT,
             note           TEXT,
@@ -595,10 +593,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
             controls       TEXT
         );
     """)
-    # Idempotent migration for databases created before metric/goal/campaign
-    # existed.  Experiments from before campaigns land in the default one.
+    # Idempotent migration for databases created before metric/goal existed.
     await _add_missing_columns(db, "experiments", {
-        "metric": "TEXT", "goal": "TEXT", "campaign": "TEXT NOT NULL DEFAULT 'default'",
+        "metric": "TEXT", "goal": "TEXT",
         "optimize": "TEXT", "controls": "TEXT",
     })
 
@@ -737,7 +734,7 @@ async def create_experiment(
     *,
     experiment_id: str,
     name: str,
-    campaign: str = DEFAULT_CAMPAIGN,
+    campaign: str,
     controller_id: str | None = None,
     note: str | None = None,
     status: ExperimentStatus = "running",
@@ -1136,10 +1133,8 @@ def _job_counts(row: Any, artifacts: bool = False) -> dict[str, int]:
 async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     """Every campaign with its experiment and per-status job counts.
 
-    Most recently modified first, meaning the newest experiment submit time.
-    Campaigns with no experiments go last, by name.  A campaign exists while
-    some experiment is in it.  The default campaign is always listed so
-    clients have somewhere to start.
+    Most recently modified first, meaning the newest experiment submit time,
+    with ties by name.  A campaign exists while some experiment is in it.
     """
     rows = await _exec_all(
         db,
@@ -1151,26 +1146,15 @@ async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
         FROM experiments e
         LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
         GROUP BY e.campaign
-        ORDER BY e.campaign
+        ORDER BY last_submit DESC, e.campaign
         """,
     )
-    by_name: dict[str, dict[str, Any]] = {DEFAULT_CAMPAIGN: {
-        "campaign": DEFAULT_CAMPAIGN, "experiments": 0, "last_submit": None,
-        "job_counts": _job_counts(None),
-    }}
-    latest: dict[str, float] = {}
-    for r in rows:
-        latest[r["campaign"]] = r["last_submit"]
-        by_name[r["campaign"]] = {
-            "campaign": r["campaign"],
-            "experiments": r["experiments"],
-            "job_counts": _job_counts(r),
-            "last_submit": _utc(r["last_submit"]).isoformat(),
-        }
-    camps = sorted(by_name.values(), key=lambda c: c["campaign"])
-    # Stable, so ties and empty campaigns stay in name order.
-    camps.sort(key=lambda c: latest.get(c["campaign"], -math.inf), reverse=True)
-    return camps
+    return [{
+        "campaign": r["campaign"],
+        "experiments": r["experiments"],
+        "job_counts": _job_counts(r),
+        "last_submit": _utc(r["last_submit"]).isoformat(),
+    } for r in rows]
 
 
 # ===============================================================================
@@ -2956,7 +2940,7 @@ class DbWriter:
         *,
         experiment_id: str,
         name: str,
-        campaign: str = DEFAULT_CAMPAIGN,
+        campaign: str,
         controller_id: str | None = None,
         note: str | None = None,
         status: ExperimentStatus = "running",

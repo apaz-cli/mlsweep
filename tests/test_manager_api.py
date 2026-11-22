@@ -90,7 +90,7 @@ def test_auth_scenarios(manager_server, headers, expected_code):
 def test_create_and_get_experiment(manager_server):
     _, url = manager_server
     data = _api_post(url, _TOKEN, "/api/experiments",
-                     {"experiment_id": "e1", "name": "my_exp",
+                     {"campaign": "test", "experiment_id": "e1", "name": "my_exp",
                       "note": "testing", "expected_jobs": 5})
 
     assert data["experiment_id"] == "e1"
@@ -134,7 +134,7 @@ def test_create_experiment_errors(manager_server, body, expected_status):
 
 def test_update_experiment_status(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e1"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e1"})
 
     updated = _api_put(url, _TOKEN, "/api/experiments/e1/status",
                        {"status": "completed"})
@@ -143,7 +143,7 @@ def test_update_experiment_status(manager_server):
 
 def test_update_experiment_status_rejects_bad_value(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_bad"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_bad"})
     try:
         _api_put(url, _TOKEN, "/api/experiments/e_bad/status", {"status": "bogus"})
         pytest.fail("expected 400 for invalid status")
@@ -153,7 +153,7 @@ def test_update_experiment_status_rejects_bad_value(manager_server):
 
 def test_pause_and_resume_experiment_status(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_pause"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_pause"})
     paused = _api_put(url, _TOKEN, "/api/experiments/e_pause/status", {"status": "paused"})
     assert paused["status"] == "paused"
     resumed = _api_put(url, _TOKEN, "/api/experiments/e_pause/status", {"status": "running"})
@@ -163,7 +163,7 @@ def test_pause_and_resume_experiment_status(manager_server):
 def test_experiment_max_concurrent_create_and_update(manager_server):
     _, url = manager_server
     created = _api_post(url, _TOKEN, "/api/experiments",
-                        {"experiment_id": "e_cap", "max_concurrent": 4})
+                        {"campaign": "test", "experiment_id": "e_cap", "max_concurrent": 4})
     assert created["max_concurrent"] == 4
 
     updated = _api_put(url, _TOKEN, "/api/experiments/e_cap/max_concurrent",
@@ -194,7 +194,7 @@ def test_scheduler_placement_get_and_set(manager_server):
 
 def test_delete_experiment(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_to_del"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_to_del"})
 
     resp = _api_delete(url, _TOKEN, "/api/experiments/e_to_del")
     assert resp["deleted"] == "e_to_del"
@@ -209,8 +209,8 @@ def test_delete_experiment(manager_server):
 
 def test_list_experiments(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "ea"})
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "eb",
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "ea"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "eb",
                                                   "status": "completed"})
 
     all_exp = _api_get(url, _TOKEN, "/api/experiments")
@@ -232,7 +232,7 @@ def test_experiment_not_found(manager_server):
 def test_experiment_summary(manager_server):
     _, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments",
-              {"experiment_id": "e_summ", "name": "summary_test"})
+              {"campaign": "test", "experiment_id": "e_summ", "name": "summary_test"})
 
     summary = _api_get(url, _TOKEN, "/api/experiments/e_summ/summary")
     assert summary["name"] == "summary_test"
@@ -242,7 +242,7 @@ def test_experiment_summary(manager_server):
 def test_create_experiment_stores_metric_and_goal(manager_server):
     _, url = manager_server
     data = _api_post(url, _TOKEN, "/api/experiments",
-                     {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+                     {"campaign": "test", "experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
     assert data["metric"] == "val_acc"
     assert data["goal"] == "maximize"
 
@@ -261,7 +261,7 @@ def test_create_experiment_rejects_bad_goal(manager_server):
     _, url = manager_server
     try:
         _api_post(url, _TOKEN, "/api/experiments",
-                  {"experiment_id": "e_bad_goal", "goal": "sideways"})
+                  {"campaign": "test", "experiment_id": "e_bad_goal", "goal": "sideways"})
         pytest.fail("expected 400")
     except urllib.error.HTTPError as e:
         assert e.code == 400
@@ -309,7 +309,7 @@ def test_stall_helpers_use_last_progress():
 
 def test_insert_job(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_j"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_j"})
 
     data = _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r1", "experiment_id": "e_j",
@@ -321,7 +321,7 @@ def test_insert_job(manager_server):
 
 def test_insert_jobs_bulk(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_bulk"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_bulk"})
 
     jobs = [
         {"run_id": "ra", "experiment_id": "e_bulk", "command": ["echo", "a"]},
@@ -336,6 +336,7 @@ def test_create_experiment_with_jobs_atomic(manager_server):
     _, url = manager_server
     body = {
         "name": "sweep",
+        "campaign": "test",
         "jobs": [
             {"run_id": "r1", "command": ["echo", "a"]},
             {"run_id": "r2", "command": ["echo", "b"]},
@@ -351,6 +352,7 @@ def test_create_experiment_with_jobs_rejects_duplicate_run_id(manager_server):
     _, url = manager_server
     body = {
         "name": "sweep",
+        "campaign": "test",
         "jobs": [
             {"run_id": "dup", "command": ["echo", "a"]},
             {"run_id": "dup", "command": ["echo", "b"]},
@@ -380,7 +382,7 @@ def test_get_job_not_found(manager_server):
 
 def test_update_job_status(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_status"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_status"})
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r_status", "experiment_id": "e_status",
         "command": ["echo"],
@@ -394,7 +396,7 @@ def test_update_job_status(manager_server):
 
 def test_update_job_priority(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_pri"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_pri"})
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r_pri", "experiment_id": "e_pri",
         "command": ["echo"],
@@ -408,7 +410,7 @@ def test_update_job_priority(manager_server):
 def test_update_job_label(manager_server):
     _, url = manager_server
     for eid in ("e_lab", "e_lab2"):
-        _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": eid})
+        _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": eid})
         _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": eid, "command": ["echo"]})
 
     def label(eid):
@@ -433,7 +435,7 @@ def test_update_job_label(manager_server):
 ])
 def test_update_job_label_errors(manager_server, path, body, expected_status):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_lab_err"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_lab_err"})
     _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": "e_lab_err", "command": ["echo"]})
     with pytest.raises(urllib.error.HTTPError) as exc:
         _api_put(url, _TOKEN, path, body)
@@ -442,7 +444,7 @@ def test_update_job_label_errors(manager_server, path, body, expected_status):
 
 def test_cancel_job(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_cancel"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_cancel"})
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r_cancel", "experiment_id": "e_cancel",
         "command": ["echo"],
@@ -454,7 +456,7 @@ def test_cancel_job(manager_server):
 
 def test_retry_job(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_retry"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_retry"})
     # Create then fail a job
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r_retry", "experiment_id": "e_retry",
@@ -471,7 +473,7 @@ def test_retry_job(manager_server):
 
 def test_retry_job_not_terminal_rejected(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_retry2"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_retry2"})
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "r_retry2", "experiment_id": "e_retry2",
         "command": ["echo"],
@@ -486,7 +488,7 @@ def test_retry_job_not_terminal_rejected(manager_server):
 
 def test_list_pending_jobs(manager_server):
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e_pen"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e_pen"})
     _api_post(url, _TOKEN, "/api/jobs/bulk", [
         {"run_id": "rp", "experiment_id": "e_pen", "command": ["echo"]},
         {"run_id": "rd", "experiment_id": "e_pen", "command": ["echo"]},

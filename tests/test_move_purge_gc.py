@@ -47,7 +47,7 @@ def _db(server) -> sqlite3.Connection:  # type: ignore[no-untyped-def]
 def test_move_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
     server, url = manager_server
     for e in ("src", "dst"):
-        _api_post(url, TOKEN, "/api/experiments", {"experiment_id": e})
+        _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": e})
     _job(url, "src", "r1")
     _job(url, "src", "r2", "failed")
     _job(url, "src", "busy", "pending")
@@ -76,8 +76,8 @@ def test_move_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
 
 def test_move_respects_campaign(manager_server) -> None:  # type: ignore[no-untyped-def]
     _, url = manager_server
-    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "a", "campaign": "one"})
-    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "b", "campaign": "two"})
+    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "a", "campaign": "one"})
+    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "b", "campaign": "two"})
     _job(url, "a", "r")
     status, _ = _post(url, "/api/experiments/a/jobs/move?campaign=one", {"run_ids": ["r"], "to": "b"})
     assert status == 404
@@ -85,7 +85,7 @@ def test_move_respects_campaign(manager_server) -> None:  # type: ignore[no-unty
 
 def test_purge_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
     server, url = manager_server
-    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "p"})
+    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "p"})
     _job(url, "p", "bad", "failed")
     _job(url, "p", "good")
     _job(url, "p", "queued", "pending")
@@ -101,7 +101,7 @@ def test_purge_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
 def test_gc(manager_server) -> None:  # type: ignore[no-untyped-def]
     server, url = manager_server
     root = Path(server.mlsweep_dir)
-    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "kept"})
+    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "kept"})
     _job(url, "kept", "r")
     kept = _run_dir(server, "kept", "r")
     stray_run = _run_dir(server, "kept", "deleted_run")
@@ -130,7 +130,7 @@ def test_gc(manager_server) -> None:  # type: ignore[no-untyped-def]
 
 def test_gc_removes_orphan_rows(manager_server) -> None:  # type: ignore[no-untyped-def]
     server, url = manager_server
-    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "x"})
+    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "x"})
     _job(url, "x", "r")
     con = _db(server)
     con.execute("INSERT INTO metrics (job_key, attempt, step, data) VALUES (99999, 0, 1, '{}')")

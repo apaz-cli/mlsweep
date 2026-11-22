@@ -189,8 +189,9 @@ For a project-local interface, run `mlsweep gen_makefile` in your repo to add `m
 A campaign is a named group of experiments. Pick one with `--campaign NAME` or
 `MLSWEEP_CAMPAIGN`, and every command works inside it. `run` submits under it,
 `ls` and `status` list only its experiments, and commands that take an
-experiment ID refuse one filed in another campaign. Without either you are in
-the campaign called `default`. `--all-campaigns` covers all of them.
+experiment ID refuse one filed in another campaign. A context can also set it.
+There is no default campaign, so a command that needs one exits 1 without it.
+`--all-campaigns` covers all of them.
 
 ```sh
 export MLSWEEP_CAMPAIGN=tokenizer_ablation
@@ -253,7 +254,7 @@ All flags below assume `--manager http://localhost:7891`:
 | `--validate` | Check config, list all combos, exit |
 | `--stream` | Live status in terminal |
 | `--experiment NAME` | Custom experiment name |
-| `--campaign NAME` | Campaign to submit under (default: `$MLSWEEP_CAMPAIGN`, else `default`) |
+| `--campaign NAME` | Campaign to submit under (else the context's, else `$MLSWEEP_CAMPAIGN`; required) |
 | `--priority N` | Higher values run sooner (default: 0) |
 | `--wandb-project P` | Stream metrics to W&B |
 | `--tensorboard-dir D` | Write TensorBoard logs |

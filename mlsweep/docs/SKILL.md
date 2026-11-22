@@ -150,7 +150,7 @@ mlsweep scheduler                               # show or set GPU placement (--p
 
 ## Campaigns
 
-- Campaigns group experiments. Every command works in the campaign from `--campaign NAME`, else `$MLSWEEP_CAMPAIGN`, else `default`. `--all-campaigns` covers all of them, except that `mlsweep run` refuses it. A command given an experiment from another campaign exits 1 and names that campaign, so rerun it with `--campaign <that one>`.
+- Campaigns group experiments. Every command works in the campaign from `--campaign NAME`, else the context's campaign, else `$MLSWEEP_CAMPAIGN`. There is no default campaign, so pass one. `--all-campaigns` covers all of them, except that `mlsweep run` refuses it. A command given an experiment from another campaign exits 1 and names that campaign, so rerun it with `--campaign <that one>`.
 - If each of your commands runs in a fresh shell, set the campaign inline: `MLSWEEP_CAMPAIGN="Campaign Name" mlsweep ...` (an `export` does not persist to the next call).
 
 ## Notes

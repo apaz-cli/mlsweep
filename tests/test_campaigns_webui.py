@@ -18,7 +18,7 @@ CHROME = find_chromium()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chromium-family browser installed")
 
 # Experiments seeded once per module, as campaign -> experiment names, newest last.
-_LAYOUT = {"default": ["d1"], "alpha": ["a1", "a2"], "beta": ["b1"]}
+_LAYOUT = {"omega": ["d1"], "alpha": ["a1", "a2"], "beta": ["b1"]}
 
 # Each page's (campaign select, experiment select) ids.
 def _js_list(values):
@@ -112,13 +112,15 @@ def _campaign_param(b):
 # ── Experiments page ───────────────────────────────────────────────────────────
 
 
-def test_experiments_page_starts_in_default_campaign(page, mgr, seeded):
+def test_experiments_page_starts_in_all_campaigns(page, mgr, seeded):
+    """There is no default campaign, so with nothing chosen the page shows every one."""
     page.goto(page.url("experiments.html"))
-    _wait_rows(page, _ids(seeded, "d1"))
-    assert _selected(page, "campaign-select") == "default"
+    _wait_rows(page, _every(mgr))
+    assert _selected(page, "campaign-select") == "*"
     assert _options(page, "campaign-select") == _campaign_options(mgr)
+    assert "default" not in _options(page, "campaign-select")
     assert page.eval("document.querySelector('#campaign-select option').textContent") == "All campaigns"
-    assert _campaign_param(page) == "default"
+    assert _campaign_param(page) == "*"
 
 
 def test_experiments_selector_is_at_the_top(page, seeded):
@@ -131,9 +133,9 @@ def test_experiments_selector_is_at_the_top(page, seeded):
     assert page.eval("!!document.querySelector('#exp-header #campaign-select')")
 
 
-def test_experiments_page_filters_on_change(page, seeded):
+def test_experiments_page_filters_on_change(page, mgr, seeded):
     page.goto(page.url("experiments.html"))
-    _wait_rows(page, _ids(seeded, "d1"))
+    _wait_rows(page, _every(mgr))
     _choose(page, "campaign-select", "alpha")
     _wait_rows(page, _ids(seeded, "a1", "a2"))
     assert _campaign_param(page) == "alpha"
@@ -149,7 +151,7 @@ def test_experiments_all_campaigns_shows_everything_tagged(page, mgr, seeded):
         [r.dataset.expId, r.querySelector('.campaign-tag')?.textContent]))""")
     assert tags[seeded["a1"]] == "alpha"
     assert tags[seeded["b1"]] == "beta"
-    assert tags[seeded["d1"]] == "default"
+    assert tags[seeded["d1"]] == "omega"
 
 
 def test_experiments_single_campaign_has_no_tags(page, seeded):
@@ -202,10 +204,13 @@ def test_empty_campaign_explains_how_to_submit(page, seeded):
     assert "nobody_here" in _options(page, "campaign-select")
 
 
-def test_default_campaign_hint_omits_flag(page, mgr, seeded):
-    page.goto(page.url("experiments.html", campaign="default"))
+def test_submit_hint_always_names_a_campaign(page, mgr, seeded):
+    page.goto(page.url("experiments.html", campaign="omega"))
     _wait_rows(page, _ids(seeded, "d1"))
-    assert "--campaign" not in page.eval("cmdBlock('http://x')")
+    assert "--campaign omega" in page.eval("cmdBlock('http://x')")
+    page.goto(page.url("experiments.html", campaign="*"))
+    _wait_rows(page, _every(mgr))
+    assert "--campaign NAME" in page.eval("cmdBlock('http://x')")
 
 
 def _prompt(b, value):
@@ -329,12 +334,12 @@ def test_sidebar_lists_only_campaign_experiments(page, mgr, seeded, name):
 
 
 @pytest.mark.parametrize("name", sorted(_SIDEBARS))
-def test_sidebar_defaults_to_default_campaign(page, seeded, name):
+def test_sidebar_starts_in_all_campaigns(page, mgr, seeded, name):
     camp, exp = _SIDEBARS[name]
     page.goto(page.url(name))
-    _wait_exp_options(page, exp, _ids(seeded, "d1"))
-    assert _selected(page, camp) == "default"
-    _wait_shown(page, name, seeded["d1"])
+    _wait_exp_options(page, exp, _every(mgr))
+    assert _selected(page, camp) == "*"
+    assert "default" not in _options(page, camp)
 
 
 @pytest.mark.parametrize("name", sorted(_SIDEBARS))
@@ -374,7 +379,7 @@ def test_sidebar_deep_link_follows_experiment_campaign(page, seeded, name):
 @pytest.mark.parametrize("name", sorted(_SIDEBARS))
 def test_sidebar_deep_link_beats_campaign_param(page, seeded, name):
     camp, _ = _SIDEBARS[name]
-    page.goto(page.url(name, campaign="default", experiment=seeded["a1"]))
+    page.goto(page.url(name, campaign="omega", experiment=seeded["a1"]))
     _wait_shown(page, name, seeded["a1"])
     assert _selected(page, camp) == "alpha"
 

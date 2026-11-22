@@ -61,7 +61,10 @@ function zipName() {
 // The campaign select lists real campaigns only in campaign scope; "All
 // campaigns" there would mean the Everything scope.
 function fillCampaigns() {
-  if (scope === "campaign" && MLCampaign.get() === MLCampaign.ALL) MLCampaign.set(MLCampaign.DEFAULT);
+  if (scope === "campaign" && MLCampaign.get() === MLCampaign.ALL) {
+    const newest = MLCampaign.names(allExps)[0];
+    if (newest) MLCampaign.set(newest);
+  }
   MLCampaign.fill(campaignSelect, allExps, scope !== "campaign");
 }
 

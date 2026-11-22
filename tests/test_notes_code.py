@@ -51,6 +51,7 @@ def exps(mgr, tmp_path_factory) -> dict[str, Any]:  # type: ignore[no-untyped-de
         sid = uploaded[0]
         exp = uid(f"code_{name}")
         status, _ = call(mgr, "POST", f"/api/experiments/{exp}/jobs/bulk", {
+            "campaign": "test",
             "code": {"snapshot": sid, "sweep_file": "train.py", "sweep_file_in_snapshot": True},
             "jobs": [{"run_id": "r1", "command": ["true"], "artifact_id": sid}],
         })
@@ -59,12 +60,13 @@ def exps(mgr, tmp_path_factory) -> dict[str, Any]:  # type: ignore[no-untyped-de
     legacy = uid("code_legacy")
     call(mgr, "POST", "/api/artifacts", {"artifact_id": "sha256:" + "e" * 64})
     call(mgr, "POST", f"/api/experiments/{legacy}/jobs/bulk",
-         {"jobs": [{"run_id": "r1", "command": ["true"], "artifact_id": "sha256:" + "e" * 64}]})
+         {"campaign": "test", "jobs": [{"run_id": "r1", "command": ["true"], "artifact_id": "sha256:" + "e" * 64}]})
     out["legacy"] = legacy
     # An experiment appended to with newer code: its runs used both snapshots.
     multi = uid("code_multi")
     for i, key in enumerate(("a_snap", "b_snap")):
         status, _ = call(mgr, "POST", f"/api/experiments/{multi}/jobs/bulk", {
+            "campaign": "test",
             "code": {"snapshot": out[key]},
             "jobs": [{"run_id": f"r{i}", "command": ["true"], "artifact_id": out[key]}],
         })
@@ -75,6 +77,7 @@ def exps(mgr, tmp_path_factory) -> dict[str, Any]:  # type: ignore[no-untyped-de
     diff = ("diff --git a/train.py b/train.py\nindex 1..2 100644\n--- a/train.py\n+++ b/train.py\n"
             "@@ -3,2 +3,2 @@\n def lr(step):\n-    return 1e-3\n+    return 1e-3 * min(1, step / 100)\n")
     status, _ = call(mgr, "POST", f"/api/experiments/{dirty}/jobs/bulk", {
+        "campaign": "test",
         "code": {"snapshot": out["b_snap"], "sweep_file": "train.py", "sweep_file_in_snapshot": True,
                  "host": "box", "argv": ["sweeps/x.py"],
                  "vcs": {"type": "git", "commit": "a" * 40, "branch": "main", "subject": "Warmup",
@@ -313,6 +316,7 @@ def test_experiment_code_is_light_and_the_full_submission_is_on_demand(mgr, exps
 def test_code_stays_visible_after_its_runs_are_purged(mgr, exps) -> None:  # type: ignore[no-untyped-def]
     exp = uid("code_purged")
     call(mgr, "POST", f"/api/experiments/{exp}/jobs/bulk", {
+        "campaign": "test",
         "code": {"snapshot": exps["a_snap"]},
         "jobs": [{"run_id": "r1", "command": ["true"], "artifact_id": exps["a_snap"]}]})
     call(mgr, "PUT", "/api/jobs/r1/status", {"experiment_id": exp, "status": "done", "exit_code": 0})

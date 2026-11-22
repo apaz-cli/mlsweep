@@ -51,7 +51,7 @@ from mlsweep._writers import (
     WriterFactory,
 )
 from mlsweep._shared import (
-    DEFAULT_CAMPAIGN, DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE,
+    DEFAULT_MANAGER_URL, _BOLD, _GREEN, _RED, _YELLOW, _CYAN, _MAGENTA, _BLUE,
     _RESET, _git_root, _mlsweep_dir, mlsweep_dir_id, set_color, strip_color_flag, validate_campaign,
     validate_experiment_dir,
 )
@@ -175,27 +175,45 @@ def _add_campaign_args(parser: argparse.ArgumentParser) -> None:
     """Add --campaign NAME and --all-campaigns (also spelled --all_campaigns)."""
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--campaign", default=_context_campaign(), metavar="NAME",
-                       help=f"Campaign to work in (env: MLSWEEP_CAMPAIGN, default: {DEFAULT_CAMPAIGN})")
+                       help="Campaign to work in (env: MLSWEEP_CAMPAIGN, or a context's campaign); required "
+                            "unless --all-campaigns")
     group.add_argument("--all-campaigns", "--all_campaigns", dest="all_campaigns",
                        action="store_true", help="Work across every campaign")
 
 
-def _resolve_campaign(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> str | None:
-    """The campaign a command works in, or None for --all-campaigns.
+def _selected_campaign(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> str | None:
+    """The campaign named by --campaign (or a context), else $MLSWEEP_CAMPAIGN, else None.
 
-    Order: --all-campaigns, --campaign, $MLSWEEP_CAMPAIGN (in *env*, by default
-    the process environment), then the default.  Exits with an error on an
-    invalid name.
+    *env* defaults to the process environment.  Ignores --all-campaigns.
+    Exits with an error on an invalid name.
     """
-    if getattr(args, "all_campaigns", False):
-        return None
     env = os.environ if env is None else env
-    name = getattr(args, "campaign", None) or env.get("MLSWEEP_CAMPAIGN") or DEFAULT_CAMPAIGN
+    name = getattr(args, "campaign", None) or env.get("MLSWEEP_CAMPAIGN")
+    if not name:
+        return None
     try:
         return validate_campaign(name)
     except ValueError as e:
         sweep_print(f"{_RED}Error: {e}{_RESET}")
         sys.exit(1)
+
+
+def _resolve_campaign(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> str | None:
+    """The campaign a command works in, or None for --all-campaigns.
+
+    Order: --all-campaigns, --campaign (or the active context's campaign), then
+    $MLSWEEP_CAMPAIGN (in *env*, by default the process environment).  Exits
+    with an error when none of them names a campaign, or on an invalid name.
+    """
+    if getattr(args, "all_campaigns", False):
+        return None
+    name = _selected_campaign(args, env)
+    if name is None:
+        sweep_print(f"{_RED}Error: no campaign given. Pass --campaign NAME, set $MLSWEEP_CAMPAIGN, "
+                    f"or set one in a context (`mlsweep context`). --all-campaigns covers every "
+                    f"campaign.{_RESET}")
+        sys.exit(1)
+    return name
 
 
 def _campaign_argv(campaign: str | None) -> list[str]:
@@ -555,6 +573,7 @@ def manager_create_experiment(
     token: str,
     experiment_id: str,
     name: str,
+    campaign: str,
     controller_id: str | None = None,
     note: str | None = None,
     expected_jobs: int = 0,
@@ -563,7 +582,6 @@ def manager_create_experiment(
     skip_rules: dict[str, Any] | None = None,
     metric: str | None = None,
     goal: str | None = None,
-    campaign: str = DEFAULT_CAMPAIGN,
     jobs: list[dict[str, Any]] | None = None,
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
@@ -1914,7 +1932,7 @@ def _main() -> None:
             "Environment variables:\n"
             "  MLSWEEP_MANAGER  Manager URL (default: http://localhost:7891)\n"
             "  MLSWEEP_TOKEN    Authentication token for manager\n"
-            "  MLSWEEP_CAMPAIGN Campaign to submit under (default: default)\n"
+            "  MLSWEEP_CAMPAIGN Campaign to submit under (required unless --campaign or a context sets one)\n"
             "  MLSWEEP_DIR      Local state dir holding manager.token (default: ~/.mlsweep)\n"
         ),
     )
@@ -1975,7 +1993,10 @@ def _main() -> None:
         parser.error("--json prints one result; it can't be used with --stream or --fetch")
     if extra and extra[0] == "--":
         extra = extra[1:]
-    campaign = _resolve_campaign(args)
+    if args.validate:  # checks the sweep locally, so no campaign is needed
+        campaign = None if args.all_campaigns else _selected_campaign(args)
+    else:
+        campaign = _resolve_campaign(args)
     if campaign is None and not args.validate:
         sweep_print(f"{_RED}Error: a new sweep needs one campaign. Pick it with --campaign NAME "
                     f"instead of --all-campaigns.{_RESET}")
@@ -2206,6 +2227,7 @@ def _main() -> None:
         sweep_print("Submitting jobs...")
     if spec is not None:
         spec["job"]["artifact_id"] = artifact_id
+    assert campaign is not None  # resolved above; only --validate runs without one, and it returned
     if not manager_create_experiment(
         manager, token, experiment_id,
         name=sweep_name,
@@ -2215,7 +2237,7 @@ def _main() -> None:
         skip_rules=_skip_rules(options) if method == "grid" else None,
         metric=info.get("metric"),
         goal=info.get("goal"),
-        campaign=campaign or DEFAULT_CAMPAIGN,
+        campaign=campaign,
         jobs=job_payloads,
         optimize=spec,
         code=provenance,
@@ -2226,7 +2248,7 @@ def _main() -> None:
     # ── 4. Write local manifest ────────────────────────────────────────────
     _write_manifest(exp_dir, experiment_id, variations, note=args.note)
     if args.json:
-        emit({"experiment_id": experiment_id, "campaign": campaign or DEFAULT_CAMPAIGN, "method": method,
+        emit({"experiment_id": experiment_id, "campaign": campaign, "method": method,
               "runs": len(variations), "budget": spec["budget"] if spec else None,
               "snapshot": artifact_id, "controls": info.get("controls"), "findings": info["findings"]})
         if _log_file:

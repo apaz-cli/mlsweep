@@ -38,8 +38,6 @@ from mlsweep._colors import (  # noqa: F401
 
 DEFAULT_MANAGER_URL = "http://localhost:7891"
 
-# Every experiment belongs to one campaign; this one when none is given.
-DEFAULT_CAMPAIGN = "default"
 DEFAULT_SCRATCH_DIR = "/tmp/mlsweep"
 
 # Experiment statuses whose pending jobs the scheduler must NOT dispatch.

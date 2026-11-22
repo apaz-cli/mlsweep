@@ -83,7 +83,7 @@ def test_multinode_dispatch_and_rendezvous(manager_with_two_workers, tmp_path):
     rendezvous, and the single run finalises as 'done'."""
     server, url = manager_with_two_workers
     exp = "exp_mn_ok"
-    manager_create_experiment(url, _TOKEN, exp, "mn_ok")
+    manager_create_experiment(url, _TOKEN, exp, "mn_ok", campaign="test")
 
     rdv_dir = tmp_path / "rdv"
     rdv_dir.mkdir()
@@ -104,7 +104,7 @@ def test_multinode_fails_if_any_node_fails(manager_with_two_workers, tmp_path):
     (DB-backed aggregation: success is the AND across all node results)."""
     server, url = manager_with_two_workers
     exp = "exp_mn_fail"
-    manager_create_experiment(url, _TOKEN, exp, "mn_fail")
+    manager_create_experiment(url, _TOKEN, exp, "mn_fail", campaign="test")
 
     rdv_dir = tmp_path / "rdv"
     rdv_dir.mkdir()

@@ -114,7 +114,7 @@ def test_lint_cli_exit_codes(tmp_path):
     assert r.returncode == 1 and "OPTIMZE" in r.stdout
 
 
-@pytest.mark.parametrize("extra", [["--validate"], ["--dry-run"]])
+@pytest.mark.parametrize("extra", [["--validate"], ["--dry-run", "--campaign", "test"]])
 def test_run_refuses_a_sweep_with_lint_errors(tmp_path, extra):
     bad = _sweep(tmp_path, GOOD + "OPTIMZE = {}\n")
     r = _cli("run", str(bad), *extra, cwd=tmp_path)

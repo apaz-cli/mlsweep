@@ -56,7 +56,7 @@ def test_tail_outside_table_view_points_at_last(shape, capsys):
 def test_metrics_command_end_to_end(manager_with_worker):
     server, url = manager_with_worker
     token = server.token
-    _api_post(url, token, "/api/experiments", {"experiment_id": "metrics_cmd"})
+    _api_post(url, token, "/api/experiments", {"campaign": "test", "experiment_id": "metrics_cmd"})
     for run_id, offset in (("a", 3.5), ("b", 3.0)):
         _api_post(url, token, "/api/jobs", {
             "run_id": run_id, "experiment_id": "metrics_cmd", "gpus_per_run": 0,
@@ -68,7 +68,7 @@ def test_metrics_command_end_to_end(manager_with_worker):
 
     env = {**os.environ, "MLSWEEP_TOKEN": token}
     base = [sys.executable, "-c", "from mlsweep.cli import main; main()", "metrics",
-            "--manager", url, "--experiment", "metrics_cmd"]
+            "--manager", url, "--experiment", "metrics_cmd", "--campaign", "test"]
 
     def run(*extra):
         p = subprocess.run(base + list(extra), capture_output=True, text=True, env=env, cwd=REPO_ROOT)

@@ -218,7 +218,7 @@ def proxied(tmp_path):
     url = f"http://127.0.0.1:{M}"
     try:
         _wait(lambda: _connected_worker(url), 30, "worker to connect")
-        _api(url, "/api/experiments", {"experiment_id": "rc"})
+        _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "rc"})
         yield url, proxy
     finally:
         mgr.terminate()
@@ -311,7 +311,7 @@ def restartable(tmp_path):
 def test_manager_restart_keeps_the_gpu_a_run_is_actually_on(restartable):
     start, managers, proj = restartable
     url = start()
-    _api(url, "/api/experiments", {"experiment_id": "rc"})
+    _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "rc"})
     _api(url, "/api/jobs", {"run_id": "A", "experiment_id": "rc", "command": _sleeper(3)})
     time.sleep(1)
     _api(url, "/api/jobs", {"run_id": "B", "experiment_id": "rc", "command": _sleeper(60)})
@@ -333,7 +333,7 @@ def test_manager_restart_keeps_the_gpu_a_run_is_actually_on(restartable):
 def test_run_that_ends_while_manager_is_down_is_not_rerun(restartable, tmp_path):
     start, managers, _ = restartable
     url = start()
-    _api(url, "/api/experiments", {"experiment_id": "rc"})
+    _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "rc"})
     starts = tmp_path / "d_starts.txt"          # one line per time D is launched
     cmd = [sys.executable, "-c",
            f"open({str(starts)!r}, 'a').write('start\\n')\n"
@@ -384,7 +384,7 @@ def test_hello_reporting_another_attempt_is_a_ghost(tmp_path):
     url = f"http://127.0.0.1:{M}"
     try:
         first = _fake_worker_connection(server, resuming=[])
-        _api(url, "/api/experiments", {"experiment_id": "rc"})
+        _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "rc"})
         _api(url, "/api/jobs", {"run_id": "r", "experiment_id": "rc", "command": ["true"]})
         run = _recv(first, MsgRun)
         assert (run.run_id, run.attempt) == ("r", 1)

@@ -88,13 +88,13 @@ _connection_words: list[str] = []  # --manager/--token/--context/--campaign alre
 
 
 def _experiments() -> list[str]:
-    from mlsweep.run_sweep import _add_manager_args, _resolve_campaign
+    from mlsweep.run_sweep import _add_manager_args, _selected_campaign
     import argparse
 
     parser = argparse.ArgumentParser(add_help=False)
     _add_manager_args(parser)
     args, _ = parser.parse_known_args(_connection_words)
-    campaign = _resolve_campaign(args)
+    campaign = None if getattr(args, "all_campaigns", False) else _selected_campaign(args)
     data = _manager_get("/api/experiments" + (f"?campaign={campaign}" if campaign else ""))
     if not isinstance(data, list):
         return []

@@ -64,9 +64,10 @@
   const qs = (page, params) => `${page}.html?` + new URLSearchParams(params).toString();
   const context = () => {
     const u = new URL(location.href);
+    const campaign = u.searchParams.get("campaign");
     return {
       page: u.pathname.split("/").pop(),
-      campaign: u.searchParams.get("campaign") || "default",
+      campaign: campaign && campaign !== "*" ? campaign : "",  // "*" is every campaign
       experiment: u.searchParams.get("experiment") || "",
       run: u.searchParams.get("run") || "",
     };
@@ -100,7 +101,7 @@
         if (seen.has(key)) return false;
         seen.add(key);
         const e = expMap.get(j.experiment_id);
-        j.campaign = j.campaign || e?.campaign || "default";
+        j.campaign = j.campaign || e?.campaign || "";
         j.experiment_name = e?.name || j.experiment_id;
         return true;
       });
@@ -166,7 +167,7 @@
     return { raw: String(raw || ""), text: terms.join(" "), terms, filters, clauses, answer };
   }
 
-  function campaignOf(j) { return j.campaign || expMap.get(j.experiment_id)?.campaign || "default"; }
+  function campaignOf(j) { return j.campaign || expMap.get(j.experiment_id)?.campaign || ""; }
   function jobText(j) {
     return `${j.run_id} ${j.label || ""} ${j.experiment_id} ${j.experiment_name || ""} ${j.worker_id || ""} ${j.status} ${j.command || ""} ${campaignOf(j)}`.toLowerCase();
   }
@@ -224,13 +225,13 @@
   function matchExp(e, p, scope) {
     const ctx = context();
     if (scope === "experiment" && ctx.experiment && e.experiment_id !== ctx.experiment) return false;
-    if (scope === "campaign" && ctx.campaign && (e.campaign || "default") !== ctx.campaign) return false;
+    if (scope === "campaign" && ctx.campaign && e.campaign !== ctx.campaign) return false;
     if (p.filters.status && !String(e.status || "").toLowerCase().includes(p.filters.status.toLowerCase())) return false;
     if (p.filters.campaign && !String(e.campaign || "").toLowerCase().includes(p.filters.campaign.toLowerCase())) return false;
     if (p.filters.type && !["experiment", "experiments"].includes(p.filters.type.toLowerCase())) return false;
     if (p.filters.has === "artifacts" && !(e.job_counts?.with_artifacts > 0)) return false;
     if (p.filters.since && new Date(e.submit_time || 0).getTime() < p.filters.since) return false;
-    if (!matchClauses({ ...e, campaign: e.campaign || "default" }, p.clauses.filter(c => ["status", "campaign", "name", "experiment"].includes(c.key)))) return false;
+    if (!matchClauses(e, p.clauses.filter(c => ["status", "campaign", "name", "experiment"].includes(c.key)))) return false;
     const hay = expText(e);
     return p.terms.every(t => hay.includes(t));
   }
@@ -238,11 +239,11 @@
   function runHref(j) { return qs("results", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id }); }
   function logsHref(j) { return qs("logs", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id }); }
   function filesHref(j, file) { return qs("files", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id, ...(file ? { file } : {}) }); }
-  function expResultsHref(e) { return qs("results", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
-  function expFilesHref(e) { return qs("files", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
+  function expResultsHref(e) { return qs("results", { campaign: e.campaign, experiment: e.experiment_id }); }
+  function expFilesHref(e) { return qs("files", { campaign: e.campaign, experiment: e.experiment_id }); }
   function codeHref(j) { return qs("code", { campaign: campaignOf(j), experiment: j.experiment_id, run: j.run_id }); }
-  function expCodeHref(e) { return qs("code", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
-  function expLogsHref(e) { return qs("logs", { campaign: e.campaign || "default", experiment: e.experiment_id }); }
+  function expCodeHref(e) { return qs("code", { campaign: e.campaign, experiment: e.experiment_id }); }
+  function expLogsHref(e) { return qs("logs", { campaign: e.campaign, experiment: e.experiment_id }); }
   function copy(text, label) { if (window.copyText) copyText(text, label); }
   function go(href) { location.href = href; }
 
@@ -296,12 +297,12 @@
     const c = e.job_counts || {};
     return {
       kind: "experiment", id: `exp:${e.experiment_id}`, title: e.name || e.experiment_id,
-      sub: `${e.status || "unknown"} · ${e.campaign || "default"} · ${c.done || 0}/${c.total || e.expected_jobs || 0} finished`,
+      sub: `${e.status || "unknown"} · ${e.campaign} · ${c.done || 0}/${c.total || e.expected_jobs || 0} finished`,
       status: e.status, icon: ICONS.experiment,
       href: expResultsHref(e),
       preview: `<div class="sp-title">${esc(e.name || e.experiment_id)}</div>
         <div class="sp-row"><span class="sp-k">Status</span>${esc(e.status || "unknown")}</div>
-        <div class="sp-row"><span class="sp-k">Campaign</span>${esc(e.campaign || "default")}</div>
+        <div class="sp-row"><span class="sp-k">Campaign</span>${esc(e.campaign)}</div>
         <div class="sp-row"><span class="sp-k">Runs</span>${c.done || 0} done · ${c.failed || 0} failed · ${(c.running || 0) + (c.dispatched || 0)} active</div>
         <div class="sp-cmd">${esc(e.note || "No experiment note.")}</div>`,
       actions: [

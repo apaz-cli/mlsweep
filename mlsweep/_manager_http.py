@@ -104,7 +104,6 @@ from mlsweep._manager_workers import (
 )
 from mlsweep._sweep import build_controls, spec_singular_dims, validate_controls
 from mlsweep._shared import (
-    DEFAULT_CAMPAIGN,
     _dir_size,
     _resolve_safe_subpath,
     mlsweep_dir_id,
@@ -698,7 +697,7 @@ routes = web.RouteTableDef()
 
 @routes.get("/api/campaigns")
 async def handle_list_campaigns(request: web.Request) -> web.Response:
-    """List campaigns with experiment and job counts (always includes the default)."""
+    """List campaigns with experiment and job counts."""
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     return _json_response(await list_campaigns(db))
 
@@ -749,15 +748,17 @@ async def _experiment_fields(
 ) -> dict[str, Any] | web.Response:
     """Experiment-create kwargs from a request body, or an error response.
 
-    The campaign comes from the body's ``campaign``, else ``?campaign=``, else
-    the default campaign.  An experiment that already exists in another
+    The campaign comes from the body's ``campaign``, else ``?campaign=``.
+    One of them is required.  An experiment that already exists in another
     campaign is refused with 409.
     """
     goal = body.get("goal")
     if goal is not None and goal not in ("minimize", "maximize"):
         return _error_response("'goal' must be 'minimize' or 'maximize'")
     query_campaign = request.query.get("campaign")
-    campaign = body.get("campaign") or query_campaign or DEFAULT_CAMPAIGN
+    campaign = body.get("campaign") or query_campaign
+    if not campaign:
+        return _error_response("'campaign' is required (in the body or as ?campaign=)")
     if query_campaign is not None and campaign != query_campaign:
         return _error_response(
             f"body campaign {campaign!r} does not match ?campaign={query_campaign}")
@@ -815,8 +816,8 @@ async def _experiment_fields(
 async def handle_create_experiment(request: web.Request) -> web.Response:
     """Create a new experiment.
 
-    Its campaign comes from the body's ``campaign``, else ``?campaign=``, else
-    the default campaign.  Re-creating an experiment that already exists in
+    Its campaign comes from the body's ``campaign``, else ``?campaign=``, and
+    one of them is required.  Re-creating an experiment that already exists in
     another campaign is refused with 409.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]

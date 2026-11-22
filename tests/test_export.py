@@ -98,7 +98,7 @@ def test_tfevents_session_end_status(tmp_path, status, code):
 
 
 async def _seed(db):
-    await create_experiment(db, experiment_id="e1", name="my sweep")
+    await create_experiment(db, experiment_id="e1", name="my sweep", campaign="test")
     for rid, status, combo in [("r1", "done", {"lr": 0.1}), ("r2", "failed", {"lr": 0.2}),
                                ("r3", "done", {"lr": 0.3})]:
         job = await insert_job(db, run_id=rid, experiment_id="e1", command=["x"], combo=combo)
@@ -117,7 +117,7 @@ async def _seed(db):
 async def _seed_no_metrics(db):
     """An experiment whose only run logged nothing."""
     await _seed(db)
-    await create_experiment(db, experiment_id="e4", name="no metrics")
+    await create_experiment(db, experiment_id="e4", name="no metrics", campaign="test")
     job = await insert_job(db, run_id="r4", experiment_id="e4", command=["x"])
     await update_job_status(db, "r4", "e4", "done")
 
@@ -134,7 +134,7 @@ async def _seed_collisions(db):
         await update_job_status(db, rid, eid, "done")
         await insert_metric(db, job.job_key, job.attempt, 1, {"loss": 1.0})
     # Two run ids in one experiment that sanitize the same way.
-    await create_experiment(db, experiment_id="c4", name="runs")
+    await create_experiment(db, experiment_id="c4", name="runs", campaign="test")
     for rid in ("run/1", "run_1"):
         job = await insert_job(db, run_id=rid, experiment_id="c4", command=["x"])
         await update_job_status(db, rid, "c4", "done")
@@ -219,15 +219,15 @@ def test_tensorboard_zip_scopes():
             "my sweep/r1", "my sweep/r2"]
         # Everything: a campaign level on top, and the repeated name made unique.
         assert await _zip_names(client, "/api/export/tensorboard.zip") == [
-            "beta/my sweep_e2/r1", "default/my sweep_e1/r1", "default/my sweep_e1/r2"]
+            "beta/my sweep_e2/r1", "test/my sweep_e1/r1", "test/my sweep_e1/r2"]
         assert await _zip_names(client, "/api/export/tensorboard.zip?only_done=1") == [
-            "beta/my sweep_e2/r1", "default/my sweep_e1/r1"]
+            "beta/my sweep_e2/r1", "test/my sweep_e1/r1"]
         r = await client.get("/api/export/tensorboard.zip", headers=AUTH)
         assert 'filename="mlsweep-tensorboard.zip"' in r.headers["Content-Disposition"]
         r = await client.get("/api/export/tensorboard.zip?campaign=nobody", headers=AUTH)
         assert r.status == 404
         r = await client.get("/api/export/tensorboard.zip?campaign=beta&experiment_id=e1", headers=AUTH)
-        assert r.status == 404 and (await r.json())["campaign"] == "default"
+        assert r.status == 404 and (await r.json())["campaign"] == "test"
     _with_client(body)
 
 
@@ -300,7 +300,7 @@ def test_wandb_export_uploads_each_run(fake_wandb):
         r1, r2 = fake_wandb
         assert r1.kwargs["project"] == "proj" and r1.kwargs["entity"] == "team"
         assert r1.kwargs["group"] == "my sweep"
-        assert r1.kwargs["tags"] == ["default"]
+        assert r1.kwargs["tags"] == ["test"]
         assert r2.kwargs["config"] == {"lr": 0.2}
         settings = r1.kwargs["settings"]
         assert settings["api_key"] == "secret"

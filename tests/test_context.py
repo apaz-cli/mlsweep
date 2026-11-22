@@ -66,12 +66,13 @@ def test_add_list_show_use_rm(env, tmp_path):
 
 
 def test_precedence(env, tmp_path):
-    assert _resolved(env) == ("http://localhost:7891", "default", False)
+    # No context and no $MLSWEEP_CAMPAIGN: no campaign at all (status still runs).
+    assert _resolved(env) == ("http://localhost:7891", None, False)
     _add_two(env, tmp_path)
     # The current context applies by itself...
     assert _resolved(env) == ("http://127.0.0.1:9", "lab-c", True)
     # ...but not over $MLSWEEP_MANAGER, whose token and campaign it can't know.
-    assert _resolved(env, MLSWEEP_MANAGER="http://127.0.0.1:7") == ("http://127.0.0.1:7", "default", False)
+    assert _resolved(env, MLSWEEP_MANAGER="http://127.0.0.1:7") == ("http://127.0.0.1:7", None, False)
     # $MLSWEEP_CAMPAIGN beats the current context's campaign.
     assert _resolved(env, MLSWEEP_CAMPAIGN="env-c")[1] == "env-c"
     # A named context beats the environment, and takes nothing from the current one;
@@ -79,7 +80,7 @@ def test_precedence(env, tmp_path):
     assert _resolved(env, "--context", "other", MLSWEEP_MANAGER="http://127.0.0.1:7",
                      MLSWEEP_CAMPAIGN="env-c") == ("http://127.0.0.1:8", "env-c", False)
     assert _resolved(env, "--context", "lab", MLSWEEP_CAMPAIGN="env-c")[1] == "lab-c"
-    assert _resolved(env, MLSWEEP_CONTEXT="other") == ("http://127.0.0.1:8", "default", False)
+    assert _resolved(env, MLSWEEP_CONTEXT="other") == ("http://127.0.0.1:8", None, False)
     # Flags beat everything, before or after --context.
     assert _resolved(env, "--manager", "http://127.0.0.1:6", "--context", "other")[0] == "http://127.0.0.1:6"
     assert _resolved(env, "--context", "other", "--campaign", "f")[1] == "f"

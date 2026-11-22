@@ -31,7 +31,7 @@ def _api_put(url, token, path, data=None):
 
 
 def _mk_exp(url, eid):
-    return _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": eid, "name": eid})
+    return _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": eid, "name": eid})
 
 
 def _mk_job(url, eid, rid, combo=None):
@@ -47,7 +47,7 @@ def _set_status(url, eid, rid, status, exit_code=0):
 
 
 def _base(url, server):
-    return ["--manager", url, "--token", server.token]
+    return ["--manager", url, "--token", server.token, "--campaign", "test"]
 
 
 # ── Pure helpers ────────────────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ def test_metric_table_grid(capsys):
 def _exp(eid, status="completed", **counts):
     c = {k: counts.get(k, 0) for k in ("done", "failed", "xfailed", "cancelled", "running", "pending", "dispatched")}
     c["total"] = sum(c.values())
-    return {"experiment_id": eid, "status": status, "campaign": "default",
+    return {"experiment_id": eid, "status": status, "campaign": "test",
             "submit_time": "2026-01-01T00:00:00+00:00", "job_counts": c}
 
 
@@ -259,9 +259,9 @@ def test_ls_experiments_grouped_by_status_most_urgent_first(capsys):
         _exp("e_some", done=1, failed=1),
         _exp("e_run", "running", done=1, running=1, pending=2),
         _exp("e_paused", "paused", pending=4),
-    ], "default", show_all=False)
+    ], "test", show_all=False)
     out = capsys.readouterr().out
-    assert out.startswith("# Campaign default: 5 experiments\n")
+    assert out.startswith("# Campaign test: 5 experiments\n")
     headings = [ln for ln in out.splitlines() if ln.startswith("## ")]
     # The manager's "completed" reads "done", the same word runs use.
     assert headings == ["## Running (1)", "## Paused (1)", "## Failed (1)", "## Done (2)"]
@@ -275,7 +275,7 @@ def test_ls_experiments_grouped_by_status_most_urgent_first(capsys):
 
 
 def test_ls_running_experiment_with_nothing_active_says_so(capsys):
-    ctl._ls_experiments([_exp("e", "running", done=1, cancelled=2)], "default", show_all=False)
+    ctl._ls_experiments([_exp("e", "running", done=1, cancelled=2)], "test", show_all=False)
     assert "- e: 3 runs, 1 done, 2 cancelled. Submitted" in (out := capsys.readouterr().out)
     assert "No runs are active." in out
 
@@ -283,13 +283,13 @@ def test_ls_running_experiment_with_nothing_active_says_so(capsys):
 def test_ls_truncates_only_settled_sections_unless_all(capsys):
     n = ctl._LS_LIMIT + 5
     exps = [_exp(f"c{i}", done=1) for i in range(n)] + [_exp(f"f{i}", failed=1) for i in range(n)]
-    ctl._ls_experiments(exps, "default", show_all=False)
+    ctl._ls_experiments(exps, "test", show_all=False)
     out = capsys.readouterr().out
     assert f"## Done ({n}, newest {ctl._LS_LIMIT} shown)" in out
     assert "- 5 more done experiments not shown. Pass --all to list them." in out
     assert f"## Failed ({n})" in out and f"- f{n - 1}:" in out
     assert f"- c{n - 1}:" not in out
-    ctl._ls_experiments(exps, "default", show_all=True)
+    ctl._ls_experiments(exps, "test", show_all=True)
     out = capsys.readouterr().out
     assert f"## Done ({n})" in out and f"- c{n - 1}:" in out and "not shown" not in out
 
@@ -317,7 +317,7 @@ def test_ls_runs_layout(capsys):
 
 def test_ls_runs_heading_says_done_for_completed(capsys):
     jobs = [{"run_id": "r1", "status": "done", "combo": "{}", "elapsed": 5.0}]
-    ctl._ls_runs("e", jobs, {"status": "completed"}, "default", show_all=False)
+    ctl._ls_runs("e", jobs, {"status": "completed"}, "test", show_all=False)
     assert capsys.readouterr().out.startswith("# Experiment e: done, 1 run, 1 done\n")
 
 
@@ -328,11 +328,11 @@ def test_ls_dims_summarizes_long_value_lists():
 
 
 def test_ls_color_only_with_flag(capsys):
-    ctl._ls_experiments([_exp("e", failed=1)], "default", show_all=False)
+    ctl._ls_experiments([_exp("e", failed=1)], "test", show_all=False)
     assert "\033[" not in capsys.readouterr().out
     set_color(True)
     try:
-        ctl._ls_experiments([_exp("e", failed=1)], "default", show_all=False)
+        ctl._ls_experiments([_exp("e", failed=1)], "test", show_all=False)
     finally:
         set_color(False)
     out = capsys.readouterr().out
@@ -608,7 +608,7 @@ def test_wait_stalled_ignores_fresh_runs():
 def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
     server, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments",
-              {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+              {"campaign": "test", "experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
     assert run_sweep.resolve_ranking(url, server.token, "e_rank") == ("val_acc", "maximize")
     assert run_sweep.resolve_ranking(url, server.token, "e_rank", "loss") == ("loss", "maximize")
     assert run_sweep.resolve_ranking(url, server.token, "e_rank", None, "minimize") == ("val_acc", "minimize")
@@ -620,7 +620,7 @@ def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
 def test_fetch_json_uses_experiment_metric_goal(manager_server, capsys):
     server, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments",
-              {"experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
+              {"campaign": "test", "experiment_id": "e_rank", "metric": "val_acc", "goal": "maximize"})
     _mk_job(url, "e_rank", "r1")
     _set_status(url, "e_rank", "r1", "done")
 
@@ -685,7 +685,7 @@ class _FakeWS:
 
 
 def test_watch_events_machine_readable(capsys):
-    run_sweep._watch_cmd(["e", "--events", "--manager", "http://x", "--token", "t"], connect=_FakeWS)
+    run_sweep._watch_cmd(["e", "--events", "--manager", "http://x", "--token", "t", "--campaign", "test"], connect=_FakeWS)
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     events = [json.loads(line) for line in lines]
     assert [e["type"] for e in events] == ["job_started", "job_done", "experiment_done"]
@@ -701,7 +701,7 @@ def test_watch_json_alias_and_failure_exit(capsys):
             ]
 
     with pytest.raises(SystemExit) as exc:
-        run_sweep._watch_cmd(["e", "--json", "--manager", "http://x", "--token", "t"], connect=_FailWS)
+        run_sweep._watch_cmd(["e", "--json", "--manager", "http://x", "--token", "t", "--campaign", "test"], connect=_FailWS)
     assert exc.value.code == 1
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     events = [json.loads(line) for line in lines]
@@ -816,10 +816,10 @@ def test_rename_unknown_run_exits_nonzero(manager_server, capsys):
 
 def test_rename_refuses_run_in_another_campaign(manager_server, capsys):
     server, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "e", "campaign": "other"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "e", "campaign": "other"})
     _mk_job(url, "e", "r1")
     with pytest.raises(SystemExit) as exc:
-        ctl.rename_cmd(_base(url, server) + ["e", "r1", "x", "--campaign", "default"])
+        ctl.rename_cmd(_base(url, server) + ["e", "r1", "x", "--campaign", "test"])
     assert exc.value.code == 1
     assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["label"] is None
 
@@ -834,7 +834,7 @@ def test_wait_unknown_experiment_is_not_success(manager_server):
 def test_wait_unreachable_manager_is_not_a_run_failure():
     # Nothing listens on the discard port.
     with pytest.raises(SystemExit) as exc:
-        ctl.wait_cmd(["e", "--manager", "http://127.0.0.1:9", "--token", "t", "--campaign", "default"])
+        ctl.wait_cmd(["e", "--manager", "http://127.0.0.1:9", "--token", "t", "--campaign", "test"])
     assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
     assert ctl.wait_outcome("e", None, "done", 900, _no_experiment).code == ctl.WAIT_EXIT_UNKNOWN
 
@@ -945,12 +945,12 @@ def test_wait_until_any_done_reports_runs_finished_since_the_cursor():
 def test_ls_shows_each_running_runs_step_and_average_step_time():
     job = {"run_id": "r1", "status": "running", "start_time": None, "last_step": 1200,
            "avg_step_seconds": 2.5, "combo": "{}"}
-    [line] = ctl._run_bullet(job, set(), set(), "e", "default")
+    [line] = ctl._run_bullet(job, set(), set(), "e", "test")
     assert "step 1200 at 2.5 s/step on average" in line
     fast = {**job, "avg_step_seconds": 0.05}
-    assert "at 20 steps/s on average" in ctl._run_bullet(fast, set(), set(), "e", "default")[0]
+    assert "at 20 steps/s on average" in ctl._run_bullet(fast, set(), set(), "e", "test")[0]
     # Before the step has advanced there is no average yet.
-    assert ctl._run_bullet({**job, "avg_step_seconds": None}, set(), set(), "e", "default")[0].endswith(
+    assert ctl._run_bullet({**job, "avg_step_seconds": None}, set(), set(), "e", "test")[0].endswith(
         "step 1200.")
 
 

@@ -1,12 +1,11 @@
 // Campaign selection shared by the dashboard pages.
 //
 // The selected campaign comes from ?campaign= in the URL, else the last one
-// picked (MLPrefs), else "default".  "*" selects every campaign.  The
+// picked (MLPrefs), else "*", which selects every campaign.  The
 // choice is written back to the URL and to MLPrefs, and links to other
 // dashboard pages carry it along.
 const MLCampaign = (function () {
   const ALL = "*";
-  const DEFAULT = "default";
   const PAGES = new RegExp(`(^|/)(${[...MLChrome.PAGES, "index"].join("|")})\\.html$`);
 
   function load() {
@@ -17,11 +16,11 @@ const MLCampaign = (function () {
     MLPrefs.set("campaign", c);
   }
 
-  let current = new URLSearchParams(location.search).get("campaign") || load() || DEFAULT;
+  let current = new URLSearchParams(location.search).get("campaign") || load() || ALL;
   save(current);
   const listeners = [];
 
-  function campaignOf(exp) { return (exp && exp.campaign) || DEFAULT; }
+  function campaignOf(exp) { return exp ? exp.campaign : null; }
 
   // A same-site dashboard URL with this campaign selected.
   function href(url) {
@@ -47,15 +46,15 @@ const MLCampaign = (function () {
   }
 
   function set(c) {
-    current = c || DEFAULT;
+    current = c || ALL;
     save(current);
     publish();
     listeners.forEach(fn => fn(current));
   }
 
-  // Campaign names to offer. These are the campaigns of *exps*, plus the default and the current one.
+  // Campaign names to offer. These are the campaigns of *exps*, plus the current one.
   // Most recently modified first, meaning the newest experiment submit time;
-  // campaigns with no experiments go last, by name.
+  // a current campaign with no experiments goes last.
   function names(exps) {
     const latest = new Map();
     for (const e of exps) {
@@ -63,7 +62,6 @@ const MLCampaign = (function () {
       if (!latest.has(c) || t > latest.get(c)) latest.set(c, t);
     }
     const s = new Set(latest.keys());
-    s.add(DEFAULT);
     if (current !== ALL) s.add(current);
     const at = c => latest.has(c) ? latest.get(c) : -1;
     return [...s].sort((a, b) => at(b) - at(a) || a.localeCompare(b));
@@ -135,7 +133,7 @@ const MLCampaign = (function () {
   document.addEventListener("DOMContentLoaded", publish);
 
   return {
-    ALL, DEFAULT,
+    ALL,
     get: () => current,
     set, campaignOf, names, filter, follow, fill, fillExperiments, bind, href, linkNav,
   };

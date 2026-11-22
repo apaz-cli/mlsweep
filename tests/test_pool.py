@@ -68,7 +68,7 @@ def test_simple_command(manager_with_worker):
     """Submit a job that echoes hello; verify success."""
     server, url = manager_with_worker
 
-    exp = manager_create_experiment(url, _TOKEN, "exp_simple", "simple_test")
+    exp = manager_create_experiment(url, _TOKEN, "exp_simple", "simple_test", campaign="test")
     assert exp is not None
 
     job = _submit_and_wait(url, "exp_simple", "run1", ["echo", "hello"])
@@ -80,7 +80,7 @@ def test_failed_command(manager_with_worker):
     """Submit a job that exits with code 42; verify failure."""
     server, url = manager_with_worker
 
-    manager_create_experiment(url, _TOKEN, "exp_fail", "fail_test")
+    manager_create_experiment(url, _TOKEN, "exp_fail", "fail_test", campaign="test")
 
     job = _submit_and_wait(url, "exp_fail", "run1", ["sh", "-c", "exit 42"])
     assert job["status"] == "failed"
@@ -97,7 +97,7 @@ def test_files_workspace(manager_with_worker, tmp_path):
     remote_dir.mkdir()
     (remote_dir / "untouched.txt").write_text("original")
 
-    manager_create_experiment(url, _TOKEN, "exp_files", "files_test")
+    manager_create_experiment(url, _TOKEN, "exp_files", "files_test", campaign="test")
 
     # Write a script that reads an injected file and exits 0 if successful
     script = (
@@ -148,7 +148,7 @@ def test_abort_experiment_stops_dispatch(manager_with_worker):
     """
     server, url = manager_with_worker
     exp = "exp_abort"
-    manager_create_experiment(url, _TOKEN, exp, "abort_test")
+    manager_create_experiment(url, _TOKEN, exp, "abort_test", campaign="test")
 
     n = _slots(url) + 4  # more than can start before the abort lands
     jobs = [
@@ -196,7 +196,7 @@ def test_cancel_running_job_frees_slot(manager_with_worker):
     """
     server, url = manager_with_worker
     exp = "exp_cancel_slot"
-    manager_create_experiment(url, _TOKEN, exp, "cancel_slot_test")
+    manager_create_experiment(url, _TOKEN, exp, "cancel_slot_test", campaign="test")
 
     slots = _slots(url)
 
@@ -240,7 +240,7 @@ def test_concurrent_slots(manager_with_worker):
     """Submit two jobs in one bulk call; verify both complete."""
     server, url = manager_with_worker
 
-    manager_create_experiment(url, _TOKEN, "exp_concurrent", "concurrent_test")
+    manager_create_experiment(url, _TOKEN, "exp_concurrent", "concurrent_test", campaign="test")
 
     jobs = [
         {
@@ -280,7 +280,7 @@ def test_local_worker_uses_the_managers_scratch_dir_and_its_output_is_logged(
     reaches the manager's log instead of filling an unread pipe."""
     server, url = manager_with_worker
     exp = "exp_scratch"
-    manager_create_experiment(url, _TOKEN, exp, "scratch_test")
+    manager_create_experiment(url, _TOKEN, exp, "scratch_test", campaign="test")
 
     job = _submit_and_wait(url, exp, "where", ["sh", "-c", 'echo "dir=$MLSWEEP_RUN_DIR"'])
     assert job["status"] == "done"

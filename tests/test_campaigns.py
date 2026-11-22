@@ -43,7 +43,7 @@ from mlsweep._manager_db import (
     update_experiment_status,
     update_job_status,
 )
-from mlsweep._shared import DEFAULT_CAMPAIGN, validate_campaign
+from mlsweep._shared import validate_campaign
 from mlsweep.run_sweep import _WebSocket
 
 _TOKEN = "test-token"
@@ -63,11 +63,6 @@ def test_validate_campaign_accepts(name):
 def test_validate_campaign_rejects(name):
     with pytest.raises(ValueError):
         validate_campaign(name)
-
-
-def test_default_campaign_is_valid():
-    assert DEFAULT_CAMPAIGN == "default"
-    validate_campaign(DEFAULT_CAMPAIGN)
 
 
 # ── DB layer ────────────────────────────────────────────────────────────────────
@@ -91,28 +86,16 @@ async def _job(db, eid, rid, status="pending"):
         await update_job_status(db, rid, eid, status)
 
 
-def test_db_migration_files_old_experiments_under_default():
-    """A database from before campaigns gains the column; old rows are in the default."""
+def test_db_experiment_requires_campaign():
+    """The column has no default, so an experiment row must name its campaign."""
     async def body(db):
-        await db.execute("DROP INDEX idx_experiments_campaign")
-        await db.execute("ALTER TABLE experiments DROP COLUMN campaign")
-        await db.execute(
-            "INSERT INTO experiments (experiment_id, name, submit_time) VALUES ('old', 'old', 0)")
-        await db.commit()
-        await init_db(db)
-        assert (await get_experiment(db, "old")).campaign == "default"
-        assert [c["campaign"] for c in await list_campaigns(db)] == ["default"]
-        await create_experiment(db, experiment_id="new", name="new", campaign="alpha")
-        await init_db(db)  # idempotent
-        assert (await get_experiment(db, "new")).campaign == "alpha"
-    _db_test(body)
-
-
-def test_db_experiment_defaults_to_default_campaign():
-    async def body(db):
-        exp = await create_experiment(db, experiment_id="e", name="e")
-        assert exp.campaign == "default"
-        assert (await get_experiment(db, "e")).campaign == "default"
+        with pytest.raises(TypeError):
+            await create_experiment(db, experiment_id="e", name="e")  # type: ignore[call-arg]
+        with pytest.raises(aiosqlite.IntegrityError):
+            await db.execute(
+                "INSERT INTO experiments (experiment_id, name, submit_time) VALUES ('e', 'e', 0)")
+        cols = {r[1]: r for r in await (await db.execute("PRAGMA table_info(experiments)")).fetchall()}
+        assert cols["campaign"][3] == 1 and cols["campaign"][4] is None  # NOT NULL, no default
     _db_test(body)
 
 
@@ -160,12 +143,12 @@ def test_db_list_experiments_filters_by_campaign():
         await create_experiment(db, experiment_id="a1", name="a1", campaign="alpha")
         await create_experiment(db, experiment_id="a2", name="a2", campaign="alpha")
         await create_experiment(db, experiment_id="b1", name="b1", campaign="beta")
-        await create_experiment(db, experiment_id="d1", name="d1")
+        await create_experiment(db, experiment_id="d1", name="d1", campaign="delta")
         ids = lambda rows: sorted(r["experiment_id"] for r in rows)  # noqa: E731
         assert ids(await list_experiments_with_counts(db)) == ["a1", "a2", "b1", "d1"]
         assert ids(await list_experiments_with_counts(db, campaign="alpha")) == ["a1", "a2"]
         assert ids(await list_experiments_with_counts(db, campaign="beta")) == ["b1"]
-        assert ids(await list_experiments_with_counts(db, campaign="default")) == ["d1"]
+        assert ids(await list_experiments_with_counts(db, campaign="delta")) == ["d1"]
         assert await list_experiments_with_counts(db, campaign="nothing") == []
         rows = await list_experiments_with_counts(db, campaign="alpha")
         assert all(r["campaign"] == "alpha" for r in rows)
@@ -194,18 +177,13 @@ def test_db_list_campaigns_counts():
         await _job(db, "a2", "r1", "failed")
         await _job(db, "b1", "r1", "done")
         camps = {c["campaign"]: c for c in await list_campaigns(db)}
-        assert camps.keys() == {"alpha", "beta", "default"}
-        alpha, beta, default = camps["alpha"], camps["beta"], camps["default"]
+        assert camps.keys() == {"alpha", "beta"}
+        alpha, beta = camps["alpha"], camps["beta"]
         assert alpha["experiments"] == 2
         assert alpha["job_counts"] == {"total": 3, "done": 1, "failed": 1, "running": 0, "pending": 1,
                                       "xfailed": 0, "cancelled": 0, "pruned": 0, "dispatched": 0}
         assert beta["experiments"] == 1
         assert beta["job_counts"]["done"] == 1 and beta["job_counts"]["total"] == 1
-        assert default == {
-            "campaign": "default", "experiments": 0, "last_submit": None,
-            "job_counts": {"total": 0, "done": 0, "failed": 0, "running": 0, "pending": 0,
-                           "xfailed": 0, "cancelled": 0, "pruned": 0, "dispatched": 0},
-        }
         assert alpha["last_submit"] is not None
     _db_test(body)
 
@@ -216,25 +194,14 @@ def test_db_list_campaigns_most_recent_first():
                              ("a2", "alpha", 300.0), ("c1", "gamma", 200.0)]:
             await create_experiment(db, experiment_id=exp, name=exp, campaign=camp)
             await db.execute("UPDATE experiments SET submit_time = ? WHERE experiment_id = ?", (t, exp))
-        # Newest submit first, ties by name, the empty default last.
-        assert [c["campaign"] for c in await list_campaigns(db)] == ["alpha", "beta", "gamma", "default"]
+        # Newest submit first, ties by name.
+        assert [c["campaign"] for c in await list_campaigns(db)] == ["alpha", "beta", "gamma"]
     _db_test(body)
 
 
-def test_db_list_campaigns_empty_db_lists_default_only():
+def test_db_list_campaigns_empty_db_lists_none():
     async def body(db):
-        camps = await list_campaigns(db)
-        assert [c["campaign"] for c in camps] == ["default"]
-    _db_test(body)
-
-
-def test_db_list_campaigns_default_not_duplicated():
-    async def body(db):
-        await create_experiment(db, experiment_id="d1", name="d1")
-        await create_experiment(db, experiment_id="z1", name="z1", campaign="zeta")
-        camps = {c["campaign"]: c for c in await list_campaigns(db)}
-        assert sorted(camps) == ["default", "zeta"]
-        assert camps["default"]["experiments"] == 1
+        assert await list_campaigns(db) == []
     _db_test(body)
 
 
@@ -242,7 +209,7 @@ def test_db_campaign_disappears_with_its_last_experiment():
     async def body(db):
         await create_experiment(db, experiment_id="a1", name="a1", campaign="alpha")
         await delete_experiment(db, "a1")
-        assert [c["campaign"] for c in await list_campaigns(db)] == ["default"]
+        assert await list_campaigns(db) == []
     _db_test(body)
 
 
@@ -250,7 +217,7 @@ def test_db_campaign_disappears_when_its_last_experiment_moves():
     async def body(db):
         await create_experiment(db, experiment_id="a1", name="a1", campaign="alpha")
         await update_experiment_campaign(db, "a1", "beta")
-        assert [c["campaign"] for c in await list_campaigns(db)] == ["beta", "default"]
+        assert [c["campaign"] for c in await list_campaigns(db)] == ["beta"]
     _db_test(body)
 
 
@@ -468,10 +435,11 @@ def _create(server, body, campaign=None):
     return _call(server, "POST", path, body)
 
 
-def test_create_defaults_to_default_campaign(mgr):
+def test_create_requires_campaign(mgr):
     eid = _uid("e")
     status, data = _create(mgr, {"experiment_id": eid})
-    assert status == 201 and data["campaign"] == "default"
+    assert status == 400 and "'campaign' is required" in data["error"]
+    assert _call(mgr, "GET", f"/api/experiments/{eid}")[0] == 404
 
 
 def test_create_takes_campaign_from_body(mgr):
@@ -508,10 +476,10 @@ def test_create_rejects_invalid_campaign(mgr, bad):
     assert _call(mgr, "GET", f"/api/experiments/{eid}")[0] == 404
 
 
-def test_create_empty_campaign_means_default(mgr):
+def test_create_empty_campaign_is_refused(mgr):
     eid = _uid("e")
     status, data = _create(mgr, {"experiment_id": eid, "campaign": ""})
-    assert status == 201 and data["campaign"] == "default"
+    assert status == 400 and "'campaign' is required" in data["error"]
 
 
 def test_recreate_in_same_campaign_updates(mgr):
@@ -523,7 +491,7 @@ def test_recreate_in_same_campaign_updates(mgr):
     assert data["max_concurrent"] == 3
 
 
-@pytest.mark.parametrize("body_campaign,query_campaign", [("beta", None), (None, "beta"), (None, None)])
+@pytest.mark.parametrize("body_campaign,query_campaign", [("beta", None), (None, "beta")])
 def test_recreate_in_other_campaign_conflicts(mgr, body_campaign, query_campaign):
     eid = _uid("e")
     _create(mgr, {"experiment_id": eid, "name": "one", "campaign": "alpha"})
@@ -570,7 +538,7 @@ def test_list_campaigns_endpoint(mgr):
     camps = _ok(mgr, "GET", "/api/campaigns")
     names = [c["campaign"] for c in camps]
     assert names[0] == cx  # just seeded, so the most recent
-    assert "default" in names
+    assert "default" not in names
     mine = next(c for c in camps if c["campaign"] == cx)
     assert mine["experiments"] == 2
     assert mine["job_counts"]["total"] == 4

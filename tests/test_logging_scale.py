@@ -292,7 +292,7 @@ def test_skip_rules_cost_stays_linear_in_the_sweep_size():
                      "bs": {"monotonic": False, "singular": True, "_values": list(bss)},
                      "seed": {"monotonic": False, "singular": False, "_values": list(seeds)}}
             await create_experiment(db, experiment_id="e", name="e", skip_rules=rules,
-                                    singular_dims=["bs"])
+                                    singular_dims=["bs"], campaign="test")
             combos = [{"lr": a, "bs": b, "seed": c} for a, b, c in itertools.product(lrs, bss, seeds)]
             await insert_jobs_bulk(db, [{"run_id": f"r{i}", "experiment_id": "e", "command": ["x"],
                                          "combo": cb} for i, cb in enumerate(combos)])

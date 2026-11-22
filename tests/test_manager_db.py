@@ -72,7 +72,7 @@ async def _init_db() -> aiosqlite.Connection:
 async def _dispatched(db, run_id="run1", experiment_id="exp1"):
     """A job dispatched once (attempt 1), as a worker would be running it."""
     if await get_experiment(db, experiment_id) is None:
-        await create_experiment(db, experiment_id=experiment_id, name="t")
+        await create_experiment(db, experiment_id=experiment_id, name="t", campaign="test")
         await upsert_worker(db, worker_id="w1", host="h", remote_dir="/")
     await insert_job(db, run_id=run_id, experiment_id=experiment_id, command=["echo"])
     return await dispatch_job(db, run_id, experiment_id, "w1", [0])
@@ -102,7 +102,7 @@ def test_setup_command_may_be_a_string_or_an_argument_list():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="e", name="e")
+            await create_experiment(db, experiment_id="e", name="e", campaign="test")
             jobs = await insert_jobs_bulk(db, [
                 {"run_id": "s", "experiment_id": "e", "command": ["true"], "setup_command": "make all"},
                 {"run_id": "l", "experiment_id": "e", "command": ["true"],
@@ -429,7 +429,7 @@ def test_create_and_get_experiment():
     async def run():
         db = await _init_db()
         try:
-            exp = await create_experiment(db, experiment_id="exp1", name="test_exp")
+            exp = await create_experiment(db, experiment_id="exp1", name="test_exp", campaign="test")
             assert exp.experiment_id == "exp1"
             assert exp.name == "test_exp"
             assert exp.status == "running"
@@ -448,7 +448,7 @@ def test_create_experiment_metric_and_goal():
         try:
             exp = await create_experiment(
                 db, experiment_id="exp1", name="test_exp",
-                metric="val_loss", goal="maximize",
+                metric="val_loss", goal="maximize", campaign="test",
             )
             assert exp.metric == "val_loss"
             assert exp.goal == "maximize"
@@ -459,7 +459,7 @@ def test_create_experiment_metric_and_goal():
             assert summary["metric"] == "val_loss"
             assert summary["goal"] == "maximize"
             # Re-creating without metric/goal keeps the stored values.
-            again = await create_experiment(db, experiment_id="exp1", name="test_exp")
+            again = await create_experiment(db, experiment_id="exp1", name="test_exp", campaign="test")
             assert (again.metric, again.goal) == ("val_loss", "maximize")
         finally:
             await db.close()
@@ -476,6 +476,7 @@ def test_init_db_migrates_metric_and_goal_columns():
                 CREATE TABLE experiments (
                     experiment_id  TEXT PRIMARY KEY,
                     name           TEXT NOT NULL,
+                    campaign       TEXT NOT NULL,
                     submit_time    REAL NOT NULL,
                     controller_id  TEXT,
                     note           TEXT,
@@ -492,7 +493,7 @@ def test_init_db_migrates_metric_and_goal_columns():
                 cols = {r["name"] for r in await cur.fetchall()}
             assert {"metric", "goal"} <= cols
             exp = await create_experiment(db, experiment_id="e1", name="e1",
-                                          metric="acc", goal="maximize")
+                                          metric="acc", goal="maximize", campaign="test")
             assert (exp.metric, exp.goal) == ("acc", "maximize")
             await init_db(db)  # idempotent
         finally:
@@ -516,7 +517,7 @@ def test_update_experiment_status():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             updated = await update_experiment_status(db, "exp1", "completed")
             assert updated is not None
             assert updated.status == "completed"
@@ -530,7 +531,7 @@ def test_delete_experiment_cascades():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="run1", experiment_id="exp1",
                              command=["echo", "hi"])
             job = await get_job(db, "run1", "exp1")
@@ -562,7 +563,7 @@ def test_insert_job_basic():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             job = await insert_job(db, run_id="run1", experiment_id="exp1",
                                    command=["echo", "hello"])
             assert job.run_id == "run1"
@@ -580,7 +581,7 @@ def test_insert_jobs_bulk():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             payloads = [
                 {"run_id": "run_a", "experiment_id": "exp1",
                  "command": ["echo", "a"]},
@@ -600,7 +601,7 @@ def test_list_pending_jobs_ordering():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r3", experiment_id="exp1", priority=0,
                              command=["echo"])
             await insert_job(db, run_id="r1", experiment_id="exp1", priority=10,
@@ -626,10 +627,10 @@ def test_list_schedulable_jobs_excludes_paused_and_aborted():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="run_exp", name="t", status="running")
-            await create_experiment(db, experiment_id="pause_exp", name="t", status="paused")
-            await create_experiment(db, experiment_id="abort_exp", name="t", status="aborted")
-            await create_experiment(db, experiment_id="done_exp", name="t", status="completed")
+            await create_experiment(db, experiment_id="run_exp", name="t", status="running", campaign="test")
+            await create_experiment(db, experiment_id="pause_exp", name="t", status="paused", campaign="test")
+            await create_experiment(db, experiment_id="abort_exp", name="t", status="aborted", campaign="test")
+            await create_experiment(db, experiment_id="done_exp", name="t", status="completed", campaign="test")
 
             await insert_job(db, run_id="a", experiment_id="run_exp", priority=1, command=["echo"])
             await insert_job(db, run_id="b", experiment_id="run_exp", priority=9, command=["echo"])
@@ -659,7 +660,7 @@ def test_multinode_aggregation_via_db():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp", name="t")
+            await create_experiment(db, experiment_id="exp", name="t", campaign="test")
             await insert_job(db, run_id="r", experiment_id="exp",
                              command=["echo"], nodes_per_run=2)
 
@@ -692,7 +693,7 @@ def test_multinode_aggregation_failure():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp", name="t")
+            await create_experiment(db, experiment_id="exp", name="t", campaign="test")
             await insert_job(db, run_id="r", experiment_id="exp",
                              command=["echo"], nodes_per_run=2)
             await insert_job_nodes(db, "r", "exp", [(0, "w0", [0]), (1, "w1", [0])])
@@ -713,8 +714,8 @@ def test_experiment_concurrency_caps_roundtrip():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="e1", name="t", max_concurrent=3)
-            await create_experiment(db, experiment_id="e2", name="t")  # default 0
+            await create_experiment(db, experiment_id="e1", name="t", max_concurrent=3, campaign="test")
+            await create_experiment(db, experiment_id="e2", name="t", campaign="test")  # default 0
 
             caps = await experiment_concurrency_caps(db)
             assert caps["e1"] == 3
@@ -734,7 +735,7 @@ def test_list_jobs_by_experiment_filter():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"], status="pending")
             await insert_job(db, run_id="r2", experiment_id="exp1",
@@ -755,7 +756,7 @@ def test_update_job_status():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"])
             job = await update_job_status(db, "r1", "exp1", "done",
@@ -774,7 +775,7 @@ def test_update_job_priority():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"])
             job = await update_job_priority(db, "r1", "exp1", 100)
@@ -789,7 +790,7 @@ def test_cancel_jobs_leaves_finished_jobs_alone():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1", command=["echo"])
             await insert_job(db, run_id="r2", experiment_id="exp1", command=["echo"], status="done")
             cancelled = await cancel_jobs(db, [("exp1", "r1"), ("exp1", "r2")])
@@ -865,7 +866,7 @@ def test_result_rules_apply_monotonic_and_singular():
                 "bs": {"monotonic": "increasing", "singular": False, "_values": [8, 16, 32]},
                 "lr": {"monotonic": None, "singular": False, "_values": [1, 2]},
             }
-            await create_experiment(db, experiment_id="m", name="t", skip_rules=rules)
+            await create_experiment(db, experiment_id="m", name="t", skip_rules=rules, campaign="test")
             for bs in (8, 16, 32):
                 for lr in (1, 2):
                     await insert_job(db, run_id=f"b{bs}_l{lr}", experiment_id="m",
@@ -880,14 +881,14 @@ def test_result_rules_apply_monotonic_and_singular():
 
             await create_experiment(db, experiment_id="s", name="t", skip_rules={
                 "bs": {"monotonic": None, "singular": True, "_values": [8, 16, 32]},
-            })
+            }, campaign="test")
             for bs in (8, 16, 32):
                 await insert_job(db, run_id=f"b{bs}", experiment_id="s", command=["x"], combo={"bs": bs})
             await update_job_status(db, "b8", "s", "done", exit_code=0)
             assert sorted(await apply_result_rules(db, "s", "b8", True)) == ["b16", "b32"]
 
             # Probes run at once, so one can also fail after another succeeded.
-            await create_experiment(db, experiment_id="late", name="t", singular_dims=["bs"])
+            await create_experiment(db, experiment_id="late", name="t", singular_dims=["bs"], campaign="test")
             await insert_job(db, run_id="ok", experiment_id="late", command=["c"], combo={"bs": 8, "lr": 1})
             await insert_job(db, run_id="late", experiment_id="late", command=["c"], combo={"bs": 16, "lr": 1})
             await db.execute("UPDATE jobs SET status = 'done' WHERE run_id = 'ok' AND experiment_id = 'late'")
@@ -896,7 +897,7 @@ def test_result_rules_apply_monotonic_and_singular():
 
             # With only singular_dims set (as Bayesian sweeps do), a success turns
             # failed probes of the same non-singular combo into xfailed.
-            await create_experiment(db, experiment_id="b", name="t", singular_dims=["bs"])
+            await create_experiment(db, experiment_id="b", name="t", singular_dims=["bs"], campaign="test")
             for bs, status in ((8, "failed"), (16, "done")):
                 await insert_job(db, run_id=f"b{bs}", experiment_id="b", command=["x"],
                                  combo={"bs": bs}, status=status)
@@ -911,7 +912,7 @@ def test_retry_job():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"], status="pending")
             assert await retry_job(db, "r1", "exp1") is None  # not finished
@@ -935,7 +936,7 @@ def test_experiment_summary_counts():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="test")
+            await create_experiment(db, experiment_id="exp1", name="test", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"], status="done")
             await insert_job(db, run_id="r2", experiment_id="exp1",
@@ -958,7 +959,7 @@ def test_count_active_jobs():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await insert_job(db, run_id="r1", experiment_id="exp1",
                              command=["echo"], status="pending")
             await insert_job(db, run_id="r2", experiment_id="exp1",
@@ -1029,7 +1030,7 @@ def test_experiment_counts_include_runs_with_artifacts():
     async def run():
         db = await _init_db()
         try:
-            await create_experiment(db, experiment_id="exp1", name="t")
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
             await register_artifact(db, artifact_id="sha256:abc")
             await insert_job(db, run_id="r1", experiment_id="exp1", command=["echo"],
                              status="done", artifact_id="sha256:abc")

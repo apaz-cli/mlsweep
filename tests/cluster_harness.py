@@ -203,7 +203,7 @@ class Cluster:
         with a worker started some other way.
         """
         eid = f"{name}_{self.tag}"
-        self.post("/api/experiments", {"experiment_id": eid, **fields})
+        self.post("/api/experiments", {"campaign": "test", "experiment_id": eid, **fields})
         return eid
 
     def job_body(self, eid, rid, *seconds, gpus=0, **fields) -> dict:

@@ -890,15 +890,16 @@ Warnings:
 ## Campaigns
 
 A campaign is a named group of experiments, the way an experiment is a group of
-runs. Every experiment belongs to exactly one campaign. If you never name one,
-everything goes into the campaign called `default`.
+runs. Every experiment belongs to exactly one campaign, and there is no default
+one. You name it when you submit.
 
 Each `mlsweep` command works inside one campaign, chosen in this order:
 
 1. `--campaign NAME`
-2. the `MLSWEEP_CAMPAIGN` environment variable
-3. `default`
+2. the campaign of the active context (see Contexts below)
+3. the `MLSWEEP_CAMPAIGN` environment variable
 
+A command that needs a campaign and finds none exits 1 and says how to pick one.
 `--all-campaigns` (also spelled `--all_campaigns`) lifts the restriction.
 
 ```bash
@@ -906,7 +907,7 @@ export MLSWEEP_CAMPAIGN=tokenizer_ablation
 mlsweep run sweeps/vocab.py --manager http://localhost:7891   # submitted under tokenizer_ablation
 mlsweep ls                                                    # tokenizer_ablation's experiments only
 mlsweep ls --all-campaigns                                    # every experiment, tagged with its campaign
-mlsweep best --experiment EXP_ID --campaign default           # reach into the default campaign
+mlsweep best --experiment EXP_ID --campaign baseline          # reach into another campaign
 ```
 
 | Command | What the campaign does |
@@ -918,7 +919,7 @@ mlsweep best --experiment EXP_ID --campaign default           # reach into the d
 A refusal looks like this:
 
 ```
-Error: experiment vocab_20260930_1412_3f2a is in campaign 'tokenizer_ablation', not 'default'.
+Error: experiment vocab_20260930_1412_3f2a is in campaign 'tokenizer_ablation', not 'baseline'.
 Pass --campaign tokenizer_ablation or --all-campaigns.
 ```
 
@@ -1059,7 +1060,7 @@ Where a setting comes from, first match wins:
 2. A context named by `--context NAME` or `$MLSWEEP_CONTEXT`.
 3. `$MLSWEEP_MANAGER`, `$MLSWEEP_TOKEN`, `$MLSWEEP_CAMPAIGN`.
 4. The current context, unless `$MLSWEEP_MANAGER` is set, since its token and campaign belong to its own manager.
-5. Otherwise the manager is `http://localhost:7891`, the token is in `$MLSWEEP_DIR/manager.token`, and the campaign is `default`.
+5. Otherwise the manager is `http://localhost:7891` and the token is in `$MLSWEEP_DIR/manager.token`. No campaign is filled in here.
 
 What a named context leaves out falls through to the steps below it, never to the
 current context's values.
@@ -1097,7 +1098,7 @@ only means no IDs are offered.
 | `--output-dir <dir>` | Directory for local submit-side artifacts (submit log + manifest). Default: `~/.mlsweep/submissions`. |
 | `--experiment <name>` | Experiment name. Default: `<sweep_name>_<YYYYMMDD_HHMM>_<rand>`. A name already in use is refused unless you pass `--append`. |
 | `--append` | Add this sweep's runs to the existing experiment named by `--experiment`. Run names must not clash with its runs. |
-| `--campaign <name>` | Campaign to submit under (env: `MLSWEEP_CAMPAIGN`, default: `default`). |
+| `--campaign <name>` | Campaign to submit under (env: `MLSWEEP_CAMPAIGN`, or the context's campaign). Required. |
 | `--all-campaigns` | Refused for a new sweep. |
 | `--priority N` | Job priority — higher values run sooner (default: 0). |
 | `--stream` | Watch live status in the terminal over the manager's WebSocket event stream. The sweep doesn't depend on it. |

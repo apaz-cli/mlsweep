@@ -15,7 +15,7 @@ import pytest
 
 from conftest import _api_post, _start_manager, _teardown_manager
 
-DOWN = ["--manager", "http://127.0.0.1:9", "--token", "t"]
+DOWN = ["--manager", "http://127.0.0.1:9", "--token", "t", "--campaign", "test"]
 
 # Each command, with arguments that get it as far as talking to the manager.
 COMMANDS = [
@@ -101,8 +101,8 @@ def manager(tmp_path_factory):
 
 def test_results_are_one_value_with_human_text_on_stderr(manager, tmp_path):
     server, url = manager
-    conn = ["--manager", url, "--token", server.token]
-    _api_post(url, server.token, "/api/experiments", {"experiment_id": "jc"})
+    conn = ["--manager", url, "--token", server.token, "--campaign", "test"]
+    _api_post(url, server.token, "/api/experiments", {"campaign": "test", "experiment_id": "jc"})
     _api_post(url, server.token, "/api/jobs", {"experiment_id": "jc", "run_id": "r1", "command": ["true"]})
 
     r = _run("pause", "jc", "--json", *conn)

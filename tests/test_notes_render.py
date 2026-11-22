@@ -208,7 +208,7 @@ def _insert_metrics(server, experiment: str, rows: dict[str, list[tuple[int, dic
 def test_real_metrics_end_to_end(mgr, page) -> None:
     from campaign_helpers import ok, uid
     exp = uid("render")
-    ok(mgr, "POST", "/api/experiments", {"experiment_id": exp})
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": exp})
     for run, lr in (("r0", 0.001), ("r1", 0.01)):
         ok(mgr, "POST", "/api/jobs", {"run_id": run, "experiment_id": exp,
                                       "command": ["echo"], "combo": {"lr": lr}})
@@ -234,7 +234,7 @@ def test_real_metrics_end_to_end(mgr, page) -> None:
 def test_chart_block_renders_in_live_mode(mgr, page) -> None:
     from campaign_helpers import ok, uid
     exp = uid("live")
-    ok(mgr, "POST", "/api/experiments", {"experiment_id": exp})
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": exp})
     ok(mgr, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": exp,
                                   "command": ["echo"], "combo": {"lr": 0.001}})
     _insert_metrics(mgr, exp, {"r0": [(1, {"loss": 1.0}), (2, {"loss": 0.4})]})

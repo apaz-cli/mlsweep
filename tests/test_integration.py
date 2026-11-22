@@ -54,7 +54,7 @@ def _run(
     """
     cmd = [*MLSWEEP_RUN, sweep_file,
            "--output-dir", str(output_dir),
-           "--experiment", EXP]
+           "--experiment", EXP, "--campaign", "test"]
     if manager_url is not None:
         cmd += ["--manager", manager_url, "--token", _TOKEN]
     cmd.extend(extra_args)
@@ -275,7 +275,7 @@ def test_run_uses_manager_from_env_with_no_flag():
     """`run` finds the manager the way every other command does."""
     url = "http://127.0.0.1:9"  # nothing listens here, so no sweep can land anywhere
     result = subprocess.run(
-        [sys.executable, "-m", "mlsweep.run_sweep", "tests/sweeps/integration_grid.py"],
+        [sys.executable, "-m", "mlsweep.run_sweep", "tests/sweeps/integration_grid.py", "--campaign", "test"],
         capture_output=True, text=True, env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": "x"},
     )
     assert result.returncode != 0
@@ -293,7 +293,7 @@ def test_watch_subcommand(manager_with_worker, tmp_path):
     _run("tests/sweeps/integration_grid.py", tmp_path, manager_url=url)
 
     watch = subprocess.run(
-        MLSWEEP_RUN + ["watch", EXP, "--manager", url, "--token", server.token],
+        MLSWEEP_RUN + ["watch", EXP, "--manager", url, "--token", server.token, "--campaign", "test"],
         env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": server.token},
         capture_output=True, text=True, timeout=30,
     )
@@ -320,6 +320,7 @@ def test_fetch_subcommand(manager_with_worker, tmp_path):
             "--manager", url,
             "--token", server.token,
             "--experiment", EXP,
+            "--campaign", "test",
             "--output-dir", str(fetch_dir),
         ],
         env={**os.environ, "MLSWEEP_MANAGER": url, "MLSWEEP_TOKEN": server.token},
@@ -334,7 +335,8 @@ def test_fetch_subcommand(manager_with_worker, tmp_path):
     # Without --output-dir, a manager on this machine means no copy is made.
     client_dir = tmp_path / "client_mlsweep"
     local = subprocess.run(
-        MLSWEEP_RUN + ["fetch", "--manager", url, "--token", server.token, "--experiment", EXP],
+        MLSWEEP_RUN + ["fetch", "--manager", url, "--token", server.token, "--experiment", EXP,
+                       "--campaign", "test"],
         env={**os.environ, "MLSWEEP_DIR": str(client_dir)},
         capture_output=True, text=True, timeout=30,
     )

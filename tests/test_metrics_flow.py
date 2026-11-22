@@ -41,7 +41,7 @@ def submit_grid_sweep(manager_with_worker, tmp_path):
     proc = subprocess.run(
         [*MLSWEEP_RUN, "tests/sweeps/integration_grid.py",
          "--output-dir", str(tmp_path),
-         "--experiment", "metrics_test",
+         "--experiment", "metrics_test", "--campaign", "test",
          "--manager", url, "--token", server.token,
          "--fetch"],
         cwd=REPO_ROOT,
@@ -89,7 +89,7 @@ def test_metrics_flow_cli(submit_grid_sweep):
 def test_metrics_endpoint_empty(manager_server):
     """Job that exists but has no metrics returns 404."""
     _, url = manager_server
-    _api_post(url, _TOKEN, "/api/experiments", {"experiment_id": "empty_m"})
+    _api_post(url, _TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "empty_m"})
     _api_post(url, _TOKEN, "/api/jobs", {
         "run_id": "no_metrics", "experiment_id": "empty_m",
         "command": ["echo"],
@@ -109,14 +109,14 @@ def test_metrics_websocket_broadcast(manager_with_worker, tmp_path):
 
     # Create the experiment and job
     _api_post(url, token, "/api/experiments",
-              {"experiment_id": "ws_metrics"})
+              {"campaign": "test", "experiment_id": "ws_metrics"})
 
     import subprocess
     # Submit a sweep that logs (integration_grid uses fast_train which logs)
     proc = subprocess.run(
         [*MLSWEEP_RUN, "tests/sweeps/integration_grid.py",
          "--output-dir", str(tmp_path),
-         "--experiment", "ws_metrics", "--append",
+         "--experiment", "ws_metrics", "--append", "--campaign", "test",
          "--manager", url, "--token", token,
          "--fetch"],
         cwd=REPO_ROOT,

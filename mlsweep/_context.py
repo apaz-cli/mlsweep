@@ -20,7 +20,8 @@ Precedence, highest first:
 3. ``$MLSWEEP_MANAGER``, ``$MLSWEEP_TOKEN`` and ``$MLSWEEP_CAMPAIGN``.
 4. The config's ``current`` context, unless ``$MLSWEEP_MANAGER`` is set, since its
    token and campaign belong to its own manager.
-5. ``http://localhost:7891``, ``$MLSWEEP_DIR/manager.token`` and the default campaign.
+5. ``http://localhost:7891`` and ``$MLSWEEP_DIR/manager.token``.  There is no
+   fallback campaign, so a command that needs one and finds none exits with an error.
 """
 
 from __future__ import annotations

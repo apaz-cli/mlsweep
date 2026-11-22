@@ -220,6 +220,7 @@ def test_experiment_records_code_and_provenance(manager_server, tmp_path: Path) 
     code = {"snapshot": sid, "sweep_file": "sweeps/a.py", "host": "h",
             "vcs": {"type": "git", "commit": "abc", "dirty": False}}
     _api_post(url, TOKEN, "/api/experiments/e1/jobs/bulk", {
+        "campaign": "test",
         "name": "e1", "code": code,
         "jobs": [{"run_id": "r1", "command": ["true"], "artifact_id": sid}],
     })
@@ -228,7 +229,7 @@ def test_experiment_records_code_and_provenance(manager_server, tmp_path: Path) 
     assert len(info["submissions"]) == 1
     assert info["submissions"][0]["snapshot"] == sid and info["submissions"][0]["meta"]["vcs"]["commit"] == "abc"
     status, body = _raw(url, "/api/experiments/e2/jobs/bulk", method="POST",
-                        data=json.dumps({"code": {"no": "snapshot"},
+                        data=json.dumps({"campaign": "test", "code": {"no": "snapshot"},
                                          "jobs": [{"run_id": "r", "command": ["true"]}]}).encode())
     assert status == 400
 
@@ -246,7 +247,7 @@ def test_gc_removes_objects_no_snapshot_lists(manager_server, tmp_path: Path) ->
     _, (sid_b, _) = _upload(url, root)
     for exp, sid in (("ea", sid_a), ("eb", sid_b)):
         _api_post(url, TOKEN, f"/api/experiments/{exp}/jobs/bulk",
-                  {"code": {"snapshot": sid}, "jobs": [{"run_id": "r", "command": ["true"], "artifact_id": sid}]})
+                  {"campaign": "test", "code": {"snapshot": sid}, "jobs": [{"run_id": "r", "command": ["true"], "artifact_id": sid}]})
     _api_request(url, TOKEN, "DELETE", "/api/experiments/ea")
 
     # Age everything past GC's grace period.

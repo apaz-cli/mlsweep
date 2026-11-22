@@ -340,7 +340,7 @@ function mlExperimentItems(exps, { exclude = [], campaign = null } = {}) {
   const skip = new Set(exclude);
   const when = e => Date.parse(e.submit_time) || 0;
   const day = e => { const d = new Date(e.submit_time); return isNaN(d) ? "" : d.toLocaleDateString([], { month: "short", day: "numeric" }); };
-  const camp = e => e.campaign || "default";
+  const camp = e => e.campaign;
   const sorted = exps.filter(e => !skip.has(e.experiment_id)).sort((a, b) => when(b) - when(a));
   const item = (e, group) => ({
     value: e.experiment_id, label: e.name && e.name !== e.experiment_id ? e.name : e.experiment_id,

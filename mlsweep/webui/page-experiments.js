@@ -381,7 +381,7 @@ function cmdBlock(url) {
   ];
   if (TOKEN) lines.push(`     --token ${TOKEN}`);
   const c = MLCampaign.get();
-  if (c !== MLCampaign.ALL && c !== MLCampaign.DEFAULT) lines.push(`     --campaign ${c}`);
+  lines.push(`     --campaign ${c !== MLCampaign.ALL ? c : "NAME"}`);
   lines.push(`    sweep.py`);
   const maxLen = Math.max(...lines.map(l => l.length));
   return `<code class="run-cmd">${lines.map((l, i) =>

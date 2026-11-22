@@ -58,7 +58,7 @@ def _req(mgr, method, path, body=None, *, raw=None, auth=True, headers=None):
 
 def _experiment(mgr):
     eid = uid("sec")
-    ok(mgr, "POST", "/api/experiments", {"experiment_id": eid})
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": eid})
     return eid
 
 
@@ -124,7 +124,7 @@ def test_inserting_a_job_refuses_unsafe_ids(mgr):
     assert _req(mgr, "POST", "/api/jobs", {**job, "run_id": "../../evil"})[0] == 400
     assert _req(mgr, "POST", "/api/jobs/bulk", [{**job, "run_id": "../evil"}])[0] == 400
     assert _req(mgr, "POST", f"/api/experiments/{eid}/jobs/bulk",
-                {"jobs": [{"run_id": "a/../../evil", "command": ["true"]}]})[0] == 400
+                {"campaign": "test", "jobs": [{"run_id": "a/../../evil", "command": ["true"]}]})[0] == 400
     assert _req(mgr, "POST", "/api/jobs", {**job, "run_id": "r", "artifact_id": "../x"})[0] == 400
     assert _req(mgr, "POST", "/api/jobs", {**job, "run_id": "org/model_lr0.1"})[0] == 201
 
@@ -134,7 +134,7 @@ def test_old_unsafe_rows_are_found_for_the_manager_to_fail_at_startup(tmp_path):
         db = await aiosqlite.connect(tmp_path / "m.db")
         db.row_factory = aiosqlite.Row
         await init_db(db)
-        await create_experiment(db, experiment_id="e", name="e")
+        await create_experiment(db, experiment_id="e", name="e", campaign="test")
         await insert_job(db, run_id="fine", experiment_id="e", command=["true"])
         await insert_job(db, run_id="old", experiment_id="e", command=["true"])
         await db.execute("UPDATE jobs SET run_id = '../other' WHERE run_id = 'old'")
@@ -223,7 +223,8 @@ def test_wrong_tokens_of_any_shape_are_refused(mgr):
 def test_the_audit_log_records_changes_without_the_token(mgr):
     eid = _experiment(mgr)
     assert _req(mgr, "GET", "/api/health?token=wrong-token", auth=False)[0] == 401
-    assert _req(mgr, "POST", f"/api/experiments?token={mgr.token}", {"experiment_id": uid("sec")}, auth=False)[0] == 201
+    assert _req(mgr, "POST", f"/api/experiments?token={mgr.token}", {"campaign": "test", "experiment_id": uid("sec")},
+                auth=False)[0] == 201
     text = (Path(mgr.mlsweep_dir) / "audit.log").read_text()
     records = [json.loads(line) for line in text.splitlines()]
     assert any(r["method"] == "POST" and r["path"] == "/api/experiments" and r["status"] == 201 for r in records)
@@ -341,7 +342,7 @@ def seeded(mgr):
     """An experiment whose job data tries to run script wherever the pages show it."""
     eid = uid("xss")
     evil = "<img src=x onerror=window.__xss=1>"
-    ok(mgr, "POST", "/api/experiments", {"experiment_id": eid, "name": evil})
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": eid, "name": evil})
     for i in range(2):
         rid = f"{evil}{i}"
         ok(mgr, "POST", "/api/jobs", {"experiment_id": eid, "run_id": rid, "command": ["echo", evil],
@@ -435,7 +436,7 @@ def test_bulk_insert_explains_bad_shapes(mgr):
     assert _req(mgr, "POST", "/api/jobs/bulk", 7)[0] == 400
     assert _req(mgr, "POST", "/api/jobs/bulk", [1])[0] == 400
     assert _req(mgr, "POST", "/api/jobs/bulk", [{"run_id": "r", "experiment_id": _experiment(mgr)}])[0] == 400
-    assert _req(mgr, "POST", f"/api/experiments/{uid('sec')}/jobs/bulk", {"jobs": [1]})[0] == 400
+    assert _req(mgr, "POST", f"/api/experiments/{uid('sec')}/jobs/bulk", {"campaign": "test", "jobs": [1]})[0] == 400
 
 
 def test_job_conflicts_name_the_problem(mgr):
@@ -469,7 +470,7 @@ def test_good_job_fields_still_work(mgr):
 
 
 @pytest.mark.parametrize("method,path,body", [
-    ("POST", "/api/experiments", {"experiment_id": 123}),
+    ("POST", "/api/experiments", {"campaign": "test", "experiment_id": 123}),
     ("PUT", "/api/jobs/r/priority", {"priority": "high", "experiment_id": "e"}),
     ("PUT", "/api/jobs/r/status", {"status": "bogus", "experiment_id": "e"}),
     ("PUT", "/api/jobs/r/status", {"status": "done", "experiment_id": "e", "exit_code": "x"}),
@@ -505,7 +506,7 @@ def test_an_oversized_body_says_so(mgr):
 
 def _cli(mgr, *args):
     env = {**os.environ, "MLSWEEP_MANAGER": mgr.url}
-    return subprocess.run([sys.executable, "-m", "mlsweep", *args, "--token", "wrong"],
+    return subprocess.run([sys.executable, "-m", "mlsweep", *args, "--token", "wrong", "--campaign", "test"],
                           capture_output=True, text=True, env=env, timeout=30)
 
 

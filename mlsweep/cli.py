@@ -172,8 +172,9 @@ def _build_help(include_banner: bool = False) -> str:
     lines += [
         "Every command defaults --manager to $MLSWEEP_MANAGER, then http://localhost:7891,",
         "unless a context says otherwise (--context NAME, $MLSWEEP_CONTEXT, `mlsweep context use`).",
-        "Each command works in the campaign named by --campaign, else $MLSWEEP_CAMPAIGN, else",
-        "`default`. --all-campaigns covers every campaign (not allowed when submitting a new sweep).",
+        "Each command works in the campaign named by --campaign, else the context's campaign, else",
+        "$MLSWEEP_CAMPAIGN. One is required. --all-campaigns covers every campaign (not allowed",
+        "when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
         f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
         f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, skill)",
@@ -290,7 +291,7 @@ def _status_cmd(argv: list[str]) -> None:
         _add_manager_args,
         _http_request,
         _manager_url,
-        _resolve_campaign,
+        _selected_campaign,
         _resolve_token,
         manager_list_experiments,
         manager_list_workers,
@@ -307,7 +308,8 @@ def _status_cmd(argv: list[str]) -> None:
 
     manager = args.manager.rstrip("/")
     token = _resolve_token(args.token)
-    campaign = _resolve_campaign(args)
+    # A diagnostic, so it runs without a campaign and then counts every experiment.
+    campaign = None if args.all_campaigns else _selected_campaign(args)
     mlsweep_dir = _mlsweep_dir()
     token_file = mlsweep_dir / "manager.token"
     local_version = _pkg_version("mlsweep")
@@ -349,7 +351,9 @@ def _status_cmd(argv: list[str]) -> None:
 
     print(f"{_BOLD}{_CYAN}mlsweep status{_RESET}")
     print(f"  {_label('manager:')}{manager}")
-    print(f"  {_label('campaign:')}{campaign or 'all (--all-campaigns)'}")
+    print(f"  {_label('campaign:')}"
+          + (campaign or ("all (--all-campaigns)" if args.all_campaigns
+                          else "none given (pass --campaign or set $MLSWEEP_CAMPAIGN)")))
     print(f"  {_label('results:')}{mlsweep_dir / 'experiments'} (on the manager's machine; "
           "read them with metrics, logs, fetch)")
     print(f"  {_label('dashboard:')}{manager}/?token=<token>")

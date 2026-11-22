@@ -114,7 +114,7 @@ def test_metric_check_pauses_a_sweep_whose_runs_log_another_name(cluster):
 
     # `mlsweep wait` reports the pause instead of waiting forever.
     r = subprocess.run([sys.executable, "-m", "mlsweep", "wait", eid, "--manager", cluster.url,
-                        "--token", TOKEN, "--interval", "0.2", "--timeout", "30"],
+                        "--token", TOKEN, "--campaign", "test", "--interval", "0.2", "--timeout", "30"],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 1 and "PAUSED" in r.stdout and "METRIC_CHECK" in r.stdout
 
@@ -139,13 +139,13 @@ def test_metric_check_stays_quiet_once_a_run_logs_the_metric(cluster):
 
 def test_bad_controls_are_refused(cluster):
     code = cluster.status_code("POST", "/api/experiments",
-                               {"experiment_id": f"bad_{cluster.tag}", "controls": {"max_runtime": "soon"}})
+                               {"campaign": "test", "experiment_id": f"bad_{cluster.tag}", "controls": {"max_runtime": "soon"}})
     assert code == 400
 
 
 def _controls_cli(c: Cluster, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "mlsweep", "controls", *args, "--manager", c.url,
-                           "--token", TOKEN, "--campaign", "default"],
+                           "--token", TOKEN, "--campaign", "test"],
                           capture_output=True, text=True, timeout=60)
 
 

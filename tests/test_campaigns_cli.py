@@ -1,9 +1,9 @@
 """Campaigns in the ``mlsweep`` command line.
 
 Each command works in the campaign named by ``--campaign``, else
-``$MLSWEEP_CAMPAIGN``, else ``default``; ``--all-campaigns`` covers every
-campaign.  A command naming an experiment from another campaign exits 1 with a
-hint and changes nothing.  Commands run in-process against a real manager,
+``$MLSWEEP_CAMPAIGN``; one of them (or ``--all-campaigns``, which covers every
+campaign) is required, since there is no default campaign.  A command naming
+an experiment from another campaign exits 1 with a hint and changes nothing.  Commands run in-process against a real manager,
 except ``mlsweep run``, which runs as a subprocess from the repo root, and the
 cases about ``$MLSWEEP_CAMPAIGN``, which run as a subprocess with it set.
 """
@@ -77,8 +77,14 @@ def _parse(argv):
 # ── Resolving the campaign ──────────────────────────────────────────────────────
 
 
-def test_resolve_defaults_to_default():
-    assert _resolve_campaign(_parse([]), _NO_ENV) == "default"
+_NO_CAMPAIGN = "no campaign given. Pass --campaign NAME"
+
+
+def test_resolve_requires_a_campaign(capsys):
+    with pytest.raises(SystemExit) as exc:
+        _resolve_campaign(_parse([]), _NO_ENV)
+    assert exc.value.code == 1
+    assert _NO_CAMPAIGN in capsys.readouterr().out
 
 
 def test_resolve_reads_env():
@@ -89,8 +95,10 @@ def test_resolve_flag_beats_env():
     assert _resolve_campaign(_parse(["--campaign", "from_flag"]), {"MLSWEEP_CAMPAIGN": "from_env"}) == "from_flag"
 
 
-def test_resolve_empty_env_means_default():
-    assert _resolve_campaign(_parse([]), {"MLSWEEP_CAMPAIGN": ""}) == "default"
+def test_resolve_empty_env_is_no_campaign(capsys):
+    with pytest.raises(SystemExit):
+        _resolve_campaign(_parse([]), {"MLSWEEP_CAMPAIGN": ""})
+    assert _NO_CAMPAIGN in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("flag", ["--all-campaigns", "--all_campaigns"])
@@ -211,22 +219,31 @@ def fake_ws():
     return _FakeWS
 
 
-@pytest.mark.parametrize("how", ["default", "flag", "env"])
+@pytest.mark.parametrize("how", ["flag", "env"])
 @pytest.mark.parametrize("name", sorted(_COMMANDS))
 def test_command_refuses_other_campaign(mgr, capsys, fake_ws, name, how):
     eid = seed(mgr, "alpha")
     before = snapshot(mgr, eid)
     argv = _argv(name, eid) + _base(mgr)
-    wanted, env = "default", None
+    env = None
     if how == "flag":
         argv += ["--campaign", "beta"]
-        wanted = "beta"
-    elif how == "env":
-        wanted = env = "beta"
+    else:
+        env = "beta"
     code, out = _run_cli(argv, capsys, env)
     assert code == 1, out
-    assert f"is in campaign 'alpha', not '{wanted}'" in out
+    assert "is in campaign 'alpha', not 'beta'" in out
     assert "Pass --campaign alpha or --all-campaigns." in out
+    assert snapshot(mgr, eid) == before
+    assert fake_ws.urls == []
+
+
+@pytest.mark.parametrize("name", sorted(_COMMANDS))
+def test_command_without_a_campaign_exits_and_changes_nothing(mgr, capsys, fake_ws, name):
+    eid = seed(mgr, "alpha")
+    before = snapshot(mgr, eid)
+    code, out = _run_cli(_argv(name, eid) + _base(mgr), capsys)
+    assert code == 1 and _NO_CAMPAIGN in out, out
     assert snapshot(mgr, eid) == before
     assert fake_ws.urls == []
 
@@ -291,7 +308,8 @@ def test_command_works_in_its_campaign(mgr, capsys, fake_ws, name, how):
 
 
 def test_unknown_experiment_is_reported_by_the_command(mgr, capsys):
-    code, out = _run_cli(["logs", "r1", "--experiment", "no_such_exp"] + _base(mgr), capsys)
+    code, out = _run_cli(["logs", "r1", "--experiment", "no_such_exp", "--campaign", "alpha"] + _base(mgr),
+                         capsys)
     assert code == 1 and "No log found" in out and "is in campaign" not in out
 
 
@@ -300,18 +318,20 @@ def test_unknown_experiment_is_reported_by_the_command(mgr, capsys):
 
 def test_ls_lists_only_the_current_campaign(mgr, capsys):
     cx = uid("cx")
-    mine, other, dflt = seed(mgr, cx), seed(mgr, uid("cy")), seed(mgr, "default")
+    cy = uid("cy")
+    mine, other = seed(mgr, cx), seed(mgr, cy)
     code, out = _run_cli(["ls", "--campaign", cx] + _base(mgr), capsys)
     assert code == 0
     assert f"# Campaign {cx}: 1 experiment\n" in out
-    assert mine in out and other not in out and dflt not in out
-    code, out = _run_cli(["ls"] + _base(mgr), capsys)
-    assert dflt in out and mine not in out and "# Campaign default:" in out
+    assert mine in out and other not in out
+    code, out = _run_cli(["ls", "--campaign", cy] + _base(mgr), capsys)
+    assert other in out and mine not in out and f"# Campaign {cy}:" in out
 
 
 def test_ls_all_campaigns_heads_each_campaign(mgr, capsys):
     cx = uid("cx")
-    mine, dflt = seed(mgr, cx), seed(mgr, "default")
+    cy = uid("cy")
+    mine, other = seed(mgr, cx), seed(mgr, cy)
     code, out = _run_cli(["ls", "--all-campaigns", "--all"] + _base(mgr), capsys)
     assert code == 0 and out.startswith("# All campaigns:")
     # Each experiment is listed under its own campaign's heading.
@@ -323,7 +343,7 @@ def test_ls_all_campaigns_heads_each_campaign(mgr, capsys):
         elif line.startswith("- "):
             under[line[2:].split(":")[0]] = heading
     assert under[mine].startswith(f"## Campaign {cx}:")
-    assert under[dflt].startswith("## Campaign default:")
+    assert under[other].startswith(f"## Campaign {cy}:")
 
 
 def test_ls_json_is_filtered(mgr, capsys):
@@ -368,6 +388,9 @@ def test_status_text_shows_campaign(mgr, capsys):
     assert code == 0 and "campaign:   alpha" in out
     code, out = _run_cli(["status", "--all-campaigns"] + _base(mgr), capsys)
     assert "campaign:   all (--all-campaigns)" in out
+    # A diagnostic, so it still runs without a campaign and says none was given.
+    code, out = _run_cli(["status"] + _base(mgr), capsys)
+    assert code == 0 and "campaign:   none given" in out
 
 
 # ── campaign ls / move ──────────────────────────────────────────────────────────
@@ -383,7 +406,6 @@ def test_campaign_ls_text(mgr, capsys, argv):
     line = next(line for line in out.splitlines() if cx in line)
     assert line.lstrip().startswith("*")
     assert "2 experiments" in line and "2 done" in line and "2 pend" in line
-    assert "default" in out
     assert "current campaign" in out
 
 
@@ -424,14 +446,15 @@ def test_campaign_move(mgr, capsys):
 
 @pytest.mark.parametrize("bad", ["a b", "*", "x" * 129])
 def test_campaign_move_invalid_target(mgr, capsys, bad):
-    eid = seed(mgr, "default")
-    code, out = _run_cli(["campaign", "move", eid, bad] + _base(mgr), capsys)
+    src = uid("src")
+    eid = seed(mgr, src)
+    code, out = _run_cli(["campaign", "move", eid, bad, "--campaign", src] + _base(mgr), capsys)
     assert code == 1 and "campaign must be" in out
-    assert ok(mgr, "GET", f"/api/experiments/{eid}")["campaign"] == "default"
+    assert ok(mgr, "GET", f"/api/experiments/{eid}")["campaign"] == src
 
 
 def test_campaign_move_unknown_experiment(mgr, capsys):
-    code, out = _run_cli(["campaign", "move", "no_such_exp", "x"] + _base(mgr), capsys)
+    code, out = _run_cli(["campaign", "move", "no_such_exp", "x", "--campaign", "y"] + _base(mgr), capsys)
     assert code == 1 and "FAIL" in out
 
 
@@ -469,7 +492,6 @@ def _grid(tmp_path, *extra):
     (["--campaign", "c_flag"], None, "c_flag"),
     ([], "c_env", "c_env"),
     (["--campaign", "c_flag"], "c_env", "c_flag"),
-    ([], None, "default"),
 ])
 def test_dry_run_prints_campaign(tmp_path, extra, env_campaign, expected):
     proc = _submit(_grid(tmp_path, "--dry-run", *extra), env_campaign)
@@ -480,7 +502,6 @@ def test_dry_run_prints_campaign(tmp_path, extra, env_campaign, expected):
 @pytest.mark.parametrize("extra,env_campaign,expected", [
     (["--campaign", "c_flag"], None, "c_flag"),
     ([], "c_env", "c_env"),
-    ([], None, "default"),
 ])
 def test_run_submits_under_campaign(mgr, tmp_path, extra, env_campaign, expected):
     eid = uid("run")
@@ -493,6 +514,14 @@ def test_run_submits_under_campaign(mgr, tmp_path, extra, env_campaign, expected
     assert len(ok(mgr, "GET", q(f"/api/experiments/{eid}/jobs", expected))) == 4
 
 
+def test_run_without_a_campaign_is_refused(mgr, tmp_path):
+    eid = uid("run")
+    for extra in (["--dry-run"], ["--manager", mgr.url, "--token", TOKEN, "--experiment", eid]):
+        proc = _submit(_grid(tmp_path, *extra))
+        assert proc.returncode == 1 and _NO_CAMPAIGN in proc.stdout, proc.stdout + proc.stderr
+    assert call(mgr, "GET", f"/api/experiments/{eid}")[0] == 404
+
+
 @pytest.mark.parametrize("flag", ["--all-campaigns", "--all_campaigns"])
 def test_run_new_sweep_refuses_all_campaigns(mgr, tmp_path, flag):
     eid = uid("run")
@@ -503,8 +532,9 @@ def test_run_new_sweep_refuses_all_campaigns(mgr, tmp_path, flag):
     assert call(mgr, "GET", f"/api/experiments/{eid}")[0] == 404
 
 
-def test_validate_allows_all_campaigns(tmp_path):
-    proc = _submit(_grid(tmp_path, "--validate", "--all-campaigns"))
+@pytest.mark.parametrize("extra", [["--all-campaigns"], []])
+def test_validate_needs_no_campaign(tmp_path, extra):
+    proc = _submit(_grid(tmp_path, "--validate", *extra))
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
@@ -529,9 +559,9 @@ def test_run_refuses_existing_experiment_in_other_campaign(mgr, tmp_path):
 
 def test_resume_refuses_experiment_in_other_campaign(mgr, capsys):
     eid = seed(mgr, "alpha")
-    code, out = _run_cli(["resume", eid, "--manager", mgr.url, "--token", TOKEN], capsys)
+    code, out = _run_cli(["resume", eid, "--campaign", "beta", "--manager", mgr.url, "--token", TOKEN], capsys)
     assert code == 1
-    assert f"experiment {eid} is in campaign 'alpha', not 'default'" in out
+    assert f"experiment {eid} is in campaign 'alpha', not 'beta'" in out
 
 
 # ── End to end, with a worker ───────────────────────────────────────────────────
@@ -555,8 +585,8 @@ def test_sweep_runs_and_fetches_within_campaign(manager_with_worker, tmp_path, c
     assert code == 0 and "Campaign:   e2e" in out
     assert any((tmp_path / "dl").iterdir())
 
-    code, out = _run_cli(["best", "--experiment", "camp_e2e"] + base, capsys)
-    assert code == 1 and "is in campaign 'e2e', not 'default'" in out
+    code, out = _run_cli(["best", "--experiment", "camp_e2e", "--campaign", "other"] + base, capsys)
+    assert code == 1 and "is in campaign 'e2e', not 'other'" in out
 
     code, out = _run_cli(["ls", "--all-campaigns"] + base, capsys)
     assert "## Campaign e2e: 1 experiment" in out and "- camp_e2e:" in out

@@ -91,7 +91,7 @@ def test_restart_does_not_rerun_jobs_of_a_worker_slow_to_return(tmp_path):
         url = f"http://127.0.0.1:{M1}"
         _wait(lambda: len([w for w in _api(url, "/api/workers") if w["status"] == "connected"]) == 2,
               30, "both workers to connect")
-        _api(url, "/api/experiments", {"experiment_id": "rs"})
+        _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "rs"})
         wid_a, wid_b = f"localhost:{PA}", f"localhost:{PB}"
 
         # Put the long job on B (A has no GPU for a moment), the short one on A.
@@ -146,7 +146,7 @@ def test_restart_does_not_rerun_jobs_of_a_worker_slow_to_return(tmp_path):
 def test_cancel_during_setup_stops_the_run_before_it_starts(manager_with_worker, tmp_path):
     server, url = manager_with_worker
     tok = server.token
-    _api(url, "/api/experiments", {"experiment_id": "cs"}, token=tok)
+    _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "cs"}, token=tok)
     marker = tmp_path / "started.txt"
     _api(url, "/api/jobs", {
         "run_id": "slow_setup", "experiment_id": "cs", "gpus_per_run": 0,
@@ -171,7 +171,7 @@ def test_same_run_id_in_two_experiments_stays_separate(manager_with_worker):
     cmd = [sys.executable, "-c",
            "import os, time\nprint('exp=' + os.environ['EXP_EXPERIMENT'], flush=True)\ntime.sleep(3)"]
     for eid in ("twin_a", "twin_b"):
-        _api(url, "/api/experiments", {"experiment_id": eid}, token=tok)
+        _api(url, "/api/experiments", {"campaign": "test", "experiment_id": eid}, token=tok)
         _api(url, "/api/jobs", {"run_id": "same", "experiment_id": eid,
                                 "gpus_per_run": 0, "command": cmd}, token=tok)
     for eid in ("twin_a", "twin_b"):
@@ -218,7 +218,7 @@ def test_readding_a_connected_worker_is_refused(manager_with_worker):
 def test_experiment_completes_when_its_last_job_is_cancelled(manager_server):
     server, url = manager_server
     tok = server.token
-    _api(url, "/api/experiments", {"experiment_id": "cc"}, token=tok)
+    _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "cc"}, token=tok)
     _api(url, "/api/jobs", {"run_id": "only", "experiment_id": "cc", "command": ["true"]},
          token=tok)
     _api(url, "/api/jobs/only/cancel?experiment_id=cc", {}, token=tok)
@@ -228,7 +228,7 @@ def test_experiment_completes_when_its_last_job_is_cancelled(manager_server):
 def test_status_route_refuses_to_touch_a_job_in_flight(manager_with_worker):
     server, url = manager_with_worker
     tok = server.token
-    _api(url, "/api/experiments", {"experiment_id": "st"}, token=tok)
+    _api(url, "/api/experiments", {"campaign": "test", "experiment_id": "st"}, token=tok)
     _api(url, "/api/jobs", {"run_id": "busy", "experiment_id": "st", "gpus_per_run": 0,
                             "command": [sys.executable, "-c", "import time; time.sleep(5)"]},
          token=tok)

@@ -252,7 +252,7 @@ def test_mentions_count_runs_and_roll_them_up(notes_manager) -> None:  # type: i
     """A note citing a run credits its experiment; the run has its own count."""
     url, notes = notes_manager.url, notes_manager.notes
     for eid in ("exp_runs", "exp_other"):
-        assert _req(url, "POST", "/api/experiments", {"experiment_id": eid, "name": eid})[0] == 201
+        assert _req(url, "POST", "/api/experiments", {"campaign": "test", "experiment_id": eid, "name": eid})[0] == 201
     # run1 is only exp_runs'; seed0 exists in both, so it needs the note to name
     # the experiment as well.
     for eid, run in (("exp_runs", "run1"), ("exp_runs", "seed0"), ("exp_other", "seed0")):
@@ -296,7 +296,7 @@ def _seed_metrics(db_path: Path, experiment: str, rows: dict[str, list[tuple[int
 def test_chart_and_table_blocks(notes_manager, tmp_path) -> None:
     url = notes_manager.url
     exp = "e_notes_blocks"
-    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    _req(url, "POST", "/api/experiments", {"campaign": "test", "experiment_id": exp})
     for run, lr in (("r0", 0.001), ("r1", 0.001), ("r2", 0.01)):
         status, _, _ = _req(url, "POST", "/api/jobs", {
             "run_id": run, "experiment_id": exp, "command": ["echo"], "combo": {"lr": lr}})
@@ -358,7 +358,7 @@ def test_chart_and_table_blocks(notes_manager, tmp_path) -> None:
 def test_evidence_links(notes_manager, tmp_path) -> None:
     url = notes_manager.url
     exp = "e_evidence"
-    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    _req(url, "POST", "/api/experiments", {"campaign": "test", "experiment_id": exp})
     _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": exp, "command": ["echo"]})
     _seed_metrics(tmp_path / "manager.db", exp, {
         "r0": [(100, {"loss": 2.0}), (200, {"loss": 1.25})],
@@ -391,7 +391,7 @@ def test_data_endpoints_need_a_token(notes_manager) -> None:
 
 def test_run_ids_endpoint(notes_manager) -> None:
     url = notes_manager.url
-    _req(url, "POST", "/api/experiments", {"experiment_id": "e_run_ids"})
+    _req(url, "POST", "/api/experiments", {"campaign": "test", "experiment_id": "e_run_ids"})
     _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": "e_run_ids",
                                     "command": ["echo"]})
     status, data, _ = _req(url, "GET", "/api/notes/run-ids")
@@ -401,7 +401,7 @@ def test_run_ids_endpoint(notes_manager) -> None:
 def test_lint_flags_stale_evidence_numbers(notes_manager, tmp_path) -> None:
     url = notes_manager.url
     exp = "e_lint_stale"
-    _req(url, "POST", "/api/experiments", {"experiment_id": exp})
+    _req(url, "POST", "/api/experiments", {"campaign": "test", "experiment_id": exp})
     _req(url, "POST", "/api/jobs", {"run_id": "r0", "experiment_id": exp, "command": ["echo"]})
     _seed_metrics(tmp_path / "manager.db", exp, {"r0": [(2, {"loss": 2.0})]})
     note = (f"Matches [2.0](mlsweep:{exp}/r0/loss@2) and "

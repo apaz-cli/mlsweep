@@ -53,7 +53,7 @@ def _node_result(tmp_path, *, success=True, in_flight=True, before=None):
         try:
             for wid in ("w0", "w1"):
                 await upsert_worker(db, worker_id=wid, host="localhost", remote_dir=str(tmp_path))
-            await create_experiment(db, experiment_id="exp1", name="exp1")
+            await create_experiment(db, experiment_id="exp1", name="exp1", campaign="test")
             await insert_job(db, run_id="run1", experiment_id="exp1", command=["true"],
                              nodes_per_run=2)
             await dispatch_job(db, "run1", "exp1", "w0", [0])

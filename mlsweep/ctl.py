@@ -5,8 +5,8 @@ unpause), run naming (rename), the result-ranking command (best), and campaign
 management (campaign). They are thin HTTP clients over the manager API and share helpers
 with ``mlsweep.run_sweep``.
 
-Every command works in one campaign (``--campaign``, ``$MLSWEEP_CAMPAIGN``, or
-the default) unless given ``--all-campaigns``.  A command naming an experiment
+Every command works in one campaign (``--campaign``, a context's campaign, or
+``$MLSWEEP_CAMPAIGN``, one of which is required) unless given ``--all-campaigns``.  A command naming an experiment
 from another campaign exits 1 with a hint.
 """
 
@@ -28,7 +28,7 @@ from typing import Any, NoReturn
 
 from mlsweep._jsonout import emit, emit_line
 from mlsweep._shared import _BLUE, _BOLD, _BRIGHT_BLUE, _CYAN, _DIM, _GREEN, _MAGENTA, _RED, _RESET, _YELLOW
-from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
+from mlsweep._shared import NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
 from mlsweep.run_sweep import (
     _add_manager_args,
     _fmt_bytes,
@@ -43,6 +43,7 @@ from mlsweep.run_sweep import (
     _manager_token,
     _parse_combo,
     _resolve_campaign,
+    _selected_campaign,
     _wait_until_settled,
     _get_experiment,
     manager_note,
@@ -375,8 +376,7 @@ def _dim_values(values: list[Any]) -> str:
 
 
 def _logs_hint(run_id: str, experiment: str, campaign: str | None) -> str:
-    scope = " --all-campaigns" if campaign is None else (
-        f" --campaign {campaign}" if campaign != DEFAULT_CAMPAIGN else "")
+    scope = " --all-campaigns" if campaign is None else f" --campaign {campaign}"
     return (f"  {_paint('Logs:', _C_AUX)} "
             + _paint(f"mlsweep logs {experiment} {run_id}{scope} --tail 50", _C_CMD))
 
@@ -435,8 +435,8 @@ def _ls_experiments(exps: list[dict[str, Any]], campaign: str | None, show_all: 
     if campaign is not None:
         by_campaign = [(campaign, exps)]
     else:
-        names = sorted({e.get("campaign") or DEFAULT_CAMPAIGN for e in exps})
-        by_campaign = [(c, [e for e in exps if (e.get("campaign") or DEFAULT_CAMPAIGN) == c])
+        names = sorted({e["campaign"] for e in exps})
+        by_campaign = [(c, [e for e in exps if e["campaign"] == c])
                        for c in names]
         sweep_print(_paint(f"# All campaigns: {len(exps)} experiments in {len(names)} campaigns", _BOLD))
     for i, (c, group) in enumerate(by_campaign):
@@ -1600,7 +1600,7 @@ def campaign_cmd(argv: list[str]) -> None:
         return
 
     manager, token = _manager_token(args)
-    current = _resolve_campaign(args)
+    current = _selected_campaign(args)
     camps = manager_list_campaigns(manager, token)
     if camps is None:
         sweep_print(f"{_RED}FAIL{_RESET}  list campaigns")
@@ -1616,7 +1616,7 @@ def campaign_cmd(argv: list[str]) -> None:
         sweep_print(f"  {mark} {_GREEN}{name}{_RESET}  {n} experiment{'' if n == 1 else 's'}, "
                     f"{_counts_str(c.get('job_counts'))}")
     if current is not None:
-        sweep_print("  (* = current campaign, from --campaign, $MLSWEEP_CAMPAIGN, or the default)")
+        sweep_print("  (* = current campaign, from --campaign, a context, or $MLSWEEP_CAMPAIGN)")
 
 
 # ── move / purge / gc ──────────────────────────────────────────────────────────
@@ -2112,7 +2112,7 @@ def export_cmd(argv: list[str]) -> None:
         prog="mlsweep export",
         description="Export finished runs' metrics: `tensorboard` writes a zip of event files "
                     "here; `wandb` makes the manager upload them to W&B. The scope is one "
-                    "experiment (--experiment), the current campaign (default), or everything "
+                    "experiment (--experiment), the current campaign (--campaign), or everything "
                     "(--all-campaigns).",
     )
     sub = parser.add_subparsers(dest="target", required=True)
