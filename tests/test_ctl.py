@@ -312,7 +312,7 @@ def test_ls_runs_layout(capsys):
     assert "- r1: lr=0.01. 2m05s.\n" in out
     assert "- r3: lr=0.1.\n" in out
     assert "- r2 (warmup): lr=0.001. Exit 1 after 13s, attempt 3 on w0.\n" in out
-    assert "  Logs: mlsweep logs r2 --experiment e --campaign alpha --tail 50" in out
+    assert "  Logs: mlsweep logs e r2 --campaign alpha --tail 50" in out
 
 
 def test_ls_runs_heading_says_done_for_completed(capsys):
@@ -592,8 +592,9 @@ def _no_experiment():
 
 def test_wait_stalled_exits_three():
     jobs = [{"run_id": "r1", "status": "running", "stall_seconds": 120.0, "stalled": False}]
-    code, message = ctl.wait_outcome("e", jobs, "stalled", 60, _no_experiment)
-    assert code == ctl.WAIT_EXIT_STALLED and "r1" in message
+    verdict = ctl.wait_outcome("e", jobs, "stalled", 60, _no_experiment)
+    assert verdict.code == ctl.WAIT_EXIT_STALLED and "r1" in verdict.message
+    assert verdict.outcome == "stalled" and [j["run_id"] for j in verdict.runs] == ["r1"]
 
 
 def test_wait_stalled_ignores_fresh_runs():
@@ -601,7 +602,7 @@ def test_wait_stalled_ignores_fresh_runs():
     assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment) is None
     # The manager's own flag counts when it sends no stall_seconds.
     jobs = [{"run_id": "r1", "status": "running", "stalled": True}]
-    assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment)[0] == ctl.WAIT_EXIT_STALLED
+    assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment).code == ctl.WAIT_EXIT_STALLED
 
 
 def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
@@ -740,7 +741,7 @@ def test_health_includes_version(manager_server):
     assert health["version"] == version("mlsweep")
 
 
-def test_apply_returns_failure_count():
+def test_apply_reports_each_run():
     jobs = [{"run_id": "a"}, {"run_id": "b"}]
 
     campaigns = []
@@ -749,9 +750,12 @@ def test_apply_returns_failure_count():
         campaigns.append(campaign)
         return {"ok": True} if r == "a" else None
 
-    assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False) == 1
-    assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=True) == 0
-    assert ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False, campaign="c") == 1
+    results = ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False)
+    assert results == [{"run_id": "a", "ok": True}, {"run_id": "b", "ok": False}]
+    assert ctl._failed(results) == 1
+    dry = ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=True)
+    assert dry == [{"run_id": "a", "ok": None}, {"run_id": "b", "ok": None}] and ctl._failed(dry) == 0
+    assert ctl._failed(ctl._apply(jobs, fn, "verb", "m", "t", "e", dry_run=False, campaign="c")) == 1
     assert campaigns == [None, None, "c", "c"]
 
 
@@ -832,7 +836,7 @@ def test_wait_unreachable_manager_is_not_a_run_failure():
     with pytest.raises(SystemExit) as exc:
         ctl.wait_cmd(["e", "--manager", "http://127.0.0.1:9", "--token", "t", "--campaign", "default"])
     assert exc.value.code == ctl.WAIT_EXIT_UNKNOWN
-    assert ctl.wait_outcome("e", None, "done", 900, _no_experiment)[0] == ctl.WAIT_EXIT_UNKNOWN
+    assert ctl.wait_outcome("e", None, "done", 900, _no_experiment).code == ctl.WAIT_EXIT_UNKNOWN
 
 
 def test_wait_cancelled_runs_are_not_a_clean_finish(manager_server):
@@ -876,7 +880,7 @@ def test_wait_does_not_call_an_unfinished_bayesian_budget_done():
     running_bayes = {"status": "running", "optimize": '{"budget": 4}'}
     assert ctl.wait_outcome("e", jobs, "done", 900, lambda: running_bayes) is None
     finished = {"status": "completed", "optimize": '{"budget": 4}'}
-    assert ctl.wait_outcome("e", jobs, "done", 900, lambda: finished)[0] == ctl.WAIT_EXIT_SETTLED
+    assert ctl.wait_outcome("e", jobs, "done", 900, lambda: finished).code == ctl.WAIT_EXIT_SETTLED
 
 
 def test_wait_after_stop_does_not_wait_for_pending_runs_forever(manager_server):
@@ -919,3 +923,45 @@ def test_workers_update_and_export_cancel_post(capsys, argv, path, status):
     assert server.calls == [("POST", path)]
     assert ("updating" if argv[0] == "workers" else "cancelling") in capsys.readouterr().out
 
+
+
+def test_wait_until_any_done_reports_runs_finished_since_the_cursor():
+    jobs = [
+        {"run_id": "old", "status": "done", "finish_time": "2026-01-01T00:00:10+00:00"},
+        {"run_id": "new", "status": "failed", "finish_time": "2026-01-01T00:00:30+00:00"},
+        {"run_id": "busy", "status": "running", "finish_time": None},
+    ]
+    t20 = ctl._parse_since("2026-01-01T00:00:20+00:00")
+    verdict = ctl.wait_outcome("e", jobs, "any-done", 900, _no_experiment, since=t20)
+    assert verdict.code == ctl.WAIT_EXIT_SETTLED and verdict.outcome == "run_finished"
+    assert [j["run_id"] for j in verdict.runs] == ["new"]
+    out = verdict.to_json("e", jobs, t20)
+    assert out["cursor"] == ctl._parse_since("2026-01-01T00:00:30+00:00")
+    assert out["counts"] == {"done": 1, "failed": 1, "running": 1}
+    # Nothing finished after the cursor: keep waiting.
+    assert ctl.wait_outcome("e", jobs, "any-done", 900, _no_experiment, since=out["cursor"]) is None
+
+
+def test_ls_shows_each_running_runs_step_and_average_step_time():
+    job = {"run_id": "r1", "status": "running", "start_time": None, "last_step": 1200,
+           "avg_step_seconds": 2.5, "combo": "{}"}
+    [line] = ctl._run_bullet(job, set(), set(), "e", "default")
+    assert "step 1200 at 2.5 s/step on average" in line
+    fast = {**job, "avg_step_seconds": 0.05}
+    assert "at 20 steps/s on average" in ctl._run_bullet(fast, set(), set(), "e", "default")[0]
+    # Before the step has advanced there is no average yet.
+    assert ctl._run_bullet({**job, "avg_step_seconds": None}, set(), set(), "e", "default")[0].endswith(
+        "step 1200.")
+
+
+def test_in_flight_runs_average_their_step_time():
+    from mlsweep._manager_state import InFlightRun
+
+    run = InFlightRun(experiment_id="e", run_id="r", job_key=1, attempt=1, primary="w")
+    assert run.avg_step_seconds is None
+    run.note_step(10, None, 100.0)
+    run.note_step(10, None, 101.0)  # same step: no change
+    assert run.avg_step_seconds is None
+    run.note_step(20, None, 120.0)
+    run.note_step(30, None, 130.0)
+    assert run.avg_step_seconds == 1.5  # 30 s over 20 steps

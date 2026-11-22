@@ -1905,19 +1905,21 @@ async def finish_job(
     success: bool,
     exit_code: int,
     elapsed: float,
+    status: JobStatus | None = None,
+    reason: str | None = None,
 ) -> JobRecord | None:
-    """Mark a job as done or failed."""
-    status = "done" if success else "failed"
+    """Mark a job as done or failed, or as *status* with *reason* (a run the manager stopped)."""
+    status = status or ("done" if success else "failed")
     now = _now_epoch()
     row = await _exec_one(
         db,
         f"""
         UPDATE jobs
-        SET status = ?, finish_time = ?, exit_code = ?, elapsed = ?
+        SET status = ?, finish_time = ?, exit_code = ?, elapsed = ?, reason = COALESCE(?, reason)
         WHERE run_id = ? AND experiment_id = ? AND {_ACTIVE_IN}
         RETURNING *;
         """,
-        (status, now, exit_code, elapsed, run_id, experiment_id),
+        (status, now, exit_code, elapsed, reason, run_id, experiment_id),
     )
     await db.commit()
     return _row_to_job(row) if row else None
@@ -2383,6 +2385,7 @@ async def experiment_summary(
         "metric": exp.metric if exp else None,
         "goal": exp.goal if exp else None,
         "controls": json.loads(exp.controls) if exp and exp.controls else None,
+        "manager_note": manager_note(exp) if exp else None,
         "job_counts": counts,
     }
 
@@ -2425,8 +2428,21 @@ async def list_experiments_with_counts(
         d = dataclasses.asdict(exp)
         d["submit_time"] = exp.submit_time.isoformat()
         d["job_counts"] = _job_counts(r, artifacts=True)
+        d["manager_note"] = manager_note(exp)
         result.append(d)
     return result
+
+
+def manager_note(exp: ExperimentRecord) -> str | None:
+    """Why the manager paused or completed *exp*: a run control's note, or its optimizer's."""
+    for raw in (exp.controls, exp.optimize):
+        try:
+            spec = json.loads(raw) if raw else None
+        except ValueError:
+            continue
+        if isinstance(spec, dict) and spec.get("note"):
+            return str(spec["note"])
+    return None
 
 
 async def delete_experiment(
@@ -3147,10 +3163,13 @@ class DbWriter:
         success: bool,
         exit_code: int,
         elapsed: float,
+        status: JobStatus | None = None,
+        reason: str | None = None,
     ) -> JobRecord | None:
         db = self._db
         return await self._enqueue(lambda: finish_job(
-            db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed
+            db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed,
+            status=status, reason=reason,
         ))
 
     async def apply_result_rules(

@@ -85,7 +85,7 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return {}
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ContextError(f"cannot read {path}: {exc}") from exc

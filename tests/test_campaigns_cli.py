@@ -167,7 +167,7 @@ def test_require_campaign_is_silent_when_manager_unreachable(capsys):
 # argv for each command, with {e} for the experiment id.
 _COMMANDS = {
     "ls": ["ls", "{e}"],
-    "logs": ["logs", "r1", "--experiment", "{e}"],
+    "logs": ["logs", "{e}", "r1"],
     "metrics": ["metrics", "--experiment", "{e}"],
     "cancel": ["cancel", "{e}", "--all", "--yes"],
     "retry": ["retry", "{e}", "r2"],

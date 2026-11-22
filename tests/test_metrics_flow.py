@@ -209,3 +209,34 @@ def test_logger_times_steps(tmp_path):
     sent = [json.loads(line) for line in data.decode().splitlines()]
     metrics = [m for m in sent if "step_seconds" in m]
     assert [m["step_seconds"] for m in metrics] == [None, None, 2.0, 4.0]
+
+
+def test_logger_spreads_lists_and_dicts_into_keys(tmp_path):
+    """A list logs one key per element, so per-layer values reach the manager."""
+    import socket as socket_mod
+
+    from mlsweep.logger import MLSweepLogger
+
+    path = str(tmp_path / "w.sock")
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
+    logger = MLSweepLogger(socket_path=path)
+    logger.log({"loss": 1.0, "moe_load": [0.25, 0.5], "val": {"nll": 2.0}}, step=1)
+    # The flattened keys are what "once per step" is about.
+    logger.log({"moe_load": {"extra": 1}}, step=1)
+    try:
+        logger.log({"moe_load": [0.1]}, step=1)
+        raise AssertionError("moe_load/0 was logged twice at step 1")
+    except ValueError as e:
+        assert "moe_load/0" in str(e)
+    logger.close()
+    conn, _ = server.accept()
+    data = b""
+    while chunk := conn.recv(65536):
+        data += chunk
+    conn.close()
+    server.close()
+    sent = [json.loads(line)["data"] for line in data.decode().splitlines()]
+    assert sent == [{"loss": 1.0, "moe_load/0": 0.25, "moe_load/1": 0.5, "val/nll": 2.0},
+                    {"moe_load/extra": 1}]

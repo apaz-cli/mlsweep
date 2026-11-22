@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
-from mlsweep._manager_db import DbWriter, JobRecord
+from mlsweep._manager_db import DbWriter, JobRecord, JobStatus
 from mlsweep._shared import DEFAULT_SCRATCH_DIR
 
 # A run is identified by (experiment_id, run_id); run names repeat across experiments.
@@ -57,7 +57,13 @@ class InFlightRun:
     last_step: int | None = None  # newest metric step this session
     last_step_time: float = 0.0  # epoch seconds when last_step first arrived here
     step_seconds: float | None = None  # the logger's wall seconds per step, if it sent one
+    first_step: int | None = None  # first metric step this session, and when it arrived
+    first_step_time: float = 0.0
     metric_seen: bool = False  # it logged its sweep's METRIC_CHECK metric this session
+    # Set when the manager is stopping the run (pruned, timed out): the status and
+    # reason its job gets once the worker's result arrives, and when the stop began.
+    ending: tuple[JobStatus, str] | None = None
+    ending_since: float = 0.0
 
     def note_step(self, step: int, step_seconds: float | None, now: float) -> None:
         """Record a metric for *step* that arrived at *now*.
@@ -70,6 +76,15 @@ class InFlightRun:
         if self.last_step is None or step > self.last_step:
             self.last_step = step
             self.last_step_time = now
+        if self.first_step is None:
+            self.first_step, self.first_step_time = step, now
+
+    @property
+    def avg_step_seconds(self) -> float | None:
+        """Wall seconds per step since the first step this session, once it has advanced."""
+        if self.first_step is None or self.last_step is None or self.last_step <= self.first_step:
+            return None
+        return (self.last_step_time - self.first_step_time) / (self.last_step - self.first_step)
 
     @classmethod
     def from_job(cls, job: JobRecord, primary: str, **kwargs: Any) -> InFlightRun:

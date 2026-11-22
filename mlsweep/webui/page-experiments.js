@@ -507,6 +507,7 @@ function renderExperiments(exps) {
           <span class="exp-toggle" ${act("toggleExpand", expId)}>${isExpanded ? "▼" : "▶"}</span>
           <span class="exp-name" ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
           ${exp.note ? `<span class="exp-note">${escHtml(exp.note)}</span>` : ""}
+          ${exp.manager_note ? `<span class="exp-manager-note${exp.status === "paused" ? " paused" : ""}" title="${escHtml(exp.manager_note)}">${escHtml(exp.manager_note)}</span>` : ""}
           ${MLCampaign.get() === MLCampaign.ALL ? `<span class="campaign-tag">${escHtml(MLCampaign.campaignOf(exp))}</span>` : ""}
         </div>
       </td>

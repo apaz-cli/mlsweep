@@ -19,6 +19,7 @@ from urllib.parse import quote
 from typing import Any
 
 from mlsweep import _notes, _notes_git, _notes_lint
+from mlsweep._jsonout import emit, emit_line
 from mlsweep._colors import _BOLD, _CYAN, _DIM, _GREEN, _RED, _RESET, _YELLOW
 from mlsweep._notes_rules import CONFIG_FILE
 from mlsweep._shared import _mlsweep_dir
@@ -100,6 +101,7 @@ def _clone(argv: list[str]) -> None:
     _add_connection_args(ap)
     ap.add_argument("--name", help="commit author name (default: your git config, else user@host)")
     ap.add_argument("--email")
+    ap.add_argument("--json", action="store_true", help="Print the clone's path and remote as JSON")
     args = ap.parse_args(argv)
     token = _resolve_token(args.token)
     if not token:
@@ -111,6 +113,8 @@ def _clone(argv: list[str]) -> None:
         if _notes_git.update_clone(args.dir, url, token=token, name=args.name, email=args.email):
             print(f"{args.dir} is already a clone of {url}. Run `git pull` there.")
             print(hint)
+            if args.json:
+                emit({"dir": str(Path(args.dir).resolve()), "remote": url, "cloned": False})
             return
         _notes_git.clone_repo(url, args.dir, token=token, name=args.name, email=args.email)
     except _notes_git.GitError as exc:
@@ -119,6 +123,8 @@ def _clone(argv: list[str]) -> None:
     print(f"{_GREEN}cloned {url} into {args.dir}{_RESET}")
     print("Use git as usual: pull, commit, push. Read AGENTS.md first.")
     print(hint)
+    if args.json:
+        emit({"dir": str(Path(args.dir).resolve()), "remote": url, "cloned": True})
 
 
 # ── status ─────────────────────────────────────────────────────────────────────
@@ -132,10 +138,16 @@ def _status(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(prog="mlsweep notes status")
     ap.add_argument("dir", nargs="?")
     ap.add_argument("-n", type=int, default=10, help="recent commits to show")
+    ap.add_argument("--json", action="store_true", help="Print the status as JSON")
     args = ap.parse_args(argv)
     root = _default_dir(args.dir)
     _require_repo(root)
     info = _notes_git.repo_info(root)
+    if args.json:
+        emit({"dir": str(root), **info, "uncommitted": _notes_git.status_entries(root),
+              "config": _notes_git.read_config(root),
+              "recent": _notes_git.log_entries(root, limit=args.n, with_files=True)})
+        return
     print(f"{_BOLD}{root}{_RESET}")
     print(f"  remote   {info['remote'] or '(none: local only)'}")
     print(f"  branch   {info['branch']} @ {info['head'][:10] or '(no commits)'}")
@@ -253,7 +265,7 @@ def _lint(argv: list[str]) -> None:
         result = _notes_lint.lint(root, known_experiments=known, known_runs=known_runs,
                                   evidence=evidence, index=index)
     if args.json:
-        print(json.dumps(result, indent=1))
+        emit(result)
         return
     if args.review_prompt:
         print(_notes_lint.review_prompt(root, result, time.strftime("%Y-%m-%d")))
@@ -315,7 +327,7 @@ def _mv(argv: list[str]) -> None:
         print(f"{_RED}{type(exc).__name__}: {exc}{_RESET}", file=sys.stderr)
         sys.exit(1)
     if args.json:
-        print(json.dumps(r, indent=1))
+        emit(r)
         return
     print(f"{_GREEN}moved {r['from']} -> {r['to']}{_RESET}")
     for p in r["links_updated_in"]:
@@ -345,7 +357,7 @@ def _links(argv: list[str]) -> None:
         "experiments": sorted(idx.mentions.get(rel, {})),
     }
     if args.json:
-        print(json.dumps(out, indent=1))
+        emit(out)
         return
     print(f"{_BOLD}{rel}{_RESET}")
     print(f"{_CYAN}Outgoing{_RESET} ({len(out['outgoing'])})")
@@ -381,7 +393,7 @@ def _mentions(argv: list[str]) -> None:
     if note:
         print(f"{_YELLOW}{note}{_RESET}", file=sys.stderr)
     if args.json:
-        print(json.dumps(hits, indent=1))
+        emit(hits)
         return
     if not hits:
         print(f"No note mentions {args.experiment} or any of its runs.")
@@ -402,7 +414,7 @@ def _search(argv: list[str]) -> None:
     files, _ = _notes.walk(root)
     res = _notes.search(root, files, " ".join(args.query))
     if args.json:
-        print(json.dumps(res, indent=1))
+        emit(res)
         return
     for r in res:
         print(f"{_BOLD}{r['path']}{_RESET}")
@@ -423,7 +435,7 @@ def _history(argv: list[str]) -> None:
     rel = _rel_in(root, args.path) if args.path else None
     entries = _notes_git.log_entries(root, rel, limit=args.n, with_files=rel is None)
     if args.json:
-        print(json.dumps(entries, indent=1))
+        emit(entries)
         return
     for e in entries:
         what = e.get("path", "") if rel else ", ".join(f["path"] for f in e.get("files", [])[:4])
@@ -436,12 +448,16 @@ def _show(argv: list[str]) -> None:
     ap.add_argument("rev")
     ap.add_argument("path")
     ap.add_argument("--dir")
+    ap.add_argument("--json", action="store_true", help="Print the file's text as JSON")
     args = ap.parse_args(argv)
     root = _default_dir(args.dir)
     data = _notes_git.show_file(root, args.rev, _rel_in(root, args.path))
     if data is None:
         print(f"{_RED}{args.path} is not in {args.rev}{_RESET}", file=sys.stderr)
         sys.exit(1)
+    if args.json:
+        emit({"rev": args.rev, "path": _rel_in(root, args.path), "text": data.decode("utf-8", errors="replace")})
+        return
     sys.stdout.buffer.write(data)
 
 
@@ -450,9 +466,14 @@ def _diff(argv: list[str]) -> None:
     ap.add_argument("rev")
     ap.add_argument("path", nargs="?")
     ap.add_argument("--dir")
+    ap.add_argument("--json", action="store_true", help="Print the diff as JSON")
     args = ap.parse_args(argv)
     root = _default_dir(args.dir)
-    sys.stdout.write(_notes_git.commit_diff(root, args.rev, _rel_in(root, args.path) if args.path else None))
+    diff = _notes_git.commit_diff(root, args.rev, _rel_in(root, args.path) if args.path else None)
+    if args.json:
+        emit({"rev": args.rev, "path": args.path, "diff": diff})
+        return
+    sys.stdout.write(diff)
 
 
 def _restore(argv: list[str]) -> None:
@@ -464,6 +485,7 @@ def _restore(argv: list[str]) -> None:
     ap.add_argument("rev")
     ap.add_argument("--from-path", help="the file's name at REV, if it was renamed since")
     ap.add_argument("--dir")
+    ap.add_argument("--json", action="store_true", help="Print what was restored as JSON")
     args = ap.parse_args(argv)
     root = _default_dir(args.dir, writes=True)
     rel = _rel_in(root, args.path)
@@ -474,6 +496,8 @@ def _restore(argv: list[str]) -> None:
         sys.exit(1)
     _notes.atomic_write(_notes.resolve(root, rel), data)
     print(f"{_GREEN}restored {rel} from {args.rev}{_RESET}")
+    if args.json:
+        emit({"path": rel, "rev": args.rev, "restored": True})
 
 
 # ── dispatch ───────────────────────────────────────────────────────────────────

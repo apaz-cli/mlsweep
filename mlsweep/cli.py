@@ -17,6 +17,7 @@ from mlsweep._colors import (
     _BOLD, _BRIGHT_BLUE, _BRIGHT_GREEN, _CYAN, _DIM, _GREEN, _RED,
     _RESET, _YELLOW, set_color, strip_color_flag,
 )
+from mlsweep._jsonout import emit
 from mlsweep._shared import _mlsweep_dir
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -130,6 +131,7 @@ def _build_help(include_banner: bool = False) -> str:
             ("delete EXP --yes", "delete an experiment and its runs"),
             ("resume EXP", "re-queue failed and cancelled runs (Bayesian: choose new trials)"),
             ("optimize EXP", "show or adjust a Bayesian sweep (--budget, --finish, --max-concurrent)"),
+            ("controls EXP", "show or change run controls (--max-runtime, --prune, --metric-check)"),
             ("stop EXP", "abort a sweep"),
             ("pause EXP", "stop dispatching new jobs"),
             ("unpause EXP", "undo pause"),
@@ -323,7 +325,7 @@ def _status_cmd(argv: list[str]) -> None:
     workers = (manager_list_workers(manager, token) or []) if manager_up else []
 
     if args.json:
-        print(json.dumps({
+        emit({
             "manager": manager,
             "campaign": campaign,
             "results_dir": str(mlsweep_dir / "experiments"),
@@ -342,7 +344,7 @@ def _status_cmd(argv: list[str]) -> None:
             "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
             "recent_experiments": experiments[-5:],
             "n_experiments": len(experiments),
-        }, indent=2))
+        })
         return
 
     print(f"{_BOLD}{_CYAN}mlsweep status{_RESET}")
@@ -509,8 +511,8 @@ def _lint_cmd(argv: list[str]) -> None:
 
     report = {path: lint_file(path) for path in args.sweep_files}
     if args.json:
-        print(json.dumps({p: [{"severity": f.severity, "message": f.message} for f in fs]
-                          for p, fs in report.items()}, indent=2))
+        emit({p: [{"severity": f.severity, "message": f.message} for f in fs]
+                          for p, fs in report.items()})
     else:
         for path, findings in report.items():
             if not findings:
@@ -570,8 +572,8 @@ def _context_cmd(argv: list[str]) -> None:
         if action in ("list", "ls"):
             current = config.get("current")
             if args.json:
-                print(json.dumps({"config": str(cx.config_path()), "current": current,
-                                  "contexts": [c.as_dict() for c in found.values()]}, indent=2))
+                emit({"config": str(cx.config_path()), "current": current,
+                                  "contexts": [c.as_dict() for c in found.values()]})
                 return
             if not found:
                 print(f"No contexts in {cx.config_path()}. Add one: mlsweep context add NAME --manager URL")
@@ -588,7 +590,7 @@ def _context_cmd(argv: list[str]) -> None:
                 return
             view = {**ctx.as_dict(), "token": "present" if ctx.token() else "missing"}
             if args.json:
-                print(json.dumps(view, indent=2))
+                emit(view)
             else:
                 print("\n".join(f"{k}: {v}" for k, v in view.items()))
             return
@@ -640,7 +642,7 @@ def _context_cmd(argv: list[str]) -> None:
 _CTL_CMDS = frozenset({
     "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "optimize", "stop", "pause", "unpause", "best",
     "wait", "campaign", "move", "purge", "gc", "delete", "export", "workers", "scheduler", "reschedule",
-    "code",
+    "code", "controls",
 })
 
 
@@ -650,12 +652,19 @@ def _forward(prog: str, fn: Callable[[], None], argv: list[str]) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    from mlsweep._jsonout import contract
+
     if argv is None:
         argv = sys.argv[1:]
 
     # The unified CLI dispatches to subcommands that parse their own argv, so
     # consume the global --color flag here and forward the rest untouched.
     argv = strip_color_flag(list(argv))
+    with contract(argv):
+        _dispatch(argv)
+
+
+def _dispatch(argv: list[str]) -> None:
 
     if not argv:
         print(_build_help(include_banner=True))

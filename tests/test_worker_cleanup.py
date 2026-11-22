@@ -10,6 +10,7 @@ import time
 import pytest
 
 from mlsweep._shared import (
+    MsgCancel,
     MsgCleaned,
     MsgCleanup,
     MsgHello,
@@ -185,3 +186,40 @@ def test_two_workers_given_one_scratch_dir_keep_their_runs_apart(tmp_path):
         first.close()
         second.close()
 
+
+
+# ── Stopping a run ─────────────────────────────────────────────────────────────
+
+
+def _started(sock, run_id, timeout=30):
+    deadline = time.time() + timeout
+    while True:
+        assert time.time() < deadline, f"{run_id} did not start within {timeout}s"
+        msg = decode(read_msg(sock))
+        if isinstance(msg, MsgLog) and msg.run_id == run_id and "ready" in msg.data:
+            return
+
+
+def test_a_cancel_with_kill_after_kills_a_run_that_ignores_sigterm(worker):
+    _, sock = worker
+    script = ("import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+              "print('ready', flush=True)\ntime.sleep(120)\n")
+    sock.sendall(encode(MsgRun(command=[sys.executable, "-c", script], run_id="stubborn", experiment="e")))
+    _started(sock, "stubborn")
+    t0 = time.time()
+    sock.sendall(encode(MsgCancel(run_id="stubborn", experiment="e", kill_after=0.5)))
+    result, _ = _result_and_log(sock, "stubborn")
+    assert not result.success and result.exit_code == -9
+    assert time.time() - t0 < 20
+
+
+def test_a_cancelled_run_that_exits_on_sigterm_is_not_killed(worker):
+    _, sock = worker
+    script = ("import signal, sys, time\n"
+              "signal.signal(signal.SIGTERM, lambda *a: (print('saved', flush=True), sys.exit(7)))\n"
+              "print('ready', flush=True)\ntime.sleep(120)\n")
+    sock.sendall(encode(MsgRun(command=[sys.executable, "-c", script], run_id="polite", experiment="e")))
+    _started(sock, "polite")
+    sock.sendall(encode(MsgCancel(run_id="polite", experiment="e", kill_after=30)))
+    result, log = _result_and_log(sock, "polite")
+    assert result.exit_code == 7 and "saved" in log

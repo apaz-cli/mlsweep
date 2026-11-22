@@ -287,6 +287,9 @@ class MsgRun:
 class MsgCancel:
     run_id: str
     experiment: str
+    # Seconds after the SIGTERM to SIGKILL what is still running (0 = never).
+    # An older worker ignores it and only sends the SIGTERM.
+    kill_after: float = 0.0
     t: str = "cancel"
 
 

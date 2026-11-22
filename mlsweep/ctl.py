@@ -15,15 +15,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, NoReturn
 
+from mlsweep._jsonout import emit, emit_line
 from mlsweep._shared import _BLUE, _BOLD, _BRIGHT_BLUE, _CYAN, _DIM, _GREEN, _MAGENTA, _RED, _RESET, _YELLOW
 from mlsweep._shared import DEFAULT_CAMPAIGN, NON_SCHEDULABLE_EXPERIMENT_STATUSES, validate_campaign
 from mlsweep.run_sweep import (
@@ -115,22 +118,33 @@ def _apply(
     experiment: str,
     dry_run: bool,
     campaign: str | None = None,
-) -> int:
-    """Run a per-job action (cancel/retry) over *targets*. Returns # of failures.
+) -> list[dict[str, Any]]:
+    """Run a per-job action (cancel/retry) over *targets*.
 
-    *fn* prints its own FAIL line with the manager's reason.
+    Returns ``{"run_id", "ok"}`` per run (``ok`` is None for a dry run).  *fn*
+    prints its own FAIL line with the manager's reason.
     """
-    failures = 0
+    results: list[dict[str, Any]] = []
     for j in targets:
         run_id = j.get("run_id", "")
         if dry_run:
             sweep_print(f"  would {verb} {run_id}")
+            results.append({"run_id": run_id, "ok": None})
         else:
-            if fn(manager, token, run_id, experiment, campaign=campaign):
+            ok = bool(fn(manager, token, run_id, experiment, campaign=campaign))
+            if ok:
                 sweep_print(f"  OK  {verb} {run_id}")
-            else:
-                failures += 1
-    return failures
+            results.append({"run_id": run_id, "ok": ok})
+    return results
+
+
+def _failed(results: list[dict[str, Any]]) -> int:
+    return sum(1 for r in results if r["ok"] is False)
+
+
+def _action_result(action: str, experiment: str, results: list[dict[str, Any]], dry_run: bool) -> dict[str, Any]:
+    """What a per-run action prints with --json."""
+    return {"experiment_id": experiment, "action": action, "dry_run": dry_run, "runs": results}
 
 
 def _retry(
@@ -140,13 +154,13 @@ def _retry(
     experiment: str,
     dry_run: bool,
     campaign: str | None = None,
-) -> int:
-    """``_apply`` with retry, then warn if the re-queued runs are held. Returns # of failures."""
-    failures = _apply(targets, manager_retry_job, "retry", manager, token, experiment,
-                      dry_run, campaign)
-    if not dry_run and failures < len(targets):
+) -> list[dict[str, Any]]:
+    """``_apply`` with retry, then warn if the re-queued runs are held."""
+    results = _apply(targets, manager_retry_job, "retry", manager, token, experiment,
+                     dry_run, campaign)
+    if not dry_run and _failed(results) < len(targets):
         _warn_if_held(manager, token, experiment, campaign)
-    return failures
+    return results
 
 
 def _warn_if_held(manager: str, token: str, experiment: str, campaign: str | None) -> None:
@@ -187,6 +201,7 @@ def _connect(args: argparse.Namespace, experiment: str | None = None) -> tuple[s
 # calls it "completed".
 
 _LS_LIMIT = 20
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Section order: what needs attention first.  Unknown statuses go last.
 _EXP_SECTIONS = ("running", "paused", "aborted", "failed", "done")
@@ -238,6 +253,15 @@ def _dur(seconds: float) -> str:
     if s < 86400:
         return f"{s // 3600}h{s % 3600 // 60:02d}m"
     return f"{s // 86400}d{s % 86400 // 3600}h" if s < 7 * 86400 else f"{s // 86400}d"
+
+
+def _per_step(seconds: float) -> str:
+    """``2.31 s/step``, or ``13 steps/s`` for fast steps."""
+    if seconds <= 0:
+        return "-"
+    if seconds < 0.5:
+        return f"{1 / seconds:.3g} steps/s"
+    return f"{seconds:.3g} s/step"
 
 
 def _ago(raw: Any) -> str | None:
@@ -354,7 +378,7 @@ def _logs_hint(run_id: str, experiment: str, campaign: str | None) -> str:
     scope = " --all-campaigns" if campaign is None else (
         f" --campaign {campaign}" if campaign != DEFAULT_CAMPAIGN else "")
     return (f"  {_paint('Logs:', _C_AUX)} "
-            + _paint(f"mlsweep logs {run_id} --experiment {experiment}{scope} --tail 50", _C_CMD))
+            + _paint(f"mlsweep logs {experiment} {run_id}{scope} --tail 50", _C_CMD))
 
 
 def _run_bullet(
@@ -377,6 +401,12 @@ def _run_bullet(
         if start:
             since = _dur((datetime.now(timezone.utc) - start).total_seconds())
             facts.append(f"Running for {_paint(since, _C_TIME)}")
+        if j.get("last_step") is not None:
+            progress = f"step {_paint(j['last_step'], _C_TIME)}"
+            avg = j.get("avg_step_seconds")
+            if avg is not None:
+                progress += f" at {_paint(_per_step(avg), _C_TIME)} on average"
+            facts.append(progress)
         if run_id in stalled:
             facts.append(_paint("stalled", _BOLD, _C_WARN))
     elif status in ("failed", "cancelled", "xfailed") and j.get("exit_code") is not None:
@@ -465,12 +495,15 @@ def ls_cmd(argv: list[str]) -> None:
     manager, token, campaign = _connect(args, args.experiment)
 
     if args.experiment:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status,
-                                            campaign=campaign) or []
+        listed = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status,
+                                              campaign=campaign)
+        if listed is None:
+            sys.exit(1)  # reported; no answer is not "no runs"
+        jobs = listed
         if args.json:
             if args.with_dims:
                 jobs = [dict(j, dims=_parse_combo(j["combo"]) or {}) for j in jobs]
-            print(json.dumps(jobs, indent=2))
+            emit(jobs)
             return
         summary = manager_get_experiment_summary(manager, token, args.experiment, quiet=True,
                                                  campaign=campaign)
@@ -483,7 +516,7 @@ def ls_cmd(argv: list[str]) -> None:
     if exps is None:
         sys.exit(1)
     if args.json:
-        print(json.dumps(exps, indent=2))
+        emit(exps)
         return
     _ls_experiments(exps, campaign, args.all)
 
@@ -492,12 +525,23 @@ def ls_cmd(argv: list[str]) -> None:
 
 
 def logs_cmd(argv: list[str]) -> None:
-    parser = _common_parser("mlsweep logs", "Print a run's training log.")
-    parser.add_argument("run", help="Run ID")
-    parser.add_argument("--experiment", required=True, help="Experiment ID")
+    parser = _common_parser(
+        "mlsweep logs",
+        "Print a run's training log: `mlsweep logs EXP RUN`, or `mlsweep logs RUN --experiment EXP`.")
+    parser.add_argument("ids", nargs="+", metavar="[EXP] RUN", help="Experiment ID and run ID")
+    parser.add_argument("--experiment", help="Experiment ID (instead of giving it first)")
     parser.add_argument("--tail", type=int, default=None, help="Show only the last N lines")
     parser.add_argument("--follow", action="store_true", help="Follow new output")
+    parser.add_argument("--json", action="store_true", help="Print the log as JSON (not with --follow)")
     args = parser.parse_args(argv)
+    if len(args.ids) == 2 and not args.experiment:
+        args.experiment, args.run = args.ids
+    elif len(args.ids) == 1 and args.experiment:
+        args.run = args.ids[0]
+    else:
+        parser.error("give EXP RUN, or RUN --experiment EXP")
+    if args.json and args.follow:
+        parser.error("--follow streams text; it can't be used with --json")
     manager, token, campaign = _connect(args, args.experiment)
 
     text = manager_get_job_logs(manager, token, args.experiment, args.run, campaign=campaign)
@@ -508,6 +552,9 @@ def logs_cmd(argv: list[str]) -> None:
     lines = text.splitlines()
     if args.tail:
         lines = lines[-args.tail:]
+    if args.json:
+        emit({"experiment_id": args.experiment, "run_id": args.run, "lines": lines})
+        return
     print("\n".join(lines))
 
     if args.follow:
@@ -648,7 +695,9 @@ def metrics_cmd(argv: list[str]) -> None:
     parser.add_argument("--with-dims", action="store_true",
                         help="Add each sweep dimension as a column, from the submitted combo")
     fmt = parser.add_mutually_exclusive_group()
-    fmt.add_argument("--json", action="store_true", help="Emit the selected metrics as JSON")
+    fmt.add_argument("--json", action="store_true",
+                     help='Emit JSON, always {"experiment_id", "runs": [{"run_id", "dims", ...}]}: each run has '
+                          '"rows" (every step), "last" ({key: latest value}) with --last, or "pivot" with --pivot')
     fmt.add_argument("--csv", action="store_true", help="Emit CSV (long, or wide with --last)")
     args = parser.parse_args(argv)
     if args.tail is not None and (args.json or args.csv or args.last or args.pivot):
@@ -664,7 +713,7 @@ def metrics_cmd(argv: list[str]) -> None:
         sys.exit(2)
 
     jobs: list[dict[str, Any]] = []
-    if not args.runs or args.with_dims:
+    if not args.runs or args.with_dims or args.json:
         jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
     dims, combo_by_run = _dim_columns(jobs)
     if not args.with_dims:
@@ -675,8 +724,11 @@ def metrics_cmd(argv: list[str]) -> None:
     def dim_cells(rid: str, fmt: Callable[[Any], str]) -> list[str]:
         return [fmt(combo_by_run[rid].get(d)) for d in dims]
 
-    def with_dims(rid: str, data: Any) -> Any:
-        return {"dims": combo_by_run[rid], "metrics": data} if args.with_dims else data
+    def emit_runs(field_name: str, data: dict[str, Any]) -> None:
+        """The one --json shape, whatever the view."""
+        emit({"experiment_id": args.experiment,
+              "runs": [{"run_id": rid, "dims": combo_by_run.get(rid, {}), field_name: value}
+                       for rid, value in data.items()]})
 
     def run_label(rid: str) -> str:
         return f"{rid} ({_combo_str(combo_by_run[rid])})" if args.with_dims else rid
@@ -697,7 +749,7 @@ def metrics_cmd(argv: list[str]) -> None:
         wide = {rid: pivot_metrics(rows, None, None)[1] for rid, rows in per_run.items()}
         keys = sorted({k for vals in wide.values() for k in vals})
         if args.json:
-            print(json.dumps({rid: with_dims(rid, vals) for rid, vals in wide.items()}, indent=2))
+            emit_runs("last", wide)
             return
         if args.csv:
             w = csv.writer(sys.stdout)
@@ -719,6 +771,23 @@ def metrics_cmd(argv: list[str]) -> None:
         if pattern.groups > 2:
             sweep_print(f"{_RED}--pivot supports at most two capture groups{_RESET}")
             sys.exit(2)
+
+        if args.json:
+            pivots: dict[str, Any] = {}
+            for rid, rows in per_run.items():
+                if pattern.groups == 1:
+                    pstep, vals = pivot_metrics(rows, pattern, args.step)
+                    if vals:
+                        pivots[rid] = {"step": pstep, "values": vals}
+                else:
+                    grid, _ = _pivot_run(rows, pattern, args.step)
+                    if grid:
+                        nested: dict[str, dict[str, Any]] = {}
+                        for (x, y), v in grid.items():
+                            nested.setdefault(str(x), {})[str(y)] = v
+                        pivots[rid] = {"values": nested}
+            emit_runs("pivot", pivots)
+            return
 
         if pattern.groups == 1:
             cols = []
@@ -749,7 +818,7 @@ def metrics_cmd(argv: list[str]) -> None:
 
     # ── long JSON / CSV ──────────────────────────────────────────────────────
     if args.json:
-        print(json.dumps({rid: with_dims(rid, rows) for rid, rows in per_run.items()}, indent=2))
+        emit_runs("rows", per_run)
         return
     if args.csv:
         w = csv.writer(sys.stdout)
@@ -775,6 +844,12 @@ def metrics_cmd(argv: list[str]) -> None:
 
 
 _SELECTABLE_STATUSES = ("failed", "cancelled", "running", "pending")
+# What each selector picks.  A dispatched run is on its worker, still setting up,
+# so --running takes it too, and --active is everything not finished.
+_SELECTOR_STATUSES = {
+    "failed": ("failed",), "cancelled": ("cancelled",), "running": ("running", "dispatched"),
+    "pending": ("pending",), "active": ("pending", "dispatched", "running"),
+}
 
 
 def _cancel_retry(argv: list[str], *, retry: bool) -> None:
@@ -788,19 +863,25 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("runs", nargs="*", help="Run IDs to act on")
     for s in _SELECTABLE_STATUSES:
-        parser.add_argument(f"--{s}", action="store_true", help=f"Select all {s} runs")
+        what = "running runs, and dispatched ones still setting up" if s == "running" else f"{s} runs"
+        parser.add_argument(f"--{s}", action="store_true", help=f"Select all {what}")
+    parser.add_argument("--active", action="store_true",
+                        help="Select every unfinished run: pending, dispatched and running")
     parser.add_argument("--all", action="store_true", help="Select every run")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation for --all")
+    parser.add_argument("--json", action="store_true", help="Print what happened to each run as JSON")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
     jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
-    statuses = [s for s in _SELECTABLE_STATUSES if getattr(args, s)]
+    statuses = [st for sel, sts in _SELECTOR_STATUSES.items() if getattr(args, sel) for st in sts]
     targets = jobs if args.all else _select_jobs(jobs, args.runs, statuses)
 
     if not targets:
         sweep_print("  No matching runs.")
+        if args.json:
+            emit(_action_result(verb, args.experiment, [], args.dry_run))
         return
 
     if args.all and not args.yes:
@@ -808,17 +889,19 @@ def _cancel_retry(argv: list[str], *, retry: bool) -> None:
         sys.exit(1)
 
     if retry:
-        failures = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
+        results = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
         sweep_print("  These rerun the code submitted with the experiment. "
                     "To run changed code, submit with `mlsweep run`.")
     else:
-        failures = _apply(targets, manager_cancel_job, verb, manager, token, args.experiment,
-                          args.dry_run, campaign)
+        results = _apply(targets, manager_cancel_job, verb, manager, token, args.experiment,
+                         args.dry_run, campaign)
         if awaits_more_runs(manager, token, args.experiment, campaign):
             sweep_print(f"  If this is a Bayesian sweep, the manager will choose new trials to replace "
                         f"these. To end it, use `mlsweep stop {args.experiment}`, or `mlsweep optimize "
                         f"{args.experiment} --finish` to let running runs end.")
-    if failures:
+    if args.json:
+        emit(_action_result(verb, args.experiment, results, args.dry_run))
+    if _failed(results):
         sys.exit(1)
 
 
@@ -844,6 +927,7 @@ def reschedule_cmd(argv: list[str]) -> None:
     parser.add_argument("run", help="Run ID")
     parser.add_argument("--to", metavar="WORKER", help="Worker ID to start it on (see `mlsweep workers`)")
     parser.add_argument("--gpus", help="GPU indices on that worker, e.g. 2,3 (default: its least busy)")
+    parser.add_argument("--json", action="store_true", help="Print the manager's answer as JSON")
     args = parser.parse_args(argv)
     if args.gpus and not args.to:
         parser.error("--gpus needs --to")
@@ -861,6 +945,8 @@ def reschedule_cmd(argv: list[str]) -> None:
     _report(ok, f"{args.run}: {'requeued' if ok and resp.get('requeued') else 'queued'}{where}")
     if not ok:
         _fail("reschedule", status, resp)
+    if args.json:
+        emit({"experiment_id": args.experiment, "run_id": args.run, **resp})
 
 
 # ── rename ─────────────────────────────────────────────────────────────────────
@@ -878,6 +964,7 @@ def rename_cmd(argv: list[str]) -> None:
     parser.add_argument("--clear", action="store_true", help="Remove the display name")
     parser.add_argument("--experiment-name", metavar="NAME",
                         help="Rename the experiment itself (its ID never changes)")
+    parser.add_argument("--json", action="store_true", help="Print the new name as JSON")
     args = parser.parse_args(argv)
     if args.experiment_name is not None:
         if args.run or args.clear:
@@ -892,6 +979,8 @@ def rename_cmd(argv: list[str]) -> None:
         _report(status == 200, f"renamed experiment {args.experiment} to {new!r}")
         if status != 200:
             _fail("rename", status, resp)
+        if args.json:
+            emit({"experiment_id": args.experiment, "name": new})
         return
     if not args.run:
         parser.error("give RUN and NAME (or --clear), or --experiment-name NAME")
@@ -905,6 +994,8 @@ def rename_cmd(argv: list[str]) -> None:
     _report(r, f"cleared the name of {args.run}" if args.clear else f"renamed {args.run} to {name!r}")
     if not r:
         sys.exit(1)
+    if args.json:
+        emit({"experiment_id": args.experiment, "run_id": args.run, "label": name or None})
 
 
 # ── stop / pause / unpause ─────────────────────────────────────────────────────
@@ -916,6 +1007,7 @@ def _set_status_cmd(argv: list[str], name: str, description: str, status: str, d
     parser.add_argument("experiment", help="Experiment ID")
     if confirm:
         parser.add_argument("--yes", action="store_true", help="Skip confirmation")
+    parser.add_argument("--json", action="store_true", help="Print the experiment's new status as JSON")
     args = parser.parse_args(argv)
     if confirm and not args.yes:
         sweep_print(f"{_RED}Aborting a sweep is destructive. Pass --yes to confirm.{_RESET}")
@@ -923,6 +1015,10 @@ def _set_status_cmd(argv: list[str], name: str, description: str, status: str, d
     manager, token, campaign = _connect(args, args.experiment)
     r = manager_set_experiment_status(manager, token, args.experiment, status, campaign=campaign)
     _report(r, f"{done} {args.experiment}")
+    if not r:
+        sys.exit(1)
+    if args.json:
+        emit({"experiment_id": args.experiment, "status": status})
 
 
 def stop_cmd(argv: list[str]) -> None:
@@ -1014,9 +1110,64 @@ def optimize_cmd(argv: list[str]) -> None:
             _fail("optimize", status, view)
 
     if args.json:
-        print(json.dumps(view, indent=2))
+        emit(view)
     else:
         _print_optimizer(view)
+
+
+# ── controls ───────────────────────────────────────────────────────────────────
+
+
+def controls_cmd(argv: list[str]) -> None:
+    from mlsweep.run_sweep import describe_controls
+
+    parser = _common_parser(
+        "mlsweep controls",
+        "Show or change an experiment's run controls (MAX_RUNTIME, PRUNE, METRIC_CHECK) while it runs.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("--max-runtime", default=None, metavar="DURATION|off",
+                        help="Stop and fail runs that run longer, e.g. 4h or 90m; off removes it. "
+                             "Applies to runs already running.")
+    parser.add_argument("--prune", default=None, metavar="JSON|off",
+                        help='A PRUNE dict as JSON, e.g. \'{"strategy": "asha", "min_steps": 500}\', or off')
+    parser.add_argument("--metric-check", default=None, metavar="N|on|off",
+                        help="Pause if the first N finished runs never log the metric (on = 2)")
+    parser.add_argument("--json", action="store_true", help="Print the controls as JSON")
+    args = parser.parse_args(argv)
+    manager, token, campaign = _connect(args, args.experiment)
+    url = _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/controls", campaign))
+
+    body: dict[str, Any] = {}
+    if args.max_runtime is not None:
+        body["max_runtime"] = None if args.max_runtime == "off" else args.max_runtime
+    if args.prune is not None:
+        if args.prune == "off":
+            body["prune"] = None
+        else:
+            try:
+                body["prune"] = json.loads(args.prune)
+            except ValueError:
+                parser.error(f"--prune must be JSON or off, not {args.prune!r}")
+    if args.metric_check is not None:
+        mc = args.metric_check
+        if mc in ("on", "off"):
+            body["metric_check"] = mc == "on"
+        elif mc.isdigit() and int(mc) > 0:
+            body["metric_check"] = int(mc)
+        else:
+            parser.error("--metric-check must be a positive number, on or off")
+
+    status, view = _http_request("PATCH" if body else "GET", url, token, json_data=body or None)
+    if status != 200 or not isinstance(view, dict):
+        _fail("controls", status, view)
+    if args.json:
+        emit(view)
+        return
+    lines = describe_controls(view)
+    sweep_print("\n".join(f"  {line}" for line in lines) if lines else "  no run controls")
+    if view.get("note"):
+        sweep_print(f"  {_paint(view['note'], _C_WARN)}")
 
 
 # ── wait ───────────────────────────────────────────────────────────────────────
@@ -1087,9 +1238,17 @@ def wait_cmd(argv: list[str]) -> None:
     _add_manager_args(parser)
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument(
-        "--until", choices=("done", "any-failure", "stalled"), default="done",
-        help="Condition to wait for (default: done = no active runs)",
+        "--until", choices=("done", "any-failure", "any-done", "stalled"), default="done",
+        help="Condition to wait for (default: done = no active runs). any-done returns as soon as "
+             "any run finishes, however it ended; pass --since to pick up where the last call left off",
     )
+    parser.add_argument(
+        "--since", default=None, metavar="T",
+        help="With --until any-done: runs that finished after T count (epoch seconds, or an ISO time; "
+             "default: now). The JSON result's 'cursor' is the T for the next call",
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="Print the verdict as JSON: outcome, exit code, the runs it is about, and counts")
     parser.add_argument(
         "--timeout", type=float, default=0, metavar="N",
         help="Seconds to wait before exiting 2 (0 = forever)",
@@ -1107,25 +1266,76 @@ def wait_cmd(argv: list[str]) -> None:
     manager, token, campaign = _connect(args, args.experiment)
 
     start = time.monotonic()
+    try:
+        since = _parse_since(args.since) if args.since is not None else time.time()
+    except ValueError:
+        parser.error(f"--since must be epoch seconds or an ISO time, not {args.since!r}")
     while True:
         jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign)
-        outcome = wait_outcome(args.experiment, jobs, args.until, args.stalled_after,
-                               lambda: _get_experiment(manager, token, args.experiment, campaign))
-        if outcome is not None:
-            code, message = outcome
-            sweep_print(message)
-            sys.exit(code)
-        if args.timeout and time.monotonic() - start >= args.timeout:
+        verdict = wait_outcome(args.experiment, jobs, args.until, args.stalled_after,
+                               lambda: _get_experiment(manager, token, args.experiment, campaign), since=since)
+        if verdict is None and args.timeout and time.monotonic() - start >= args.timeout:
             active = [j for j in jobs or [] if j.get("status") in _WAIT_ACTIVE_STATUSES]
             if active:
-                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
-                            f"{len(active)} active run(s) after {args.timeout:g}s.")
+                message = (f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
+                           f"{len(active)} active run(s) after {args.timeout:g}s.")
             else:
-                sweep_print(f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
-                            f"but the manager still expects more. `mlsweep optimize "
-                            f"{args.experiment}` shows where a Bayesian sweep stands.")
-            sys.exit(WAIT_EXIT_TIMEOUT)
+                message = (f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
+                           f"but the manager still expects more. `mlsweep optimize "
+                           f"{args.experiment}` shows where a Bayesian sweep stands.")
+            verdict = WaitVerdict(WAIT_EXIT_TIMEOUT, message, "timeout", active)
+        if verdict is not None:
+            sweep_print(verdict.message)
+            if args.json:
+                emit(verdict.to_json(args.experiment, jobs, since))
+            sys.exit(verdict.code)
         time.sleep(args.interval)
+
+
+def _parse_since(raw: str) -> float:
+    try:
+        return float(raw)
+    except ValueError:
+        t = datetime.fromisoformat(raw)
+        return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def _finish_epoch(job: dict[str, Any]) -> float | None:
+    t = _parse_time(job.get("finish_time"))
+    return t.timestamp() if t else None
+
+
+@dataclass
+class WaitVerdict:
+    """What one poll of ``mlsweep wait`` decided: exit with *code*, saying *message*.
+
+    *outcome* names it for --json (settled, failure, cancelled, stopped, paused,
+    stalled, run_finished, timeout, unknown), and *runs* are the runs it is about:
+    the failed, stalled or newly finished ones.
+    """
+
+    code: int
+    message: str
+    outcome: str
+    runs: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_json(self, experiment: str, jobs: list[dict[str, Any]] | None, since: float) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for j in jobs or []:
+            counts[str(j.get("status"))] = counts.get(str(j.get("status")), 0) + 1
+        out: dict[str, Any] = {
+            # No answer (manager unreachable, unknown experiment) is a failure like any other.
+            **({"error": _ANSI_RE.sub("", self.message).replace("FAIL  ", "")} if self.outcome == "unknown" else {}),
+            "experiment_id": experiment, "outcome": self.outcome, "exit_code": self.code,
+            "message": _ANSI_RE.sub("", self.message),
+            "runs": [{k: j.get(k) for k in ("run_id", "status", "reason", "exit_code", "finish_time")}
+                     for j in self.runs],
+            "counts": counts,
+        }
+        # The --since of the next any-done call: the newest finish seen, so nothing is missed or repeated.
+        finished = [t for j in jobs or [] if (t := _finish_epoch(j)) is not None]
+        out["cursor"] = max([since, *finished])
+        return out
 
 
 def wait_outcome(
@@ -1134,35 +1344,47 @@ def wait_outcome(
     until: str,
     stalled_after: float,
     get_experiment: Callable[[], dict[str, Any]],
-) -> tuple[int, str] | None:
-    """What ``mlsweep wait`` does after one poll: ``(exit code, message)``, or None to keep waiting.
+    since: float = 0.0,
+) -> WaitVerdict | None:
+    """What ``mlsweep wait`` does after one poll, or None to keep waiting.
 
     *jobs* is the experiment's runs (None if the manager did not answer), and
     *get_experiment* fetches the experiment itself, only when it is needed.
+    For ``any-done``, runs that finished after *since* (epoch seconds) count.
     """
     if jobs is None:
-        return WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  Cannot list jobs for {experiment}"
+        return WaitVerdict(WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  Cannot list jobs for {experiment}", "unknown")
     if not jobs:
-        return WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  {experiment} has no runs. Check the ID with `mlsweep ls`."
+        return WaitVerdict(WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  {experiment} has no runs. "
+                                              "Check the ID with `mlsweep ls`.", "unknown")
 
     failed = _wait_failed(jobs)
     active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
 
     if until == "any-failure" and failed:
         names = ", ".join(j.get("run_id", "?") for j in failed)
-        return WAIT_EXIT_FAILURE, f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}"
+        return WaitVerdict(WAIT_EXIT_FAILURE, f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}",
+                           "failure", failed)
+
+    if until == "any-done":
+        newly = sorted((j for j in jobs if j.get("status") not in _WAIT_ACTIVE_STATUSES
+                        and (t := _finish_epoch(j)) is not None and t > since), key=lambda j: _finish_epoch(j) or 0)
+        if newly:
+            names = ", ".join(f"{j.get('run_id', '?')} ({j.get('status')})" for j in newly)
+            return WaitVerdict(WAIT_EXIT_SETTLED, f"{_GREEN}FINISHED{_RESET}  {len(newly)} run(s): {names}",
+                               "run_finished", newly)
 
     if active and all(j.get("status") == "pending" for j in active):
         exp = get_experiment()
         # Runs added after a `stop`, or left by a stop from an older version, never start.
         if exp.get("status") == "aborted":
-            return (WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED,
-                    f"{_YELLOW}STOPPED{_RESET}  {experiment} was stopped, leaving "
-                    f"{len(active)} run(s) that will not start.")
+            return WaitVerdict(WAIT_EXIT_FAILURE if failed else WAIT_EXIT_CANCELLED,
+                               f"{_YELLOW}STOPPED{_RESET}  {experiment} was stopped, leaving "
+                               f"{len(active)} run(s) that will not start.", "stopped", failed)
         # The manager paused it (e.g. METRIC_CHECK); it waits for someone to look.
         note = manager_note(exp)
         if exp.get("status") == "paused" and note:
-            return WAIT_EXIT_FAILURE, f"{_RED}PAUSED{_RESET}  {experiment}: {note}"
+            return WaitVerdict(WAIT_EXIT_FAILURE, f"{_RED}PAUSED{_RESET}  {experiment}: {note}", "paused")
 
     if not active:
         exp = get_experiment()
@@ -1172,27 +1394,29 @@ def wait_outcome(
         # Settled: nothing pending/dispatched/running.
         note = manager_note(exp)
         lines = [f"{_YELLOW}NOTE{_RESET}  {note}"] if note else []
+        about: list[dict[str, Any]] = []
         if failed:
             names = ", ".join(j.get("run_id", "?") for j in failed)
-            code = WAIT_EXIT_FAILURE
+            code, outcome, about = WAIT_EXIT_FAILURE, "failure", failed
             lines.append(f"{_RED}FAILURE{_RESET}  {experiment} settled with {len(failed)} failed run(s): {names}")
-        elif cancelled := sum(1 for j in jobs if j.get("status") == "cancelled"):
-            code = WAIT_EXIT_CANCELLED
+        elif cancelled := [j for j in jobs if j.get("status") == "cancelled"]:
+            code, outcome, about = WAIT_EXIT_CANCELLED, "cancelled", cancelled
             lines.append(f"{_YELLOW}CANCELLED{_RESET}  {experiment} settled with "
-                         f"{cancelled} of {len(jobs)} run(s) cancelled.")
+                         f"{len(cancelled)} of {len(jobs)} run(s) cancelled.")
         else:
-            code = WAIT_EXIT_SETTLED
+            code, outcome = WAIT_EXIT_SETTLED, "settled"
             pruned = sum(1 for j in jobs if j.get("status") == "pruned")
             lines.append(f"{_GREEN}DONE{_RESET}  {experiment} settled cleanly"
                          + (f" ({pruned} of {len(jobs)} run(s) pruned)." if pruned else "."))
-        return code, "\n".join(lines)
+        return WaitVerdict(code, "\n".join(lines), outcome, about)
 
     if until == "stalled":
         stalled = _wait_stalled(jobs, stalled_after)
         if stalled:
             names = ", ".join(j.get("run_id", "?") for j in stalled)
-            return (WAIT_EXIT_STALLED, f"{_YELLOW}STALLED{_RESET}  {len(stalled)} running run(s) made no "
-                                       f"progress in {stalled_after:g}s: {names}")
+            return WaitVerdict(WAIT_EXIT_STALLED, f"{_YELLOW}STALLED{_RESET}  {len(stalled)} running run(s) "
+                                                  f"made no progress in {stalled_after:g}s: {names}",
+                               "stalled", stalled)
     return None
 
 
@@ -1206,26 +1430,33 @@ def resume_cmd(argv: list[str]) -> None:
         "to running and the manager chooses new trials. It does not undo `pause`; use `unpause` for that.")
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
+    parser.add_argument("--json", action="store_true",
+                        help="Print what happened as JSON (a Bayesian sweep's has no runs, and its new status)")
     args = parser.parse_args(argv)
     manager, token, campaign = _connect(args, args.experiment)
 
     if _get_experiment(manager, token, args.experiment, campaign).get("optimize"):
         if args.dry_run:
             sweep_print(f"  Would set {args.experiment} running, so the manager chooses new trials.")
-            return
-        r = manager_set_experiment_status(manager, token, args.experiment, "running", campaign=campaign)
-        _report(r, f"resumed {args.experiment}; the manager chooses new trials")
-        if not r:
-            sys.exit(1)
+        else:
+            r = manager_set_experiment_status(manager, token, args.experiment, "running", campaign=campaign)
+            _report(r, f"resumed {args.experiment}; the manager chooses new trials")
+            if not r:
+                sys.exit(1)
+        if args.json:
+            emit({**_action_result("resume", args.experiment, [], args.dry_run), "status": "running"})
         return
 
     jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
     targets = [j for j in jobs if j.get("status") in ("failed", "cancelled")]
+    results: list[dict[str, Any]] = []
     if not targets:
         sweep_print("  Nothing to resume, no failed or cancelled jobs.")
-        return
-    failures = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
-    if failures:
+    else:
+        results = _retry(targets, manager, token, args.experiment, args.dry_run, campaign)
+    if args.json:
+        emit(_action_result("resume", args.experiment, results, args.dry_run))
+    if _failed(results):
         sys.exit(1)
 
 
@@ -1310,12 +1541,13 @@ def best_cmd(argv: list[str]) -> None:
 
     metric, goal = resolve_ranking(manager, token, args.experiment, args.metric, args.goal,
                                    campaign=campaign)
-    rows = build_leaderboard(manager, token, args.experiment, metric, goal, campaign=campaign)
+    jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
+    rows = build_leaderboard(manager, token, args.experiment, metric, goal, jobs=jobs, campaign=campaign)
 
     if args.json:
         if args.with_dims:
             rows = [{**r, **(r["combo"] or {})} for r in rows]
-        print(json.dumps(rows, indent=2))
+        emit(rows)
     elif args.group_by:
         _print_grouped_leaderboard(rows, args.group_by, metric, goal, args.top)
     elif args.table:
@@ -1349,6 +1581,7 @@ def campaign_cmd(argv: list[str]) -> None:
     _add_manager_args(move)
     move.add_argument("experiment", help="Experiment ID")
     move.add_argument("target", help="Campaign to move it to (created if new)")
+    move.add_argument("--json", action="store_true", help="Print the result as JSON")
     args = parser.parse_args(argv if argv and argv[0] in ("ls", "move", "-h", "--help") else ["ls", *argv])
 
     if args.action == "move":
@@ -1362,6 +1595,8 @@ def campaign_cmd(argv: list[str]) -> None:
         _report(r, f"moved {args.experiment} to campaign {args.target}")
         if not r:
             sys.exit(1)
+        if args.json:
+            emit({"experiment_id": args.experiment, "campaign": args.target})
         return
 
     manager, token = _manager_token(args)
@@ -1371,7 +1606,7 @@ def campaign_cmd(argv: list[str]) -> None:
         sweep_print(f"{_RED}FAIL{_RESET}  list campaigns")
         sys.exit(1)
     if args.json:
-        print(json.dumps(camps, indent=2))
+        emit(camps)
         return
     sweep_print(f"{_BOLD}{_CYAN}{len(camps)}{_RESET} campaigns:")
     for c in camps:
@@ -1437,7 +1672,7 @@ def _post_runs(
         token, json_data=body,
     )
     if args.json:
-        print(json.dumps(resp, indent=2))
+        emit(resp)
     if status != 200:
         _fail(verb, status, resp)
     return resp
@@ -1536,7 +1771,7 @@ def gc_cmd(argv: list[str]) -> None:
         plan["local_downloads"] = [{"path": p, "bytes": b} for p, b in local]
 
     if args.json:
-        print(json.dumps(plan, indent=2))
+        emit(plan)
         return
     db = plan["database"]
     verb = "Deleted" if args.yes else "Would delete"
@@ -1820,13 +2055,13 @@ def code_cmd(argv: list[str]) -> None:
         info = {k: resp[k] for k in ("artifact_id", "files", "size_bytes")}
         sid = info["artifact_id"]
         if args.json:
-            print(json.dumps(info, indent=2))
+            emit(info)
         else:
             sweep_print(f"{_BOLD}{sid}{_RESET}  {info['files']} files, {_fmt_bytes(info['size_bytes'])}")
     else:
         info = _experiment_code(manager, token, args.ref, campaign)
         if args.json:
-            print(json.dumps(info, indent=2))
+            emit(info)
         else:
             _print_code_info(info)
 
@@ -1842,6 +2077,7 @@ def delete_cmd(argv: list[str]) -> None:
     )
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("--yes", action="store_true", help="Confirm")
+    parser.add_argument("--json", action="store_true", help="Print the result as JSON")
     args = parser.parse_args(argv)
     if not args.yes:
         sweep_print(f"{_RED}Deleting an experiment removes its runs, metrics and logs. "
@@ -1853,6 +2089,8 @@ def delete_cmd(argv: list[str]) -> None:
     _report(status == 200, f"deleted {args.experiment}")
     if status != 200:
         _fail("delete", status, resp)
+    if args.json:
+        emit({"experiment_id": args.experiment, "deleted": True})
 
 
 def _export_query(args: argparse.Namespace) -> str:
@@ -1883,6 +2121,9 @@ def export_cmd(argv: list[str]) -> None:
     cancel = sub.add_parser("cancel", help="Stop a running W&B export")
     _add_manager_args(cancel)
     cancel.add_argument("export_id", help="The ID `export wandb` printed when it started")
+    for p in (tb, wb, cancel):
+        p.add_argument("--json", action="store_true",
+                       help="Print the result as JSON: the zip's path, or the export's status")
     for p in (tb, wb):
         _add_manager_args(p)
         p.add_argument("--experiment", help="Only this experiment")
@@ -1902,6 +2143,8 @@ def export_cmd(argv: list[str]) -> None:
         _report(ok, f"W&B export {args.export_id}: cancelling")
         if not ok:
             _fail("cancel export", status, resp)
+        if args.json:
+            emit(resp)
         return
 
     query = _export_query(args)
@@ -1920,6 +2163,8 @@ def export_cmd(argv: list[str]) -> None:
             sweep_print(f"  {_RED}FAIL{_RESET}  tensorboard export: {exc}")
             sys.exit(1)
         _report(True, f"wrote {out}  (tensorboard --logdir on the unzipped folder)")
+        if args.json:
+            emit({"path": os.path.abspath(out), "bytes": os.path.getsize(out)})
         return
 
     body = {"project": args.project, "entity": args.entity, "api_key": args.api_key}
@@ -1932,6 +2177,8 @@ def export_cmd(argv: list[str]) -> None:
                 f"to {args.entity + '/' if args.entity else ''}{args.project}")
     if args.no_wait:
         sweep_print(f"  `mlsweep export cancel {eid}` stops it")
+        if args.json:
+            emit(resp)
         return
     last = -1
     while True:
@@ -1945,6 +2192,8 @@ def export_cmd(argv: list[str]) -> None:
         if st["status"] != "running":
             ok = st["status"] == "done"
             _report(ok, f"W&B export {st['status']}" + (f": {st['error']}" if st.get("error") else ""))
+            if args.json:
+                emit(st)
             if not ok:
                 sys.exit(1)
             return
@@ -1983,7 +2232,7 @@ def workers_cmd(argv: list[str]) -> None:
                                        "(its in-flight runs are requeued)")
     for p in (ls, add, rm, st, up):
         _add_manager_args(p)
-    ls.add_argument("--json", action="store_true")
+        p.add_argument("--json", action="store_true", help="Print the result as JSON")
     add.add_argument("host", help="SSH destination, e.g. user@host")
     add.add_argument("--remote-dir", default="", help="Project dir on the worker (optional)")
     add.add_argument("--ssh-key", help="SSH private key")
@@ -2011,11 +2260,15 @@ def workers_cmd(argv: list[str]) -> None:
         _report(ok, f"connected {resp.get('worker_id', args.host) if ok else args.host}")
         if not ok:
             _fail("add worker", status, resp)
+        if args.json:
+            emit(resp)
         return
     if args.action == "rm":
         if not _report_request("remove worker", f"removed {args.worker_id}", "DELETE",
                                _manager_url(manager, f"/api/workers/{args.worker_id}"), token):
             sys.exit(1)
+        if args.json:
+            emit({"worker_id": args.worker_id, "removed": True})
         return
     if args.action == "update":
         status, resp = _http_request("POST", _manager_url(manager, f"/api/workers/{args.worker_id}/update"),
@@ -2024,6 +2277,8 @@ def workers_cmd(argv: list[str]) -> None:
         _report(ok, f"{args.worker_id}: updating (`mlsweep workers` shows when it reconnects)")
         if not ok:
             _fail("update worker", status, resp)
+        if args.json:
+            emit(resp if isinstance(resp, dict) else {"worker_id": args.worker_id, "status": "updating"})
         return
     if args.action == "set":
         if args.jobs is None and not (args.add_devices or args.remove_devices or args.drain_devices):
@@ -2041,13 +2296,19 @@ def workers_cmd(argv: list[str]) -> None:
                                   token, json_data=body)
         if not ok:
             sys.exit(1)
+        if args.json:
+            status, workers = _http_request("GET", _manager_url(manager, "/api/workers"), token)
+            if status != 200 or not isinstance(workers, list):
+                _fail("list workers", status, workers)
+            emit(next((w for w in workers if w.get("worker_id") == args.worker_id),
+                      {"worker_id": args.worker_id}))
         return
 
     status, workers = _http_request("GET", _manager_url(manager, "/api/workers"), token)
     if status != 200 or not isinstance(workers, list):
         _fail("list workers", status, workers)
     if args.json:
-        print(json.dumps(workers, indent=2))
+        emit(workers)
         return
     if not workers:
         sweep_print("No workers.")
@@ -2068,6 +2329,7 @@ def scheduler_cmd(argv: list[str]) -> None:
         "free for big jobs); spread puts each job on the least busy GPU.",
     )
     parser.add_argument("--placement", choices=("pack", "spread"))
+    parser.add_argument("--json", action="store_true", help="Print the scheduler settings as JSON")
     args = parser.parse_args(argv)
     manager, token = _manager_token(args)
     if args.placement:
@@ -2077,4 +2339,7 @@ def scheduler_cmd(argv: list[str]) -> None:
         status, resp = _http_request("GET", _manager_url(manager, "/api/scheduler"), token)
     if status != 200 or not isinstance(resp, dict):
         _fail("scheduler", status, resp)
+    if args.json:
+        emit(resp)
+        return
     sweep_print(f"  placement: {resp.get('placement')}")

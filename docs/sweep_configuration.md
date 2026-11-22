@@ -461,6 +461,21 @@ restarts, and they apply to grid and Bayesian sweeps alike. Each run the manager
 stops or flags gets a `reason`, which `mlsweep ls EXP` prints under the run and
 the dashboard shows when you hover over its status.
 
+To stop a run, the worker sends it SIGTERM, and SIGKILL 30 seconds later if it is
+still going. A script that saves a checkpoint on SIGTERM keeps it: the run's
+artifacts, log and metrics are synced to the manager as for a run that exited by
+itself, and then its job is marked.
+
+`mlsweep controls EXP` shows them, and changes them while the sweep runs:
+
+```bash
+mlsweep controls EXP --max-runtime 4h        # or off; applies to runs already running
+mlsweep controls EXP --prune '{"strategy": "asha", "min_steps": 500}'   # or off
+mlsweep controls EXP --metric-check 5        # or on, off
+```
+
+Over HTTP these are `GET` and `PATCH /api/experiments/{id}/controls`.
+
 ### `MAX_RUNTIME`
 
 ```python
@@ -809,6 +824,7 @@ rather than text that must be parsed.
 ```bash
 mlsweep wait EXP --until done            # no pending/dispatched/running jobs
 mlsweep wait EXP --until any-failure     # return as soon as any run failed
+mlsweep wait EXP --until any-done        # return as soon as any run finished, however it ended
 mlsweep wait EXP --until stalled         # return when a running run stops progressing
 mlsweep wait EXP --until done --timeout 3600 --interval 15
 mlsweep wait EXP --until stalled --stalled-after 900
@@ -825,6 +841,25 @@ mlsweep wait EXP --until stalled --stalled-after 900
 
 `--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs
 stuck in `pending`. Pruned runs count as finished; the summary line says how many there were. A running Bayesian sweep is not settled, even with no active runs, because the manager is about to add more.
+
+`--until any-done` reports each run as it finishes. It counts runs that finished
+after `--since T` (epoch seconds or an ISO time, default now) and exits `0` naming
+them. With `--json` the result has a `cursor`. Pass that as the next call's `--since`
+so a run that finishes between two calls is reported once:
+
+```bash
+cursor=$(date +%s)
+while :; do
+  out=$(mlsweep wait EXP --until any-done --since "$cursor" --json)
+  cursor=$(jq .cursor <<<"$out")
+  jq -r '.runs[] | "\(.run_id) \(.status)"' <<<"$out"
+  [ "$(jq -r .outcome <<<"$out")" = run_finished ] || break   # settled, failed, ...
+done
+```
+
+`wait --json` prints one verdict: `outcome` (`settled`, `failure`, `cancelled`,
+`stopped`, `paused`, `stalled`, `run_finished`, `timeout` or `unknown`), `exit_code`,
+the `runs` it is about with their status and reason, `counts` by status, and `cursor`.
 
 `--interval` controls the poll period (default `10` seconds). `mlsweep fetch
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
@@ -949,11 +984,12 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `wait <exp_id>` | Block until an experiment settles, fails, or stalls. Exit codes: `0` clean, `1` failure, `2` timeout, `3` stalled. |
 | `status` (`doctor`) | Diagnose manager / token / GPUs / results / disk. |
 | `ls [exp_id]` | List experiments, or the runs within one experiment. |
-| `logs <run_id>` | Print (and optionally follow) a run's training log. |
-| `metrics` | Print runs' logged metrics as tables, fetched on demand. `--keys REGEX` selects keys; `--pivot` turns keys into rows using the regex's capture group (e.g. `val/nll@r(\d+)` becomes value vs. r, one column per run); `--step`, `--tail` (table view only), `--json`, `--csv`. |
-| `cancel <exp_id>` | Cancel runs (`--running` / `--pending` / run IDs / `--all`). |
+| `logs <exp_id> <run_id>` | Print (and optionally follow) a run's training log. `logs <run_id> --experiment <exp_id>` also works. |
+| `metrics` | Print runs' logged metrics as tables, fetched on demand. `--keys REGEX` selects keys; `--pivot` turns keys into rows using the regex's capture group (e.g. `val/nll@r(\d+)` becomes value vs. r, one column per run); `--step`, `--tail` (table view only), `--json`, `--csv`. `--json` always has the shape `{"experiment_id", "runs": [{"run_id", "dims", ...}]}`, where each run carries `rows` (every step), `last` (with `--last`) or `pivot` (with `--pivot`). |
+| `cancel <exp_id>` | Cancel runs (`--active` for every unfinished one, `--running` (dispatched ones too) / `--pending` / run IDs / `--all`). |
 | `retry <exp_id>` | Re-queue finished runs (`--failed` / `--cancelled` / run IDs) with the code submitted with the experiment. Each gets a fresh `--max-retries` budget. |
 | `resume <exp_id>` | Re-queue failed and cancelled runs, with the same code. A Bayesian sweep instead goes back to running, and the manager chooses new trials. It does not undo `pause`. |
+| `controls <exp_id>` | Show or change an experiment's [run controls](#run-controls) (`--max-runtime`, `--prune`, `--metric-check`, `--json`). |
 | `optimize <exp_id>` | Show or adjust a Bayesian sweep (`--budget N`, `--budget +N`, `--finish`, `--max-concurrent K`, `--max-failures N`, `--json`). See [Controlling a Bayesian sweep](#controlling-a-bayesian-sweep). |
 | `stop <exp_id>` | Abort a sweep (requires `--yes`). Every unfinished run is cancelled. |
 | `pause <exp_id>` | Stop dispatching new jobs. |
@@ -969,8 +1005,29 @@ Every command defaults `--manager` to `http://localhost:7891` (override with
 `--manager` or `MLSWEEP_MANAGER`). `fetch` and `best` rank by `--metric` / `--goal`, defaulting
 to the experiment's stored `METRIC`/`GOAL` (or `OPTIMIZE`) and finally
 `loss`/`minimize`. `fetch` also takes `--wait` and `--top`.
-`status`, `ls`, `best`, and `fetch` also accept `--json`. `watch` accepts
-`--events` (alias `--json`) for a machine-readable event stream.
+For a running run, `ls EXP` shows its current step and the average time per step
+since the manager started tracking it, e.g. `step 1200 at 2.5 s/step on average`.
+`ls EXP --json` has the same as `last_step` and `avg_step_seconds`.
+
+### `--json`
+
+Every command that returns data or changes something takes `--json`, and they all
+keep the same contract, so scripts and agents can rely on it:
+
+- stdout holds one JSON value, the result. `watch --events` (alias `--json`) is the
+  exception: it streams one JSON object per line.
+- Everything meant for people goes to stderr: progress, OK/FAIL lines, warnings.
+- A failure prints `{"error": "...", "exit_code": N}` and exits with that `N`.
+  Bad arguments, an unreachable manager and an unknown experiment are failures like
+  any other. A failure may add fields, e.g. `run --json` with lint errors adds `findings`.
+- A command whose result explains a nonzero exit prints that result and no error
+  object: `wait` (the verdict) and `lint` (the findings).
+
+Commands that change things report what they changed. `cancel`, `retry` and
+`resume` print `{"experiment_id", "action", "dry_run", "runs": [{"run_id", "ok"}]}`.
+`stop`, `pause` and `unpause` print the experiment's new status. `run --json`
+prints the submitted experiment (`experiment_id`, `campaign`, `runs`, `snapshot`),
+or with `--validate` and `--dry-run` the runs it would make.
 
 `cancel`, `retry`, and `resume` exit non-zero if any targeted run fails, so
 scripts can detect partial failures.
@@ -1151,6 +1208,12 @@ with MLSweepLogger() as logger:
         # Trigger an artifact sync mid-training (fire-and-forget):
         logger.sync()
 ```
+
+A list is logged as one metric per element, with its index after a slash, so
+per-layer values reach the manager: `logger.log({"moe_load": [0.2, 0.5]})` logs
+`moe_load/0` and `moe_load/1`. A nested dict is spread the same way
+(`{"val": {"nll": x}}` logs `val/nll`), and numpy or torch values become plain
+numbers. Each resulting key may be logged once per step.
 
 The context manager calls `close()` on exit. Without it, call `logger.close()` manually when done.
 

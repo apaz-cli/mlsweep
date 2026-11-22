@@ -30,7 +30,7 @@ Do what the user asked: keep going through steps 2 to 6 if they said to, otherwi
 2. Write a sweep file, then run `mlsweep run sweeps/my_sweep.py --validate` and check the combo count. It refuses a file with lint errors, such as a misspelled setting (`mlsweep lint` runs the checks alone); read the warnings too.
 3. Submit with `mlsweep run sweeps/my_sweep.py`. It prints the experiment ID. Put the ID in `STATUS.md` and push, so that another session can pick up from there.
 4. Monitor. Run `mlsweep wait <id> --until any-failure --timeout 300` to catch early crashes, then `mlsweep wait <id> --until stalled --timeout 300`. Repeat while it exits 2. Keep `--timeout` below any command limit you have, or run `wait` in the background.
-5. Handle failures. Read `mlsweep logs <run_id> --experiment <id>`. If the code was wrong, fix it, stop the old sweep if it is still running, and go back to step 2. If the code was fine, use `mlsweep retry <id> --failed`. If the cause is unclear, for example a worker error, work it out with the user.
+5. Handle failures. Read `mlsweep logs <id> <run_id>`. If the code was wrong, fix it, stop the old sweep if it is still running, and go back to step 2. If the code was fine, use `mlsweep retry <id> --failed`. If the cause is unclear, for example a worker error, work it out with the user.
 6. Record. Compare with `mlsweep best --experiment <id>` and `mlsweep metrics`, then write what you learned in the notes, with failed arms and dead ends. Update `STATUS.md`, commit and push.
 
 ### What `wait` exits with
@@ -45,6 +45,10 @@ Do what the user asked: keep going through steps 2 to 6 if they said to, otherwi
 | 5 | no failures, but some runs were cancelled or the sweep was stopped | the results are partial, so say so in the notes |
 
 `--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs stuck in pending, so look at `ls` if a timeout repeats.
+
+To hear about each run as it finishes, use `mlsweep wait <id> --until any-done --since <cursor> --json` in a loop, passing the previous result's `cursor` each time. It exits 0 with `outcome: run_finished` and the finished runs, or with the sweep's final outcome once it settles.
+
+Every `--json` command prints exactly one JSON value on stdout, and everything else on stderr. A failure is `{"error": ..., "exit_code": N}` with that exit code.
 
 ## Sweep files
 
@@ -99,7 +103,7 @@ mlsweep ls --all                                # also every done experiment or 
 mlsweep wait <id> --until stalled --timeout 300 # block; see the exit table above
 mlsweep watch <id>                              # live terminal status
 mlsweep watch <id> --events                     # one JSON event per line (alias: --json)
-mlsweep logs <run_id> --experiment <id>         # tail a run's training.log
+mlsweep logs <id> <run_id>                      # tail a run's training.log
 
 # results
 mlsweep best --experiment <id>                  # top runs by metric (--group-by DIM, --table D1,D2, --json)

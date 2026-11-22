@@ -45,7 +45,7 @@ mlsweep run sweeps/my_sweep.py --validate   # or: print all combos without submi
 mlsweep status                             # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                       # live terminal status
 mlsweep ls                                 # experiments grouped by status (`mlsweep ls EXP_ID` lists runs, --all lifts the cap of 20 settled)
-mlsweep logs RUN_ID --experiment EXP_ID    # tail a run's training.log
+mlsweep logs EXP_ID RUN_ID                # tail a run's training.log
 mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape keys (--last, --with-dims, 2-group --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download

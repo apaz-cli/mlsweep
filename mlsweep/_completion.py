@@ -22,14 +22,14 @@ from pathlib import Path
 COMMANDS = (
     "manager", "run", "worker", "lint", "gen_makefile", "watch", "fetch", "best", "wait", "status", "doctor",
     "ls", "logs", "metrics", "export", "code", "cancel", "retry", "reschedule", "rename", "move", "purge", "gc",
-    "delete", "resume", "optimize", "stop", "pause", "unpause", "workers", "scheduler", "campaign", "notes",
+    "delete", "resume", "optimize", "controls", "stop", "pause", "unpause", "workers", "scheduler", "campaign", "notes",
     "context", "completion", "docs", "version", "help",
 )
 
 # Subcommands whose first positional argument is an experiment ID.
 _EXPERIMENT_FIRST = frozenset({
     "watch", "wait", "ls", "cancel", "retry", "reschedule", "rename", "move", "purge", "delete", "resume",
-    "optimize", "stop", "pause", "unpause", "code",
+    "optimize", "controls", "stop", "pause", "unpause", "code", "logs",
 })
 
 _SUBCOMMANDS = {

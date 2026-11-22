@@ -962,6 +962,29 @@ def _handle_cancel(msg: MsgCancel) -> None:
         except OSError:
             pass
     _signal_pids(pids)
+    if msg.kill_after > 0:
+        timer = threading.Timer(msg.kill_after, _kill_if_still_running, args=((msg.experiment, msg.run_id), state))
+        timer.daemon = True
+        timer.start()
+
+
+def _kill_if_still_running(key: RunKey, state: RunState) -> None:
+    """SIGKILL a cancelled run that outlived its grace period after the SIGTERM."""
+    with _lock:
+        if _in_flight.get(key) is not state:
+            return  # it ended (or a later attempt took its place)
+        pids = list(state.pids)
+        setup_proc = state.setup_proc
+    if setup_proc is not None:
+        try:
+            os.killpg(setup_proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _handle_replay(msg: MsgReplay, conn: ConnState) -> None:

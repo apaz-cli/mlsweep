@@ -128,7 +128,8 @@ def test_db_recreate_keeps_campaign():
     async def body(db):
         await create_experiment(db, experiment_id="e", name="first", campaign="alpha")
         again = await create_experiment(db, experiment_id="e", name="second", campaign="beta")
-        assert again.name == "second"
+        # Appending keeps the experiment's name (rename changes it) and its campaign.
+        assert again.name == "first"
         assert again.campaign == "alpha"
     _db_test(body)
 
@@ -516,8 +517,10 @@ def test_create_empty_campaign_means_default(mgr):
 def test_recreate_in_same_campaign_updates(mgr):
     eid = _uid("e")
     _create(mgr, {"experiment_id": eid, "name": "one", "campaign": "alpha"})
-    status, data = _create(mgr, {"experiment_id": eid, "name": "two", "campaign": "alpha"})
-    assert status == 201 and data["name"] == "two" and data["campaign"] == "alpha"
+    status, data = _create(mgr, {"experiment_id": eid, "name": "two", "campaign": "alpha", "max_concurrent": 3})
+    # Appending updates its settings but keeps its name; rename changes that.
+    assert status == 201 and data["name"] == "one" and data["campaign"] == "alpha"
+    assert data["max_concurrent"] == 3
 
 
 @pytest.mark.parametrize("body_campaign,query_campaign", [("beta", None), (None, "beta"), (None, None)])

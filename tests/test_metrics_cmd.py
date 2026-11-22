@@ -86,8 +86,16 @@ def test_metrics_command_end_to_end(manager_with_worker):
     assert [(r["run"], r["step"], r["key"], float(r["value"])) for r in rows] == \
         [("b", "1", "loss", 2.0), ("b", "2", "loss", 1.0)]
 
+    # --json has one shape in every view: runs, each with its dims and its data.
     data = json.loads(run("a", "--json"))
-    assert data["a"][0]["step"] == 1 and "val@4" in data["a"][0]
+    assert data["experiment_id"] == "metrics_cmd" and [r["run_id"] for r in data["runs"]] == ["a"]
+    [a] = data["runs"]
+    assert set(a) == {"run_id", "dims", "rows"} and a["rows"][0]["step"] == 1 and "val@4" in a["rows"][0]
+    last = json.loads(run("--keys", "^loss$", "--last", "--json"))
+    assert {r["run_id"]: r["last"] for r in last["runs"]} == {"a": {"loss": 1.0}, "b": {"loss": 1.0}}
+    pivot_json = json.loads(run("--keys", r"^val@(\d+)$", "--pivot", "--json"))
+    by_run = {r["run_id"]: r["pivot"] for r in pivot_json["runs"]}
+    assert by_run["a"]["step"] == 2 and by_run["a"]["values"]["4"] == 1.5
 
     bad = subprocess.run(base + ["--keys", "^loss$", "--pivot"], capture_output=True, text=True,
                          env=env, cwd=REPO_ROOT)

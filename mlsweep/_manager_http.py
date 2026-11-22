@@ -102,7 +102,7 @@ from mlsweep._manager_workers import (
     validate_worker_host,
     worker_id_for,
 )
-from mlsweep._sweep import spec_singular_dims, validate_controls
+from mlsweep._sweep import build_controls, spec_singular_dims, validate_controls
 from mlsweep._shared import (
     DEFAULT_CAMPAIGN,
     _dir_size,
@@ -977,6 +977,67 @@ async def handle_patch_optimizer(request: web.Request) -> web.Response:
     return view if isinstance(view, web.Response) else _json_response(view)
 
 
+@routes.get("/api/experiments/{experiment_id}/controls")
+async def handle_get_controls(request: web.Request) -> web.Response:
+    """An experiment's run controls (MAX_RUNTIME, PRUNE, METRIC_CHECK), ``{}`` if it has none."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    exp = await get_experiment(db, request.match_info["experiment_id"])
+    if exp is None:
+        return _not_found("experiment")
+    return _json_response(json.loads(exp.controls) if exp.controls else {})
+
+
+@routes.patch("/api/experiments/{experiment_id}/controls")
+async def handle_patch_controls(request: web.Request) -> web.Response:
+    """Change an experiment's run controls while it runs.
+
+    Body fields, all optional; ``null`` (or ``false`` for ``metric_check``) turns one off:
+
+    * ``max_runtime``: seconds, or a duration like ``"4h"``.  Applies to runs already running.
+    * ``prune``: a PRUNE dict.  Its metric and goal default to the experiment's.
+      A new spec compares runs afresh from their stored metrics.
+    * ``metric_check``: true, or how many finished runs to judge by.  Turning it on
+      again after it fired checks again.
+
+    Returns the controls as they now are.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    experiment_id = request.match_info["experiment_id"]
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return _error_response("body must be an object")
+    unknown = sorted(set(body) - {"max_runtime", "prune", "metric_check"})
+    if unknown:
+        return _error_response(f"unknown field(s) {unknown}")
+    async with state.lock:
+        exp = await get_experiment(db, experiment_id)
+        if exp is None:
+            return _not_found("experiment")
+        current: dict[str, Any] = json.loads(exp.controls) if exp.controls else {}
+        merged = {k: current.get(k) for k in ("max_runtime", "prune")}
+        merged.update({k: v for k, v in body.items() if k in merged})
+        check = current.get("metric_check")
+        metric_check: Any = check["runs"] if check else False
+        if "metric_check" in body:
+            metric_check = body["metric_check"] if body["metric_check"] is not None else False
+        try:
+            controls = build_controls(
+                max_runtime=merged["max_runtime"], prune=merged["prune"], metric_check=metric_check,
+                metric=exp.metric, goal=exp.goal, where="controls",
+            ) or {}
+        except ValueError as exc:
+            return _error_response(str(exc))
+        if current.get("note"):
+            controls["note"] = current["note"]
+        await state.db_writer.update_experiment_controls(experiment_id, controls)
+        if exp.status in ("running", "paused"):
+            state.controls[experiment_id] = controls
+    state.request_schedule()
+    _broadcast_experiment_event(request, experiment_id, "controls_updated", controls=controls)
+    return _json_response(controls)
+
+
 @routes.put("/api/experiments/{experiment_id}/name")
 async def handle_update_experiment_name(request: web.Request) -> web.Response:
     """Update an experiment's display name."""
@@ -1071,8 +1132,10 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
     log/metric progress) and ``stalled`` (whether that exceeds the manager's
     default threshold), merged from in-memory run state.  Once a metric has
     arrived this session they also carry ``last_step``, ``step_age_seconds``
-    (seconds since that step first arrived) and ``step_seconds`` (wall seconds
-    per step as the run's logger measured it, or null until it has one).
+    (seconds since that step first arrived), ``step_seconds`` (wall seconds
+    per step as the run's logger measured it, or null until it has one) and
+    ``avg_step_seconds`` (wall seconds per step since the first step this
+    session, or null until the step has advanced).
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -1093,6 +1156,7 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
                     d["last_step"] = run.last_step
                     d["step_age_seconds"] = max(0.0, now - run.last_step_time)
                     d["step_seconds"] = run.step_seconds
+                    d["avg_step_seconds"] = run.avg_step_seconds
         out.append(d)
     return _json_response(out)
 

@@ -1106,7 +1106,7 @@ async def _handle_metric(
     if why is not None:
         async with state.lock:
             if state.runs.get(run.key) is run:
-                await end_runs_locked(db, state, [run.key], "pruned", why)
+                stop_runs_locked(state, [run.key], "pruned", why)
 
 
 async def _handle_sync_req(
@@ -1181,16 +1181,22 @@ async def _handle_result(
         if finished:
             del state.runs[run.key]
             await state.db_writer.pack_metrics(run.job_key, run.attempt, extra)
+            # A run the manager stopped ends as what it stopped it for, however it exited.
+            status, reason = run.ending if run.ending is not None else (None, None)
+            if status is not None:
+                success = False
             await state.db_writer.finish_job(
                 rid, eid, success=success, exit_code=msg.exit_code, elapsed=elapsed,
+                status=status, reason=reason,
             )
             if nodes:
                 await state.db_writer.delete_job_nodes(rid, eid)
-            xfailed = await state.db_writer.apply_result_rules(eid, rid, success)
+            # A pruned run ran fine, so for skip rules it is a success.
+            xfailed = await state.db_writer.apply_result_rules(eid, rid, success or status == "pruned")
             state.broadcast(eid, {
                 "type": "job_done", "run_id": rid, "worker_id": wc.worker_id,
                 "success": success, "elapsed": elapsed, "exit_code": msg.exit_code,
-                "xfailed": xfailed,
+                "xfailed": xfailed, **({"status": status, "reason": reason} if status else {}),
             })
             check = state.controls.get(eid, {}).get("metric_check")
             if success and check and not run.metric_seen:
@@ -1337,6 +1343,14 @@ async def requeue_runs_locked(
     """
     if not keys:
         return
+    # A run being stopped is not run again: it ends as what it was stopped for.
+    for key in [k for k in keys if (r := state.runs.get(k)) is not None and r.ending is not None]:
+        ending = state.runs[key].ending
+        assert ending is not None
+        await end_runs_locked(db, state, [key], *ending)
+    keys = [k for k in keys if k in state.runs]
+    if not keys:
+        return
     _detach_locked(state, keys)
     requeued, failed = await state.db_writer.requeue_jobs(keys, spend_retry=lost)
     for job in requeued:
@@ -1383,10 +1397,12 @@ async def _check_experiments_complete_locked(
 async def end_runs_locked(
     db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey], status: JobStatus, reason: str,
 ) -> list[JobRecord]:
-    """Stop in-flight runs and finish their jobs as *status* ("pruned", or "failed" for a timeout).
+    """Finish in-flight runs' jobs as *status* now, without waiting for their results.
 
-    The worker kills the process; its late result is only acknowledged, as for
-    a cancel.  The metrics already stored are kept and packed.
+    For a stopped run whose result never came, or whose worker was lost.  The
+    worker kills the process; its late result is only acknowledged, as for a
+    cancel, so its outputs are not synced.  The metrics already stored are kept
+    and packed.  ``stop_runs_locked`` is the graceful way.
     """
     for key in keys:
         state.pins.pop(key, None)
@@ -1395,9 +1411,8 @@ async def end_runs_locked(
     ended = await state.db_writer.end_jobs(keys, status, reason)
     for run in runs:
         await state.db_writer.pack_metrics(run.job_key, run.attempt)
-    word = "PRUNE" if status == "pruned" else "STOP "
     for job in ended:
-        print(f"  {_YELLOW}{word}{_RESET} {job.experiment_id}/{job.run_id}: {reason}")
+        print(f"  {_YELLOW}END  {_RESET} {job.experiment_id}/{job.run_id} without its result: {reason}")
         # A pruned run ran fine, so for skip rules it is a success.
         xfailed = await state.db_writer.apply_result_rules(job.experiment_id, job.run_id, status == "pruned")
         state.broadcast(job.experiment_id, {
@@ -1407,6 +1422,43 @@ async def end_runs_locked(
     await _check_experiments_complete_locked(db, state, {j.experiment_id for j in ended})
     state.request_schedule()
     return ended
+
+
+# How long a stopped run has between its SIGTERM and SIGKILL, to save a checkpoint.
+STOP_GRACE_SECONDS = 30.0
+# How long past that the manager waits for its result before ending the job without it.
+_STOP_GIVE_UP_SECONDS = STOP_GRACE_SECONDS + 60.0
+
+
+def stop_runs_locked(
+    state: ManagerState, keys: Sequence[RunKey], status: JobStatus, reason: str,
+) -> list[InFlightRun]:
+    """Stop in-flight runs gracefully, to finish their jobs as *status* ("pruned", or
+    "failed" for a timeout) once their results arrive.
+
+    The worker sends SIGTERM, and SIGKILL after ``STOP_GRACE_SECONDS``.  The run
+    stays in flight until then, so its outputs are synced, its log and metrics
+    completed and its GPUs freed exactly as for a run that exited by itself.
+    ``enforce_controls_locked`` ends any whose result never comes.  Returns the
+    runs it began stopping (a run already being stopped is left alone).
+    """
+    stopping = []
+    for key in keys:
+        run = state.runs.get(key)
+        if run is None or run.ending is not None:
+            continue
+        run.ending = (status, reason)
+        run.ending_since = time.time()
+        word = "PRUNE" if status == "pruned" else "STOP "
+        print(f"  {_YELLOW}{word}{_RESET} {run.experiment_id}/{run.run_id}: {reason}")
+        for wid in run.nodes:
+            wc = state.workers.get(wid)
+            if wc is not None and wc.status != "dead":
+                _send(wc, MsgCancel(run_id=run.run_id, experiment=run.experiment_id,
+                                    kill_after=STOP_GRACE_SECONDS))
+        state.broadcast(run.experiment_id, {"type": "job_updated", "run_id": run.run_id, "reason": reason})
+        stopping.append(run)
+    return stopping
 
 
 def _apply_metric_controls(state: ManagerState, run: InFlightRun, step: int, data: dict[str, Any]) -> str | None:
@@ -1475,14 +1527,17 @@ async def enforce_controls_locked(db: aiosqlite.Connection, state: ManagerState)
         tracker = state.prune.get(eid)
         if tracker is not None and not tracker.loaded:
             for key, why in await _load_prune_tracker_locked(db, state, eid, tracker):
-                if key in state.runs:
-                    await end_runs_locked(db, state, [key], "pruned", why)
+                stop_runs_locked(state, [key], "pruned", why)
         limit = controls.get("max_runtime")
         if limit:
             late = [j.key for j in await running_jobs_started_before(db, eid, now - limit) if j.key in state.runs]
-            if late:
-                await end_runs_locked(db, state, late, "failed",
-                                      f"timed out: ran longer than MAX_RUNTIME ({format_duration(limit)})")
+            stop_runs_locked(state, late, "failed",
+                             f"timed out: ran longer than MAX_RUNTIME ({format_duration(limit)})")
+    # A stopped run whose result never came (an older worker ignores the SIGKILL
+    # deadline, or the process will not die): end its job without it.
+    for run in [r for r in state.runs.values() if r.ending and now - r.ending_since > _STOP_GIVE_UP_SECONDS]:
+        assert run.ending is not None
+        await end_runs_locked(db, state, [run.key], *run.ending)
 
 
 async def _check_run_metric_locked(

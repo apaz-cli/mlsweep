@@ -13,6 +13,11 @@ Usage::
     logger.log({"loss": 0.5})   # step auto-increments; logger.step becomes 1
     logger.close()
 
+A list (or tuple, or array) is logged as one metric per element, with the
+index after a slash: ``log({"moe_load": [0.2, 0.5]})`` logs ``moe_load/0`` and
+``moe_load/1``.  A nested dict is flattened the same way (``{"val": {"nll": x}}``
+logs ``val/nll``), and numpy or torch scalars become plain numbers.
+
 Steps never go backwards, and a metric is logged at most once per step:
 ``log()`` raises ``ValueError`` rather than overwrite an earlier value.
 Several calls at the same step are fine when their keys differ
@@ -44,6 +49,29 @@ def _as_step(step: Any) -> int:
         raise TypeError(f"step must be an integer, got {step!r}") from None
 
 
+
+
+def _flatten(metrics: dict[str, Any]) -> dict[str, Any]:
+    """*metrics* with lists, tuples, arrays and nested dicts spread into ``key/i`` and ``key/sub``."""
+    out: dict[str, Any] = {}
+
+    def add(key: str, value: Any) -> None:
+        if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+            value = value.tolist()  # numpy / torch: arrays to lists, scalars to numbers
+        elif hasattr(value, "item") and not isinstance(value, (int, float, bool)):
+            value = value.item()
+        if isinstance(value, dict):
+            for k, v in value.items():
+                add(f"{key}/{k}", v)
+        elif isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                add(f"{key}/{i}", v)
+        else:
+            out[key] = value
+
+    for key, value in metrics.items():
+        add(str(key), value)
+    return out
 
 
 class MLSweepLogger:
@@ -131,7 +159,9 @@ class MLSweepLogger:
         """Log a metrics dict for the given step.
 
         Args:
-            metrics: Mapping of metric name to scalar value.
+            metrics: Mapping of metric name to value: a number, or a list or
+                     dict of them, which is logged one key per element
+                     (``name/0``, ``name/sub``).
             step:    Training step.  If omitted, ``self.step`` is incremented
                      by 1 and the new value is used.
 
@@ -140,6 +170,7 @@ class MLSweepLogger:
                 *metrics* was already logged at *step*.  Either would
                 overwrite a value already recorded.
         """
+        metrics = _flatten(metrics)
         prev_step = self.step if self._logged_any else None
         if step is not None:
             step = _as_step(step)

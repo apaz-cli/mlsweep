@@ -50,6 +50,8 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .exp-name-cell { display: flex; align-items: center; }
 .exp-name { font-weight: 600; color: var(--text-strong); }
 .exp-note { font-size: 11px; color: var(--text-muted); font-style: italic; margin-left: 8px; }
+.exp-manager-note.paused { color: var(--warn); }
+.exp-manager-note { font-size: 11px; color: var(--text-muted); margin-left: 8px; max-width: 48ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 /* Action cells stay table cells (the buttons flex inside a div), so they
    stretch to the row and its bottom border stays one line. */
 .btn-delete { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 27%, transparent); }

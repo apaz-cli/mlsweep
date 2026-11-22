@@ -32,6 +32,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from mlsweep._jsonout import emit, emit_line
 from mlsweep._sweep import (
     _write_manifest,
     build_job_payloads as _build_job_payloads,
@@ -1636,8 +1637,11 @@ def describe_controls(controls: dict[str, Any] | None) -> list[str]:
     return out
 
 
-def _load_and_lint(sweep_file: str) -> dict[str, Any]:
-    """Load a sweep file, print its lint findings, and exit on an error."""
+def _load_and_lint(sweep_file: str, as_json: bool = False) -> dict[str, Any]:
+    """Load a sweep file, print its lint findings, and exit on an error.
+
+    With *as_json*, an error exits with ``{"error", "exit_code", "findings"}``.
+    """
     from mlsweep._lint import Finding, lint_module
     from mlsweep._sweep import _load_module, sweep_info
 
@@ -1653,8 +1657,13 @@ def _load_and_lint(sweep_file: str) -> dict[str, Any]:
     if any(f.severity == "error" for f in findings):
         sweep_print(f"{_RED}{sweep_file} has errors; nothing was submitted.{_RESET} "
                     "(`mlsweep lint` checks a sweep file on its own.)")
+        if as_json:
+            emit({"error": f"{sweep_file} has errors; nothing was submitted", "exit_code": 1,
+                  "findings": [{"severity": f.severity, "message": f.message} for f in findings]})
         sys.exit(1)
-    return sweep_info(mod, sweep_file)
+    info = sweep_info(mod, sweep_file)
+    info["findings"] = [{"severity": f.severity, "message": f.message} for f in findings]
+    return info
 
 
 def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
@@ -1733,7 +1742,7 @@ def _watch_cmd(args: list[str], prog: str = "mlsweep_run watch", connect: Any = 
                 failed = True
 
             if emit_json:
-                print(json.dumps(event), flush=True)
+                emit_line(event)
                 if event_type == "experiment_done":
                     break
                 continue
@@ -1841,7 +1850,7 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
             "goal": goal,
             "runs": rows,
         }
-        print(json.dumps(out, indent=2))
+        emit(out)
         if had_failure:
             sys.exit(1)
         return
@@ -1872,6 +1881,13 @@ def _fetch_cmd(args: list[str], prog: str = "mlsweep_run fetch") -> None:
 
 
 def main() -> None:
+    from mlsweep._jsonout import contract
+
+    with contract(sys.argv[1:]):
+        _main()
+
+
+def _main() -> None:
     global _log_file
 
     # Standalone `mlsweep_run` also accepts the global --color flag; consume it
@@ -1950,8 +1966,13 @@ def main() -> None:
              "In a Bayesian sweep it is also how many trials run at once (default: n_initial).")
     parser.add_argument("--color", action="store_true",
                         help="Enable ANSI color in human-readable output (default: off)")
+    parser.add_argument("--json", action="store_true",
+                        help="Print the result as JSON: the submitted experiment, or with --validate "
+                             "and --dry-run the runs it would make. Not with --stream or --fetch.")
 
     args, extra = parser.parse_known_args(argv)
+    if args.json and (args.stream or args.fetch):
+        parser.error("--json prints one result; it can't be used with --stream or --fetch")
     if extra and extra[0] == "--":
         extra = extra[1:]
     campaign = _resolve_campaign(args)
@@ -1976,7 +1997,7 @@ def main() -> None:
         writer_factory = MultiWriterFactory(factories)
 
     # ── Load and lint the sweep ─────────────────────────────────────────────
-    info = _load_and_lint(args.sweep_file)
+    info = _load_and_lint(args.sweep_file, as_json=args.json)
     sweep_name = info["name"]
     options = info["options"]
     command = info["command"]
@@ -2024,6 +2045,14 @@ def main() -> None:
                 elif opt["_values"] != [None]:
                     sweep_print(f"  {dim}: {opt['_values']}"
                                 + (" [singular]" if opt.get("singular") else ""))
+            if args.json:
+                emit({"sweep": sweep_name, "method": "bayes", "budget": optimize_cfg["budget"],
+                      "metric": optimize_cfg["metric"], "goal": optimize_cfg["goal"],
+                      "dimensions": {k[1:]: ({"distribution": o["distribution"], "min": o["min"], "max": o["max"]}
+                                             if o.get("_type") == "continuous" else o["_values"])
+                                     for k, o in options.items() if o["_values"] != [None]
+                                     or o.get("_type") == "continuous"},
+                      "controls": info.get("controls"), "findings": info["findings"]})
             sys.exit(0)
 
         all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
@@ -2044,6 +2073,10 @@ def main() -> None:
         sweep_print(f"\n{_BOLD}{_CYAN}Runs:{_RESET}")
         for var in all_variations:
             sweep_print(f"  {var['name']}: {var['combo']}")
+        if args.json:
+            emit({"sweep": sweep_name, "method": "grid", "combinations": len(all_variations),
+                  "excluded": excluded, "runs": [{"name": v["name"], "combo": v["combo"]} for v in all_variations],
+                  "controls": info.get("controls"), "findings": info["findings"]})
         sys.exit(0)
 
     # ── Generate variations ────────────────────────────────────────────────
@@ -2101,6 +2134,11 @@ def main() -> None:
         sweep_print(f"\n{_CYAN}{'=' * 80}{_RESET}")
         sweep_print(f"{_BOLD}DRY RUN{_RESET} — {_GREEN}{len(variations)}{_RESET} runs would be submitted to manager")
         sweep_print(f"{_CYAN}{'=' * 80}{_RESET}")
+        if args.json:
+            emit({"experiment_id": experiment_id, "campaign": campaign, "dry_run": True,
+                  "runs": [{"name": v["name"], "combo": v["combo"],
+                            "command": list(command) + v["overrides"] + list(extra)} for v in variations],
+                  "findings": info["findings"]})
         return
 
     manager, token = _manager_token(args)
@@ -2187,6 +2225,13 @@ def main() -> None:
 
     # ── 4. Write local manifest ────────────────────────────────────────────
     _write_manifest(exp_dir, experiment_id, variations, note=args.note)
+    if args.json:
+        emit({"experiment_id": experiment_id, "campaign": campaign or DEFAULT_CAMPAIGN, "method": method,
+              "runs": len(variations), "budget": spec["budget"] if spec else None,
+              "snapshot": artifact_id, "controls": info.get("controls"), "findings": info["findings"]})
+        if _log_file:
+            _log_file.close()
+        return
 
     # ── 5. Stream or fetch ─────────────────────────────────────────────────
     if args.stream:
