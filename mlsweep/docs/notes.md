@@ -518,6 +518,17 @@ dashboard's Code tab.
 
 Code that ran from a tarball, from before snapshots, can't be linked.
 
+### Trace links
+
+```md
+The sweep came out of [that idea about warmup](mlsweep:trace/9f6c0e22).
+```
+
+The link opens the session trace named by its id (the agent's own session id; the
+prefix is optional when it is unique). The tab checks the link and marks it ⚠ with
+the reason when the trace isn't there. Lint reports a trace link that does not
+resolve, like every other `mlsweep:` link. See [traces.md](traces.md).
+
 ### Code and diff blocks
 
 A `mlsweep-code` block shows the lines in the note:

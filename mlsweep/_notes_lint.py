@@ -185,6 +185,16 @@ def _check_blocks(
             if _notes_code.is_code_ref(raw):
                 _check_code_ref(path, i + 1, raw, evidence, findings, "code link")
                 continue
+            if raw.startswith("trace/"):
+                # A trace: the manager says whether the session exists.  There
+                # is no number to check the note's text against.
+                if evidence is not None:
+                    hit = evidence.get(raw)
+                    if hit is not None and not hit.get("ok"):
+                        findings.append(Finding(
+                            "report", "evidence-ref", path, i + 1,
+                            f"mlsweep:{raw}: {hit.get('error', 'does not resolve')}", {"ref": raw}))
+                continue
             if _LOOKS_LIKE_FILE.search(raw):
                 findings.append(Finding(
                     "report", "code-ref", path, i + 1,

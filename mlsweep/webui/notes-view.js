@@ -815,6 +815,13 @@ function postProcess(root, srcPath, depth, opts = {}) {
   root.querySelectorAll("a[href]").forEach(a => {
     if (a.classList.contains("wikilink") || a.dataset.path) return;
     const href = a.getAttribute("href");
+    if (/^mlsweep:trace\//i.test(href)) {
+      // A trace link: opens that session on the Traces tab.
+      a.href = pageHref("traces.html", { session: href.slice("mlsweep:trace/".length) });
+      a.classList.add("trace-ev");
+      a.title = "Open this trace";
+      return;
+    }
     if (/^mlsweep:code\//i.test(href) && typeof annotateCode === "function") {
       // A file (and lines) as an experiment ran it: opens the code page.
       const ref = href.slice("mlsweep:".length);

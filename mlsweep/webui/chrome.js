@@ -143,6 +143,7 @@ const VIEW_ICONS = {
   logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h6"/></svg>',
   artifacts: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.5 14 4.5v7L8 14.5 2 11.5v-7z"/><path d="M2 4.5 8 7.5l6-3M8 7.5v7"/></svg>',
   notes: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="m2.5 13.5.8-3.2 7.4-7.4 2.4 2.4-7.4 7.4z"/><path d="m9.5 3.7 2.4 2.4"/></svg>',
+  traces: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12.5v-9"/><path d="M6 13.5V6.5"/><path d="M10 12.5V3"/><path d="M14 13.5V8.5"/></svg>',
   code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/></svg>',
   export: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7.5"/><path d="m4.8 6.5 3.2 3.2 3.2-3.2"/><path d="M3 13.5h10"/></svg>',
   system: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.6 4.75h.01M4.6 11.25h.01M7 4.75h.01M7 11.25h.01" stroke-width="2"/></svg>',
@@ -177,7 +178,7 @@ const PANEL_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" s
 const MLChrome = (() => {
   const PAGES = [
     ["experiments", "Experiments"], ["results", "Results"], ["logs", "Logs"], ["files", "Artifacts"],
-    ["code", "Code"], ["notes", "Notes"], ["export", "Export"], ["system", "System"],
+    ["code", "Code"], ["notes", "Notes"], ["traces", "Traces"], ["export", "Export"], ["system", "System"],
   ];
   const root = document.documentElement;
 

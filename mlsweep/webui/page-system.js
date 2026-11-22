@@ -628,6 +628,7 @@ async function cancelInFlight(expId, runId) {
 }
 
 watchNoteMentions(() => {});
+watchTraceCounts(() => {});
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 async function refresh() {

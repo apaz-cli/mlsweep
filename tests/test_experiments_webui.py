@@ -122,10 +122,11 @@ def test_menus_and_citation_counts(notes_mgr):
 
         # View holds the pages with what each leads to, the experiment (and
         # campaign) carried along: two finished runs, two logs, no artifacts.
+        b.wait_for("traceCounts.__loaded === true")
         b.eval(f"document.querySelector('#exp-row-{eid} .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", "2"], ["Logs", "2"], ["Artifacts", "0"],
-                                  ["Code", None], ["Notes", "1"], ["Export", "2"]]
+                                  ["Code", None], ["Notes", "1"], ["Traces", "0"], ["Export", "2"]]
         hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
         assert any("results.html?experiment=" + eid in h for h in hrefs), hrefs
         assert any("logs.html?experiment=" + eid in h for h in hrefs), hrefs
@@ -144,7 +145,7 @@ def test_menus_and_citation_counts(notes_mgr):
         b.eval(f"document.querySelector('#exp-row-{other} .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", "1"], ["Logs", "1"], ["Artifacts", "0"],
-                                  ["Code", None], ["Notes", "0"], ["Export", "1"]]
+                                  ["Code", None], ["Notes", "0"], ["Traces", "0"], ["Export", "1"]]
         assert b.eval("""(() => { const it = [...document.querySelectorAll('.row-menu-item')]
             .find(x => x.querySelector('.mi-label').textContent === 'Notes');
             return it.tagName === 'SPAN' && it.classList.contains('disabled')
@@ -157,14 +158,14 @@ def test_menus_and_citation_counts(notes_mgr):
         b.eval(f"document.querySelector('#exp-tbody tr[data-runs-of={eid}] .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", None], ["Artifacts", None], ["Logs", None],
-                                  ["Code", None], ["Notes", "1"]]
+                                  ["Code", None], ["Notes", "1"], ["Traces", None]]
         run_hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
         # Results goes to the run's experiment; the other pages carry the run.
         results_hrefs = [h for h in run_hrefs if h.startswith("results.html")]
         assert len(results_hrefs) == 1 and "run=" not in results_hrefs[0], run_hrefs
         assert f"experiment={eid}" in results_hrefs[0], run_hrefs
         assert all("run=" in h for h in run_hrefs
-                   if not h.startswith(("results.html", "notes.html"))), run_hrefs
+                   if not h.startswith(("results.html", "notes.html", "traces.html"))), run_hrefs
         assert any("notes.html?mentions=run_a" in h for h in run_hrefs), run_hrefs
         b.eval(f"document.querySelector('#exp-tbody tr[data-runs-of={eid}] .btn-manage').click()")
         b.wait_for("!!document.querySelector('.row-menu')")

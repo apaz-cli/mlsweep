@@ -82,6 +82,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not serve a notes folder",
     )
     parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Do not accept session traces from coding agents (`mlsweep capture`): "
+             "the Traces tab stays empty and uploads are refused",
+    )
+    parser.add_argument(
         "--terminals",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -285,6 +291,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     from mlsweep._manager_http import create_app, setup_audit_log
     from mlsweep._notes_http import setup_notes
     from mlsweep._sessions import setup_sessions
+    from mlsweep._manager_capture import setup_capture
     from mlsweep._manager_workers import (
         connect_workers,
         reconnect_known_workers,
@@ -310,6 +317,11 @@ async def _async_main(args: argparse.Namespace) -> None:
         print(f"Terminals: on, sandboxed, workspace {mlsweep_dir / 'workspace'}")
     else:
         print("Terminals: off (--no-terminals)")
+    setup_capture(app, mlsweep_dir, enabled=not args.no_capture)
+    if args.no_capture:
+        print("Capture: off (--no-capture)")
+    else:
+        print("Capture: on — `mlsweep capture on` on a machine with coding agents")
 
     runner = web.AppRunner(app)
     await runner.setup()

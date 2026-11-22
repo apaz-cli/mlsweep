@@ -6,6 +6,9 @@
 let notesEnabled = false;
 let noteMentions = {};      // experiment id -> [note paths] (its own or its runs')
 let noteRunMentions = {};   // experiment id -> {run id: [note paths]}
+// capture is optional too: a manager started with --no-capture has no traces.
+let captureEnabled = false;
+let traceCounts = {};       // experiment id -> linked trace count
 
 let rowMenu = null;
 
@@ -69,6 +72,23 @@ function notesItem(expId, runId) {
 }
 
 // Where a run's View menu leads.
+function tracesItem(expId, runId) {
+  if (!captureEnabled) return null;
+  const what = runId || expId;
+  const item = { label: "Traces", icon: "traces" };
+  if (runId) return { ...item, href: pageHref("traces.html", { experiment: expId }),
+                      title: "The coding-agent sessions around this run" };
+  const n = traceCounts[expId] ?? 0;
+  if (!traceCounts.__loaded) return { ...item, href: pageHref("traces.html", { experiment: expId }),
+                                     title: "The coding-agent sessions around this" };
+  if (!n) return { ...item, disabled: true, count: n, title: `No trace submitted ${what} yet` };
+  return {
+    ...item, count: n,
+    href: pageHref("traces.html", { experiment: expId }),
+    title: `${n} trace${n === 1 ? "" : "s"} submitted ${what}`,
+  };
+}
+
 function toggleRunView(expId, runId) {
   toggleMenu(this, `runview:${expId}/${runId}`, [
     { label: "Results", icon: "results", href: pageHref("results.html", { experiment: expId }) },
@@ -76,6 +96,7 @@ function toggleRunView(expId, runId) {
     { label: "Logs", icon: "logs", href: pageHref("logs.html", { experiment: expId, run: runId }) },
     { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId, run: runId }) },
     notesItem(expId, runId),
+    tracesItem(expId, runId),
   ].filter(Boolean));
 }
 
@@ -109,6 +130,31 @@ function watchNoteMentions(onChange) {
       notesEnabled = nextEnabled;
       if (changed) onChange();
     } catch { /* notes are optional */ }
+  }
+  poll();
+  setInterval(() => { if (!document.hidden) poll(); }, 30000);
+}
+
+// Which experiment how many traces link to, so the View menu can show the count
+// (and go disabled without one).  The count endpoint answers 404 on a manager
+// with capture off; then there is no Traces entry either.
+function watchTraceCounts(onChange) {
+  let loaded = false;
+  async function poll() {
+    try {
+      const r = await apiFetch("/api/capture/sessions?limit=200&state=all");
+      if (r.status === 404) { captureEnabled = false; return; }
+      if (!r.ok) return;
+      const sessions = await r.json();
+      captureEnabled = true;
+      const next = {};
+      for (const s of sessions) for (const e of s.experiments || []) next[e] = (next[e] || 0) + 1;
+      next.__loaded = true;
+      const changed = !loaded || JSON.stringify(next) !== JSON.stringify(traceCounts);
+      loaded = true;
+      traceCounts = next;
+      if (changed) onChange();
+    } catch { /* capture is optional */ }
   }
   poll();
   setInterval(() => { if (!document.hidden) poll(); }, 30000);

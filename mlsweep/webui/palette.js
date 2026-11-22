@@ -3,7 +3,8 @@
 (function () {
   const PAGES = [
     ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
-    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"], ["export", "Export", "⇩"],
+    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"],
+    ["traces", "Traces", "∿"], ["export", "Export", "⇩"],
     ["system", "System", "⚙"],
   ];
 

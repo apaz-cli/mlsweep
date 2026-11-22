@@ -29,6 +29,7 @@ function toggleExpView(expId) {
     { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId }),
       title: "The code this experiment ran, with its file tree and where it came from" },
     notesItem(expId),
+    tracesItem(expId),
     { label: "Export", icon: "export", count: n.finished, href: pageHref("export.html", { experiment: expId }) },
   ].filter(Boolean));
 }
@@ -283,7 +284,7 @@ function runsHtml(expId) {
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
       <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
       <td class="actions-cell" data-act=""><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes, Traces" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
@@ -520,7 +521,7 @@ function renderExperiments(exps) {
       <td>${relTime(exp.submit_time)}</td>
       <td class="notes-cell">${noteRefHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Export" ${act("toggleExpView", expId)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Traces, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
       </div></td>`;
 
@@ -579,6 +580,7 @@ function showCampaign() {
 MLCampaign.bind(campaignSelect, showCampaign);
 
 watchNoteMentions(() => { if (allExperiments.length) showCampaign(); });
+watchTraceCounts(() => { if (allExperiments.length) showCampaign(); });
 
 async function refreshAll() {
   await fetchExperiments();

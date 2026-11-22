@@ -82,6 +82,20 @@ def _resolve_token(token_arg: str | None) -> str:
     return token
 
 
+def capture_session_id() -> str | None:
+    """The agent trace this command belongs to, for experiment attribution.
+
+    Resolved from the environment the coding agent ran this command with
+    (see ``_capture.resolve_capture_session``).  Import errors or a missing
+    watcher only ever mean "no trace": a sweep is never held up by it.
+    """
+    try:
+        from mlsweep._capture import resolve_capture_session
+        return resolve_capture_session()
+    except Exception:
+        return None
+
+
 def _require_token(token_arg: str | None) -> str:
     """Like _resolve_token, but exit with an error if no token is found."""
     token = _resolve_token(token_arg)
@@ -586,6 +600,7 @@ def manager_create_experiment(
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
     controls: dict[str, Any] | None = None,
+    capture_session: str | None = None,
 ) -> dict[str, Any] | None:
     """Create an experiment in *campaign* on the manager. Returns the response dict or None.
 
@@ -616,6 +631,7 @@ def manager_create_experiment(
             **({"optimize": optimize} if optimize else {}),
             **({"code": code} if code else {}),
             **({"controls": controls} if controls else {}),
+            **({"capture_session": capture_session} if capture_session else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
@@ -2242,6 +2258,7 @@ def _main() -> None:
         optimize=spec,
         code=provenance,
         controls=info.get("controls"),
+        capture_session=capture_session_id(),
     ):
         sys.exit(1)
 

@@ -148,6 +148,10 @@ def _build_help(include_banner: bool = False) -> str:
             ("notes clone DIR", "clone the shared research notes from the manager, then use git"),
             ("notes lint [DIR]", "check links, experiment IDs and conflict markers"),
         ]),
+        ("Capture", [
+            ("capture [on|off|watch]", "record this machine's coding-agent traces to the Traces tab"),
+            ("capture [status|ls|link|import]", "capture state; traces on the manager; link one to EXP"),
+        ]),
         ("Client", [
             ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),
             ("completion bash|zsh|fish", "print a shell completion script"),
@@ -177,7 +181,7 @@ def _build_help(include_banner: bool = False) -> str:
         "when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
         f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
-        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, skill)",
+        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, traces, skill)",
         f"      or {_CYAN}mlsweep docs{_RESET}. {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
     ]
     return "\n".join(lines) + "\n"
@@ -195,6 +199,9 @@ _DOC_ALIASES = {
     "skill": "SKILL.md",
     "examples": "examples.md",
     "notes": "notes.md",
+    "traces": "traces.md",
+    "capture": "traces.md",
+    "sessions": "traces.md",
 }
 
 def _build_makefile_template() -> str:
@@ -746,6 +753,11 @@ def _dispatch(argv: list[str]) -> None:
     if cmd == "notes":
         from mlsweep.notes_cli import main as _notes_main
         _notes_main(rest)
+        return
+
+    if cmd == "capture":
+        from mlsweep._capture import _cmd as _capture_main
+        _capture_main(rest)
         return
 
     if cmd in _CTL_CMDS:

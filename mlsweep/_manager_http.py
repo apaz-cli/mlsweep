@@ -838,14 +838,38 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
     if isinstance(fields, web.Response):
         return fields
     if fields.get("optimize") is None:
-        return _json_response(await state.db_writer.create_experiment(**fields), status=201)
+        exp = await state.db_writer.create_experiment(**fields)
+        await _maybe_link_capture(request, state, body, exp)
+        return _json_response(exp, status=201)
 
     # The first trials exist by the time this returns, so a client never sees a sweep with no runs.
     async with state.lock:
         exp = await state.db_writer.create_experiment(**fields)
         await advance_optimizer_locked(db, state, exp)
+    await _maybe_link_capture(request, state, body, exp)
     state.request_schedule()
     return _json_response(exp, status=201)
+
+
+async def _maybe_link_capture(
+    request: web.Request, state: ManagerState, body: dict[str, Any], exp: Any,
+) -> None:
+    """Link a newly created experiment to the trace that submitted it.
+
+    The body's ``capture_session`` is the agent session the sweep was typed
+    into (resolved by the client from its own agent's environment).  A trace
+    the manager has not seen, or capture being off, changes nothing.
+    """
+    session_id = body.get("capture_session") if isinstance(body, dict) else None
+    if not session_id:
+        return
+    experiment_id = (exp.get("experiment_id") if isinstance(exp, dict)
+                     else getattr(exp, "experiment_id", None))
+    try:
+        from mlsweep._manager_capture import link_experiment_to_capture
+        await link_experiment_to_capture(state, str(session_id), str(experiment_id))
+    except Exception:  # capture is best effort: never fail the submission
+        pass
 
 
 @routes.get("/api/experiments/{experiment_id}")
@@ -1361,6 +1385,7 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
             status=409,
         )
 
+    await _maybe_link_capture(request, state, body, exp)
     state.request_schedule()
     return _json_response({"experiment": exp, "jobs": records}, status=201)
 
