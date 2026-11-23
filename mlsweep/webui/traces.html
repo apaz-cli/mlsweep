@@ -16,18 +16,27 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #sidebar { flex: 0 0 clamp(240px, 26vw, 320px); min-width: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
 #sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 10px; }
 .sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.list-info { font-size: 10px; color: var(--text-muted); margin-top: 6px; }
+.list-info button { border: 0; background: none; color: var(--accent-text); cursor: pointer; padding: 0 2px; font-size: 10px; }
+.list-info button:hover { text-decoration: underline; }
+.list-more { margin: 8px 12px; padding: 5px 8px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); font-size: 11px; cursor: pointer; }
+.list-more:hover { background: var(--btn-hover); }
 #search { width: 100%; padding: 5px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
 #search:focus { outline: none; border-color: var(--accent); }
-.agent-chips { display: flex; gap: 4px; }
+.agent-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .chip:hover { background: var(--btn-hover); }
 .chip.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); }
+.chip .state-dot { display: inline-block; vertical-align: 1px; margin-right: 4px; }
 #session-list { flex: 1; overflow-y: auto; }
 .session-item { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
+.session-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .session-item:hover { background: var(--btn-hover); }
 .session-item.selected { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
-.session-item-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.session-title { font-size: 12px; color: var(--text-strong); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item-top { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.session-title { font-size: 12px; line-height: 1.25; color: var(--text-strong); flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-item-top .state-dot { margin-top: 5px; }
+.session-item-top .session-agent { margin-top: 1px; }
 .session-agent { font-size: 9px; padding: 1px 5px; border-radius: 3px; flex-shrink: 0; background: var(--surface-3); color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
 .session-item-bottom { display: flex; gap: 6px; align-items: center; margin-top: 2px; font-size: 10px; color: var(--text-muted); min-width: 0; }
 .session-cwd { font-family: var(--font-mono); font-size: 10px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -36,6 +45,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .state-dot.closed { background: var(--text-muted); }
 .state-dot.imported { background: var(--info); }
 .snippet { margin-top: 3px; font-size: 10px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snippet mark { background: color-mix(in srgb, var(--warn) 32%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 .list-msg { padding: 20px 12px; color: var(--text-muted); font-size: 12px; text-align: center; }
 
 /* Main */
@@ -47,6 +57,20 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .link-chip { font-size: 10px; padding: 2px 7px; border: 1px solid var(--accent-border); border-radius: 10px; color: var(--accent-text); background: var(--accent-soft); text-decoration: none; white-space: nowrap; }
 .link-chip:hover { border-color: var(--accent); }
 .hdr-spacer { flex: 1; }
+.trace-links { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chip-wrap { display: inline-flex; align-items: stretch; border: 1px solid var(--accent-border); border-radius: 10px; background: var(--accent-soft); overflow: hidden; }
+.chip-wrap .link-chip { border: 0; background: none; border-radius: 0; padding: 2px 2px 2px 8px; }
+.chip-wrap .unlink { border: 0; background: none; color: var(--accent-text); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 6px 0 2px; opacity: .55; }
+.chip-wrap .unlink:hover { opacity: 1; color: var(--bad); }
+.trace-state { font-size: 9px; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; letter-spacing: .04em; border: 1px solid var(--border); color: var(--text-dim); }
+.trace-state.active { color: var(--ok); border-color: var(--ok); }
+.trace-state.imported { color: var(--info); border-color: var(--info); }
+.add-link { font-size: 15px; line-height: 1; padding: 1px 7px; }
+.hdr-notes { font-size: 10px; color: var(--accent-text); text-decoration: none; }
+.hdr-notes:hover { text-decoration: underline; }
+.turn-nav { display: inline-flex; align-items: center; gap: 1px; }
+.turn-pos { min-width: 4.2em; text-align: center; font: 10px/1 var(--font-mono); color: var(--text-dim); }
+.icon-btn:disabled { opacity: .3; cursor: default; }
 #in-filter { width: 150px; padding: 4px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 11px; background: var(--btn-bg); color: var(--text); }
 #in-filter:focus { outline: none; border-color: var(--accent); }
 
@@ -54,7 +78,12 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #ledger-wrap { flex: 1; overflow: auto; min-height: 0; }
 #ledger { width: 100%; table-layout: fixed; border-spacing: 0; border-collapse: collapse; font-size: 12.5px; line-height: 1.5; }
 #ledger td { padding: 0 10px; vertical-align: top; border-bottom: 1px solid var(--border); }
-#ledger .tag-col { width: 108px; position: relative; padding-left: 12px; }
+#ledger .time-col { width: 80px; padding-left: 12px; padding-top: 7px; font: 10px/1.4 var(--font-mono); color: var(--text-muted); white-space: nowrap; }
+#ledger .tag-col { width: 100px; position: relative; padding-left: 8px; }
+.event-status { margin-left: 6px; font: 10px var(--font-mono); cursor: pointer; user-select: none; }
+.event-status.ok { color: var(--ok); }
+.event-status.err { color: var(--bad); }
+.event-status:hover { text-decoration: underline; }
 #ledger tr.turn-start td { border-top: 2px solid var(--border-strong); }
 #ledger tr.turn-start .tag-col::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent-soft); }
 #ledger tbody tr:hover { background: var(--btn-hover); }
@@ -66,6 +95,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .kind-tool { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); }
 .kind-tool_result { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .kind-meta { color: var(--text-muted); background: var(--surface-3); }
+.kind-meta .event-text { color: var(--text-muted); font-size: 11px; }
 .event-text { display: block; white-space: pre-wrap; word-break: break-word; padding: 4px 0; min-width: 0; }
 .kind-user .event-text { font-weight: 500; color: var(--text-strong); }
 .kind-thinking .event-text { font-style: italic; color: var(--text-muted); }
@@ -76,6 +106,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .event-err { color: var(--bad); font-size: 11px; }
 .turn-label { position: absolute; right: 4px; top: 4px; font: 8px/10px var(--font-mono); color: var(--text-muted); }
 #ledger-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
+#ledger-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* Inspector */
 #inspector { flex: 0 0 clamp(300px, 34%, 480px); border-left: 1px solid var(--border); background: var(--surface); display: none; flex-direction: column; min-width: 0; overflow: hidden; }
@@ -86,8 +117,10 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .event-full.tool { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
 .overview { display: grid; grid-template-columns: 90px 1fr; gap: 3px 10px; margin-top: 12px; font-size: 11px; }
 .overview dt { color: var(--text-dim); }
+.overview-link { border: 0; background: none; padding: 0; color: var(--accent-text); font: inherit; cursor: pointer; text-decoration: underline; }
 .overview dd { color: var(--text-label); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#inspector-close { margin-left: auto; }
+#inspector-copy { margin-left: auto; }
+#inspector-close { margin-left: 0; }
 
 /* No selection */
 #no-sel { flex: 1; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
@@ -112,30 +145,49 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
       <div>
         <span class="sb-title">Agent</span>
         <div class="agent-chips" id="agent-chips">
-          <button class="chip active" data-agent="">all</button>
-          <button class="chip" data-agent="pi">pi</button>
-          <button class="chip" data-agent="claude_code">claude</button>
+          <button class="chip active" data-agent="" aria-pressed="true">all</button>
+          <button class="chip" data-agent="pi" aria-pressed="false">pi</button>
+          <button class="chip" data-agent="claude_code" aria-pressed="false">claude</button>
         </div>
       </div>
+      <div>
+        <span class="sb-title">State</span>
+        <div class="agent-chips" id="state-chips">
+          <button class="chip active" data-state="all" aria-pressed="true">all</button>
+          <button class="chip" data-state="active" aria-pressed="false"><span class="state-dot"></span>live</button>
+          <button class="chip" data-state="closed" aria-pressed="false"><span class="state-dot closed"></span>closed</button>
+          <button class="chip" data-state="imported" aria-pressed="false"><span class="state-dot imported"></span>imported</button>
+        </div>
+        <div class="list-info" id="list-info" aria-live="polite"></div>
+      </div>
     </div>
-    <div id="session-list">
+    <div id="session-list" role="listbox" aria-label="Traces">
       <div class="list-msg">Loading…</div>
     </div>
+    <button id="more-btn" class="list-more" hidden>Show more traces</button>
   </div>
 
   <div id="main">
     <div id="trace-header">
       <span class="trace-title" id="trace-title">No trace selected</span>
       <span class="agent-tag" id="trace-agent" style="display:none"></span>
+      <span class="trace-state" id="trace-state" style="display:none"></span>
       <span class="trace-meta" id="trace-meta"></span>
-      <span id="trace-links" style="display:flex;gap:4px;align-items:center;"></span>
+      <span id="trace-links" class="trace-links" style="display:none"></span>
+      <button class="icon-btn add-link" id="link-btn" style="display:none" title="Link this trace to an experiment">+</button>
+      <a class="hdr-notes" id="trace-notes" style="display:none"></a>
       <span class="hdr-spacer"></span>
+      <span class="turn-nav" id="turn-nav" style="display:none">
+        <button class="icon-btn" id="turn-prev" title="Previous prompt (&#91;)">&#8249;</button>
+        <span class="turn-pos" id="turn-pos"></span>
+        <button class="icon-btn" id="turn-next" title="Next prompt (&#93;)">&#8250;</button>
+      </span>
       <input id="in-filter" type="search" placeholder="Filter events…" style="display:none">
       <a class="icon-btn" id="dl-btn" style="display:none" title="Download transcript (JSONL)">&#8599;</a>
+      <button class="icon-btn" id="menu-btn" style="display:none" title="More actions">&#8942;</button>
       <button class="icon-btn" id="refresh-btn" title="Refresh">&#8635;</button>
-      <button class="icon-btn" id="delete-btn" style="display:none" title="Delete this trace">&times;</button>
     </div>
-    <div id="ledger-wrap">
+    <div id="ledger-wrap" tabindex="0" role="region" aria-label="Trace events">
       <div id="no-sel">
         <div>Pick a trace from the left, or turn capture on:</div>
         <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim)">mlsweep capture on</div>
@@ -148,6 +200,7 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
     <div id="inspector-header">
       <span class="kind-tag" id="inspector-kind">event</span>
       <span class="trace-meta" id="inspector-where"></span>
+      <button class="icon-btn" id="inspector-copy" title="Copy this event">&#10697;</button>
       <button class="icon-btn" id="inspector-close">&times;</button>
     </div>
     <div id="inspector-body">

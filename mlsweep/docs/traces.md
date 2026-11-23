@@ -79,15 +79,30 @@ an experiment by hand.
 
 ## Reading traces
 
-The **Traces** tab lists the sessions every linked machine uploaded. A trace
-page is a ledger: a narrow lane of event tags, then the content — your
-prompts, the agent's replies, its thinking collapsed and dimmed, tool calls
-one line each. Clicking an event opens the inspector with the full text and
-its metadata (model, tokens). A search box over the sidebar searches
-every trace's text; a second box filters the open trace's events.
+The **Traces** tab lists the sessions every linked machine uploaded, newest
+activity first. The sidebar filters by agent and by state (live, closed,
+imported), and its search box searches every trace's text, title and working
+directory; a second box filters the open trace's events. A trace too far down
+the list is reached with **Show more traces**.
+
+A trace page is a ledger: a time column, the event tag, then the content —
+your prompts, the agent's replies, its thinking collapsed and dimmed, tool
+calls one line each with their result's status and duration. Clicking an event
+opens the inspector with the full text and its metadata (model, tokens), and a
+copy button. The turn counter in the header steps between prompts (`[` and
+`]`); `j`/`k` or the arrow keys move through events, `Enter` opens one, `Esc`
+closes the inspector, and `/` jumps to the search box. The page's URL names the
+open trace and the selected event, so a copied link comes back to them.
+
+A trace records the experiments it submitted, and each chip links to one. `+`
+links a trace the auto-link missed (choose the experiment from a list), and the
+chip's `×` unlinks it. The `⋮` menu copies the trace id or its
+`mlsweep:trace/<id>` reference for a note, downloads the transcript, or deletes
+the trace. When notes are served, the header also says how many notes cite the
+trace.
 
 An experiment page links to the traces that submitted it, the other way
-around too.
+around too (its **Traces** entry filters this list to that experiment).
 
 ## Notes
 

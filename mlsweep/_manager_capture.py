@@ -21,9 +21,11 @@ from mlsweep._manager_db import (
     _MAX_EVENTS_PER_SESSION,
     CAPTURE_STATES,
     DbWriter,
+    capture_counts,
     capture_sessions_for_experiment,
     get_capture_events,
     get_capture_session,
+    get_experiment,
     list_capture_sessions,
     search_capture,
     validate_capture_id,
@@ -133,6 +135,8 @@ async def handle_capture_link(request: web.Request) -> web.Response:
         return _bad_request("'source' must be 'auto' or 'manual'")
     if not await get_capture_session(db, session_id):
         raise _not_found_exc("trace")
+    if not await get_experiment(db, experiment_id):
+        raise _not_found_exc("experiment")
     created = await state.db_writer.link_capture(session_id, experiment_id, source)
     return _json_response({"session_id": session_id, "experiment_id": experiment_id,
                            "linked": created}, status=201)
@@ -192,6 +196,14 @@ async def handle_capture_search(request: web.Request) -> web.Response:
     except ValueError:
         return _bad_request("limit must be an integer")
     return _json_response(await search_capture(db, q, limit=limit))
+
+
+@capture_routes.get("/api/capture/counts")
+async def handle_capture_counts(request: web.Request) -> web.Response:
+    """How many traces there are, in total and per experiment (for the row menus)."""
+    if not _enabled(request):
+        return _refuse()
+    return _json_response(await capture_counts(request.config_dict[DB_KEY]))
 
 
 @capture_routes.get("/api/capture/sessions/{session_id}")

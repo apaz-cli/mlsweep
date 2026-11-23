@@ -83,10 +83,12 @@ def test_pi_normalizer_produces_expected_events():
         PI_TOOL_RESULT_LINE,
     ])
     kinds = [e["kind"] for e in events]
-    assert kinds == ["user", "thinking", "assistant", "tool", "tool", "tool_result"]
+    assert kinds == ["meta", "user", "thinking", "assistant", "tool", "tool", "tool_result"]
     assert meta["cwd"] == "/home/apaz/git/mlsweep"
     assert meta["native_id"] == "01a2047e-e683-706c-8e4d-58c9e737378e"
-    user, thinking, assistant, tool, edit, result = events
+    # A model switch stays in the ledger, so later events make sense.
+    model, user, thinking, assistant, tool, edit, result = events
+    assert model["text"] == "model → test-model"
     assert user["text"] == "Run the sweep"
     assert thinking["text"] == "Let me look at the repo."
     assert assistant["text"] == "On it."
@@ -101,7 +103,7 @@ def test_pi_normalizer_produces_expected_events():
     assert "output" not in json.dumps(result)
     # Within one line the events number onward; across lines the caller
     # renumbers (see read_transcript).
-    assert [e["seq"] for e in events] == [0, 0, 1, 2, 3, 0]
+    assert [e["seq"] for e in events] == [0, 0, 0, 1, 2, 3, 0]
 
 
 def test_pi_session_id_is_the_native_id_without_prefix():
@@ -360,6 +362,35 @@ def test_capture_manual_link_and_unlink(manager_server):
     assert body["experiments"] == []
 
 
+def test_capture_search_titles_counts_and_link_errors(manager_server):
+    server, url = manager_server
+    token = server.token
+    session = {**_SESSION, "session_id": "searchme", "title": "Warmup investigation"}
+    _post(url, token, "/api/capture/sessions",
+          {"session": session, "events": [{"seq": 1, "ts": 1.0, "kind": "user", "text": "hello"}]})
+
+    # A title match finds the trace even though the FTS index holds only events.
+    status, body = _get(url, token, "/api/capture/search?q=warmup")
+    assert status == 200 and [s["session_id"] for s in body] == ["searchme"]
+    assert body[0]["snippet"] == "Warmup investigation"
+
+    # A quote is a search term, not an FTS5 syntax error.
+    status, _ = _get(url, token, "/api/capture/search?q=%22warmup")
+    assert status == 200
+
+    # Counts drive the View menus, without listing every session.
+    _post(url, token, "/api/experiments", {"experiment_id": "sweep_counts_1", "campaign": "main"})
+    _post(url, token, "/api/capture/link",
+          {"session_id": "searchme", "experiment_id": "sweep_counts_1", "source": "manual"})
+    status, body = _get(url, token, "/api/capture/counts")
+    assert status == 200 and body == {"sessions": 1, "experiments": {"sweep_counts_1": 1}}
+
+    # Linking to an experiment the manager does not have is a 404, not a 500.
+    status, _ = _post(url, token, "/api/capture/link",
+                      {"session_id": "searchme", "experiment_id": "no_such_experiment"})
+    assert status == 404
+
+
 def test_capture_delete(manager_server):
     server, url = manager_server
     token = server.token
@@ -519,5 +550,32 @@ def test_traces_page_renders_a_session(tmp_path_factory):
         # A tool call is one line with its name; tool results show a status, not output.
         b.eval("document.querySelectorAll('#ledger tbody tr')[2].click()")
         b.wait_for("document.getElementById('inspector-kind').textContent === 'bash'")
+
+        # The address bar holds the open trace, so a reload keeps it.
+        assert "session=" + _SESSION["session_id"] in b.eval("location.search")
+        # Time, turn counter and the filters are part of the ledger.
+        assert b.eval("[...document.querySelectorAll('#ledger .time-col')]"
+                      ".every(td => td.textContent.length > 0)")
+        assert b.eval("document.getElementById('turn-pos').textContent") == "1 / 1"
+        # The More menu carries the note reference; deleting lives there, not
+        # next to Refresh.
+        b.eval("document.getElementById('menu-btn').click()")
+        b.wait_for("!!document.querySelector('.ml-ctx')")
+        items = b.eval("[...document.querySelectorAll('.ml-ctx-item .l')].map(x => x.textContent)")
+        assert "Copy note reference" in items and "Delete trace" in items, items
+        b.eval("document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+        # Filtering by state narrows the list, and clearing brings it back.
+        b.eval("[...document.querySelectorAll('#state-chips .chip')]"
+               ".find(c => c.dataset.state === 'closed').click()")
+        b.wait_for("document.querySelectorAll('.session-item').length === 0")
+        assert "No traces match" in b.eval("document.getElementById('session-list').textContent")
+        b.eval("[...document.querySelectorAll('#state-chips .chip')]"
+               ".find(c => c.dataset.state === 'all').click()")
+        b.wait_for("document.querySelectorAll('.session-item').length === 1")
+        # View -> Traces on an experiment filters to its traces, not the whole list.
+        b.goto(static_url(server, "traces.html", experiment="sweep_traced_1"))
+        b.wait_for("document.querySelectorAll('.session-item').length === 1")
+        info = b.eval("document.getElementById('list-info').textContent")
+        assert info.startswith("1 trace") and "exp sweep_traced_1" in info, info
     finally:
         b.close()

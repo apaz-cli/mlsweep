@@ -136,20 +136,31 @@ function watchNoteMentions(onChange) {
 }
 
 // Which experiment how many traces link to, so the View menu can show the count
-// (and go disabled without one).  The count endpoint answers 404 on a manager
+// (and go disabled without one).  The counts endpoint answers 404 on a manager
 // with capture off; then there is no Traces entry either.
 function watchTraceCounts(onChange) {
   let loaded = false;
   async function poll() {
     try {
-      const r = await apiFetch("/api/capture/sessions?limit=200&state=all");
-      if (r.status === 404) { captureEnabled = false; return; }
-      if (!r.ok) return;
-      const sessions = await r.json();
+      const r = await apiFetch("/api/capture/counts");
+      let counts = null;
+      if (r.ok) {
+        counts = await r.json();
+      } else if (r.status === 404) {
+        // A manager from before the counts route: fall back to the session list.
+        const list = await apiFetch("/api/capture/sessions?limit=200&state=all");
+        if (list.status === 404) { captureEnabled = false; return; }
+        if (!list.ok) return;
+        const byExperiment = {};
+        for (const s of await list.json()) {
+          for (const e of s.experiments || []) byExperiment[e] = (byExperiment[e] || 0) + 1;
+        }
+        counts = { experiments: byExperiment };
+      } else {
+        return;
+      }
       captureEnabled = true;
-      const next = {};
-      for (const s of sessions) for (const e of s.experiments || []) next[e] = (next[e] || 0) + 1;
-      next.__loaded = true;
+      const next = { ...(counts.experiments || {}), __loaded: true };
       const changed = !loaded || JSON.stringify(next) !== JSON.stringify(traceCounts);
       loaded = true;
       traceCounts = next;

@@ -3540,6 +3540,34 @@ async def get_capture_session(db: aiosqlite.Connection, session_id: str) -> dict
     return dict(row) if row else None
 
 
+# How many sessions one page may ask for.  The sidebar pages through them, so
+# this only bounds a single request.
+_MAX_SESSION_LIST = 1000
+
+# Search snippets mark their matches with characters no transcript contains, so
+# the page can highlight them without trusting the text as HTML.
+SEARCH_MARK_START = "\x01"
+SEARCH_MARK_END = "\x02"
+
+
+async def _attach_experiment_links(
+    db: aiosqlite.Connection, sessions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add each session's linked experiment ids, in one query."""
+    ids = [s["session_id"] for s in sessions]
+    links: dict[str, list[str]] = {i: [] for i in ids}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        link_rows = await _exec_all(
+            db, f"SELECT session_id, experiment_id FROM capture_links WHERE session_id IN ({marks})",
+            tuple(ids))
+        for lid, eid in link_rows:
+            links[str(lid)].append(str(eid))
+    for s in sessions:
+        s["experiments"] = links[s["session_id"]]
+    return sessions
+
+
 async def list_capture_sessions(
     db: aiosqlite.Connection, *, agent: str | None = None, state: str | None = None,
     q: str | None = None, experiment_id: str | None = None, limit: int = 50,
@@ -3559,46 +3587,67 @@ async def list_capture_sessions(
     if experiment_id:
         where.append("session_id IN (SELECT session_id FROM capture_links WHERE experiment_id = ?)")
         params.append(experiment_id)
-    params.append(min(max(limit, 1), 200))
+    params.append(min(max(limit, 1), _MAX_SESSION_LIST))
     rows = await _exec_all(
         db, f"SELECT * FROM capture_sessions WHERE {' AND '.join(where)} "
             "ORDER BY last_seen_at DESC LIMIT ?", tuple(params))
-    sessions = [dict(r) for r in rows]
-    ids = [s["session_id"] for s in sessions]
-    links: dict[str, list[str]] = {i: [] for i in ids}
-    if ids:
-        marks = ",".join("?" * len(ids))
-        link_rows = await _exec_all(
-            db, f"SELECT session_id, experiment_id FROM capture_links WHERE session_id IN ({marks})",
-            tuple(ids))
-        for lid, eid in link_rows:
-            links[str(lid)].append(str(eid))
-    for s in sessions:
-        s["experiments"] = links[s["session_id"]]
-    return sessions
+    return await _attach_experiment_links(db, [dict(r) for r in rows])
 
 
 def _fts_query(q: str) -> str:
     """*q* as an FTS5 MATCH query: terms ANDed, quotes kept as one term."""
-    terms = [f'"{t}"' for t in q.split() if t]
+    terms = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in q.split() if t]
     return " AND ".join(terms) if terms else '""'
+
+
+def _like_pattern(q: str) -> str:
+    """*q* as a LIKE pattern: its own `%` and `_` are literal."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 async def search_capture(
     db: aiosqlite.Connection, q: str, *, limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """Sessions matching *q*, with a snippet of the best-matching event text."""
+    """Sessions matching *q* in their events, title or working directory.
+
+    A snippet of the best-matching event text comes with each result, its matches
+    wrapped in ``SEARCH_MARK_START``/``SEARCH_MARK_END``.
+    """
+    limit = min(max(limit, 1), 100)
     rows = await _exec_all(
-        db, "SELECT session_id, snippet(capture_fts, 1, '', '', ' … ', 12) AS snippet "
-            "FROM capture_fts WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
-        (_fts_query(q), min(max(limit, 1), 100)))
-    out = []
-    for session_id, snippet in rows:
-        session = await get_capture_session(db, str(session_id))
-        if session:
-            session["snippet"] = snippet
-            out.append(session)
-    return out
+        db, "SELECT s.*, snippet(capture_fts, 1, ?, ?, ' … ', 12) AS snippet "
+            "FROM capture_fts JOIN capture_sessions s ON s.session_id = capture_fts.session_id "
+            "WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
+        (SEARCH_MARK_START, SEARCH_MARK_END, _fts_query(q), limit))
+    found = [dict(r) for r in rows]
+    seen = {s["session_id"] for s in found}
+    # Titles and working directories are not in the FTS index; match them too,
+    # so "which session was in that repo" finds the trace.
+    like = _like_pattern(q)
+    extra = await _exec_all(
+        db, "SELECT * FROM capture_sessions WHERE (title LIKE ? ESCAPE '\\' "
+            "OR cwd LIKE ? ESCAPE '\\') ORDER BY last_seen_at DESC LIMIT ?",
+        (like, like, limit))
+    for row in extra:
+        session = dict(row)
+        if session["session_id"] in seen:
+            continue
+        session["snippet"] = session.get("title") or session.get("cwd") or ""
+        found.append(session)
+    found = found[:limit]
+    return await _attach_experiment_links(db, found)
+
+
+async def capture_counts(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Trace totals for the dashboard: all sessions, and per experiment."""
+    total = await _exec_one(db, "SELECT COUNT(*) FROM capture_sessions")
+    rows = await _exec_all(
+        db, "SELECT experiment_id, COUNT(*) FROM capture_links GROUP BY experiment_id")
+    return {
+        "sessions": int(total[0]) if total else 0,
+        "experiments": {str(eid): int(n) for eid, n in rows},
+    }
 
 
 async def get_capture_events(

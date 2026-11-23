@@ -71,6 +71,10 @@ from mlsweep._shared import _mlsweep_dir
 #    "tool_id": "call_00"}
 #   {"seq": 14, ..., "kind": "tool_result", "name": "bash", "ok": true,
 #    "duration_ms": 24}
+#   {"seq": 15, ..., "kind": "meta", "text": "model → claude-sonnet-5"}
+#
+# `meta` is a note the agent's transcript carries (a model switch, say), shown
+# as its own line in the ledger.
 #
 # A trace's id is the agent's own native session id (a UUID for both pi and
 # Claude Code).  The agent is a column, not part of the id.
@@ -148,8 +152,11 @@ def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> 
             meta["native_id"] = str(line["id"])
         return []
     if kind == "model_change":
-        meta["model"] = line.get("modelId") or meta.get("model")
-        return []
+        model = line.get("modelId") or meta.get("model")
+        meta["model"] = model
+        # A switch mid-session explains why later events name another model.
+        return [_event(seq, _iso_to_epoch(line.get("timestamp")), "meta",
+                       text=f"model → {model}")] if model else []
     if kind != "message":
         return []
     message = line.get("message") or {}
