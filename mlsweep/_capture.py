@@ -1,10 +1,20 @@
 """Session capture: coding-agent traces, in the manager's dashboard.
 
 Every coding agent writes a transcript of its session on disk.  The capture
-watcher tails those transcripts, normalizes them to a small event schema, and
-uploads each session to the manager, which serves it on the dashboard's
-Traces tab next to the notes.  A trace answers "why was this experiment run":
-the conversation that produced it, searchable later.
+watcher tails the transcripts of the sessions it follows, normalizes them to a
+small event schema, and uploads each one to the manager, which serves it on
+the dashboard's Traces tab next to the notes.  A trace answers "why was this
+experiment run": the conversation that produced it, searchable later.
+
+Which sessions
+--------------
+Only followed sessions are ever read.  A session is followed when it asks to
+be (``mlsweep capture this``, run inside it) or, while capture is on, when it
+submits or links an experiment (``mlsweep run``, ``mlsweep capture link``).
+Every other transcript on the machine is never opened.  A followed session is
+uploaded from its first line, so its trace holds the whole conversation.
+Follow requests are files in ``<capture-dir>/follow/``, one per session, so a
+client command never writes the watcher's own state.
 
 What is captured (per event):
 
@@ -18,30 +28,24 @@ What is captured (per event):
 What is not captured: tool output, file contents, the system prompt.
 
 Nothing is redacted and nothing is streamed: the watcher uploads a session's
-new events in one batch once its transcript has been quiet for a while, and
-again when the session closes.  Sessions are tiny.
+new events in one batch right after it is followed, then whenever its
+transcript has been quiet for a while, and again when the session closes.
 
 Attribution
 -----------
 `mlsweep run` and friends want to link the experiment they submit to the agent
 session they were typed into.  The harnesses tell their children who they are:
-
-  * pi exports ``PI_SESSION_ID`` / ``PI_SESSION_FILE`` into every child
-    process, so a command the agent runs carries its own session's id;
-
-  * other agents fall back to the process tree: the client walks its
-    ``/proc`` ancestors and matches each against the watcher's registry of
-    running agent processes (``capture/active.json``), then against the most
-    recent transcript whose session cwd matches an ancestor's cwd.
-
-Every answer is exact per agent context — two agents in one directory are two
-sessions and never cross-link.  ``MLSWEEP_SESSION_ID`` overrides everything.
+pi exports ``PI_SESSION_ID`` / ``PI_SESSION_FILE`` and Claude Code exports
+``CLAUDE_CODE_SESSION_ID`` into every child process.  The client reads its own
+environment, then its ``/proc`` ancestors' (for a command whose environment
+was scrubbed).  Nothing is guessed: no variable means no session.
+``MLSWEEP_SESSION_ID`` overrides everything.
 
 Consent
 -------
-Capture is off until ``mlsweep capture on`` turns it on for this machine.  It
-writes the manager URL and token into ``<capture-dir>/on.json`` and starts the
-watcher.  ``mlsweep capture off`` removes the credential, stops the watcher and
+Capture is off until ``mlsweep capture on`` (or the first ``capture this``)
+turns it on for this machine.  It writes the manager URL and token into
+``<capture-dir>/on.json`` and starts the watcher, which follows nothing yet.  ``mlsweep capture off`` removes the credential, stops the watcher and
 writes an ``off.json`` marker (who, when) that a running watcher checks every
 loop — so "off" holds even if stopping the process failed.  Turning capture
 back on replaces the marker; what was never uploaded stays local.
@@ -212,19 +216,42 @@ def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> 
 # title, every line a sessionId (and most a cwd).
 
 
+_CLAUDE_COMMAND_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
+_CLAUDE_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+
+
+def _claude_prompt_text(text: str, line: dict[str, Any]) -> str:
+    """What the user typed, from a Claude Code user text block.
+
+    A slash command arrives wrapped in tags and becomes ``/name args``.  Its
+    local output (``<local-command-stdout>``) and the harness's own tagged
+    notes are not prompts: they are dropped, like other tool output.
+    """
+    if (line.get("origin") or {}).get("kind") == "human":
+        return text
+    command = _CLAUDE_COMMAND_RE.search(text)
+    if command:
+        args = _CLAUDE_ARGS_RE.search(text)
+        return " ".join(p for p in (command.group(1), args.group(1) if args else "") if p)
+    if text.startswith("<") and re.match(r"<[a-z][a-z0-9-]*>", text):
+        return ""
+    return text
+
+
 def _normalize_claude_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> list[dict[str, Any]]:
     kind = line.get("type")
     if line.get("sessionId"):
         meta["native_id"] = str(line["sessionId"])
-    if line.get("cwd"):
-        meta.setdefault("cwd", str(line["cwd"]))
+    if line.get("cwd") and not meta.get("cwd"):
+        meta["cwd"] = str(line["cwd"])
     ts = _iso_to_epoch(line.get("timestamp"))
     if kind == "summary":
         meta["title"] = line.get("summary") or meta.get("title")
         return []
     if kind == "attachment":
         snapshot = (line.get("attachment") or {}).get("snapshot") or {}
-        meta.setdefault("cwd", snapshot.get("workingDirectory"))
+        if snapshot.get("workingDirectory") and not meta.get("cwd"):
+            meta["cwd"] = str(snapshot["workingDirectory"])
         return []
     if kind not in ("user", "assistant"):
         return []
@@ -242,10 +269,12 @@ def _normalize_claude_line(line: dict[str, Any], seq: int, meta: dict[str, Any])
                     ok=not block.get("is_error", False)))
                 seq += 1
             elif block.get("type") == "text" and (block.get("text") or "").strip():
-                if line.get("origin", {}).get("kind") != "human" and line.get("isMeta") is True:
+                if (line.get("origin") or {}).get("kind") != "human" and line.get("isMeta") is True:
                     continue  # tool results replayed as user messages
-                events.append(_event(seq, ts, "user", text=block["text"].strip()))
-                seq += 1
+                text = _claude_prompt_text(block["text"].strip(), line)
+                if text:
+                    events.append(_event(seq, ts, "user", text=text))
+                    seq += 1
         return events
     events = []
     usage = message.get("usage") or {}
@@ -344,6 +373,7 @@ class SessionState:
     last_seen_at: float = 0.0
     offset: int = 0          # transcript bytes read so far
     uploaded_seq: int = 0    # highest seq the manager has
+    last_upload_at: float = 0.0
     closed: bool = False
 
 
@@ -354,11 +384,60 @@ def _native_id_from_path(agent: str, path: Path) -> str:
     return stem
 
 
-class CaptureClient:
-    """The watcher's state: which transcripts are where, and what was uploaded.
+def find_transcript(specs: list[AgentSpec], session_id: str) -> tuple[AgentSpec, Path] | None:
+    """The transcript file a session id names, and the agent that wrote it."""
+    if not session_id or "/" in session_id or session_id.startswith("."):
+        return None
+    for spec in specs:
+        if not spec.directory.is_dir():
+            continue
+        pattern = f"*/*_{session_id}.jsonl" if spec.name == "pi" else f"*/{session_id}.jsonl"
+        for path in sorted(spec.directory.glob(pattern)):
+            return spec, path
+    return None
 
-    Everything survives a restart in ``state.json``; event batches not yet
-    accepted sit in ``pending/<session_id>.jsonl``.
+
+def follow_dir() -> Path:
+    return capture_dir() / "follow"
+
+
+def request_follow(session_id: str, directory: Path | None = None, *, why: str = "") -> Path:
+    """Ask the watcher to follow a session: one small file per session.
+
+    Client commands write here and nowhere else, so they never race the
+    watcher's own state file.
+    """
+    root = directory or follow_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "_-." else "_" for c in session_id)[:150]
+    path = root / f"{safe}.json"
+    if not path.exists():
+        path.write_text(json.dumps({
+            "session_id": session_id, "why": why, "at": time.time(),
+            "by": f"{os.getenv('USER', 'user')}@{socket.gethostname()}",
+        }))
+    return path
+
+
+def followed_requests(directory: Path | None = None) -> list[dict[str, Any]]:
+    root = directory or follow_dir()
+    out: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json")) if root.is_dir() else []:
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict) and raw.get("session_id"):
+            out.append(raw)
+    return out
+
+
+class CaptureClient:
+    """The watcher's state: the sessions it follows, and what was uploaded.
+
+    Everything survives a restart in ``followed.json``; event batches not yet
+    accepted sit in ``pending/<session_id>.jsonl``.  Only sessions with a
+    follow request (``<dir>/follow/``) are ever read.
     """
 
     IDLE_SECONDS = 60.0        # a quiet transcript is ready to upload
@@ -369,8 +448,8 @@ class CaptureClient:
     def __init__(self, directory: Path | None = None) -> None:
         self.dir = directory or capture_dir()
         self.pending_dir = self.dir / "pending"
-        self.state_path = self.dir / "state.json"
-        self.active_path = self.dir / "active.json"
+        self.follow_dir = self.dir / "follow"
+        self.state_path = self.dir / "followed.json"
         self.sessions: dict[str, SessionState] = {}
 
     # ── persistence ──────────────────────────────────────────────────
@@ -399,43 +478,57 @@ class CaptureClient:
         except OSError:
             return 0
 
+    # ── following ────────────────────────────────────────────────────
+
+    def follow(self, specs: list[AgentSpec], session_id: str) -> SessionState | None:
+        """Start following a session, if its transcript can be found."""
+        if session_id in self.sessions:
+            return self.sessions[session_id]
+        found = find_transcript(specs, session_id)
+        if found is None:
+            return None  # not written yet; the request stays and is retried
+        spec, path = found
+        stat = path.stat()
+        state = SessionState(
+            session_id=session_id, agent=spec.name, path=str(path),
+            native_id=_native_id_from_path(spec.name, path),
+            started_at=stat.st_ctime, last_seen_at=stat.st_mtime,
+        )
+        self.sessions[session_id] = state
+        return state
+
+    def follow_requested(self, specs: list[AgentSpec]) -> None:
+        for request in followed_requests(self.follow_dir):
+            self.follow(specs, str(request["session_id"]))
+
     # ── transcript reading ───────────────────────────────────────────
 
     def scan(self, specs: list[AgentSpec]) -> None:
-        """Pick up new and grown transcripts, normalizing their new lines."""
-        for spec in specs:
-            for path in spec.sessions():
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                state = self._state_for(spec, path, stat)
-                if state.closed:
-                    continue
-                state.last_seen_at = stat.st_mtime
-                if stat.st_size <= state.offset:
-                    continue
-                with path.open("rb") as f:
-                    f.seek(state.offset)
-                    raw = f.read(stat.st_size - state.offset)
-                state.offset += len(raw)
-                self._consume(state, spec, raw)
-
-    def _state_for(self, spec: AgentSpec, path: Path, stat: os.stat_result) -> SessionState:
-        key = str(path)
+        """Read what followed transcripts gained since the last scan."""
+        by_name = {spec.name: spec for spec in specs}
         for state in self.sessions.values():
-            if state.path == key:
-                if stat.st_size < state.offset:  # truncated or replaced: read it again
-                    state.offset = 0
-                    state.closed = False
-                return state
-        native_id = _native_id_from_path(spec.name, path)
-        state = SessionState(
-            session_id=session_id_for(spec.name, native_id), agent=spec.name, path=key,
-            native_id=native_id, started_at=stat.st_ctime, last_seen_at=stat.st_mtime,
-        )
-        self.sessions[state.session_id] = state
-        return state
+            spec = by_name.get(state.agent)
+            if spec is None or state.closed:
+                continue
+            path = Path(state.path)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size < state.offset:  # truncated or replaced: read it again
+                state.offset = 0
+            state.last_seen_at = stat.st_mtime
+            if stat.st_size <= state.offset:
+                continue
+            with path.open("rb") as f:
+                f.seek(state.offset)
+                raw = f.read(stat.st_size - state.offset)
+            # Only whole lines: a line the agent is still writing waits.
+            cut = raw.rfind(b"\n") + 1
+            if not cut:
+                continue
+            state.offset += cut
+            self._consume(state, spec, raw[:cut])
 
     def _consume(self, state: SessionState, spec: AgentSpec, raw: bytes) -> None:
         meta: dict[str, Any] = {
@@ -454,11 +547,10 @@ class CaptureClient:
                 continue
             events.extend(spec.normalize(parsed, 0, meta))
         self._apply_meta(state, meta)
-        # An agent that names no title gets one from its first prompt.
+        if not state.model:
+            state.model = next((str(e["model"]) for e in events if e.get("model")), "")
         if not state.title:
-            first_user = next((e for e in events if e["kind"] == "user" and e.get("text")), None)
-            if first_user:
-                state.title = first_user["text"][:80]
+            state.title = title_from_events(events)
         if not events:
             return
         # Renumber across reads: seq continues from uploaded + still-pending.
@@ -485,21 +577,25 @@ class CaptureClient:
     # ── upload scheduling ─────────────────────────────────────────────
 
     def due_sessions(self, now: float) -> list[SessionState]:
-        """Sessions with pending events that are quiet enough to upload."""
+        """Sessions with pending events that are quiet enough to upload.
+
+        A session never uploaded is due at once, so following one shows its
+        trace within a poll or two.
+        """
         out = []
         for state in self.sessions.values():
             if state.closed:
                 continue
-            pending = self.pending_count(state.session_id)
-            if not pending:
+            if not self.pending_count(state.session_id):
                 continue
             idle = now - state.last_seen_at
-            if idle >= self.IDLE_SECONDS or now - state.started_at >= self.FORCE_SECONDS:
+            if idle >= self.IDLE_SECONDS or now - state.last_upload_at >= self.FORCE_SECONDS:
                 out.append(state)
         return out
 
-    def mark_uploaded(self, state: SessionState, count: int) -> None:
+    def mark_uploaded(self, state: SessionState, count: int, now: float | None = None) -> None:
         state.uploaded_seq += count
+        state.last_upload_at = now if now is not None else time.time()
         try:
             self.pending_path(state.session_id).unlink()
         except OSError:
@@ -509,12 +605,21 @@ class CaptureClient:
         state.closed = True
 
 
+def title_from_events(events: list[dict[str, Any]]) -> str:
+    """A trace's title: its first prompt that is not a slash command, one line."""
+    for event in events:
+        text = event.get("text") or ""
+        if event.get("kind") == "user" and text and not text.startswith("/"):
+            return " ".join(text.split())[:80]
+    return ""
+
+
 # ── attribution: which agent session is this command running in? ─────────────
 
 
 _SESSION_ENV: dict[str, tuple[str, ...]] = {
     "pi": ("PI_SESSION_ID", "PI_SESSION_FILE"),
-    "claude_code": ("CLAUDE_SESSION_ID",),
+    "claude_code": ("CLAUDE_CODE_SESSION_ID",),
 }
 
 
@@ -581,68 +686,59 @@ def _ancestor_environ_session(ancestors: list[int] | None = None) -> str | None:
     return None
 
 
-def _watcher_registry() -> dict[str, Any]:
-    try:
-        raw = json.loads((capture_dir() / "active.json").read_text())
-        return raw if isinstance(raw, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _pid_cwd(pid: int) -> str:
-    try:
-        return os.path.realpath(f"/proc/{pid}/cwd")
-    except OSError:
-        return ""
-
-
-def _most_recent_matching(registry: dict[str, Any], ancestor_cwd: str) -> str | None:
-    """The newest active session whose cwd is (or contains) the ancestor's."""
-    best: tuple[float, str] | None = None
-    for entry in registry.get("sessions", []):
-        if not isinstance(entry, dict):
-            continue
-        cwd = entry.get("cwd") or ""
-        if cwd and not ancestor_cwd.startswith(cwd):
-            continue
-        seen = entry.get("last_seen_at") or 0
-        if best is None or seen > best[0]:
-            best = (seen, str(entry.get("session_id", "")))
-    return best[1] if best and best[1] else None
-
-
 def resolve_capture_session(env: dict[str, str] | None = None, *,
-                            ancestors: list[int] | None = None,
-                            registry: dict[str, Any] | None = None) -> str | None:
-    """The agent trace the current command belongs to, or None.
+                            ancestors: list[int] | None = None) -> str | None:
+    """The agent session the current command runs in, or None.
 
-    In order: the MLSWEEP_SESSION_ID override, the agent harnesses' own
-    environment (exact), our ancestors matched against the watcher's registry
-    of agent processes by pid (exact), then by cwd (best effort).  *ancestors*
-    and *registry* override what would be read from /proc and from
-    capture/active.json (tests use them to stay off the real machine).
+    In order: the MLSWEEP_SESSION_ID override, then the session variables the
+    agent harnesses export (our own environment, then our ancestors', for a
+    command whose environment was scrubbed).  Exact or nothing: two agents in
+    one directory are two sessions, and a human's shell names none.
+    *ancestors* overrides the /proc walk (tests use it to stay off the real
+    machine).
     """
     env = env if env is not None else dict(os.environ)
     direct = _from_env(env)
     if direct:
         return direct
-    via_ancestors = _ancestor_environ_session(ancestors)
-    if via_ancestors:
-        return via_ancestors
-    reg = registry if registry is not None else _watcher_registry()
-    known = {entry.get("pid"): entry for entry in reg.get("processes", [])
-             if isinstance(entry, dict)}
-    for pid in _ancestors() if ancestors is None else ancestors:
-        entry = known.get(pid)
-        if entry and entry.get("session_id"):
-            return str(entry["session_id"])
-    for pid in _ancestors() if ancestors is None else ancestors:
-        cwd = _pid_cwd(pid)
-        if cwd and cwd != str(Path.home()):
-            found = _most_recent_matching(reg, cwd)
-            if found:
-                return found
-    return None
+    return _ancestor_environ_session(ancestors)
+
+
+def capture_is_on() -> bool:
+    return _on_path().exists() and not _off_path().exists()
+
+
+def _same_manager(a: str, b: str) -> bool:
+    """Whether two manager URLs name the same manager (localhost spellings agree)."""
+    from urllib.parse import urlsplit
+
+    def key(url: str) -> tuple[str, str, int | None]:
+        parts = urlsplit(url.strip().rstrip("/"))
+        host = (parts.hostname or "").lower()
+        if host in ("127.0.0.1", "::1", "0.0.0.0"):
+            host = "localhost"
+        return parts.scheme or "http", host, parts.port
+    return key(a) == key(b)
+
+
+def follow_if_on(session_id: str | None, *, why: str, manager: str) -> bool:
+    """Follow a session that submitted or linked something, if capture is on.
+
+    Only for the manager capture uploads to: a sweep sent elsewhere (a test
+    manager, another cluster) has no business pulling its session onto this
+    one.  Best effort, like attribution: a submission never fails over capture.
+    """
+    if not session_id or not capture_is_on():
+        return False
+    try:
+        on_file = json.loads(_on_path().read_text())
+        if not _same_manager(str(on_file.get("manager", "")), manager):
+            return False
+        request_follow(session_id, why=why)
+        ensure_watcher()
+        return True
+    except Exception:
+        return False
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -680,30 +776,36 @@ def _read_off_marker() -> dict[str, Any] | None:
 
 
 def _cmd(argv: list[str]) -> None:
-    """`mlsweep capture`: on / off / watch / status / ls / link / import."""
+    """`mlsweep capture`: this / on / off / watch / status / ls / link / import."""
     import argparse
     import sys
 
 
     parser = argparse.ArgumentParser(
         prog="mlsweep capture",
-        description="Session capture: upload this machine's coding-agent traces to the "
-                    "manager's Traces tab. Off by default.",
+        description="Session capture: upload the coding-agent sessions you choose to the "
+                    "manager's Traces tab. Off by default; nothing else is read.",
     )
     sub = parser.add_subparsers(dest="action")
 
-    on = sub.add_parser("on", help="Turn capture on and start the watcher")
+    this = sub.add_parser("this", help="Upload the agent session this command runs in")
+    this.add_argument("--session", help="Trace id (default: the session this command runs in)")
+    this.add_argument("--manager", help="Manager URL, if this turns capture on "
+                                        "(default: http://localhost:7891)")
+    this.add_argument("--token", help="Manager token, if this turns capture on")
+
+    on = sub.add_parser("on", help="Turn capture on: sessions that submit sweeps are uploaded")
     on.add_argument("--manager", help="Manager URL (default: http://localhost:7891)")
     on.add_argument("--token", help="Manager token (default: ~/.mlsweep/manager.token)")
     on.add_argument("--agents", default=",".join(AGENT_NAMES),
-                    help="Agents to watch, comma-separated (default: pi,claude_code)")
+                    help="Agents to follow, comma-separated (default: pi,claude_code)")
     on.add_argument("--foreground", action="store_true",
                     help="Run the watcher in this terminal instead of the background")
 
     sub.add_parser("off", help="Turn capture off and stop the watcher")
     sub.add_parser("watch", help="Run the watcher in the foreground (used by `on`)")
 
-    status = sub.add_parser("status", help="Whether capture is on, and what it is doing")
+    status = sub.add_parser("status", help="Whether capture is on, and what it follows")
     status.add_argument("--json", action="store_true", dest="as_json")
 
     ls = sub.add_parser("ls", aliases=["list"], help="Traces on the manager, newest first")
@@ -730,7 +832,9 @@ def _cmd(argv: list[str]) -> None:
 
     args = parser.parse_args(argv)
     action = args.action or "status"
-    if action == "on":
+    if action == "this":
+        _cmd_this(args, sys)
+    elif action == "on":
         _cmd_on(args, sys)
     elif action == "off":
         _cmd_off(sys)
@@ -752,23 +856,21 @@ def _cmd_status(args: Any, sys: Any) -> None:
 
     on_file = _on_path()
     pid = watcher_pid()
-    live = [e for e in _watcher_registry().get("sessions", []) if isinstance(e, dict)]
-    agents = sorted({str(e["agent"]) for e in live if e.get("agent")})
+    followed = followed_requests()
     if args.as_json:
         emit({
-            "state": "on" if on_file.exists() else "off",
+            "state": "on" if capture_is_on() else "off",
             "off_marker": _read_off_marker(),
             "watcher_pid": pid,
             "credential": str(_on_path()) if on_file.exists() else None,
-            "active_sessions": len(live),
-            "agents": agents,
+            "followed": followed,
         })
         return
-    if on_file.exists():
-        print(f"{_GREEN}on{_RESET} — watching {', '.join(agents) or 'nothing'}, watcher pid {pid or '-'}")
-        for entry in live[-5:]:
-            title = entry.get("title") or entry.get("cwd") or "?"
-            print(f"  {_DIM}{entry.get('session_id', '?')}: {title[:70]}{_RESET}")
+    if capture_is_on():
+        print(f"{_GREEN}on{_RESET} — following {len(followed)} session(s), "
+              f"watcher pid {pid or '- (not running)'}")
+        for entry in followed[-10:]:
+            print(f"  {_DIM}{entry.get('session_id', '?')}  {entry.get('why', '')}{_RESET}")
     else:
         print(f"{_YELLOW}off{_RESET} — traces are not captured on this machine")
     marker = _read_off_marker()
@@ -777,14 +879,13 @@ def _cmd_status(args: Any, sys: Any) -> None:
               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(marker.get('at', 0)))}{_RESET}")
 
 
-def _cmd_on(args: Any, sys: Any) -> None:
-    import subprocess
-
-    from mlsweep._colors import _DIM, _GREEN, _RED, _RESET
+def _turn_on(manager: str | None, token_arg: str | None, agents: list[str], sys: Any) -> str:
+    """Write the credential that makes capture on; the manager URL it names."""
+    from mlsweep._colors import _RED, _RESET
     from mlsweep.run_sweep import _manager_url, _resolve_token
 
-    url = _manager_url(args.manager or "http://localhost:7891", "")
-    token = _resolve_token(args.token)
+    url = _manager_url(manager or "http://localhost:7891", "")
+    token = _resolve_token(token_arg)
     if not token:
         print(f"{_RED}No token: pass --token, or start the manager first "
               f"(~/.mlsweep/manager.token).{_RESET}", file=sys.stderr)
@@ -793,21 +894,66 @@ def _cmd_on(args: Any, sys: Any) -> None:
     # with an off marker, is what the watcher checks every loop.
     capture_dir().mkdir(parents=True, exist_ok=True)
     _on_path().write_text(json.dumps({
-        "manager": url, "token": token, "agents": args.agents.split(","),
+        "manager": url, "token": token, "agents": agents,
         "by": f"{os.getenv('USER', 'user')}@{socket.gethostname()}", "at": time.time(),
     }))
     os.chmod(_on_path(), 0o600)
     _off_path().unlink(missing_ok=True)
-    print(f"{_GREEN}on{_RESET} — watching {args.agents} and uploading to {url}")
-    print(f"  {_DIM}mlsweep capture off turns it back off.{_RESET}")
-    if not args.foreground:
-        log = capture_dir() / "watcher.log"
-        with log.open("ab") as f:
-            proc = subprocess.Popen(
-                ["mlsweep", "capture", "watch"], stdout=f, stderr=f,
-                stdin=subprocess.DEVNULL, start_new_session=True)
-        (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
-        print(f"  watcher pid {proc.pid}")
+    return url
+
+
+def ensure_watcher() -> int:
+    """The watcher's pid, starting it in the background if it is not running."""
+    import subprocess
+
+    pid = watcher_pid()
+    if pid:
+        return pid
+    log = capture_dir() / "watcher.log"
+    with log.open("ab") as f:
+        proc = subprocess.Popen(
+            ["mlsweep", "capture", "watch"], stdout=f, stderr=f,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
+    return proc.pid
+
+
+def _cmd_on(args: Any, sys: Any) -> None:
+    from mlsweep._colors import _DIM, _GREEN, _RESET
+
+    url = _turn_on(args.manager, args.token, args.agents.split(","), sys)
+    print(f"{_GREEN}on{_RESET} — uploading to {url} the sessions that submit sweeps "
+          "or run `mlsweep capture this`")
+    print(f"  {_DIM}Nothing else is read. mlsweep capture off turns it back off.{_RESET}")
+    if args.foreground:
+        _cmd_watch()
+    else:
+        print(f"  watcher pid {ensure_watcher()}")
+
+
+def _cmd_this(args: Any, sys: Any) -> None:
+    from mlsweep._colors import _DIM, _GREEN, _RED, _RESET
+
+    session_id = args.session or resolve_capture_session()
+    if not session_id:
+        print(f"{_RED}No agent session here: run this inside the agent, or pass "
+              f"--session.{_RESET}", file=sys.stderr)
+        raise SystemExit(2)
+    marker = _read_off_marker()
+    if marker and not _on_path().exists():
+        print(f"{_RED}Capture was turned off on this machine by {marker.get('by', '?')}. "
+              f"`mlsweep capture on` turns it back on.{_RESET}", file=sys.stderr)
+        raise SystemExit(2)
+    if not _on_path().exists():
+        url = _turn_on(args.manager, args.token, list(AGENT_NAMES), sys)
+        print(f"{_GREEN}on{_RESET} — capture is now on for this machine ({url})")
+    if find_transcript(agent_specs(), session_id) is None:
+        print(f"{_DIM}No transcript for {session_id} yet; it uploads once the agent "
+              f"writes one.{_RESET}")
+    request_follow(session_id, why="capture this")
+    pid = ensure_watcher()
+    print(f"Following {session_id}: the whole session uploads within a few seconds, "
+          f"and new turns after each quiet minute (watcher pid {pid}).")
 
 
 def _cmd_off(sys: Any) -> None:
@@ -831,7 +977,7 @@ def _cmd_off(sys: Any) -> None:
 
 
 def _cmd_watch() -> None:
-    """The watcher loop: scan transcripts, spool events, upload when quiet."""
+    """The watcher loop: follow requested sessions, spool events, upload when quiet."""
     import signal
 
 
@@ -849,8 +995,9 @@ def _cmd_watch() -> None:
             return
         manager, token = on_file["manager"], on_file["token"]
         now = time.time()
-        client.scan(agent_specs(list(on_file.get("agents") or AGENT_NAMES)))
-        _write_active_registry(client, now)
+        specs = agent_specs(list(on_file.get("agents") or AGENT_NAMES))
+        client.follow_requested(specs)
+        client.scan(specs)
         for state in client.due_sessions(now):
             _upload(client, state, manager, token)
         if now - last_sweep > 300:
@@ -864,54 +1011,6 @@ def _cmd_watch() -> None:
                     _upload(client, state, manager, token)
         client.save()
         time.sleep(client.POLL_SECONDS)
-
-
-def _agent_processes() -> list[dict[str, Any]]:
-    """Running agent processes on this machine, with the session they name.
-
-    A client command matches its own /proc ancestors against this list, so a
-    command that runs with a harness's env var in its children is attributed
-    exactly, even when two agents share a working directory.
-    """
-    processes: list[dict[str, Any]] = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        raw = _read_proc(pid, "environ")
-        if not raw:
-            continue
-        env: dict[str, str] = {}
-        for item in raw.split(b"\0"):
-            if b"=" in item:
-                name, _, value = item.partition(b"=")
-                env[name.decode(errors="replace")] = value.decode(errors="replace")
-        for agent, keys in _SESSION_ENV.items():
-            for session_env in keys:
-                if env.get(session_env):
-                    native = _native_from_env(agent, session_env, env[session_env])
-                    processes.append({
-                        "pid": pid, "agent": agent, "cwd": _pid_cwd(pid),
-                        "session_id": session_id_for(agent, native),
-                    })
-                    break
-    return processes
-
-
-def _write_active_registry(client: CaptureClient, now: float) -> None:
-    sessions = []
-    for state in client.sessions.values():
-        if state.closed:
-            continue
-        sessions.append({
-            "session_id": state.session_id, "agent": state.agent, "cwd": state.cwd,
-            "title": state.title, "last_seen_at": state.last_seen_at,
-        })
-    tmp = client.active_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({
-        "sessions": sessions, "processes": _agent_processes(), "updated": now,
-    }))
-    os.replace(tmp, client.active_path)
 
 
 def _upload(client: CaptureClient, state: SessionState, manager: str, token: str) -> None:
@@ -934,8 +1033,7 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
             "POST", f"{manager.rstrip('/')}/api/capture/sessions", token,
             json_data={"session": meta, "events": events})
         if status in (200, 201):
-            if events:
-                client.mark_uploaded(state, len(events))
+            client.mark_uploaded(state, len(events))
             if state.closed:
                 _http_request(
                     "POST", f"{manager.rstrip('/')}/api/capture/sessions/{state.session_id}/close",
@@ -969,7 +1067,7 @@ def _cmd_ls(args: Any, sys: Any) -> None:
         return
     for s in sessions:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("last_seen_at") or 0))
-        title = s.get("title") or s.get("cwd") or "?"
+        title = " ".join(str(s.get("title") or s.get("cwd") or "?").split())
         links = ", ".join(s.get("experiments") or [])
         print(f"{when}  {s.get('agent', '?'):12}  {s.get('state', '?'):8}  "
               f"{s.get('session_id', ''):40}  {str(title)[:60]}"
@@ -993,6 +1091,7 @@ def _cmd_link(args: Any, sys: Any) -> None:
         "session_id": session_id, "experiment_id": args.experiment_id, "source": "manual"})
     if status in (200, 201):
         print(f"Linked {session_id} → {args.experiment_id}")
+        follow_if_on(session_id, why=f"linked {args.experiment_id}", manager=url)
     else:
         print(f"Manager answered {status}: {resp}", file=sys.stderr)
         raise SystemExit(1)

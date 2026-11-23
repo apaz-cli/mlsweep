@@ -318,7 +318,7 @@ function showNoSelection(message, hint) {
     || (captureOff ? "Capture is off on this manager." : "Pick a trace from the left.");
   noSel.append(line);
   const text = hint === undefined
-    ? (captureOff ? "Start the manager without --no-capture to record traces." : "mlsweep capture on")
+    ? (captureOff ? "Start the manager without --no-capture to record traces." : "mlsweep capture this")
     : hint;
   if (text) {
     const sub = document.createElement("div");

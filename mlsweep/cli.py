@@ -149,7 +149,7 @@ def _build_help(include_banner: bool = False) -> str:
             ("notes lint [DIR]", "check links, experiment IDs and conflict markers"),
         ]),
         ("Capture", [
-            ("capture [on|off|watch]", "record this machine's coding-agent traces to the Traces tab"),
+            ("capture [this|on|off]", "upload this agent session (or sweep-submitting ones) to the Traces tab"),
             ("capture [status|ls|link|import]", "capture state; traces on the manager; link one to EXP"),
         ]),
         ("Client", [

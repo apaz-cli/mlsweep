@@ -110,6 +110,12 @@ def test_menus_and_citation_counts(notes_mgr):
     # run_b is unique to eid; run_a is shared with `other`, so the note naming
     # eid is what attributes it.
     (notes / "a.md").write_text(f"{eid} improved run_b\nrun_a too\n")
+    # One agent session submitted eid.
+    trace = uid("trace")
+    ok(mgr, "POST", "/api/capture/sessions", {"session": {
+        "session_id": trace, "agent": "claude_code", "title": "t", "state": "active"},
+        "events": [{"seq": 1, "ts": 1.0, "kind": "user", "text": "go"}]})
+    ok(mgr, "POST", "/api/capture/link", {"session_id": trace, "experiment_id": eid})
     b = Browser(CHROME)
     try:
         b.call("Emulation.setDeviceMetricsOverride", width=1300, height=900,
@@ -123,10 +129,21 @@ def test_menus_and_citation_counts(notes_mgr):
         # View holds the pages with what each leads to, the experiment (and
         # campaign) carried along: two finished runs, two logs, no artifacts.
         b.wait_for("traceCounts.__loaded === true")
+
+        # The Traces column, right of Notes, holds the icon and count of the
+        # sessions that submitted the experiment, linking to them.
+        b.wait_for(f"!!document.querySelector('#exp-row-{eid} .traces-cell .trace-ref')")
+        chip = b.eval(f"""(() => {{ const a = document.querySelector('#exp-row-{eid} .traces-cell a');
+            return [a.textContent, a.getAttribute('href'), !!a.querySelector('svg')]; }})()""")
+        assert chip[0] == "1" and chip[2], chip
+        assert f"traces.html?experiment={eid}" in chip[1], chip
+        assert b.eval(f"document.querySelector('#exp-row-{other} .traces-cell').textContent") == ""
+        headers = b.eval("[...document.querySelectorAll('#exp-table th')].map(th => th.textContent)")
+        assert headers.index("Traces") == headers.index("Notes") + 1, headers
         b.eval(f"document.querySelector('#exp-row-{eid} .btn-menu').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
         assert _menu_items(b) == [["Results", "2"], ["Logs", "2"], ["Artifacts", "0"],
-                                  ["Code", None], ["Notes", "1"], ["Traces", "0"], ["Export", "2"]]
+                                  ["Code", None], ["Notes", "1"], ["Traces", "1"], ["Export", "2"]]
         hrefs = b.eval("[...document.querySelectorAll('.row-menu a')].map(a => a.getAttribute('href'))")
         assert any("results.html?experiment=" + eid in h for h in hrefs), hrefs
         assert any("logs.html?experiment=" + eid in h for h in hrefs), hrefs

@@ -321,7 +321,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     if args.no_capture:
         print("Capture: off (--no-capture)")
     else:
-        print("Capture: on — `mlsweep capture on` on a machine with coding agents")
+        print("Capture: on — `mlsweep capture this` inside a coding-agent session")
 
     runner = web.AppRunner(app)
     await runner.setup()

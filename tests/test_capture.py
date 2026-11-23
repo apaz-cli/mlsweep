@@ -181,7 +181,7 @@ def test_attribution_from_agent_environment():
         "PI_SESSION_FILE": "/home/u/.pi/agent/sessions/x/2026-01-01T00-00-00-000Z_abc-456.jsonl",
     }) == "abc-456"
     assert _capture.resolve_capture_session({
-        "CLAUDE_SESSION_ID": "cc-1"}) == "cc-1"
+        "CLAUDE_CODE_SESSION_ID": "cc-1"}) == "cc-1"
 
 
 def test_mlsweep_session_id_overrides_everything():
@@ -189,19 +189,14 @@ def test_mlsweep_session_id_overrides_everything():
         "MLSWEEP_SESSION_ID": "manual-1", "PI_SESSION_ID": "agent-1"}) == "manual-1"
 
 
-EMPTY_REGISTRY = {"sessions": [], "processes": []}
-
-
 def test_no_agent_environment_means_no_trace():
-    assert _capture.resolve_capture_session(
-        {}, ancestors=[], registry=EMPTY_REGISTRY) is None
+    # Nothing is guessed from the working directory or recent transcripts.
+    assert _capture.resolve_capture_session({}, ancestors=[]) is None
 
 
-def test_attribution_never_refuses_a_submission():
-    # Even a broken watcher is not the submission's business: the fallbacks
-    # read whatever they can find, and answer None without raising.
-    assert _capture.resolve_capture_session(
-        {}, ancestors=[], registry=EMPTY_REGISTRY) is None
+def test_attribution_reads_a_gone_ancestor_as_nothing():
+    # A pid that no longer exists is skipped, not an error.
+    assert _capture.resolve_capture_session({}, ancestors=[2**22 + 12345]) is None
 
 
 # ── the manager's HTTP side ───────────────────────────────────────────────────
@@ -290,6 +285,25 @@ def test_capture_upload_read_search_delete_roundtrip(manager_server):
     # Not found is 404 for a well-formed id.
     status, _ = _get(url, token, "/api/capture/sessions/no-such-trace")
     assert status == 404
+
+
+def test_capture_oversized_event_is_trimmed_not_broken(manager_server):
+    # A thinking block over the per-event cap once made the whole upload fail.
+    server, url = manager_server
+    token = server.token
+    session = {**_SESSION, "session_id": "oversized-1"}
+    big = "zebra " + "x" * 100_000
+    status, _ = _post(url, token, "/api/capture/sessions", {"session": session, "events": [
+        {"seq": 1, "ts": 1.0, "kind": "user", "text": "short"},
+        {"seq": 2, "ts": 2.0, "kind": "thinking", "text": big}]})
+    assert status == 201
+    status, body = _get(url, token, "/api/capture/sessions/oversized-1/events")
+    assert status == 200
+    long_event = body["events"][1]
+    assert long_event["truncated"] is True
+    assert big.startswith(long_event["text"]) and 30_000 < len(long_event["text"]) < 64 * 1024
+    status, hits = _get(url, token, "/api/capture/search?q=zebra")
+    assert status == 200 and "oversized-1" in json.dumps(hits)
 
 
 def test_capture_requires_a_session_before_events(manager_server):
@@ -490,8 +504,11 @@ def test_watcher_uploads_session_end_to_end(manager_server, tmp_path):
 
     client = _capture.CaptureClient(directory=tmp_path / "capture")
     specs = _capture.agent_specs(["pi"], root=sessions_root)
+    session_id = _capture.session_id_for("pi", "01a1cbca-f65f-71f6-888e-e3d1da5280ff")
+    _capture.request_follow(session_id, client.follow_dir, why="test")
+    client.follow_requested(specs)
     client.scan(specs)
-    state = client.sessions[_capture.session_id_for("pi", "01a1cbca-f65f-71f6-888e-e3d1da5280ff")]
+    state = client.sessions[session_id]
     assert state.cwd == "/home/apaz/git/mlsweep"
     assert state.offset == transcript.stat().st_size
     # The spool holds the events; the manager has never seen them.
@@ -509,6 +526,123 @@ def test_watcher_uploads_session_end_to_end(manager_server, tmp_path):
     kinds = [e["kind"] for e in events["events"]]
     assert kinds == ["user", "thinking", "assistant", "tool", "tool", "tool_result"]
     assert not any("lots of output" in json.dumps(e) for e in events["events"])
+
+
+# ── which sessions the watcher reads ──────────────────────────────────────────
+
+
+CLAUDE_COMMAND_LINE = {
+    "type": "user", "sessionId": "cc-follow-1", "cwd": "/home/apaz/git/mlsweep",
+    "timestamp": "2026-11-11T04:02:00.000Z",
+    "message": {"role": "user", "content": (
+        "<command-name>/login</command-name>\n            "
+        "<command-message>login</command-message>\n            "
+        "<command-args></command-args>")},
+}
+
+CLAUDE_COMMAND_OUTPUT_LINE = {
+    "type": "user", "sessionId": "cc-follow-1", "cwd": "/home/apaz/git/mlsweep",
+    "timestamp": "2026-11-11T04:02:01.000Z",
+    "message": {"role": "user", "content": "<local-command-stdout>Login successful</local-command-stdout>"},
+}
+
+CLAUDE_HUMAN_LINE = {
+    "type": "user", "sessionId": "cc-follow-1", "cwd": "/home/apaz/git/mlsweep",
+    "origin": {"kind": "human"}, "timestamp": "2026-11-11T04:02:05.000Z",
+    "message": {"role": "user", "content": "Submit some test\nsweeps please"},
+}
+
+
+def _write_jsonl(path, lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def test_watcher_reads_only_followed_sessions(tmp_path):
+    root = tmp_path / "projects"
+    followed = root / "-home-apaz-git-mlsweep" / "cc-follow-1.jsonl"
+    other = root / "-home-apaz-elsewhere" / "cc-other-2.jsonl"
+    _write_jsonl(followed, [CLAUDE_COMMAND_LINE, CLAUDE_HUMAN_LINE, CLAUDE_ASSISTANT_LINE])
+    _write_jsonl(other, [CLAUDE_HUMAN_LINE, CLAUDE_ASSISTANT_LINE])
+    client = _capture.CaptureClient(directory=tmp_path / "capture")
+    specs = _capture.agent_specs(["claude_code"], root=root)
+
+    # Turned on, following nothing: no transcript is read at all.
+    client.follow_requested(specs)
+    client.scan(specs)
+    assert client.sessions == {}
+    assert not client.pending_dir.exists()
+
+    _capture.request_follow("cc-follow-1", client.follow_dir, why="capture this")
+    client.follow_requested(specs)
+    client.scan(specs)
+    assert list(client.sessions) == ["cc-follow-1"]
+    assert client.pending_count("cc-follow-1") > 0
+    assert client.pending_count("cc-other-2") == 0
+    # A follow request is idempotent, and survives a watcher restart.
+    _capture.request_follow("cc-follow-1", client.follow_dir, why="again")
+    assert len(_capture.followed_requests(client.follow_dir)) == 1
+
+
+def test_followed_claude_session_meta(tmp_path):
+    root = tmp_path / "projects"
+    path = root / "-home-apaz-git-mlsweep" / "cc-follow-1.jsonl"
+    _write_jsonl(path, [CLAUDE_COMMAND_LINE, CLAUDE_COMMAND_OUTPUT_LINE,
+                        CLAUDE_HUMAN_LINE, CLAUDE_ASSISTANT_LINE])
+    client = _capture.CaptureClient(directory=tmp_path / "capture")
+    specs = _capture.agent_specs(["claude_code"], root=root)
+    state = client.follow(specs, "cc-follow-1")
+    assert state is not None
+    client.scan(specs)
+    assert state.cwd == "/home/apaz/git/mlsweep"
+    assert state.model == "claude-x"
+    # The title is the first real prompt, on one line; not the /login wrapper.
+    assert state.title == "Submit some test sweeps please"
+    with client.pending_path("cc-follow-1").open() as f:
+        events = [json.loads(line) for line in f]
+    users = [e["text"] for e in events if e["kind"] == "user"]
+    # The slash command reads as typed; its local output is not a prompt.
+    assert users == ["/login", "Submit some test\nsweeps please"]
+
+
+def test_follow_waits_for_whole_lines_and_uploads_at_once(tmp_path):
+    root = tmp_path / "projects"
+    path = root / "-p" / "cc-follow-1.jsonl"
+    _write_jsonl(path, [CLAUDE_HUMAN_LINE])
+    with path.open("a") as f:
+        f.write(json.dumps(CLAUDE_ASSISTANT_LINE)[:20])  # mid-write
+    client = _capture.CaptureClient(directory=tmp_path / "capture")
+    specs = _capture.agent_specs(["claude_code"], root=root)
+    state = client.follow(specs, "cc-follow-1")
+    client.scan(specs)
+    assert client.pending_count("cc-follow-1") == 1
+    # Never uploaded: due now, without waiting for a quiet minute.
+    assert client.due_sessions(state.last_seen_at + 1) == [state]
+    client.mark_uploaded(state, 1, now=state.last_seen_at + 1)
+    path.write_text(path.read_text()[: -20] + json.dumps(CLAUDE_ASSISTANT_LINE) + "\n")
+    client.scan(specs)
+    assert client.pending_count("cc-follow-1") == 2  # thinking + tool, read whole
+    # Uploaded a moment ago and still busy: it waits.
+    assert client.due_sessions(state.last_seen_at + 5) == []
+
+
+def test_only_the_capture_manager_pulls_a_session_in():
+    same = _capture._same_manager
+    assert same("http://localhost:7891", "http://127.0.0.1:7891/")
+    assert same("http://localhost:7891", "http://localhost:7891/api/capture")
+    # A test manager on another port, or another cluster, is not this one.
+    assert not same("http://localhost:7891", "http://localhost:40123")
+    assert not same("http://localhost:7891", "http://gpu-box:7891")
+
+
+def test_unknown_session_is_not_followed_until_its_transcript_exists(tmp_path):
+    root = tmp_path / "projects"
+    client = _capture.CaptureClient(directory=tmp_path / "capture")
+    specs = _capture.agent_specs(["claude_code"], root=root)
+    assert client.follow(specs, "cc-later") is None
+    assert client.follow(specs, "../escape") is None
+    _write_jsonl(root / "-p" / "cc-later.jsonl", [CLAUDE_HUMAN_LINE])
+    assert client.follow(specs, "cc-later") is not None
 
 
 # ── the Traces tab in a real browser ──────────────────────────────────────────

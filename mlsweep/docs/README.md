@@ -299,8 +299,8 @@ mlsweep notes clone DIR              mlsweep notes status
 mlsweep notes lint                   mlsweep notes links|mentions|search|history|mv
 
 # capture (coding-agent traces, on the dashboard's Traces tab; mlsweep docs traces)
-mlsweep capture on                   mlsweep capture status
-mlsweep capture off                  mlsweep capture ls
+mlsweep capture this                 mlsweep capture status
+mlsweep capture on|off               mlsweep capture ls
 mlsweep capture link EXP             mlsweep capture import --days 30
 
 # docs
@@ -375,13 +375,14 @@ See [notes.md](docs/notes.md) (`mlsweep docs notes`).
 ## Traces
 
 Session capture records the coding-agent conversation next to the runs it
-produced. `mlsweep capture on` on the machine the agents run on watches pi and
-Claude Code transcripts and uploads each session to the manager, where the
-dashboard's **Traces** tab shows them as a ledger: your prompts, the agent's
-replies, its thinking, tool calls one line each. Not captured: tool output,
-file contents.
+produced. An agent runs `mlsweep capture this` inside its session, and that
+session uploads to the manager. The dashboard's Traces tab shows it as a
+ledger of your prompts, the agent's replies, its thinking, and tool calls one
+line each. Tool output and file contents are not captured. Sessions that never
+ask are never read. With `mlsweep capture on`, a session that submits a sweep is
+uploaded too.
 
-An experiment records the trace it was submitted from — the session id comes
+An experiment records the trace it was submitted from. The session id comes
 out of the environment the agent runs its commands with, so the link is exact
 per agent context, with no shell hooks and no guessing. A note can cite a
 trace as `[that idea](mlsweep:trace/9f6c0e22)`, and `mlsweep capture import`
@@ -406,7 +407,7 @@ other way round (watching live is the exception; `mlsweep watch` and
 | System: workers, devices, jobs per GPU, placement | `mlsweep workers ...`, `mlsweep scheduler --placement` |
 | System: storage cleanup | `mlsweep gc` |
 | Notes | `mlsweep notes ...` (see [notes.md](docs/notes.md)) |
-| Traces | `mlsweep capture on\|off\|status\|ls\|link\|import` (see [traces.md](docs/traces.md)) |
+| Traces | `mlsweep capture this\|on\|off\|status\|ls\|link\|import` (see [traces.md](docs/traces.md)) |
 
 ## Running an agent
 

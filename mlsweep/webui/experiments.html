@@ -26,7 +26,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .filter-chip .n { color: var(--text-muted); font-variant-numeric: tabular-nums; margin-left: 2px; }
 .filter-chip.active .n { color: inherit; }
 #exp-shown { font-size: 11px; color: var(--text-muted); }
-.notes-cell { white-space: nowrap; }
+.notes-cell, .traces-cell { white-space: nowrap; }
 .note-ref { display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; font-size: 10px; font-weight: 600; font-family: system-ui, sans-serif; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 3px; text-decoration: none; vertical-align: middle; font-variant-numeric: tabular-nums; }
 .note-ref svg { width: 10px; height: 10px; }
 .note-ref:hover { background: var(--radio-checked-bg); border-color: var(--accent); }
@@ -122,7 +122,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
   <table class="exp-table" id="exp-table">
     <thead>
       <tr>
-        <th style="width:34%">Name</th>
+        <th style="width:30%">Name</th>
         <th style="width:8%">Status</th>
         <th style="width:6%;text-align:right">Done</th>
         <th style="width:6%;text-align:right">Failed</th>
@@ -131,7 +131,8 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
         <th style="width:6%;text-align:right">Finished</th>
         <th style="width:11%">Submitted</th>
         <th style="width:5%">Notes</th>
-        <th style="width:12%">Actions</th>
+        <th style="width:5%">Traces</th>
+        <th style="width:11%">Actions</th>
       </tr>
     </thead>
     <tbody id="exp-tbody"></tbody>

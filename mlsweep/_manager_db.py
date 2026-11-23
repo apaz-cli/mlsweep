@@ -3442,6 +3442,27 @@ async def upsert_capture_session(db: aiosqlite.Connection, meta: dict[str, Any])
     return await get_capture_session(db, session_id) or {}
 
 
+def _capped_event_json(event: dict[str, Any]) -> str:
+    """One event as JSON of at most _MAX_EVENT_JSON_BYTES, still valid JSON.
+
+    A long event (a big thinking block, say) keeps the start of its text and
+    says it was cut.  Cutting the JSON itself would leave a row nothing can
+    parse.
+    """
+    data = json.dumps(event, separators=(",", ":"))
+    if len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
+        return data
+    text = event.get("text")
+    if isinstance(text, str):
+        overflow = len(data.encode()) - _MAX_EVENT_JSON_BYTES + 256
+        keep = text.encode()[: max(0, len(text.encode()) - overflow)].decode(errors="ignore")
+        data = json.dumps({**event, "text": keep, "truncated": True}, separators=(",", ":"))
+        if len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
+            return data
+    # Nothing to shorten (or still too big): keep the bare shape of the event.
+    bare = {k: event[k] for k in ("seq", "ts", "kind", "name", "tool_id", "ok") if k in event}
+    return json.dumps({**bare, "truncated": True}, separators=(",", ":"))
+
 async def insert_capture_events(
     db: aiosqlite.Connection, session_id: str, events: list[dict[str, Any]],
     last_seen_at: float | None = None,
@@ -3464,10 +3485,7 @@ async def insert_capture_events(
         seq = event.get("seq")
         if not isinstance(seq, int):
             continue
-        data = json.dumps(event, separators=(",", ":"))
-        if len(data) > _MAX_EVENT_JSON_BYTES:
-            data = data[:_MAX_EVENT_JSON_BYTES]
-        rows.append((session_id, seq, data))
+        rows.append((session_id, seq, _capped_event_json(event)))
     stored = 0
     if rows:
         await db.executemany(

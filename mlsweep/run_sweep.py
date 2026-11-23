@@ -2258,9 +2258,13 @@ def _main() -> None:
         optimize=spec,
         code=provenance,
         controls=info.get("controls"),
-        capture_session=capture_session_id(),
+        capture_session=(capture_session := capture_session_id()),
     ):
         sys.exit(1)
+    # The session that submitted a sweep is followed, so its trace uploads
+    # (only while capture is on for this machine).
+    from mlsweep._capture import follow_if_on
+    follow_if_on(capture_session, why=f"submitted {experiment_id}", manager=manager)
 
     # ── 4. Write local manifest ────────────────────────────────────────────
     _write_manifest(exp_dir, experiment_id, variations, note=args.note)

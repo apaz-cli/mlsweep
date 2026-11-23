@@ -266,6 +266,16 @@ function noteRefHtml(expId, runId) {
     + `${VIEW_ICONS.notes}${n}</a>`;
 }
 
+// The traces icon and count beside an experiment that agent sessions submitted,
+// linking to those traces.  Traces link to experiments, not runs.
+function traceRefHtml(expId) {
+  const n = captureEnabled ? (traceCounts[expId] || 0) : 0;
+  if (!n) return "";
+  const title = `${n} trace${n === 1 ? "" : "s"} submitted this experiment`;
+  return `<a class="note-ref trace-ref" href="${escHtml(pageHref("traces.html", { experiment: expId }))}" title="${title}" data-act="">`
+    + `${VIEW_ICONS.traces}${n}</a>`;
+}
+
 // ── Render runs ───────────────────────────────────────────────────────────────
 // An experiment's runs are rows of the experiments table, tagged with
 // data-runs-of so they can be replaced together.
@@ -283,18 +293,19 @@ function runsHtml(expId) {
       <td>${fmtElapsed(j.elapsed)}</td>
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
       <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
+      <td class="traces-cell"></td>
       <td class="actions-cell" data-act=""><div class="actions">
         <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes, Traces" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
     <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
-      <td colspan="10">${isOpen ? renderJobDetail(j) : ""}</td>
+      <td colspan="11">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
   const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
-      <td>Elapsed</td><td colspan="3">Combo</td><td>Notes</td><td></td></tr>`;
-  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="10">No jobs</td></tr>`);
+      <td>Elapsed</td><td colspan="3">Combo</td><td>Notes</td><td></td><td></td></tr>`;
+  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="11">No jobs</td></tr>`);
 }
 
 // Experiment controls (the same as mlsweep pause/unpause/stop/retry/cancel/purge).
@@ -312,7 +323,7 @@ function runTools(expId, jobs) {
   if (active) btns.push(b(`Cancel active (${active})`, ["bulkRuns", expId, "cancel"], "Cancel pending and running runs (mlsweep cancel --all)", "btn-delete"));
   if (purgeable) btns.push(b(`Delete failed (${purgeable})`, ["bulkRuns", expId, "purge"], "Delete failed, cancelled and xfailed runs with their files (mlsweep purge)", "btn-delete"));
   if (!btns.length) return "";
-  return `<tr class="runs-tools"><td colspan="10"><div class="actions">${btns.join("")}</div></td></tr>`;
+  return `<tr class="runs-tools"><td colspan="11"><div class="actions">${btns.join("")}</div></td></tr>`;
 }
 
 function runRowsOf(expId) {
@@ -520,6 +531,7 @@ function renderExperiments(exps) {
       <td class="count-cell">${total ? `${(c.done||0)+(c.pruned||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
       <td class="notes-cell">${noteRefHtml(expId)}</td>
+      <td class="traces-cell">${traceRefHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
         <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Traces, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
