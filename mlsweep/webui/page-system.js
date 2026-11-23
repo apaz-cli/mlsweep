@@ -493,7 +493,6 @@ function workerItems(workerId, withLifecycle = false) {
   return items.length ? items : [{ label: "No pool changes for an offline worker", disabled: true }];
 }
 
-function copyId(id, toast) { copyText(id, toast); }
 
 // One GPU's own pool changes, for a right-click on its tile.
 function gpuItems(w, g) {
@@ -703,7 +702,9 @@ watchNoteMentions(() => {});
 watchTraceCounts(() => {});
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
+let refreshSeq = 0;
 async function refresh() {
+  const seq = ++refreshSeq;
   try {
     const [wRes, jRes, dRes, sRes] = await Promise.all([
       apiFetch("/api/workers"),
@@ -711,18 +712,32 @@ async function refresh() {
       apiFetch("/api/jobs?status=dispatched"),
       apiFetch("/api/scheduler"),
     ]);
+    if (seq !== refreshSeq) return;   // a newer refresh owns the page now
     if (!wRes.ok || !jRes.ok || !dRes.ok || !sRes.ok) {
       setConnStatus("disconnected");
       return;
     }
-    const workers = await wRes.json();
-    const jobs    = [...(await jRes.json()), ...(await dRes.json())];
+    const [workers, running, dispatched, scheduler] = await Promise.all([
+      wRes.json(), jRes.json(), dRes.json(), sRes.json(),
+    ]);
+    if (seq !== refreshSeq) return;
+
+    // The two job queries are separate snapshots.  A run that changed status
+    // between them can appear in both (or neither); keep one row per run and
+    // prefer the later state.
+    const byRun = new Map();
+    for (const j of [...running, ...dispatched]) {
+      const key = `${j.experiment_id}\u0000${j.run_id}`;
+      const old = byRun.get(key);
+      if (!old || (old.status === "dispatched" && j.status === "running")) byRun.set(key, j);
+    }
+
     setConnStatus("connected");
-    renderPlacement((await sRes.json()).placement);
-    renderInFlight(jobs);   // first: the worker cards name runs from it
+    renderPlacement(scheduler.placement);
+    renderInFlight([...byRun.values()]);   // first: the worker cards name runs from it
     renderWorkers(workers);
   } catch (e) {
-    setConnStatus("disconnected");
+    if (seq === refreshSeq) setConnStatus("disconnected");
   }
 }
 
@@ -749,9 +764,14 @@ function renderGc(plan, done) {
   box.innerHTML = html;
   document.getElementById("gc-run").disabled = done || (!items.length && !rows);
 }
+let gcBusy = false;
 async function runGc(dryRun) {
+  // A scan that finishes after a delete would redraw the deleted plan and
+  // re-enable the delete button; only one cleanup request at a time.
+  if (gcBusy) return;
   const vacuum = document.getElementById("gc-vacuum").checked;
   if (!dryRun && !(await mlConfirm("Delete everything listed? This cannot be undone.", { confirmLabel: "Delete" }))) return;
+  gcBusy = true;
   const btn = document.getElementById(dryRun ? "gc-scan" : "gc-run");
   btn.disabled = true; const label = btn.textContent; btn.textContent = dryRun ? "Scanning…" : "Deleting…";
   try {
@@ -761,7 +781,7 @@ async function runGc(dryRun) {
     if (!r.ok) throw new Error(plan.error || r.status);
     renderGc(plan, !dryRun);
   } catch (e) { await mlAlert("Cleanup failed: " + e.message); }
-  finally { btn.textContent = label; if (dryRun) btn.disabled = false; }
+  finally { gcBusy = false; btn.textContent = label; if (dryRun) btn.disabled = false; }
 }
 document.getElementById("gc-scan").onclick = () => runGc(true);
 document.getElementById("gc-run").onclick = () => runGc(false);

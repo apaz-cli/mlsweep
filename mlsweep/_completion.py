@@ -23,7 +23,7 @@ COMMANDS = (
     "manager", "run", "worker", "lint", "gen_makefile", "watch", "fetch", "best", "wait", "status", "doctor",
     "ls", "logs", "metrics", "export", "code", "cancel", "retry", "reschedule", "rename", "move", "purge", "gc",
     "delete", "resume", "optimize", "controls", "stop", "pause", "unpause", "workers", "scheduler", "campaign", "notes",
-    "context", "completion", "docs", "version", "help",
+    "capture", "sql", "context", "completion", "docs", "version", "help",
 )
 
 # Subcommands whose first positional argument is an experiment ID.
@@ -39,9 +39,10 @@ _SUBCOMMANDS = {
     "campaign": ("ls", "move"),
     "export": ("tensorboard", "wandb"),
     "notes": ("clone", "lint"),
+    "capture": ("this", "on", "off", "status", "ls", "show", "search", "export", "import"),
 }
 
-_DOC_TOPICS = ("readme", "sweep_configuration", "mlsweep", "examples", "notes", "skill")
+_DOC_TOPICS = ("readme", "sweep_configuration", "mlsweep", "examples", "notes", "traces", "skill")
 
 _FLAG_RE = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)")
 

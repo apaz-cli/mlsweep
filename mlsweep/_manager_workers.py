@@ -1113,15 +1113,21 @@ async def _handle_sync_req(
     db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgSyncReq,
 ) -> None:
     """Copy a running run's artifacts to the manager, off the read loop."""
-    run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
-    if run is None:
-        return
+    async with state.lock:
+        run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
+        # Two sync calls for one run would rsync into the same directory at once.
+        if run is None or run.sync_inflight:
+            return
+        run.sync_inflight = True
 
     async def sync() -> None:
-        await _run_rsync(state, wc, run.experiment_id, run.run_id)
-        # final=False because the run is still executing; the worker keeps its scratch.
-        _send(wc, MsgCleanup(run_id=run.run_id, experiment=run.experiment_id,
-                             attempt=run.attempt, final=False))
+        try:
+            await _run_rsync(state, wc, run.experiment_id, run.run_id)
+            # final=False because the run is still executing; the worker keeps its scratch.
+            _send(wc, MsgCleanup(run_id=run.run_id, experiment=run.experiment_id,
+                                 attempt=run.attempt, final=False))
+        finally:
+            run.sync_inflight = False
 
     asyncio.create_task(sync())
 

@@ -154,12 +154,17 @@ $("search-input").addEventListener("input", doSearch);
 function searchFor(text) { switchPane("search"); $("search-input").value = text; doSearch(); }
 
 // ── Changes feed ───────────────────────────────────────────────────────────────
-let feedSkip = 0, feedVersion = "";
+let feedSkip = 0, feedVersion = "", feedSeq = 0;
 async function loadFeed(reset = false) {
   const feed = $("feed");
   if (reset) { if (feedVersion === S.version && feed.childElementCount) return; feedSkip = 0; feed.innerHTML = ""; feedVersion = S.version; }
+  const seq = ++feedSeq;
+  const skip = feedSkip;
   try {
-    const r = await api(`/api/notes/history?limit=40&skip=${feedSkip}`);
+    const r = await api(`/api/notes/history?limit=40&skip=${skip}`);
+    // A reset or a newer page started while this one was in flight; appending
+    // it now would duplicate or misorder the feed.
+    if (seq !== feedSeq) return;
     const old = feed.querySelector(".load-more"); if (old) old.remove();
     if (!r.commits.length && !feedSkip) { feed.innerHTML = `<div class="tree-empty">No history yet.</div>`; return; }
     let lastDay = feed.dataset.lastDay || "";
@@ -195,13 +200,17 @@ async function loadFeed(reset = false) {
       feed.append(box);
     }
     feed.dataset.lastDay = lastDay;
-    feedSkip += r.commits.length;
+    feedSkip = skip + r.commits.length;
     if (r.commits.length === 40) {
       const more = el("button", "mini-btn load-more", "Load older changes");
       more.onclick = () => loadFeed(false);
       feed.append(more);
     }
-  } catch (e) { feed.innerHTML = ""; feed.append(el("div", "tree-empty", "Could not load history: " + e.message)); }
+  } catch (e) {
+    if (seq !== feedSeq) return;
+    feed.innerHTML = "";
+    feed.append(el("div", "tree-empty", "Could not load history: " + e.message));
+  }
 }
 
 // A commit's own entries, for the menus on a change.
@@ -213,7 +222,7 @@ function commitItems(c) {
 }
 function commitMenu(e, c) {
   e.preventDefault();
-  showMenu(e.clientX, e.clientY, [...commitItems(c), { label: "Copy message", run: () => copyText(c.subject || "") }]);
+  mlMenuAt(e.clientX, e.clientY, [...commitItems(c), { label: "Copy message", run: () => copyText(c.subject || "") }]);
 }
 
 // ── Diff view ──────────────────────────────────────────────────────────────────
@@ -303,6 +312,8 @@ function renderVersionView(view, t) {
 async function restoreVersion(srcPath, rev, c, path = srcPath) {
   if (!(await mlConfirm(`Restore ${path} to the version from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : rev.slice(0, 10)}?\n\nThe current version stays in history.`, { confirmLabel: "Restore", danger: false }))) return;
   try {
+    // An autosave that lands after this PUT would undo the restore.
+    await flushSaves();
     const r = await api(`/api/notes/show?path=${q(srcPath)}&rev=${q(rev)}`);
     if (r.binary) { toast("Restoring binary files is not supported here", "err"); return; }
     let base = null;
@@ -418,7 +429,7 @@ async function refreshRight() {
       it.oncontextmenu = e => {
         if (l.resolved) return fileMenu(e, l.resolved);
         e.preventDefault();
-        showMenu(e.clientX, e.clientY, [
+        mlMenuAt(e.clientX, e.clientY, [
           { label: "Create this note", run: () => newNote(dirname(path), basename(l.target)) },
           { label: "Copy link target", run: () => copyText(l.target) },
         ]);
@@ -466,7 +477,7 @@ async function refreshRight() {
       it.oncontextmenu = e => {
         e.preventDefault();
         const then = c.path || path;
-        showMenu(e.clientX, e.clientY, [
+        mlMenuAt(e.clientX, e.clientY, [
           { label: "Show this change", run: () => openDiff(c, then, path) },
           { label: "View this version", run: () => showVersion(then, c.hash, c) },
           { label: "Restore this version…", run: () => restoreVersion(then, c.hash, c, path) },
@@ -528,7 +539,7 @@ function toggleRight() {
 function moreMenu(e) {
   const t = activeTab(); if (!t || !t.path) return;
   const r = e.currentTarget.getBoundingClientRect();
-  showMenu(r.right - 200, r.bottom + 4, [
+  mlMenuAt(r.right - 200, r.bottom + 4, [
     { label: "Rename…", run: () => { const row = treeRow(t.path); if (row) startRename(row); else moveDialog(t.path); } },
     { label: "Move to…", run: () => moveDialog(t.path) },
     { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(t.path); } },
@@ -536,8 +547,8 @@ function moreMenu(e) {
     { label: "Local graph", run: () => openGraph(t.path) },
     { label: "Find mentions of this note", run: () => searchFor(stemOf(t.path)) },
     "-",
-    { label: "Split right", key: "\\", run: () => splitTab(t, "right") },
-    { label: "Split down", key: "|", run: () => splitTab(t, "down") },
+    { label: "Split right", hint: "\\", run: () => splitTab(t, "right") },
+    { label: "Split down", hint: "|", run: () => splitTab(t, "down") },
     "-",
     { label: "Copy path", run: () => copyText(t.path) },
     { label: "Copy wikilink", run: () => copyText(`[[${stemOf(t.path)}]]`) },
@@ -983,7 +994,7 @@ document.addEventListener("keydown", e => {
   const t = activeTab();
   if (mod && !e.altKey && e.key.toLowerCase() === "s") { e.preventDefault(); saveActiveNow(); return; }
   if (e.key === "Escape") {
-    hideMenu(); $("lightbox").classList.remove("show");
+    mlCloseContextMenu(); $("lightbox").classList.remove("show");
     // Leave a plain text field, so the single-key shortcuts work again.
     if (e.target.matches("input, select") && !e.target.closest("#switcher, .ml-dialog, .tnode")) e.target.blur();
   }

@@ -67,15 +67,27 @@ def _api_get(url, token, path):
         return json.loads(resp.read())
 
 
-def _api_request(url, token, method, path, data=None):
-    """Send *data* as JSON with *method* to *path*, return the parsed JSON response."""
+def _api_req(url, token, method, path, data=None):
     body = json.dumps(data).encode() if data is not None else None
     headers = {"Authorization": f"Bearer {token}"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    return urllib.request.Request(f"{url}{path}", data=body, headers=headers, method=method)
+
+
+def _api_request(url, token, method, path, data=None):
+    """Send *data* as JSON with *method* to *path*, return the parsed JSON response."""
+    with urllib.request.urlopen(_api_req(url, token, method, path, data), timeout=10) as resp:
         return json.loads(resp.read())
+
+
+def _api_status(url, token, method, path, data=None):
+    """Like ``_api_request``, but an error answer is returned, not raised: (status, JSON)."""
+    try:
+        with urllib.request.urlopen(_api_req(url, token, method, path, data), timeout=15) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
 def _api_post(url, token, path, data=None):

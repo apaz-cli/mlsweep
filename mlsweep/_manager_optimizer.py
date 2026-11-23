@@ -93,7 +93,10 @@ async def _run_value(
     db: aiosqlite.Connection, state: ManagerState, exp_id: str, spec: dict[str, Any], row: Any,
 ) -> float | None:
     """A finished run's metric value.  Cached, since it can't change until the next attempt."""
-    key = (row["job_key"], row["attempt"])
+    # A run moved to another experiment keeps its job_key.  The experiment and
+    # the ranking spec are part of the key so moving cannot reuse the source
+    # experiment's cached value for a different metric or goal.
+    key = (exp_id, row["job_key"], row["attempt"], spec["metric"], spec["goal"])
     if key not in state.run_values:
         metrics = await get_metrics_for_run(db, row["run_id"], exp_id)
         state.run_values[key] = best_metric(metrics, spec["metric"], spec["goal"])
@@ -104,7 +107,7 @@ async def _pruned_point(
     db: aiosqlite.Connection, state: ManagerState, exp_id: str, spec: dict[str, Any], row: Any,
 ) -> tuple[int, float | None]:
     """A pruned run's last metric step and best value up to it.  Cached like ``_run_value``."""
-    key = (row["job_key"], row["attempt"])
+    key = (exp_id, row["job_key"], row["attempt"], spec["metric"], spec["goal"])
     if key not in state.pruned_points:
         metrics = await get_metrics_for_run(db, row["run_id"], exp_id)
         steps = [int(r["step"]) for r in metrics if spec["metric"] in r]

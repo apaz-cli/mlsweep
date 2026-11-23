@@ -6,6 +6,8 @@ let experiments = [];     // experiments in the selected campaign
 let allExperiments = [];  // every experiment, for the campaign list
 let expSearch = "";       // words to match in name, ID and note
 let expFilter = "all";    // all | running | completed | failed
+let experimentsSeq = 0;   // guards the periodic / visibility refreshes from landing out of order
+const jobLoadSeq = new Map();  // experiment id -> newest run-list request for it
 
 // ── Experiment descriptions ─────────────────────────────────────────────────
 // A note is the experiment's description. It used to sit beside the name,
@@ -109,7 +111,6 @@ function toggleRunMenu(expId, runId) {
   toggleMenu(this, `run:${expId}/${runId}`, runManageItems(expId, runId));
 }
 
-function copyId(id, toast) { copyText(id, toast); }
 
 function runManageItems(expId, runId) {
   const j = (jobsCache[expId] || []).find(x => x.run_id === runId) || {};
@@ -146,6 +147,8 @@ async function deleteExperiment(expId) {
   if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
   if (r.ok) {
+    // A list request started before the delete may still answer with the row.
+    experimentsSeq += 1;
     document.getElementById(`exp-row-${expId}`)?.remove();
     runRowsOf(expId).forEach(r => r.remove());
     experiments = experiments.filter(e => e.experiment_id !== expId);
@@ -352,7 +355,7 @@ function noteRefHtml(expId, runId) {
 // The traces badge: how many agent sessions submitted the experiment, linking
 // to them.  Traces link to experiments, not runs.
 function traceRefHtml(expId) {
-  if (!captureEnabled || !traceCounts.__loaded) return "";
+  if (!captureEnabled || !traceCounts) return "";
   const n = traceCounts[expId] || 0;
   if (!n) return `<span class="note-ref trace-ref zero" title="No agent trace submitted this experiment">${VIEW_ICONS.traces}0</span>`;
   const title = `${n} trace${n === 1 ? "" : "s"} submitted this experiment`;
@@ -451,10 +454,15 @@ async function toggleExpand(expId) {
   expRow && expRow.classList.add("expanded");
 
   if (!jobsCache[expId]) {
+    const seq = (jobLoadSeq.get(expId) || 0) + 1;
+    jobLoadSeq.set(expId, seq);
     try {
       const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
+      const loaded = await r.json();
+      if (seq !== jobLoadSeq.get(expId)) return;  // a newer expand/fetch owns the cache
+      jobsCache[expId] = loaded;
     } catch {
+      if (seq !== jobLoadSeq.get(expId)) return;
       jobsCache[expId] = [];
     }
   }
@@ -464,10 +472,14 @@ async function toggleExpand(expId) {
 
 // ── Refresh jobs for expanded experiments ─────────────────────────────────────
 async function refreshExpandedJobs() {
-  for (const expId of expandedExps) {
+  for (const expId of [...expandedExps]) {
+    const seq = (jobLoadSeq.get(expId) || 0) + 1;
+    jobLoadSeq.set(expId, seq);
     try {
       const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
+      const jobs = await r.json();
+      if (seq !== jobLoadSeq.get(expId)) continue;  // an expand or newer poll already answered
+      jobsCache[expId] = jobs;
       renderRuns(expId);
     } catch {}
   }
@@ -653,8 +665,10 @@ function renderExperiments(exps) {
 
 // ── Fetch and refresh ─────────────────────────────────────────────────────────
 async function fetchExperiments() {
+  const seq = ++experimentsSeq;
   try {
     const r = await apiFetch("/api/experiments");
+    if (seq !== experimentsSeq) return;
     if (!r.ok) {
       setConnStatus("disconnected");
       document.getElementById("error-msg").textContent = `API error: ${r.status}`;
@@ -663,11 +677,14 @@ async function fetchExperiments() {
       document.getElementById("exp-table").style.display = "none";
       return;
     }
-    allExperiments = await r.json();
+    const loaded = await r.json();
+    if (seq !== experimentsSeq) return;
+    allExperiments = loaded;
     showCampaign();
     setConnStatus("connected");
     document.getElementById("error-msg").style.display = "none";
   } catch (e) {
+    if (seq !== experimentsSeq) return;
     setConnStatus("disconnected");
     document.getElementById("error-msg").textContent = `Failed to fetch: ${e}`;
     document.getElementById("error-msg").style.display = "";

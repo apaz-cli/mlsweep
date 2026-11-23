@@ -284,7 +284,9 @@ save your copy.
 For a note: the experiments it cites with their status, its outline, backlinks with
 the linking line, outgoing links (missing ones create the note on click), and history.
 For other files: size, modified time, download, the notes linking to it, and history.
-With no file open: folder totals and the most cited experiments.
+With no file open: folder totals and the most cited experiments. Right-click a backlink
+or a link for Open in new tab, Open to the side, Reveal in file tree and Copy path. A
+history entry offers View this version and Restore this version.
 
 ### History and Changes
 
@@ -300,7 +302,8 @@ An author name is whatever that clone's git config says; nothing verifies it.
 `/` searches file paths and the text of markdown and text files. PDFs are left out. Every word
 must match, case-insensitively; `"quote"` a phrase. Click a result to open the file,
 or a line to open it at that line. A note opens in Live view, scrolled to that line, with
-the search words highlighted for a few seconds.
+the search words highlighted for a few seconds. Right-click a result, a changed file or a
+lint finding for the same menu as a backlink.
 
 ### Graph
 
@@ -318,7 +321,7 @@ files, and notes not written yet, and sets how many labels show.
 The Experiments page counts the documents citing an experiment in its `View ▾` menu,
 next to Notes, and those citing a run in the run's `View ▾` menu. Every entry there
 shows what it leads to (results and export: finished runs, logs: every run, artifacts:
-runs with files). Nothing cites the experiment yet, Notes is there with 0 but greyed
+runs with files, code: the files in it). Nothing cites the experiment yet, Notes is there with 0 but greyed
 out.
 
 ### Keys
@@ -472,6 +475,9 @@ to Results (Shift+click for Logs). If you list `columns` and the run names are j
 one of those values, the run column is dropped and that parameter cell links to the
 run instead, so the same name is not shown twice. Each metric cell's tooltip has
 final/min/max/mean, and `⧉` copies the table as markdown in the order shown.
+Right-click a row for the run's Results, Logs, Artifacts and Code, or to copy its ID.
+On a metric cell it also copies the value, or an evidence link that cites it at the
+table's `agg`.
 
 ### Evidence links
 

@@ -29,6 +29,7 @@ let onlyDone = false;
 let wandbAvailable = false;
 let pollTimer = null;
 let firstLoad = true;
+let expsSeq = 0;   // an older experiment-count refresh must not replace a newer one
 
 wbProject.value = recall("wandb_project");
 wbEntity.value  = recall("wandb_entity");
@@ -112,10 +113,13 @@ function render() {
 }
 
 async function loadExperiments() {
+  const seq = ++expsSeq;
   try {
     const r = await apiFetch("/api/experiments");
     if (!r.ok) { setConnStatus("disconnected"); return; }
-    allExps = await r.json();
+    const exps = await r.json();
+    if (seq !== expsSeq) return;
+    allExps = exps;
     setConnStatus("connected");
     const urlExp = firstLoad ? params.get("experiment") : null;
     firstLoad = false;
@@ -141,9 +145,14 @@ document.querySelectorAll("#runs-toggle button").forEach(b => {
 // Job counts change as sweeps run.  Refresh them without rebuilding the
 // selects, which would close one the user has open.
 setInterval(async () => {
+  const seq = ++expsSeq;
   try {
     const r = await apiFetch("/api/experiments");
-    if (r.ok) { allExps = await r.json(); render(); }
+    if (!r.ok) return;
+    const exps = await r.json();
+    if (seq !== expsSeq) return;
+    allExps = exps;
+    render();
   } catch {}
 }, 15000);
 
@@ -265,17 +274,23 @@ exportList.addEventListener("contextmenu", ev => {
 
 // Every recent upload is listed, whatever the scope.  Poll every 2s while
 // one is running; stop once all have finished.
+let pollSeq = 0;
 async function pollExports() {
+  const seq = ++pollSeq;
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   try {
     const r = await apiFetch("/api/exports");
+    if (seq !== pollSeq) return;   // a newer poll (or a scope change) owns the list
     if (!r.ok) return;
     const exports = await r.json();
+    if (seq !== pollSeq) return;
     // Keep a <details> the user toggled open or shut across re-renders.
     const open = [...exportList.querySelectorAll("details")].map(d => d.open);
     renderExports(exports);
     exportList.querySelectorAll("details").forEach((d, i) => { if (i < open.length) d.open = open[i]; });
-    if (exports.some(e => e.status === "running")) pollTimer = setTimeout(pollExports, 2000);
+    if (exports.some(e => e.status === "running")) {
+      pollTimer = setTimeout(() => { if (seq === pollSeq) pollExports(); }, 2000);
+    }
   } catch {}
 }
 

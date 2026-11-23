@@ -44,13 +44,13 @@ function renderStrip(g) {
     d.oncontextmenu = e => {
       e.preventDefault();
       const others = g.tabs.filter(id => id !== t.id);
-      showMenu(e.clientX, e.clientY, [
-        { label: "Close", key: "X", run: () => closeTab(t.id) },
+      mlMenuAt(e.clientX, e.clientY, [
+        { label: "Close", hint: "X", run: () => closeTab(t.id) },
         { label: "Close others", run: () => others.forEach(id => closeTab(id)) },
         { label: "Close all in this group", run: () => [...g.tabs].forEach(id => closeTab(id)) },
         "-",
-        { label: "Split right", key: "\\", run: () => splitTab(t, "right") },
-        { label: "Split down", key: "|", run: () => splitTab(t, "down") },
+        { label: "Split right", hint: "\\", run: () => splitTab(t, "right") },
+        { label: "Split down", hint: "|", run: () => splitTab(t, "down") },
         ...(t.path ? ["-", { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(t.path); } }, { label: "Copy path", run: () => copyText(t.path) }] : []),
       ]);
     };
@@ -140,26 +140,39 @@ async function openFile(path, { newTab: inNew = false, mode = null, line = null,
       t = newTab({ path, title: titleFor(path), kind, mode: mode || defMode });
       addTab(t, g, index != null ? index : (cur ? g.tabs.indexOf(cur.id) + 1 : g.tabs.length));
     }
-    try { await loadTabContent(t); }
+    let loaded = true;
+    try { loaded = await loadTabContent(t); }
     catch (e) {
+      // Another click may have reused this tab for a different file while the
+      // request was in flight; it owns the tab (and must not be closed because
+      // the file this request wanted is gone).
+      if (t.path !== path) return;
       if (e.status === 404) { toast(`${path} no longer exists`, "err"); closeTab(t.id, true); return; }
       toast("Could not open: " + e.message, "err");
     }
+    if (t.path !== path || loaded === false) return;
   } else if (mode) t.mode = mode;
   t.pendingLine = line; t.pendingHits = hits; t.pendingHeading = heading; t.focusEnd = focusEnd;
   activate(t.id, { pushNav });
 }
 
 async function loadTabContent(t) {
-  const meta = await api(`/api/notes/file?path=${q(t.path)}`);
+  const path = t.path;
+  const seq = (t.loadSeq || 0) + 1;
+  t.loadSeq = seq;
+  const meta = await api(`/api/notes/file?path=${q(path)}`);
+  // The tab switched files, or a newer load/reload started, while this was
+  // in flight.  Applying it would put one file's content under another's path.
+  if (t.path !== path || t.loadSeq !== seq) return false;
   t.meta = meta; t.kind = meta.kind; t.hash = meta.hash; t.deleted = false;
   if (meta.content != null) {
     t.saved = meta.content;
-    const mode = t.kind === "md" ? "gfm" : modeForPath(t.path);
+    const mode = t.kind === "md" ? "gfm" : modeForPath(path);
     t.doc = CodeMirror.Doc(meta.content, mode);
     t.doc.on("change", () => onDocChange(t));
   } else t.doc = null;
   t.dirty = false;
+  return true;
 }
 // Put text that came from outside into the tab's doc, not as an edit of the user's.
 function applyRemote(t, content) {
@@ -170,9 +183,22 @@ function applyRemote(t, content) {
   t.applyingRemote = false;
   t.doc.setCursor(cur);
 }
-async function reloadTab(t, { quiet = false } = {}) {
+async function reloadTab(t, { quiet = false, force = false } = {}) {
+  const path = t.path;
+  const seq = (t.loadSeq || 0) + 1;
+  t.loadSeq = seq;
   try {
-    const meta = await api(`/api/notes/file?path=${q(t.path)}`);
+    const meta = await api(`/api/notes/file?path=${q(path)}`);
+    if (t.path !== path || t.loadSeq !== seq) return;
+    // The reader typed (or a save began) while this fetch was out.  Do not put
+    // the fetched text under their cursor; surface a changed file as a conflict.
+    if (!force && (t.saving || t.dirty)) {
+      if (meta.content != null && meta.hash !== t.hash) {
+        t.conflict = { hash: meta.hash, content: meta.content };
+        renderBanner(t);
+      }
+      return;
+    }
     t.meta = meta; t.hash = meta.hash; t.kind = meta.kind;
     if (meta.content != null && t.doc) {
       if (t.doc.getValue() !== meta.content) {
@@ -183,11 +209,12 @@ async function reloadTab(t, { quiet = false } = {}) {
         if (!quiet) toast(`${t.title} was updated by sync`);
       }
       t.saved = meta.content; t.dirty = false;
-    } else if (meta.content != null && !t.doc) { await loadTabContent(t); }
+    } else if (meta.content != null && !t.doc) { await loadTabContent(t); return; }
     t.conflict = null; t.deleted = false;
     if (isShown(t)) renderGroup(groupOf(t), { keepEditor: true });
     renderTabs();
   } catch (e) {
+    if (t.path !== path || t.loadSeq !== seq) return;
     if (e.status === 404) { t.deleted = true; renderBanner(t); }
   }
 }
@@ -196,11 +223,15 @@ async function reloadTab(t, { quiet = false } = {}) {
 async function checkOpenTabs() {
   for (const t of S.tabs) {
     if (t.type !== "file" || !t.path || t.saving) continue;
-    const f = S.fileMap.get(t.path);
+    const path = t.path, seq = t.loadSeq;
+    const f = S.fileMap.get(path);
     if (!f) { if (!t.deleted) { t.deleted = true; renderBanner(t); } continue; }
     if (t.meta && f.mtime === t.meta.mtime && f.size === t.meta.size) continue;
     let meta;
-    try { meta = await api(`/api/notes/file?path=${q(t.path)}`); } catch { continue; }
+    try { meta = await api(`/api/notes/file?path=${q(path)}`); } catch { continue; }
+    // The tab switched files, started saving or was reloaded while this fetch
+    // was out; its newer state wins.
+    if (t.path !== path || t.loadSeq !== seq || t.saving) continue;
     if (meta.hash === t.hash) { t.meta = meta; continue; }
     if (!t.dirty) {
       t.meta = meta; t.hash = meta.hash;
@@ -241,7 +272,12 @@ const TAB_TYPES = {
   term: { view: (view, t) => renderTermView(view, t), dispose: t => disposeTerm(t), ownRefresh: true },
 };
 const tabType = t => TAB_TYPES[t.type] || {};
-function disposeTab(t) { const d = tabType(t).dispose; if (d) d(t); }
+function disposeTab(t) {
+  // No autosave may fire after the tab is gone (or was closed with Discard).
+  clearTimeout(autosave.get(t.id));
+  autosave.delete(t.id);
+  const d = tabType(t).dispose; if (d) d(t);
+}
 function renderActive(opts = {}) { const g = focusedGroup(); if (g) renderGroup(g, opts); }
 function renderGroup(g, { keepEditor = false } = {}) {
   if (!g || !Groups.has(g.id)) return;
@@ -863,9 +899,7 @@ function postProcess(root, srcPath, depth, opts = {}) {
   // the note.  After embeds, because a caption pairs with the resolved image.
   decorateFigures(root, opts.figBase);
   linkExperiments(root);
-  if (typeof annotateEvidence === "function") annotateEvidence(root);
-  if (typeof annotateCode === "function") annotateCode(root);
-  if (typeof annotateTraces === "function") annotateTraces(root);
+  if (typeof annotateLinks === "function") annotateLinks(root);
   renderMath(root);
 }
 
@@ -1355,22 +1389,41 @@ function onDocChange(t) {
   clearTimeout(autosave.get(t.id));
   if (dirty) autosave.set(t.id, setTimeout(() => saveTab(t), 1200));
 }
-async function saveTab(t, { create = false } = {}) {
+function saveTab(t, opts = {}) {
+  // Keep editing the live block in the doc even when a save is already out.
   if (t.live && t.live.editing >= 0 && t.live.t === t) lvSyncOpen(t.live);
+  // A caller that wants everything saved must wait for the save already in
+  // flight, not start a second one (the server is compare-and-swap).
+  if (t.saving) return t.savePromise || Promise.resolve();
+  if (!t.doc || t.conflict) return Promise.resolve();
+  const p = _saveTab(t, opts);
+  t.savePromise = p;
+  const done = () => { if (t.savePromise === p) t.savePromise = null; };
+  p.then(done, done);
+  return p;
+}
+async function _saveTab(t, { create = false } = {}) {
   if (!t.doc || t.saving || t.conflict) return;
   if (!t.dirty && !create) return;
   clearTimeout(autosave.get(t.id));
   t.saving = true; updateSaveState(t);
+  const path = t.path;
+  const loadSeqAtStart = t.loadSeq;
   const content = t.doc.getValue();
   try {
-    const r = await apiJSON("/api/notes/file", "PUT", { path: t.path, content, base_hash: create ? null : t.hash });
+    const r = await apiJSON("/api/notes/file", "PUT", { path, content, base_hash: create ? null : t.hash });
+    // The tab was reused for another file, or reloaded from disk, while this
+    // save was in flight.  The old file is saved, but its hash and text must
+    // not overwrite the tab's newer state.
+    if (t.path !== path || t.loadSeq !== loadSeqAtStart) return;
     t.hash = r.hash; t.saved = content; t.saveError = null;
     t.meta = { ...(t.meta || {}), size: r.size, mtime: r.mtime, hash: r.hash };
-    const f = S.fileMap.get(t.path); if (f) { f.mtime = r.mtime; f.size = r.size; }
-    S.ownSaves.set(t.path, r.mtime);
+    const f = S.fileMap.get(path); if (f) { f.mtime = r.mtime; f.size = r.size; }
+    S.ownSaves.set(path, r.mtime);
     t.dirty = t.doc.getValue() !== t.saved;
     if (t.dirty) autosave.set(t.id, setTimeout(() => saveTab(t), 800));
   } catch (e) {
+    if (t.path !== path || t.loadSeq !== loadSeqAtStart) return;
     if (e.status === 409 && e.body && e.body.current_hash) {
       t.conflict = { hash: e.body.current_hash, content: e.body.current_content };
     } else if (e.status === 409 && e.body && e.body.deleted) {
@@ -1378,12 +1431,30 @@ async function saveTab(t, { create = false } = {}) {
     } else t.saveError = e.message;
   } finally {
     t.saving = false;
+    // The tab now shows another file: this save belonged to the old one, but
+    // edits made to the new one while it ran still need their autosave.
+    if (t.path !== path && t.dirty) {
+      clearTimeout(autosave.get(t.id));
+      autosave.set(t.id, setTimeout(() => saveTab(t), 800));
+    }
     renderTabs();
     updateSaveState(t); renderBanner(t);
   }
 }
 async function saveActiveNow() { const t = activeTab(); if (t && t.type === "file") { await saveTab(t); if (!t.dirty && !t.conflict) toast("Saved", "ok"); } }
-async function flushSaves() { for (const t of S.tabs) if (t.dirty) await saveTab(t); }
+async function flushSaves() {
+  // Save every dirty tab, including one that was already saving when we got
+  // here, and wait until it is actually on disk before returning.  Operations
+  // that rename or delete a file (move/delete/restore) depend on that.
+  for (const t of [...S.tabs]) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (t.saving) { if (t.savePromise) await t.savePromise; continue; }
+      if (!t.dirty || t.conflict || t.deleted) break;
+      await saveTab(t);
+      if (t.conflict || t.deleted || t.saveError) break;
+    }
+  }
+}
 window.addEventListener("beforeunload", e => { if (S.tabs.some(t => t.dirty)) { flushSaves(); e.preventDefault(); e.returnValue = ""; } });
 
 // ── Line diff (for conflicts) ──────────────────────────────────────────────────
@@ -1413,7 +1484,7 @@ function diffLinesEl(ops) {
   return body;
 }
 async function keepMine(t) { t.hash = t.conflict.hash; t.conflict = null; t.dirty = true; await saveTab(t); renderBanner(t); }
-async function takeTheirs(t) { t.conflict = null; await reloadTab(t, { quiet: true }); }
+async function takeTheirs(t) { t.conflict = null; await reloadTab(t, { quiet: true, force: true }); }
 async function showMerge(t) {
   const theirs = t.conflict.content ?? "";
   const mine = t.doc.getValue();

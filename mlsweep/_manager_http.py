@@ -72,6 +72,7 @@ from mlsweep._manager_db import (
     get_job,
     job_statuses,
     get_logs_for_run,
+    get_logs_with_seq_for_run,
     get_metrics_for_run,
     get_worker,
     list_campaigns,
@@ -224,6 +225,32 @@ def _run_dir_exists(mlsweep_dir: Path, experiment_id: str, run_id: str) -> bool:
         return _run_dir(mlsweep_dir, experiment_id, run_id).exists()
     except ValueError:
         return False
+
+
+def _quarantine_run_dirs(mlsweep_dir: Path, experiment_id: str, run_ids: list[str]) -> list[Path]:
+    """Rename purged run directories aside so a same-ID resubmission can reuse the path.
+
+    The rename happens while the purge holds ``state.lock``.  A new run can be
+    inserted concurrently (job insertion does not take that lock), but it
+    cannot be dispatched until the lock is released, so it cannot have files at
+    the old path yet.  Deleting the quarantined copies afterwards is safe.
+    """
+    moved: list[Path] = []
+    stamp = f"{os.getpid()}-{time.time_ns()}"
+    for rid in run_ids:
+        try:
+            d = _run_dir(mlsweep_dir, experiment_id, rid)
+        except ValueError:  # an old row with a bad ID: its row is gone, leave the disk alone
+            continue
+        if not d.is_dir():
+            continue
+        try:
+            q = d.with_name(f"{d.name}.purging-{stamp}")
+            d.rename(q)
+        except OSError:
+            continue
+        moved.append(q)
+    return moved
 
 
 def _experiment_runs(state: ManagerState, experiment_id: str) -> list[Any]:
@@ -809,6 +836,7 @@ async def _experiment_fields(
         "goal": goal,
         "code": code,
         "controls": controls,
+        "capture_session": _capture_session(request, body),
         **optimizer,
     }
 
@@ -840,37 +868,33 @@ async def handle_create_experiment(request: web.Request) -> web.Response:
         return fields
     if fields.get("optimize") is None:
         exp = await state.db_writer.create_experiment(**fields)
-        await _maybe_link_capture(request, state, body, exp)
         return _json_response(exp, status=201)
 
     # The first trials exist by the time this returns, so a client never sees a sweep with no runs.
     async with state.lock:
         exp = await state.db_writer.create_experiment(**fields)
         await advance_optimizer_locked(db, state, exp)
-    await _maybe_link_capture(request, state, body, exp)
     state.request_schedule()
     return _json_response(exp, status=201)
 
 
-async def _maybe_link_capture(
-    request: web.Request, state: ManagerState, body: dict[str, Any], exp: Any,
-) -> None:
-    """Link a newly created experiment to the trace that submitted it.
+def _capture_session(request: web.Request, body: dict[str, Any]) -> str | None:
+    """The agent trace a submission names (``capture_session``), to link the experiment to.
 
-    The body's ``capture_session`` is the agent session the sweep was typed
-    into (resolved by the client from its own agent's environment).  A trace
-    the manager has not seen, or capture being off, changes nothing.
+    The client resolves it from its own agent's environment.  An id that is
+    not a trace id, or capture being off, links nothing; a trace the watcher
+    has not uploaded yet is linked all the same.
     """
-    session_id = body.get("capture_session") if isinstance(body, dict) else None
-    if not session_id:
-        return
-    experiment_id = (exp.get("experiment_id") if isinstance(exp, dict)
-                     else getattr(exp, "experiment_id", None))
+    from mlsweep._manager_capture import capture_enabled
+    from mlsweep._manager_db import validate_capture_id
+
+    session_id = body.get("capture_session")
+    if not session_id or not capture_enabled(request.config_dict):
+        return None
     try:
-        from mlsweep._manager_capture import link_experiment_to_capture
-        await link_experiment_to_capture(state, str(session_id), str(experiment_id))
-    except Exception:  # capture is best effort: never fail the submission
-        pass
+        return validate_capture_id(session_id)
+    except ValueError:
+        return None
 
 
 @routes.get("/api/experiments/{experiment_id}")
@@ -1390,7 +1414,6 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
             status=409,
         )
 
-    await _maybe_link_capture(request, state, body, exp)
     state.request_schedule()
     return _json_response({"experiment": exp, "jobs": records}, status=201)
 
@@ -1560,11 +1583,6 @@ async def handle_reschedule_job(request: web.Request) -> web.Response:
     experiment_id = request.query.get("experiment_id", "")
     body = await _json_body(request)
 
-    job = await get_job(db, run_id, experiment_id)
-    if job is None:
-        return _not_found("job")
-    if job.status not in ("pending", "dispatched", "running"):
-        return _error_response(f"job is {job.status}; only pending and in-flight jobs can be rescheduled", status=409)
     worker_id = body.get("worker_id")
     gpus = body.get("gpus") or []
     if worker_id is not None and not isinstance(worker_id, str):
@@ -1574,8 +1592,17 @@ async def handle_reschedule_job(request: web.Request) -> web.Response:
     if gpus and worker_id is None:
         return _error_response("'gpus' needs a 'worker_id'")
 
-    key = (job.experiment_id, run_id)
     async with state.lock:
+        # Re-read it under the lock: it may have finished between the request
+        # arriving and the scheduler letting us in.  A pin for a finished job
+        # would otherwise be used by its next retry much later.
+        job = await get_job(db, run_id, experiment_id)
+        if job is None:
+            return _not_found("job")
+        if job.status not in ("pending", "dispatched", "running"):
+            return _error_response(
+                f"job is {job.status}; only pending and in-flight jobs can be rescheduled", status=409)
+        key = (job.experiment_id, run_id)
         pin: Pin | None = None
         if worker_id is not None:
             if job.nodes_per_run > 1:
@@ -1628,14 +1655,18 @@ async def handle_retry_job(request: web.Request) -> web.Response:
     run_id = request.match_info["run_id"]
     experiment_id = request.query.get("experiment_id", "")
 
-    job = await state.db_writer.retry_job(run_id, experiment_id)
-    if job is None:
-        current = await get_job(db, run_id, experiment_id)
-        if current is None:
-            return _not_found("job")
-        return _error_response(
-            f"job is {current.status}; only finished jobs can be retried", status=409,
-        )
+    # The lock serializes this with purge/move, which check that a run is
+    # finished and then act on it; otherwise a retry could land between the
+    # check and the purge and be deleted (or moved) as the old run.
+    async with state.lock:
+        job = await state.db_writer.retry_job(run_id, experiment_id)
+        if job is None:
+            current = await get_job(db, run_id, experiment_id)
+            if current is None:
+                return _not_found("job")
+            return _error_response(
+                f"job is {current.status}; only finished jobs can be retried", status=409,
+            )
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -1790,17 +1821,17 @@ async def handle_purge_jobs(request: web.Request) -> web.Response:
         if problems:
             return _run_conflict(problems)
         purged = await state.db_writer.purge_jobs(experiment_id, run_ids)
+        quarantined = await asyncio.to_thread(
+            _quarantine_run_dirs, mlsweep_dir, experiment_id, purged)
 
     def _rm() -> int:
         freed = 0
-        for rid in purged:
+        for d in quarantined:
             try:
-                d = _run_dir(mlsweep_dir, experiment_id, rid)
-            except ValueError:  # an old row with a bad ID: its row is gone, leave the disk alone
-                continue
-            if d.is_dir():
                 freed += _dir_size(d)
                 shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
         return freed
     freed = await asyncio.to_thread(_rm)
     _broadcast_experiment_event(request, experiment_id, "jobs_purged", run_ids=purged)
@@ -1994,11 +2025,16 @@ async def handle_get_job_log(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     run_id = request.match_info["run_id"]
 
-    text = await get_logs_for_run(db, run_id, experiment_id)
+    # The text and its offset come from one statement, so they are a consistent
+    # snapshot even while a worker appends more log chunks.
+    text, seq = await get_logs_with_seq_for_run(db, run_id, experiment_id)
     if not text:
         return _not_found("log")
 
-    return web.Response(text=text, content_type="text/plain")
+    # The client follows the live WebSocket at the same time.  Telling it the
+    # offset this snapshot ends at lets it discard live chunks already included
+    # (and append only the newer ones) instead of duplicating or reordering them.
+    return web.Response(text=text, content_type="text/plain", headers={"X-Log-Seq": str(seq)})
 
 
 @routes.get("/api/experiments/{experiment_id}/jobs/{run_id}/artifacts")
@@ -2751,11 +2787,12 @@ async def handle_patch_worker_concurrency(request: web.Request) -> web.Response:
     if value is None or not isinstance(value, int) or value < 0:
         return _error_response("'max_jobs_per_gpu' (int >= 0) is required")
 
-    wc = state.workers.get(worker_id)
-    if wc is None:
-        return _not_found("worker")
-
     async with state.lock:
+        # Look it up under the lock: a reconnect may have replaced the live
+        # connection while the body was being read.
+        wc = state.workers.get(worker_id)
+        if wc is None:
+            return _not_found("worker")
         wc.max_jobs_per_gpu = value
 
     state.request_schedule()
@@ -2787,11 +2824,12 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
     if not (int_list(add_gpus) and int_list(remove_gpus) and int_list(drain_gpus)):
         return _error_response("'add', 'remove' and 'drain' must be lists of GPU indices")
 
-    wc = state.workers.get(worker_id)
-    if wc is None:
-        return _not_found("worker")
-
     async with state.lock:
+        # Look it up under the lock: a reconnect may have replaced the live
+        # connection while the body was being read.
+        wc = state.workers.get(worker_id)
+        if wc is None:
+            return _not_found("worker")
         # Runs on a GPU being removed are requeued (no retry spent).
         remove_set = set(remove_gpus)
         evict = [r for r in state.runs_on(worker_id) if remove_set & set(r.nodes[worker_id])]
@@ -2799,11 +2837,12 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
         # A pin to a GPU that just left the pool is dropped by the next pass.
         await requeue_runs_locked(db, state, [r.key for r in evict], lost=False)
         await state.db_writer.update_worker_devices(worker_id, json.dumps(wc.gpus))
-    to_evict = [r.run_id for r in evict]
+        gpus = list(wc.gpus)
+        to_evict = [r.run_id for r in evict]
+        draining = sorted({r.run_id for r in state.runs_on(worker_id)
+                           if set(drain_gpus) & set(r.nodes[worker_id])})
     state.request_schedule()
-    draining = sorted({r.run_id for r in state.runs_on(worker_id)
-                       if set(drain_gpus) & set(r.nodes[worker_id])})
-    return _json_response({"worker_id": worker_id, "gpus": wc.gpus, "evicted": to_evict,
+    return _json_response({"worker_id": worker_id, "gpus": gpus, "evicted": to_evict,
                            "draining": draining})
 
 
@@ -3008,78 +3047,80 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
     ws = web.WebSocketResponse(max_msg_size=_MAX_WS_MESSAGE_BYTES)
     await ws.prepare(request)
 
-    # ── ?since= replay ────────────────────────────────────────────────────
-    since_str = request.query.get("since")
-    if since_str is not None:
-        try:
-            since_epoch = float(since_str)
-        except (ValueError, TypeError):
-            await ws.send_json({"error": "invalid 'since' parameter — must be a Unix timestamp"})
-            await ws.close()
-            return ws
-
-        # Replay job_done events for done/failed jobs finished since `since`
-        done_jobs = await list_jobs_since(
-            db, experiment_id,
-            statuses=['done', 'failed'],
-            since_col='finish_time',
-            since_ts=since_epoch,
-        )
-        for job in done_jobs:
-            await ws.send_json({
-                "type": "job_done",
-                "experiment_id": experiment_id,
-                "run_id": job.run_id,
-                "status": job.status,
-                "success": job.status == "done",
-                "elapsed": job.elapsed,
-                "exit_code": job.exit_code,
-                "worker_id": job.worker_id,
-            }, dumps=_json_dumps)
-
-        # Replay job_started events for jobs started since `since`
-        started_jobs = await list_jobs_since(
-            db, experiment_id,
-            statuses=['dispatched', 'running', 'done', 'failed', 'cancelled'],
-            since_col='start_time',
-            since_ts=since_epoch,
-        )
-        for job in started_jobs:
-            await ws.send_json({
-                "type": "job_started",
-                "experiment_id": experiment_id,
-                "run_id": job.run_id,
-                "worker_id": job.worker_id,
-            }, dumps=_json_dumps)
-
-    # ── Live subscriber loop ──────────────────────────────────────────────
-
-    # Create a bounded queue so we can detect slow/disconnected clients
-    # in broadcast() via QueueFull.
+    # Subscribe before the replay queries: anything broadcast from now on is
+    # queued, so a run that finishes between the client's snapshot and this
+    # connection is not lost.  The queue is drained after the replay, keeping
+    # replayed events ahead of live ones.
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1024)
     state.add_subscriber(experiment_id, queue)
-
     logger.debug("WebSocket subscriber joined experiment %s", experiment_id)
 
-    # Background task: forward broadcast events from the queue to the
-    # WebSocket client.
-    async def _forward_events() -> None:
-        try:
-            while True:
-                event = await queue.get()
-                try:
-                    await ws.send_json(event, dumps=_json_dumps)
-                except Exception:
-                    # Connection closed or broken
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("WebSocket forward task exited", exc_info=True)
-
-    forward_task = asyncio.create_task(_forward_events())
-
+    forward_task: asyncio.Task[None] | None = None
     try:
+        # ── ?since= replay ────────────────────────────────────────────────
+        since_str = request.query.get("since")
+        if since_str is not None:
+            try:
+                since_epoch = float(since_str)
+            except (ValueError, TypeError):
+                await ws.send_json({"error": "invalid 'since' parameter — must be a Unix timestamp"})
+                await ws.close()
+                return ws
+
+            # job_started first: a job that both started and finished since
+            # `since` must end in its finished state on the client.
+            # Replay job_started events for jobs started since `since`
+            started_jobs = await list_jobs_since(
+                db, experiment_id,
+                statuses=['dispatched', 'running', 'done', 'failed', 'cancelled'],
+                since_col='start_time',
+                since_ts=since_epoch,
+            )
+            for job in started_jobs:
+                await ws.send_json({
+                    "type": "job_started",
+                    "experiment_id": experiment_id,
+                    "run_id": job.run_id,
+                    "worker_id": job.worker_id,
+                }, dumps=_json_dumps)
+
+            # Replay job_done events for done/failed jobs finished since `since`
+            done_jobs = await list_jobs_since(
+                db, experiment_id,
+                statuses=['done', 'failed'],
+                since_col='finish_time',
+                since_ts=since_epoch,
+            )
+            for job in done_jobs:
+                await ws.send_json({
+                    "type": "job_done",
+                    "experiment_id": experiment_id,
+                    "run_id": job.run_id,
+                    "status": job.status,
+                    "success": job.status == "done",
+                    "elapsed": job.elapsed,
+                    "exit_code": job.exit_code,
+                    "worker_id": job.worker_id,
+                }, dumps=_json_dumps)
+
+        # Background task: forward the events queued during the replay, then
+        # every later broadcast, to the WebSocket client.
+        async def _forward_events() -> None:
+            try:
+                while True:
+                    event = await queue.get()
+                    try:
+                        await ws.send_json(event, dumps=_json_dumps)
+                    except Exception:
+                        # Connection closed or broken
+                        break
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("WebSocket forward task exited", exc_info=True)
+
+        forward_task = asyncio.create_task(_forward_events())
+
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 # Clients can send JSON commands (e.g., ping, filter)
@@ -3098,11 +3139,12 @@ async def handle_ws_experiment(request: web.Request) -> web.StreamResponse:
                 logger.warning("WebSocket error for experiment %s: %s",
                                experiment_id, ws.exception())
     finally:
-        forward_task.cancel()
-        try:
-            await forward_task
-        except asyncio.CancelledError:
-            pass
+        if forward_task is not None:
+            forward_task.cancel()
+            try:
+                await forward_task
+            except asyncio.CancelledError:
+                pass
         state.remove_subscriber(experiment_id, queue)
         logger.debug("WebSocket subscriber left experiment %s", experiment_id)
 
@@ -3226,8 +3268,10 @@ def create_app(
 
     # Register REST routes
     from mlsweep._manager_code import code_routes
+    from mlsweep._manager_code_read import code_read_routes
     app.add_routes(routes)
     app.add_routes(code_routes)
+    app.add_routes(code_read_routes)
 
     # Static file serving for web UI
     webui_dir = Path(mlsweep_dir).expanduser().resolve() / "webui"

@@ -3,26 +3,21 @@ logger's refusal to overwrite logged steps."""
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import time
-import urllib.error
 from pathlib import Path
 
 import pytest
 
-from conftest import _api_get, _api_post, _api_request
+from conftest import _api_get, _api_post, _api_request, _api_status
 from mlsweep.logger import MLSweepLogger
 
 TOKEN = "test-token"
 
 
 def _post(url: str, path: str, data: object) -> tuple[int, dict]:  # type: ignore[type-arg]
-    try:
-        return 200, _api_post(url, TOKEN, path, data)
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
+    return _api_status(url, TOKEN, "POST", path, data)
 
 
 def _job(url: str, exp: str, run: str, status: str = "done") -> None:
@@ -76,8 +71,8 @@ def test_move_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
 
 def test_move_respects_campaign(manager_server) -> None:  # type: ignore[no-untyped-def]
     _, url = manager_server
-    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "a", "campaign": "one"})
-    _api_post(url, TOKEN, "/api/experiments", {"campaign": "test", "experiment_id": "b", "campaign": "two"})
+    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "a", "campaign": "one"})
+    _api_post(url, TOKEN, "/api/experiments", {"experiment_id": "b", "campaign": "two"})
     _job(url, "a", "r")
     status, _ = _post(url, "/api/experiments/a/jobs/move?campaign=one", {"run_ids": ["r"], "to": "b"})
     assert status == 404

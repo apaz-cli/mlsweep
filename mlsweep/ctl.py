@@ -1806,6 +1806,9 @@ def gc_cmd(argv: list[str]) -> None:
 _CODE_HELP = """\
 mlsweep code EXP                     what code EXP's runs used, and where it came from
 mlsweep code EXP PATH                print one file as EXP ran it
+mlsweep code EXP PATH --lines 40-60  numbered lines, with their note reference (-n: the file, paged)
+mlsweep code mlsweep:code/EXP/PATH#L40-60   the same, from a note's link
+mlsweep code search PATTERN [EXP...] lines that match, in EXP or across the campaign (-E, -i, -C N)
 mlsweep code EXP --files [PREFIX]    list the snapshot's files
 mlsweep code diff A B [--path P]     what changed between two experiments' code (--stat for a summary)
 mlsweep code checkout EXP DIR        write EXP's code out to DIR
@@ -2002,19 +2005,37 @@ def _print_uncommitted(manager: str, token: str, exp: str, campaign: str | None,
 
 
 def code_cmd(argv: list[str]) -> None:
-    verb = argv[0] if argv and argv[0] in ("diff", "checkout") else "show"
+    verb = argv[0] if argv and argv[0] in ("diff", "checkout", "search") else "show"
     parser = argparse.ArgumentParser(prog=f"mlsweep code{'' if verb == 'show' else ' ' + verb}",
-                                     description="The code experiments ran: show, print, diff, check out.",
+                                     description="The code experiments ran: show, print, search, diff, "
+                                                 "check out.",
                                      epilog=_CODE_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_manager_args(parser)
     parser.add_argument("--json", action="store_true", help="Print what the manager returned, as JSON")
     if verb == "show":
-        parser.add_argument("ref", metavar="EXP", help="Experiment ID or snapshot ID")
+        parser.add_argument("ref", metavar="EXP",
+                            help="Experiment ID, snapshot ID, or a note's mlsweep:code/EXP/PATH#L40-60 link")
         parser.add_argument("path", nargs="?", help="A file to print, as the experiment ran it")
         parser.add_argument("--files", nargs="?", const="", metavar="PREFIX", help="List the snapshot's files")
         parser.add_argument("--snapshot", help="Which of the experiment's code versions (ID or prefix)")
         parser.add_argument("--uncommitted", action="store_true",
                             help="Print the uncommitted changes recorded when the code was submitted")
+        parser.add_argument("--lines", metavar="A-B",
+                            help="Print these lines, numbered (40, 40-60, or 40- for the rest)")
+        parser.add_argument("-n", "--numbered", action="store_true",
+                            help="Print the file numbered, within --budget, with the command for the next page")
+        parser.add_argument("--budget", type=int, default=2000, metavar="TOKENS",
+                            help="With -n or --lines, stop after about this many tokens (default 2000, 0: no limit)")
+    elif verb == "search":
+        parser.add_argument("pattern", metavar="PATTERN", help="Text to find (a regular expression with -E)")
+        parser.add_argument("targets", nargs="*", metavar="EXP",
+                            help="Experiments or snapshots to search (default: every experiment of the campaign)")
+        parser.add_argument("--path", help="Only files under this path")
+        parser.add_argument("-E", "--regex", action="store_true", help="PATTERN is a regular expression")
+        parser.add_argument("-i", "--ignore-case", action="store_true")
+        parser.add_argument("-C", "--context-lines", dest="context_lines", type=int, default=0, metavar="N",
+                            help="Lines around each match (at most 10)")
+        parser.add_argument("--limit", type=int, default=50, help="At most this many lines (max 500)")
     elif verb == "diff":
         parser.add_argument("a", metavar="A")
         parser.add_argument("b", metavar="B")
@@ -2027,8 +2048,25 @@ def code_cmd(argv: list[str]) -> None:
     args = parser.parse_args(argv[1:] if verb != "show" else argv)
     manager, token = _manager_token(args)
     campaign = _resolve_campaign(args)
+    if verb == "show":
+        from mlsweep._notes_code import CodeRefError, is_code_ref, parse_code_ref
+        if is_code_ref(args.ref):     # a note's link: mlsweep:code/EXP/PATH#L40-60
+            try:
+                cref = parse_code_ref(args.ref)
+            except CodeRefError as exc:
+                _die(str(exc))
+            args.ref, args.path = cref.target, args.path or cref.path or None
+            if cref.start is not None and not args.lines:
+                args.lines = f"{cref.start}-{cref.end}" if cref.end else str(cref.start)
 
-    if verb == "diff":
+    if verb == "search":
+        from mlsweep._code_read import search
+        from mlsweep._snapshot import is_snapshot_id
+        for t in args.targets:
+            if not is_snapshot_id(t):
+                require_campaign(manager, token, t, campaign)
+        search(manager, token, args, campaign)
+    elif verb == "diff":
         a = _resolve_code_ref(manager, token, args.a, campaign, None)
         b = _resolve_code_ref(manager, token, args.b, campaign, None)
         _code_diff(manager, token, a, b, args.path, args.stat)
@@ -2042,6 +2080,19 @@ def code_cmd(argv: list[str]) -> None:
         if args.path is not None:
             from urllib.parse import quote
             data = _code_get(manager, token, f"/api/snapshots/{sid}/files/{quote(args.path)}", raw=True)
+            if args.lines or args.numbered:
+                from mlsweep._code_read import parse_line_range, print_lines
+                from mlsweep._snapshot import is_snapshot_id, short_id
+                try:
+                    start, end = parse_line_range(args.lines) if args.lines else (1, None)
+                except ValueError as exc:
+                    _die(str(exc))
+                # Cite the experiment, or the snapshot when one was picked or given.
+                cite = short_id(sid) if (args.snapshot or is_snapshot_id(args.ref)) else args.ref
+                print_lines(data, cite_target=cite, path=args.path, start=start, end=end,
+                            budget=args.budget, again=f"mlsweep code {cite} {quote(args.path, safe='/')}",
+                            as_json=args.json)
+                return
             sys.stdout.buffer.write(data)
             sys.stdout.flush()
             return

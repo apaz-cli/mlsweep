@@ -292,20 +292,31 @@
     });
   };
 
-  // mlContextMenu(event, items) shows a right-click menu at the pointer.
-  // items: [{ label, hint?, run, danger?, disabled? } | "-" | { title }].
+  // mlContextMenu(event, items) shows a right-click menu at the pointer;
+  // mlMenuAt(x, y, items) shows the same menu at a point (a button's corner).
+  // items: [{ label, hint?, run, danger?, disabled? } | "-" | { title } | null].
   let ctx = null;
   function closeCtx() { if (ctx) { ctx.remove(); ctx = null; } }
+  window.mlCloseContextMenu = closeCtx;
   window.mlContextMenu = function (event, items) {
     event.preventDefault();
     event.stopPropagation();
+    window.mlMenuAt(event.clientX, event.clientY, items);
+  };
+  window.mlMenuAt = function (x, y, items) {
     closeCtx();
     const menu = document.createElement("div");
     menu.className = "ml-ctx";
     menu.setAttribute("role", "menu");
     for (const it of items) {
       if (!it) continue;
-      if (it === "-") { const sep = document.createElement("div"); sep.className = "ml-ctx-sep"; menu.append(sep); continue; }
+      if (it === "-") {
+        // No separator at the top or twice in a row (items around it were left out).
+        if (menu.lastChild && menu.lastChild.className !== "ml-ctx-sep") {
+          const sep = document.createElement("div"); sep.className = "ml-ctx-sep"; menu.append(sep);
+        }
+        continue;
+      }
       if (it.title) { const t = document.createElement("div"); t.className = "ml-ctx-title"; t.textContent = it.title; menu.append(t); continue; }
       const b = document.createElement("button");
       b.type = "button";
@@ -320,12 +331,11 @@
       b.onclick = () => { closeCtx(); it.run(); };
       menu.append(b);
     }
-    // Drop separators left at the edges by items that were filtered out.
     while (menu.lastChild && menu.lastChild.className === "ml-ctx-sep") menu.lastChild.remove();
     document.body.append(menu);
     const w = menu.offsetWidth, h = menu.offsetHeight;
-    menu.style.left = Math.max(4, Math.min(event.clientX, innerWidth - w - 4)) + "px";
-    menu.style.top = Math.max(4, Math.min(event.clientY, innerHeight - h - 4)) + "px";
+    menu.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
+    menu.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
     ctx = menu;
   };
   // A right-click on a link, a field or selected text inside a row keeps the
@@ -338,6 +348,18 @@
     if ((inner && inner !== row) || t.isContentEditable) return true;
     const sel = getSelection();
     return !!(sel && !sel.isCollapsed && String(sel).trim() && sel.containsNode(t, true));
+  };
+  // A run's other pages, as right-click menu items: every page but *skip*.
+  // *code*: whether the run has a code snapshot to open.
+  window.mlRunPageItems = function (expId, runId, { skip = "", code = true } = {}) {
+    const q = { experiment: expId, run: runId };
+    return [
+      ["results", "Open results", { experiment: expId }],
+      ["logs", "Open logs", q],
+      ["files", "Open artifacts", q],
+      code ? ["code", "Open code", q] : null,
+    ].filter(p => p && p[0] !== skip)
+      .map(([page, label, query]) => ({ label, run: () => { location.href = pageHref(`${page}.html`, query); } }));
   };
   document.addEventListener("mousedown", e => { if (ctx && !ctx.contains(e.target)) closeCtx(); }, true);
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeCtx(); });

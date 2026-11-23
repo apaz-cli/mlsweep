@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import os
 import signal
 import socket
@@ -123,23 +124,56 @@ def _resolve_notes_dir(arg: str, mlsweep_dir: Path) -> Path | None:
     return path
 
 
+# Kept open for the manager's lifetime: it holds the flock that makes the
+# PID-file check and write atomic between two managers starting together.
+_pid_lock_fd: int | None = None
+
+
 def _check_pid_file(pid_file: Path) -> None:
-    """Ensure only one manager is running.  Exit if another is alive."""
-    if pid_file.exists():
+    """Ensure only one manager is running.  Exit if another is alive.
+
+    The existence check and the write used to be separate, so two managers
+    starting at once could both pass and write the file.  The lock is taken on
+    the file itself, before it is read or truncated.
+    """
+    global _pid_lock_fd
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        print(f"Error: cannot open PID file {pid_file}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
         try:
-            old_pid = int(pid_file.read_text().strip())
-        except (ValueError, OSError):
+            old = os.pread(fd, 64, 0).decode(errors="replace").strip()
+        except OSError:
+            old = ""
+        os.close(fd)
+        detail = f" with PID {old}" if old else ""
+        print(f"Error: manager already running{detail}", file=sys.stderr)
+        sys.exit(1)
+    except OSError:
+        os.close(fd)
+        raise
+    # A manager from before this lock existed may still be alive without it.
+    try:
+        old = os.pread(fd, 64, 0).decode(errors="replace").strip()
+    except OSError:
+        old = ""
+    if old and old != str(os.getpid()):
+        try:
+            os.kill(int(old), 0)  # signal 0 just checks existence
+        except (OSError, ValueError):
             pass
         else:
-            try:
-                os.kill(old_pid, 0)  # signal 0 just checks existence
-                print(f"Error: manager already running with PID {old_pid}", file=sys.stderr)
-                sys.exit(1)
-            except OSError:
-                # Process not alive — stale pid file
-                pid_file.unlink(missing_ok=True)
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()))
+            os.close(fd)
+            print(f"Error: manager already running with PID {old}", file=sys.stderr)
+            sys.exit(1)
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+    _pid_lock_fd = fd
 
 
 async def _find_reachable_urls(port: int, token: str) -> list[tuple[str, str]]:
@@ -317,7 +351,9 @@ async def _async_main(args: argparse.Namespace) -> None:
         print(f"Terminals: on, sandboxed, workspace {mlsweep_dir / 'workspace'}")
     else:
         print("Terminals: off (--no-terminals)")
-    setup_capture(app, mlsweep_dir, enabled=not args.no_capture)
+    from mlsweep._manager_sql import setup_sql
+    setup_sql(app, db_path)   # read-only queries: `mlsweep sql`
+    setup_capture(app, enabled=not args.no_capture)
     if args.no_capture:
         print("Capture: off (--no-capture)")
     else:

@@ -219,10 +219,14 @@ function splitTab(t, side) {
   else { S.focus = ng.id; markFocus(); renderTabs(); renderGroup(ng); saveTabs(); refreshRight(); }
 }
 
-function closeGroup(g) {
-  if (Groups.size < 2) return;
-  for (const id of [...g.tabs]) { const t = tabById(id); if (t && t.dirty) saveTab(t); }
-  for (const t of S.tabs.filter(t => t.group === g.id)) disposeTab(t);
+async function closeGroup(g) {
+  if (Groups.size < 2 || g.closing) return;
+  g.closing = true;
+  const tabs = S.tabs.filter(t => t.group === g.id);
+  // Finish saves before disposing: disposeTab cancels the autosave timer, and
+  // an in-flight save must not be lost with the tab.
+  for (const t of tabs) if (t.type === "file" && (t.dirty || t.saving)) await saveTab(t);
+  for (const t of tabs) disposeTab(t);
   S.tabs = S.tabs.filter(t => t.group !== g.id);
   if (removeGroup(g.id)) { renderLayout(); renderTabs(); renderGroup(focusedGroup()); saveTabs(); }
 }

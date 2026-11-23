@@ -1,12 +1,7 @@
 // Command palette — search, resolve, preview, and act.
 // Uses MLSearch (search-core.js) for the actual index.
 (function () {
-  const PAGES = [
-    ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
-    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"],
-    ["traces", "Traces", "∿"], ["export", "Export", "⇩"],
-    ["system", "System", "⚙"],
-  ];
+  const PAGES = MLChrome.pages;
 
   // Earlier versions kept a search history and per-result usage; forget them.
   try { localStorage.removeItem("mlsweep_search_history"); localStorage.removeItem("mlsweep_search_usage"); } catch {}

@@ -49,6 +49,7 @@ from mlsweep._manager_db import (
     get_metrics_for_run,
     insert_log,
     get_logs_for_run,
+    get_logs_with_seq_for_run,
     last_log_seq,
     uncompacted_log_attempts,
     compact_log_attempt,
@@ -1039,6 +1040,59 @@ def test_experiment_counts_include_runs_with_artifacts():
             rows = await list_experiments_with_counts(db)
             assert rows[0]["job_counts"]["with_artifacts"] == 1
             assert rows[0]["job_counts"]["total"] == 2
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_db_writer_survives_a_cancelled_caller():
+    """A caller cancelled while its write is queued must not kill the actor.
+
+    `run()` used to call `fut.set_result`/`set_exception` without checking that
+    the caller's future was already cancelled; the resulting InvalidStateError
+    escaped the loop and every later write hung forever.
+    """
+    class FakeDb:
+        async def rollback(self) -> None:
+            pass
+
+    async def run():
+        writer = DbWriter(FakeDb())  # type: ignore[arg-type]
+        task = asyncio.create_task(writer.run())
+        started = asyncio.Event()
+
+        async def slow():
+            started.set()
+            await asyncio.sleep(0.2)
+            return "done"
+
+        caller = asyncio.create_task(writer._enqueue(slow))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await asyncio.sleep(0.3)
+        assert not task.done(), "a cancelled caller killed the writer actor"
+        assert await asyncio.wait_for(
+            writer._enqueue(lambda: asyncio.sleep(0, result=42)), 1) == 42
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+
+def test_log_text_and_offset_are_one_snapshot():
+    async def run():
+        db = await _init_db()
+        try:
+            job = await _dispatched(db)
+            end = await _write_chunks(db, job, _CHUNKS)
+            text, seq = await get_logs_with_seq_for_run(db, "run1", "exp1")
+            assert text == "".join(_CHUNKS)
+            assert seq == end
+            assert await get_logs_for_run(db, "run1", "exp1") == text
         finally:
             await db.close()
 

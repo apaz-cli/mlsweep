@@ -105,6 +105,11 @@ function wsURL(path) {
   return `${proto}://${location.host}${path}?token=${encodeURIComponent(TOKEN)}`;
 }
 
+// What a trace is called: its title, else its working directory's last part, else its id.
+function traceName(s) {
+  return s.title || (s.cwd ? s.cwd.split("/").filter(Boolean).pop() : s.session_id);
+}
+
 // A link to another dashboard page, with query *extra*.
 function pageHref(page, extra = {}) {
   const query = new URLSearchParams(extra).toString();
@@ -176,9 +181,11 @@ function fileKindOf(path) {
 const PANEL_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M5.5 2.5v11"/></svg>';
 
 const MLChrome = (() => {
+  // [page, label, palette glyph]: the nav bar and the command palette both list these.
   const PAGES = [
-    ["experiments", "Experiments"], ["results", "Results"], ["logs", "Logs"], ["files", "Artifacts"],
-    ["code", "Code"], ["notes", "Notes"], ["traces", "Traces"], ["export", "Export"], ["system", "System"],
+    ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
+    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"],
+    ["traces", "Traces", "∿"], ["export", "Export", "⇩"], ["system", "System", "⚙"],
   ];
   const root = document.documentElement;
 
@@ -297,7 +304,7 @@ const MLChrome = (() => {
     h.addEventListener("dblclick", () => { MLPrefs.remove(name); set(null); refit(); });
   }
 
-  return { PAGES: PAGES.map(([page]) => page), nav, collapsibleSidebar, resizable };
+  return { PAGES: PAGES.map(([page]) => page), pages: PAGES, nav, collapsibleSidebar, resizable };
 })();
 
 // The Ctrl/Cmd+K palette (palette.js, searching through search-core.js) on every page.

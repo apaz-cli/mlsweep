@@ -50,6 +50,7 @@ mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape 
 mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
                                            # (on the manager's machine: prints its results folder, no copy)
+mlsweep sql "SELECT ..."                   # read-only SQL over the manager's database (no query: list tables)
 
 # 4. Control a running sweep
 mlsweep cancel EXP_ID --running            # cancel jobs (--pending / --all --yes)
@@ -395,7 +396,14 @@ and `Manage` (Rename, Move to campaign, Delete). A run's row has the same two: `
 for its Artifacts and Logs, `Manage` for Rename, Cancel or Retry, Move and Delete. The
 page has
 Pause, Unpause, Stop, Retry failed, Cancel active and Delete failed above an expanded
-experiment's runs.
+experiment's runs. Right-click a row for both menus in one, with Copy ID added. The Code
+entry counts the files in the code: the experiment's latest version, or the run's own.
+
+Right-click works the same way across the dashboard. On the System page it covers a worker,
+one GPU (drain, remove or return it), a run chip and an in-flight run. Logs and Artifacts
+have it on their run lists, Artifacts also on files and compare cards, Traces on traces and
+events, and Export on uploads and their runs. On a link, a field or selected text you get
+the browser's own menu instead.
 
 The Artifacts page previews images and text files. For model and array files (safetensors,
 PyTorch `.pt`/`.pth`/`.ckpt`/`.bin`, TorchScript, pickle, NumPy `.npy`/`.npz`, GGUF and
@@ -487,11 +495,23 @@ reading an experiment later.
 ```sh
 mlsweep code EXP                        # the code EXP's runs used, and where it came from
 mlsweep code EXP yoco/train.py          # one file, as EXP ran it
+mlsweep code EXP yoco/train.py --lines 40-60   # numbered, with the note reference (-n: the whole file, paged)
+mlsweep code "mlsweep:code/EXP/yoco/train.py#L40-60"   # the same, from a note's link
+mlsweep code search warmup [EXP...]     # matching lines, in EXP or across the campaign (-E, -i, -C N, --path)
 mlsweep code EXP --files [PREFIX]       # the snapshot's file list
 mlsweep code EXP --uncommitted          # the uncommitted changes recorded at submit
 mlsweep code diff EXP_A EXP_B           # what changed (--path DIR to narrow, --stat for a summary)
 mlsweep code checkout EXP DIR           # write EXP's code out to DIR
 ```
+
+With `--lines` or `-n`, a file prints with line numbers and stops at about 2000 tokens
+(`--budget`). The last lines give the note reference for what was shown and the command for
+the next page. Without either, the file prints raw, so `> FILE` saves it as it was. `search`
+matches text, or a regular expression with `-E`, and gives each line with its
+`mlsweep:code/EXP/path#L12` reference. With no experiment named it searches the campaign's
+experiments, newest first, each as its latest code. A file several of them share is searched
+once, and its hits name the newest experiment and count the others. Binary files and files
+over 2 MB are skipped.
 
 The dashboard's Code tab shows the same. Pick an experiment and a run, as on Logs, to see
 that run's code as a file tree and files with line numbers, and where it came from.
@@ -519,6 +539,15 @@ runs still retry from it, but `mlsweep code`, the code page and notes can't show
 Research notes live in `<mlsweep-dir>/notes` and show in the dashboard's Notes tab. See
 `docs/notes.md` (`mlsweep docs notes`) for the tab, the markdown it renders, sharing between
 machines, and lint.
+
+## SQL
+
+`mlsweep sql "SELECT ..."` runs one query over the manager's database and prints the rows as a
+table (`--json` for the data). With no query it lists the tables and their columns. The query
+can only read. It runs on a read-only connection that refuses writes, `ATTACH` and settings,
+and it stops after 5 seconds (`--timeout`, at most 30) and 200 rows (`--limit`, at most 5000).
+Table layouts can change between versions, so prefer a command where one fits. `POST /api/sql`
+with `{"sql": ...}` is the same thing over HTTP.
 
 ## Troubleshooting
 

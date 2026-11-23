@@ -8,7 +8,7 @@ let noteMentions = {};      // experiment id -> [note paths] (its own or its run
 let noteRunMentions = {};   // experiment id -> {run id: [note paths]}
 // capture is optional too: a manager started with --no-capture has no traces.
 let captureEnabled = false;
-let traceCounts = {};       // experiment id -> linked trace count
+let traceCounts = null;     // experiment id -> linked trace count (null until loaded)
 
 let rowMenu = null;
 
@@ -17,6 +17,9 @@ async function postRunAction(expId, runId, action) {
   const r = await apiFetch(`/api/jobs/${encodeURIComponent(runId)}/${action}?experiment_id=${encodeURIComponent(expId)}`, { method: "POST" });
   if (!r.ok) { const body = await r.json().catch(() => ({})); await mlAlert(`${action} failed: ${body.error || r.status}`); }
 }
+
+// A menu's "Copy … ID" entry (an act() handler, so it takes plain arguments).
+function copyId(id, toast) { copyText(id, toast); }
 
 function closeRowMenu() { if (rowMenu) { rowMenu.remove(); rowMenu = null; } }
 
@@ -99,19 +102,12 @@ function notesItem(expId, runId) {
 // Where a run's View menu leads.
 function tracesItem(expId, runId) {
   if (!captureEnabled) return null;
-  const what = runId || expId;
-  const item = { label: "Traces", icon: "traces" };
-  if (runId) return { ...item, href: pageHref("traces.html", { experiment: expId }),
-                      title: "The coding-agent sessions around this run" };
+  const item = { label: "Traces", icon: "traces", href: pageHref("traces.html", { experiment: expId }) };
+  // A run has no traces of its own: it shows its experiment's.
+  if (runId || !traceCounts) return { ...item, title: `The coding-agent sessions around ${runId || expId}` };
   const n = traceCounts[expId] ?? 0;
-  if (!traceCounts.__loaded) return { ...item, href: pageHref("traces.html", { experiment: expId }),
-                                     title: "The coding-agent sessions around this" };
-  if (!n) return { ...item, disabled: true, count: n, title: `No trace submitted ${what} yet` };
-  return {
-    ...item, count: n,
-    href: pageHref("traces.html", { experiment: expId }),
-    title: `${n} trace${n === 1 ? "" : "s"} submitted ${what}`,
-  };
+  if (!n) return { ...item, href: null, disabled: true, count: n, title: `No trace submitted ${expId} yet` };
+  return { ...item, count: n, title: `${n} trace${n === 1 ? "" : "s"} submitted ${expId}` };
 }
 
 // codeFiles: how many files the run's code snapshot has (null: no snapshot).
@@ -151,11 +147,14 @@ window.addEventListener("resize", closeRowMenu);
 // What cites each experiment and each of its runs (empty with no --notes).
 // onChange runs whenever the answer differs from the last one.
 function watchNoteMentions(onChange) {
+  let seq = 0;
   async function poll() {
+    const mine = ++seq;
     try {
       const r = await apiFetch("/api/notes/mentions");
-      if (!r.ok) return;
+      if (mine !== seq || !r.ok) return;
       const d = await r.json();
+      if (mine !== seq) return;
       const next = d.mentions || {};
       const nextRuns = d.runs || {};
       const nextEnabled = d.enabled !== false;
@@ -176,30 +175,21 @@ function watchNoteMentions(onChange) {
 // (and go disabled without one).  The counts endpoint answers 404 on a manager
 // with capture off; then there is no Traces entry either.
 function watchTraceCounts(onChange) {
-  let loaded = false;
+  let seq = 0;
   async function poll() {
+    const mine = ++seq;
     try {
       const r = await apiFetch("/api/capture/counts");
-      let counts = null;
-      if (r.ok) {
-        counts = await r.json();
-      } else if (r.status === 404) {
-        // A manager from before the counts route: fall back to the session list.
-        const list = await apiFetch("/api/capture/sessions?limit=200&state=all");
-        if (list.status === 404) { captureEnabled = false; return; }
-        if (!list.ok) return;
-        const byExperiment = {};
-        for (const s of await list.json()) {
-          for (const e of s.experiments || []) byExperiment[e] = (byExperiment[e] || 0) + 1;
-        }
-        counts = { experiments: byExperiment };
-      } else {
+      if (mine !== seq) return;
+      if (r.status === 404) {
+        if (captureEnabled) { captureEnabled = false; onChange(); }
         return;
       }
+      if (!r.ok) return;
+      const next = (await r.json()).experiments || {};
+      if (mine !== seq) return;
+      const changed = !captureEnabled || JSON.stringify(next) !== JSON.stringify(traceCounts);
       captureEnabled = true;
-      const next = { ...(counts.experiments || {}), __loaded: true };
-      const changed = !loaded || JSON.stringify(next) !== JSON.stringify(traceCounts);
-      loaded = true;
       traceCounts = next;
       if (changed) onChange();
     } catch { /* capture is optional */ }

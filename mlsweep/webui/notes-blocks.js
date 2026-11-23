@@ -377,13 +377,8 @@ function nbRunMenu(e, row, spec) {
   if (mlNativeMenuWanted(e, null)) return;
   e.preventDefault();
   e.stopPropagation();
-  const q = { experiment: row.experiment, run: row.run };
-  const go = page => () => { location.href = pageHref(page, q); };
   const items = [
-    { label: "Open results", run: go("results.html") },
-    { label: "Open logs", run: go("logs.html") },
-    { label: "Open artifacts", run: go("files.html") },
-    { label: "Open code", run: go("code.html") },
+    ...mlRunPageItems(row.experiment, row.run),
     "-",
     { label: "Copy run ID", run: () => copyText(row.run) },
   ];
@@ -393,10 +388,10 @@ function nbRunMenu(e, row, spec) {
   if (value != null) {
     const at = ["min", "max", "mean"].includes(spec.agg) ? spec.agg : "final";
     items.push({ label: "Copy value", run: () => copyText(String(value)) },
-      { label: "Copy evidence link", key: `@${at}`,
+      { label: "Copy evidence link", hint: `@${at}`,
         run: () => copyText(`[${nbNum(value)}](mlsweep:${row.experiment}/${row.run}/${metric}@${at})`) });
   }
-  showMenu(e.clientX, e.clientY, items);
+  mlMenuAt(e.clientX, e.clientY, items);
 }
 
 // ── block wiring ─────────────────────────────────────────────────────────────
@@ -577,12 +572,16 @@ function nbBlock(pre, kind, raw, figState) {
     figure.append(card);
   }
 
+  let loadSeq = 0;
   async function load(force) {
+    const seq = ++loadSeq;
     if (force) NB_CACHE.delete(kind + "\n" + raw);
     body.innerHTML = "";
     body.append(el("div", "nb-loading", "Loading…"));
     try {
       const data = await nbFetchBlock(kind, raw);
+      // A refresh clicked while this fetch was out owns the block now.
+      if (seq !== loadSeq) return;
       body.innerHTML = "";
       body.append(nbRenderBody(kind, data));
       const spec = data.spec || {};
@@ -595,7 +594,7 @@ function nbBlock(pre, kind, raw, figState) {
           : codeHref(`code/${data.to.experiment || data.to.snapshot}${data.path ? "/" + data.path : ""}`);
       }
     } catch (e) {
-      nbError(body, e.message || String(e));
+      if (seq === loadSeq) nbError(body, e.message || String(e));
     }
   }
   load(false);
@@ -643,30 +642,40 @@ function nbEvidenceMark(a, ev) {
     : `${where} = ${nbNum(got)}, but the note says ${nbNum(claimed)}. Click for the experiment.`;
 }
 
-async function annotateEvidence(root) {
-  const anchors = [...root.querySelectorAll("a[data-ev-ref]")];
-  if (!anchors.length) return;
-  const refs = [...new Set(anchors.map(a => a.dataset.evRef))];
-  const missing = refs.filter(r => {
+// Resolve `mlsweep:` link refs the cache lacks (or has stale), in one request.
+async function evResolve(refs) {
+  const missing = [...new Set(refs)].filter(r => {
     const hit = EV_CACHE.get(r);
     return !hit || Date.now() - hit.at >= EV_CACHE_MS;
   });
-  if (missing.length) {
-    try {
-      const r = await apiFetch("/api/notes/evidence", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refs: missing }),
-      });
-      const body = await r.json();
-      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
-      for (const [ref, data] of Object.entries(body.results || {})) {
-        EV_CACHE.set(ref, { at: Date.now(), data });
-      }
-    } catch (e) {
-      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
-    }
+  if (!missing.length) return;
+  try {
+    const r = await apiFetch("/api/notes/evidence", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refs: missing }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
+    for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
+  } catch (e) {
+    for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
   }
+}
+
+// Every kind of `mlsweep:` link in *root*, resolved together, then marked.
+async function annotateLinks(root) {
+  const anchors = root.querySelectorAll("a[data-ev-ref], a[data-code-ref], a[data-trace-ref]");
+  if (!anchors.length) return;
+  await evResolve([...anchors].map(a => a.dataset.evRef || a.dataset.codeRef || a.dataset.traceRef));
+  annotateEvidence(root);
+  annotateCode(root);
+  annotateTraces(root);
+}
+
+async function annotateEvidence(root) {
+  const anchors = [...root.querySelectorAll("a[data-ev-ref]")];
+  if (!anchors.length) return;
+  await evResolve(anchors.map(a => a.dataset.evRef));
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.evRef);
     nbEvidenceMark(a, hit && hit.data);
@@ -679,24 +688,7 @@ async function annotateEvidence(root) {
 async function annotateCode(root) {
   const anchors = [...root.querySelectorAll("a[data-code-ref]")];
   if (!anchors.length) return;
-  const refs = [...new Set(anchors.map(a => a.dataset.codeRef))];
-  const missing = refs.filter(r => {
-    const hit = EV_CACHE.get(r);
-    return !hit || Date.now() - hit.at >= EV_CACHE_MS;
-  });
-  if (missing.length) {
-    try {
-      const r = await apiFetch("/api/notes/evidence", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refs: missing }),
-      });
-      const body = await r.json();
-      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
-      for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
-    } catch (e) {
-      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
-    }
-  }
+  await evResolve(anchors.map(a => a.dataset.codeRef));
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.codeRef);
     const res = hit && hit.data;
@@ -723,24 +715,7 @@ async function annotateCode(root) {
 async function annotateTraces(root) {
   const anchors = [...root.querySelectorAll("a[data-trace-ref]")];
   if (!anchors.length) return;
-  const refs = [...new Set(anchors.map(a => a.dataset.traceRef))];
-  const missing = refs.filter(r => {
-    const hit = EV_CACHE.get(r);
-    return !hit || Date.now() - hit.at >= EV_CACHE_MS;
-  });
-  if (missing.length) {
-    try {
-      const r = await apiFetch("/api/notes/evidence", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refs: missing }),
-      });
-      const body = await r.json();
-      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
-      for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
-    } catch (e) {
-      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
-    }
-  }
+  await evResolve(anchors.map(a => a.dataset.traceRef));
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.traceRef);
     const res = hit && hit.data;

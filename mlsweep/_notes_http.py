@@ -780,12 +780,14 @@ async def _resolve_refs(request: web.Request, refs: list[str]) -> dict[str, dict
     db = request.config_dict[DB_KEY]
     out = await _notes_blocks.resolve_evidence_many(db, other)
     out.update(await _notes_code.resolve_code_refs(db, request.config_dict[DIR_KEY], code))
-    try:
-        from mlsweep._manager_capture import resolve_trace_refs
-        out.update(await resolve_trace_refs(db, trace))
-    except Exception:  # capture off: a trace link just does not resolve
-        for ref in trace:
-            out[ref] = {"ok": False, "ref": ref, "error": "capture is off on this manager"}
+    if trace:
+        from mlsweep._manager_capture import capture_enabled, resolve_trace_refs
+
+        if capture_enabled(request.config_dict):
+            out.update(await resolve_trace_refs(db, trace))
+        else:
+            out.update({ref: {"ok": False, "ref": ref, "error": "capture is off on this manager"}
+                        for ref in trace})
     return out
 
 

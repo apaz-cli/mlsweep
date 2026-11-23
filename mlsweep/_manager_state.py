@@ -53,6 +53,7 @@ class InFlightRun:
     nodes: dict[str, list[int]] = field(default_factory=dict)  # worker_id → GPU ids
     log_end: int = 0  # training.log is stored up to this byte offset
     replay_requested: bool = False
+    sync_inflight: bool = False  # an artifact rsync for a mid-run sync is running
     last_progress: float = 0.0  # epoch seconds of the last log/metric/start event
     last_step: int | None = None  # newest metric step this session
     last_step_time: float = 0.0  # epoch seconds when last_step first arrived here
@@ -197,9 +198,10 @@ class ManagerState:
         self.runs: dict[RunKey, InFlightRun] = {}
         self.pins: dict[RunKey, Pin] = {}  # hand-chosen placements for pending jobs
         self.placement: Placement = DEFAULT_PLACEMENT
-        # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.
-        self.run_values: dict[tuple[int, int], float | None] = {}
-        self.pruned_points: dict[tuple[int, int], tuple[int, float | None]] = {}  # likewise, of pruned runs
+        # Metric values of finished Bayesian runs, keyed by
+        # (experiment_id, job_key, attempt, metric, goal).  See _manager_optimizer.
+        self.run_values: dict[tuple[str, int, int, str, str], float | None] = {}
+        self.pruned_points: dict[tuple[str, int, int, str, str], tuple[int, float | None]] = {}
         # Run controls of running and paused experiments, by experiment id, reloaded by
         # each scheduler pass, and the pruning state of those that prune.  See _manager_controls.
         self.controls: dict[str, dict[str, Any]] = {}

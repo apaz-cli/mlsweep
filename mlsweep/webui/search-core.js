@@ -58,6 +58,7 @@
   let jobs = null, jobsAt = 0;
   let workers = null, workersAt = 0;
   let loadingJobs = null;
+  let expsSeq = 0, workersSeq = 0;   // only the newest cache fetch may replace it
 
   const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -75,9 +76,16 @@
 
   async function getExperiments(force = false) {
     if (!force && exps && Date.now() - expsAt < 60000) return exps;
+    const seq = ++expsSeq;
     try {
       const r = await apiFetch("/api/experiments");
-      if (r.ok) { exps = await r.json(); expsAt = Date.now(); expMap = new Map(exps.map(e => [e.experiment_id, e])); }
+      if (r.ok) {
+        const data = await r.json();
+        if (seq === expsSeq) {
+          exps = data; expsAt = Date.now();
+          expMap = new Map(exps.map(e => [e.experiment_id, e]));
+        }
+      }
     } catch {}
     return exps || (exps = []);
   }
@@ -113,9 +121,13 @@
 
   async function getWorkers(force = false) {
     if (!force && workers && Date.now() - workersAt < 30000) return workers;
+    const seq = ++workersSeq;
     try {
       const r = await apiFetch("/api/workers");
-      if (r.ok) { workers = await r.json(); workersAt = Date.now(); }
+      if (r.ok) {
+        const data = await r.json();
+        if (seq === workersSeq) { workers = data; workersAt = Date.now(); }
+      }
     } catch {}
     return workers || (workers = []);
   }
@@ -362,7 +374,7 @@
   const markHtml = s => esc(s).replace(/\x01/g, "<mark>").replace(/\x02/g, "</mark>");
   function traceHref(s) { return qs("traces", { session: s.session_id }); }
   function traceItem(s) {
-    const title = s.title || (s.cwd ? s.cwd.split("/").filter(Boolean).pop() : s.session_id);
+    const title = traceName(s);
     const linked = s.experiments || [];
     const snippet = unmark(s.snippet).replace(/\s+/g, " ").trim();
     return {
@@ -549,14 +561,13 @@
     }
     if (p.filters.log) items.push(...await searchLogs(p));
 
-    const onlyNotes = !!p.filters.note;
-    const onlyDocs = !!p.filters.docs;
-    const onlyFiles = !!p.filters.file;
-    const onlyLogs = !!p.filters.log;
-    const onlyTraces = !!p.filters.trace;
-    const onlyAnswer = !p.text && !onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && !onlyTraces && Object.keys(p.answer).length > 0;
+    // A source filter (note: docs: file: log: trace:) limits the search to the
+    // sources it names; with none, every source is searched.
+    const only = ["note", "docs", "file", "log", "trace"].filter(k => p.filters[k]);
+    const wants = source => !only.length || only.includes(source);
+    const onlyAnswer = !p.text && !only.length && Object.keys(p.answer).length > 0;
     const typeIs = (...names) => !p.filters.type || names.includes(p.filters.type.toLowerCase());
-    if (!onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && !onlyTraces && !onlyAnswer) {
+    if (!only.length && !onlyAnswer) {
       const jobsToShow = allJobs.filter(j => matchJob(j, p, scope)).sort((a, b) => (b.status === "running") - (a.status === "running") || new Date(b.submit_time || 0) - new Date(a.submit_time || 0));
       for (const j of jobsToShow.slice(0, opts.limit || 20)) items.push(runItem(j));
 
@@ -564,17 +575,17 @@
       for (const e of expsToShow.slice(0, opts.limit || 12)) items.push(expItem(e));
     }
 
-    if (!onlyDocs && !onlyTraces && typeIs("note", "notes")) {
+    if (wants("note") && typeIs("note", "notes")) {
       const notes = await searchNotes(p.filters.note || p.text);
       for (const n of notes.slice(0, opts.limit || 10)) items.push(noteItem(n));
     }
 
-    if (!onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && typeIs("trace", "traces")) {
+    if (wants("trace") && typeIs("trace", "traces")) {
       const traces = await searchTraces(p.filters.trace || p.text, scope);
       for (const s of traces.slice(0, opts.limit || 10)) items.push(traceItem(s));
     }
 
-    if (!onlyNotes && !onlyTraces && typeIs("doc", "docs", "help")) {
+    if (wants("docs") && typeIs("doc", "docs", "help")) {
       const q = (p.filters.docs || p.text).toLowerCase();
       const docs = q ? DOCS.filter(d => `${d.title} ${d.keys}`.toLowerCase().includes(q) || q.split(/\s+/).every(t => `${d.title} ${d.keys} ${d.body}`.toLowerCase().includes(t))) : [];
       for (const d of docs.slice(0, 10)) items.push(docItem(d));

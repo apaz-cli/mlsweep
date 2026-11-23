@@ -114,6 +114,48 @@ trace.
 An experiment page links to the traces that submitted it, the other way
 around too (its Traces entry filters this list to that experiment).
 
+## Reading traces from the terminal
+
+The same traces can be read without the dashboard, which is how an agent
+reads them. Every command takes a trace id, a unique prefix of one, or a note
+reference, so a link copied from a note works as it is.
+
+```sh
+mlsweep capture ls --experiment rzo_e1        # the sessions behind an experiment (--search WORDS too)
+mlsweep capture show 9f6c0e22                 # one line per event
+mlsweep capture show 9f6c0e22 --kind mlsweep  # only the mlsweep commands it ran
+mlsweep capture show "mlsweep:trace/9f6c0e22#E412"   # one event in full
+mlsweep capture search warmup "cosine decay"  # matching events across traces
+mlsweep capture export 9f6c0e22 -o t.json     # the trace as ATIF
+```
+
+`show` prints the trace's header, then one line per event with its number,
+time, tag and text, the way the ledger lists them. A tool call's line ends with
+its result (`✓ 1.5 s` or `✗`), and an mlsweep command shows only its mlsweep
+part. Output stops at about 2000 tokens. Change that with `--budget TOKENS`, and
+the last line gives the command for the next page (`--from N`). `--kind` takes
+the same kinds as the bar above the ledger. `--event N`, or `#EN` on the
+reference, prints one event in full with its metadata and its reference.
+
+`search` matches every word, or a `"quoted phrase"`, against each event's
+text, best-matching traces first. Each hit comes with its
+`mlsweep:trace/<id>#E<n>` reference, ready to cite. `--trace REF` searches one
+trace, and `--kind` narrows the hits as it does for `show`.
+
+`export` writes ATIF, the Agent Trajectory Interchange Format other agent tools
+read. Prompts become user steps, and each response of the agent becomes an
+agent step with its thinking, reply, tool calls and their results. Since
+capture keeps no tool output, a result holds only its status and duration.
+Each step lists the event numbers it came from. `--format jsonl` gives the
+events as they were uploaded, like the Traces tab's Download transcript. The
+`⋮` menu and a right-click on a trace also offer Download as ATIF.
+
+Every command takes `--json` for the data instead of the text.
+
+For a question none of the commands answers, `mlsweep sql` runs one read-only
+query over the manager's database, and with no query it lists the tables. The
+`capture_events` table holds each event as JSON in its `data` column.
+
 ## Notes
 
 A note can link to a trace with the evidence-link syntax:

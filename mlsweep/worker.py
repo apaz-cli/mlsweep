@@ -1172,7 +1172,7 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
                         if rs is not None:
                             rs.ipc_conns += 1
                         _ipc_cond.notify_all()
-                _handle_ipc_msg(msg)
+                _handle_ipc_msg(msg, rs)
     except OSError:
         pass
     finally:
@@ -1221,16 +1221,22 @@ def _ipc_run_state_locked(msg: dict[str, Any]) -> RunState | None:
     return next((rs for rs in _in_flight.values() if rs.run_id == run_id), None)
 
 
-def _handle_ipc_msg(msg: dict[str, Any]) -> None:
-    """Route an IPC message (metric or sync) from a training script."""
+def _handle_ipc_msg(msg: dict[str, Any], state: RunState | None) -> None:
+    """Route an IPC message (metric or sync) from a training script.
+
+    *state* is the run its connection was bound to by its first message.  A
+    logger left over from an attempt that has been drained and replaced must
+    not write into the next attempt's metrics, so it is dropped once *state*
+    is no longer the in-flight run under its key.
+    """
     run_id = msg.get("run_id", "")
     msg_type = msg.get("type")
 
-    with _lock:
-        state = _ipc_run_state_locked(msg)
-
     if state is None:
         return
+    with _lock:
+        if _in_flight.get((state.experiment, state.run_id)) is not state:
+            return
 
     metrics_path = os.path.join(state.scratch_path, "metrics.jsonl")
 

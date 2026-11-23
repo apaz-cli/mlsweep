@@ -53,12 +53,13 @@ back on replaces the marker; what was never uploaded stays local.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -131,8 +132,9 @@ def _summarize_args(name: str, args: Any) -> str:
     return " ".join(parts)[:400]
 
 
-def _event(seq: int, ts: float | None, kind: str, **kw: Any) -> dict[str, Any]:
-    event: dict[str, Any] = {"seq": seq, "ts": ts if ts is not None else time.time(), "kind": kind}
+def _event(ts: float | None, kind: str, **kw: Any) -> dict[str, Any]:
+    """One event, without its seq: the caller numbers events across the session."""
+    event: dict[str, Any] = {"ts": ts if ts is not None else time.time(), "kind": kind}
     for key, value in kw.items():
         if value is not None:
             event[key] = value
@@ -147,7 +149,7 @@ def _event(seq: int, ts: float | None, kind: str, **kw: Any) -> dict[str, Any]:
 # of type text / thinking / toolCall.  model_change lines carry the model.
 
 
-def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalize_pi_line(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
     kind = line.get("type")
     if kind == "session":
         meta["cwd"] = line.get("cwd") or meta.get("cwd")
@@ -159,7 +161,7 @@ def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> 
         model = line.get("modelId") or meta.get("model")
         meta["model"] = model
         # A switch mid-session explains why later events name another model.
-        return [_event(seq, _iso_to_epoch(line.get("timestamp")), "meta",
+        return [_event(_iso_to_epoch(line.get("timestamp")), "meta",
                        text=f"model → {model}")] if model else []
     if kind != "message":
         return []
@@ -172,7 +174,7 @@ def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> 
         text = " ".join(
             b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
         if text.strip():
-            return [_event(seq, ts, "user", text=text.strip())]
+            return [_event(ts, "user", text=text.strip())]
         return []
     if role == "assistant":
         events: list[dict[str, Any]] = []
@@ -187,23 +189,20 @@ def _normalize_pi_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> 
                 continue
             btype = block.get("type")
             if btype == "thinking":
-                events.append(_event(seq, ts, "thinking", text=block.get("thinking") or "", **common))
-                seq += 1
+                events.append(_event(ts, "thinking", text=block.get("thinking") or "", **common))
             elif btype == "text":
                 if (block.get("text") or "").strip():
-                    events.append(_event(seq, ts, "assistant", text=block["text"], **common))
-                    seq += 1
+                    events.append(_event(ts, "assistant", text=block["text"], **common))
             elif btype == "toolCall":
                 name = block.get("name") or "tool"
                 events.append(_event(
-                    seq, ts, "tool", name=name, tool_id=block.get("id"),
+                    ts, "tool", name=name, tool_id=block.get("id"),
                     text=_summarize_args(name, block.get("arguments")), **common))
-                seq += 1
         return events
     if role == "toolResult":
         # Status only: the result's text never leaves the machine.
         return [_event(
-            seq, ts, "tool_result", name=message.get("toolName"),
+            ts, "tool_result", name=message.get("toolName"),
             tool_id=message.get("toolCallId"), ok=not message.get("isError", False),
             duration_ms=message.get("durationMs"))]
     return []  # the system preamble, and anything else
@@ -238,7 +237,7 @@ def _claude_prompt_text(text: str, line: dict[str, Any]) -> str:
     return text
 
 
-def _normalize_claude_line(line: dict[str, Any], seq: int, meta: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalize_claude_line(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
     kind = line.get("type")
     if line.get("sessionId"):
         meta["native_id"] = str(line["sessionId"])
@@ -265,16 +264,14 @@ def _normalize_claude_line(line: dict[str, Any], seq: int, meta: dict[str, Any])
                 continue
             if block.get("type") == "tool_result":
                 events.append(_event(
-                    seq, ts, "tool_result", tool_id=block.get("tool_use_id"),
+                    ts, "tool_result", tool_id=block.get("tool_use_id"),
                     ok=not block.get("is_error", False)))
-                seq += 1
             elif block.get("type") == "text" and (block.get("text") or "").strip():
                 if (line.get("origin") or {}).get("kind") != "human" and line.get("isMeta") is True:
                     continue  # tool results replayed as user messages
                 text = _claude_prompt_text(block["text"].strip(), line)
                 if text:
-                    events.append(_event(seq, ts, "user", text=text))
-                    seq += 1
+                    events.append(_event(ts, "user", text=text))
         return events
     events = []
     usage = message.get("usage") or {}
@@ -286,24 +283,21 @@ def _normalize_claude_line(line: dict[str, Any], seq: int, meta: dict[str, Any])
             continue
         btype = block.get("type")
         if btype == "thinking":
-            events.append(_event(seq, ts, "thinking", text=block.get("thinking") or "", **common))
-            seq += 1
+            events.append(_event(ts, "thinking", text=block.get("thinking") or "", **common))
         elif btype == "text" and (block.get("text") or "").strip():
-            events.append(_event(seq, ts, "assistant", text=block["text"], **common))
-            seq += 1
+            events.append(_event(ts, "assistant", text=block["text"], **common))
         elif btype == "tool_use":
             name = block.get("name") or "tool"
             events.append(_event(
-                seq, ts, "tool", name=name, tool_id=block.get("id"),
+                ts, "tool", name=name, tool_id=block.get("id"),
                 text=_summarize_args(name, block.get("input")), **common))
-            seq += 1
     return events
 
 
 # ── agents ────────────────────────────────────────────────────────────────────
 
 AGENT_NAMES = ("pi", "claude_code")
-_NORMALIZERS: dict[str, Callable[[dict[str, Any], int, dict[str, Any]], list[dict[str, Any]]]] = {
+_NORMALIZERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]]] = {
     "pi": _normalize_pi_line,
     "claude_code": _normalize_claude_line,
 }
@@ -315,7 +309,7 @@ class AgentSpec:
 
     name: str          # canonical agent name: pi, claude_code
     directory: Path    # sessions live under this, in per-project folders
-    normalize: Any     # (line, seq, meta) -> events; meta is mutated in place
+    normalize: Any     # (line, meta) -> events; meta is mutated in place
 
     def sessions(self) -> list[Path]:
         return sorted(self.directory.glob("*/*.jsonl")) if self.directory.is_dir() else []
@@ -346,9 +340,28 @@ def agent_specs(agents: list[str] | None = None,
     return normalizers
 
 
-def session_id_for(agent: str, native_id: str) -> str:
-    """A trace's id: the agent's own native session id, unchanged."""
-    return str(native_id)
+def _normalize_raw(spec: AgentSpec, raw: bytes, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Whole transcript lines, normalized (unnumbered); *meta* is filled in place."""
+    events: list[dict[str, Any]] = []
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            events.extend(spec.normalize(parsed, meta))
+    return events
+
+
+def _whoami() -> str:
+    return f"{os.getenv('USER', 'user')}@{socket.gethostname()}"
+
+
+def _safe_name(session_id: str) -> str:
+    """A session id as a file name."""
+    return "".join(c if c.isalnum() or c in "_-." else "_" for c in session_id)[:150]
 
 
 # ── state ─────────────────────────────────────────────────────────────────────
@@ -375,6 +388,7 @@ class SessionState:
     uploaded_seq: int = 0    # highest seq the manager has
     last_upload_at: float = 0.0
     closed: bool = False
+    close_reported: bool = False  # the manager has stored this session as closed
 
 
 def _native_id_from_path(agent: str, path: Path) -> str:
@@ -409,12 +423,10 @@ def request_follow(session_id: str, directory: Path | None = None, *, why: str =
     """
     root = directory or follow_dir()
     root.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "_-." else "_" for c in session_id)[:150]
-    path = root / f"{safe}.json"
+    path = root / f"{_safe_name(session_id)}.json"
     if not path.exists():
         path.write_text(json.dumps({
-            "session_id": session_id, "why": why, "at": time.time(),
-            "by": f"{os.getenv('USER', 'user')}@{socket.gethostname()}",
+            "session_id": session_id, "why": why, "at": time.time(), "by": _whoami(),
         }))
     return path
 
@@ -451,6 +463,10 @@ class CaptureClient:
         self.follow_dir = self.dir / "follow"
         self.state_path = self.dir / "followed.json"
         self.sessions: dict[str, SessionState] = {}
+        self._pending: dict[str, int] = {}
+        self._saved = ""
+        # Follow requests whose transcript is not on disk yet: when to look again.
+        self._retry_at: dict[str, float] = {}
 
     # ── persistence ──────────────────────────────────────────────────
 
@@ -462,21 +478,35 @@ class CaptureClient:
             self.sessions = {}
 
     def save(self) -> None:
+        """Write ``followed.json``, when anything in it changed."""
+        text = json.dumps({"sessions": [vars(s) for s in self.sessions.values()]})
+        if text == self._saved:
+            return
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"sessions": [vars(s) for s in self.sessions.values()]}))
+        tmp.write_text(text)
         os.replace(tmp, self.state_path)
+        self._saved = text
 
     def pending_path(self, session_id: str) -> Path:
-        safe = "".join(c if c.isalnum() or c in "_-." else "_" for c in session_id)[:150]
-        return self.pending_dir / f"{safe}.jsonl"
+        return self.pending_dir / f"{_safe_name(session_id)}.jsonl"
 
     def pending_count(self, session_id: str) -> int:
+        """Events spooled and not yet accepted: counted from the file once, then kept."""
+        if session_id not in self._pending:
+            try:
+                with self.pending_path(session_id).open() as f:
+                    self._pending[session_id] = sum(1 for _ in f)
+            except OSError:
+                self._pending[session_id] = 0
+        return self._pending[session_id]
+
+    def pending_events(self, session_id: str) -> list[dict[str, Any]]:
         try:
             with self.pending_path(session_id).open() as f:
-                return sum(1 for _ in f)
+                return [json.loads(line) for line in f if line.strip()]
         except OSError:
-            return 0
+            return []
 
     # ── following ────────────────────────────────────────────────────
 
@@ -497,9 +527,26 @@ class CaptureClient:
         self.sessions[session_id] = state
         return state
 
-    def follow_requested(self, specs: list[AgentSpec]) -> None:
-        for request in followed_requests(self.follow_dir):
-            self.follow(specs, str(request["session_id"]))
+    RETRY_SECONDS = 30.0  # how often to look again for a transcript not written yet
+
+    def follow_requested(self, specs: list[AgentSpec], now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        followed = {_safe_name(sid) for sid in self.sessions}
+        root = self.follow_dir
+        for path in sorted(root.glob("*.json")) if root.is_dir() else []:
+            if path.stem in followed:
+                continue  # already followed: no need to read the request again
+            try:
+                raw = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            session_id = str(raw.get("session_id") or "") if isinstance(raw, dict) else ""
+            if not session_id or self._retry_at.get(session_id, 0.0) > now:
+                continue
+            if self.follow(specs, session_id) is None:
+                self._retry_at[session_id] = now + self.RETRY_SECONDS
+            else:
+                self._retry_at.pop(session_id, None)
 
     # ── transcript reading ───────────────────────────────────────────
 
@@ -535,17 +582,7 @@ class CaptureClient:
             "cwd": state.cwd, "title": state.title, "model": state.model,
             "started_at": state.started_at, "native_id": state.native_id,
         }
-        events: list[dict[str, Any]] = []
-        for line in raw.split(b"\n"):
-            if not line.strip():
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            events.extend(spec.normalize(parsed, 0, meta))
+        events = _normalize_raw(spec, raw, meta)
         self._apply_meta(state, meta)
         if not state.model:
             state.model = next((str(e["model"]) for e in events if e.get("model")), "")
@@ -554,10 +591,9 @@ class CaptureClient:
         if not events:
             return
         # Renumber across reads: seq continues from uploaded + still-pending.
-        seq = state.uploaded_seq + self.pending_count(state.session_id) + 1
-        for event in events:
+        first = state.uploaded_seq + self.pending_count(state.session_id) + 1
+        for seq, event in enumerate(events, start=first):
             event["seq"] = seq
-            seq += 1
         self._spool(state, events)
 
     def _apply_meta(self, state: SessionState, meta: dict[str, Any]) -> None:
@@ -569,10 +605,12 @@ class CaptureClient:
             state.started_at = state.started_at or meta["started_at"]
 
     def _spool(self, state: SessionState, events: list[dict[str, Any]]) -> None:
+        count = self.pending_count(state.session_id)
         self.pending_dir.mkdir(parents=True, exist_ok=True)
         with self.pending_path(state.session_id).open("a") as f:
             for event in events:
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        self._pending[state.session_id] = count + len(events)
 
     # ── upload scheduling ─────────────────────────────────────────────
 
@@ -594,15 +632,22 @@ class CaptureClient:
         return out
 
     def mark_uploaded(self, state: SessionState, count: int, now: float | None = None) -> None:
+        """The manager accepted the first *count* spooled events: drop them from the spool."""
         state.uploaded_seq += count
         state.last_upload_at = now if now is not None else time.time()
-        try:
-            self.pending_path(state.session_id).unlink()
-        except OSError:
-            pass
+        path = self.pending_path(state.session_id)
+        left = self.pending_events(state.session_id)[count:]
+        if left:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(e, separators=(",", ":")) + "\n" for e in left))
+            os.replace(tmp, path)
+        else:
+            path.unlink(missing_ok=True)
+        self._pending[state.session_id] = len(left)
 
-    def mark_closed(self, state: SessionState) -> None:
-        state.closed = True
+    def needs_close_upload(self, state: SessionState) -> bool:
+        """A closed session whose last events, or the close itself, the manager lacks."""
+        return state.closed and (not state.close_reported or self.pending_count(state.session_id) > 0)
 
 
 def title_from_events(events: list[dict[str, Any]]) -> str:
@@ -637,7 +682,7 @@ def _from_env(env: dict[str, str]) -> str | None:
         for key in keys:
             value = env.get(key)
             if value:
-                return session_id_for(agent, _native_from_env(agent, key, value))
+                return _native_from_env(agent, key, value)
     return None
 
 
@@ -776,10 +821,12 @@ def _read_off_marker() -> dict[str, Any] | None:
 
 
 def _cmd(argv: list[str]) -> None:
-    """`mlsweep capture`: this / on / off / watch / status / ls / import."""
+    """`mlsweep capture`: this / on / off / watch / status / ls / import, and
+    show / search / export for reading traces (``_capture_read``)."""
     import argparse
     import sys
 
+    from mlsweep.run_sweep import _add_connection_args
 
     parser = argparse.ArgumentParser(
         prog="mlsweep capture",
@@ -790,13 +837,10 @@ def _cmd(argv: list[str]) -> None:
 
     this = sub.add_parser("this", help="Upload the agent session this command runs in")
     this.add_argument("--session", help="Trace id (default: the session this command runs in)")
-    this.add_argument("--manager", help="Manager URL, if this turns capture on "
-                                        "(default: http://localhost:7891)")
-    this.add_argument("--token", help="Manager token, if this turns capture on")
+    _add_connection_args(this)  # used only if this turns capture on
 
     on = sub.add_parser("on", help="Turn capture on: sessions that submit sweeps are uploaded")
-    on.add_argument("--manager", help="Manager URL (default: http://localhost:7891)")
-    on.add_argument("--token", help="Manager token (default: ~/.mlsweep/manager.token)")
+    _add_connection_args(on)
     on.add_argument("--agents", default=",".join(AGENT_NAMES),
                     help="Agents to follow, comma-separated (default: pi,claude_code)")
     on.add_argument("--foreground", action="store_true",
@@ -812,8 +856,9 @@ def _cmd(argv: list[str]) -> None:
     ls.add_argument("--agent")
     ls.add_argument("--state", choices=["active", "closed", "imported", "all"], default="all")
     ls.add_argument("--limit", type=int, default=20)
-    ls.add_argument("--manager")
-    ls.add_argument("--token")
+    ls.add_argument("--experiment", metavar="EXP", help="only traces linked to this experiment")
+    ls.add_argument("--search", metavar="WORDS", help="only traces whose text has these words")
+    _add_connection_args(ls)
     ls.add_argument("--json", action="store_true", dest="as_json")
 
     imp = sub.add_parser("import", help="Upload transcripts you already have (backfill)")
@@ -821,12 +866,16 @@ def _cmd(argv: list[str]) -> None:
     imp.add_argument("--all", action="store_true", help="Every transcript, however old")
     imp.add_argument("--agents", default=",".join(AGENT_NAMES))
     imp.add_argument("--dry-run", action="store_true", help="List what would be uploaded")
-    imp.add_argument("--manager")
-    imp.add_argument("--token")
+    _add_connection_args(imp)
+
+    from mlsweep import _capture_read
+    _capture_read.add_parsers(sub, _add_connection_args)
 
     args = parser.parse_args(argv)
     action = args.action or "status"
-    if action == "this":
+    if action in _capture_read.COMMANDS:
+        _capture_read.COMMANDS[action](args)
+    elif action == "this":
         _cmd_this(args, sys)
     elif action == "on":
         _cmd_on(args, sys)
@@ -871,12 +920,12 @@ def _cmd_status(args: Any, sys: Any) -> None:
               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(marker.get('at', 0)))}{_RESET}")
 
 
-def _turn_on(manager: str | None, token_arg: str | None, agents: list[str], sys: Any) -> str:
+def _turn_on(manager: str, token_arg: str | None, agents: list[str], sys: Any) -> str:
     """Write the credential that makes capture on; the manager URL it names."""
     from mlsweep._colors import _RED, _RESET
-    from mlsweep.run_sweep import _manager_url, _resolve_token
+    from mlsweep.run_sweep import _resolve_token
 
-    url = _manager_url(manager or "http://localhost:7891", "")
+    url = manager.rstrip("/")
     token = _resolve_token(token_arg)
     if not token:
         print(f"{_RED}No token: pass --token, or start the manager first "
@@ -886,8 +935,7 @@ def _turn_on(manager: str | None, token_arg: str | None, agents: list[str], sys:
     # with an off marker, is what the watcher checks every loop.
     capture_dir().mkdir(parents=True, exist_ok=True)
     _on_path().write_text(json.dumps({
-        "manager": url, "token": token, "agents": agents,
-        "by": f"{os.getenv('USER', 'user')}@{socket.gethostname()}", "at": time.time(),
+        "manager": url, "token": token, "agents": agents, "by": _whoami(), "at": time.time(),
     }))
     os.chmod(_on_path(), 0o600)
     _off_path().unlink(missing_ok=True)
@@ -898,16 +946,39 @@ def ensure_watcher() -> int:
     """The watcher's pid, starting it in the background if it is not running."""
     import subprocess
 
-    pid = watcher_pid()
-    if pid:
-        return pid
-    log = capture_dir() / "watcher.log"
-    with log.open("ab") as f:
-        proc = subprocess.Popen(
-            ["mlsweep", "capture", "watch"], stdout=f, stderr=f,
-            stdin=subprocess.DEVNULL, start_new_session=True)
-    (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
-    return proc.pid
+    # Two clients turning capture on together would otherwise both see no
+    # watcher and both start one.  The check, spawn and record happen under
+    # one lock; the watcher's own lock (see _cmd_watch) stops any duplicate.
+    with _flocked(capture_dir() / "spawn.lock", block=True):
+        pid = watcher_pid()
+        if pid:
+            return pid
+        log = capture_dir() / "watcher.log"
+        with log.open("ab") as f:
+            proc = subprocess.Popen(
+                ["mlsweep", "capture", "watch"], stdout=f, stderr=f,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+        (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
+        return proc.pid
+
+
+@contextlib.contextmanager
+def _flocked(path: Path, *, block: bool) -> Iterator[bool]:
+    """Hold an exclusive flock on *path*; yields False when *block* is off and
+    another process holds it."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
 
 
 def _cmd_on(args: Any, sys: Any) -> None:
@@ -946,6 +1017,7 @@ def _cmd_this(args: Any, sys: Any) -> None:
     pid = ensure_watcher()
     print(f"Following {session_id}: the whole session uploads within a few seconds, "
           f"and new turns after each quiet minute (watcher pid {pid}).")
+    print(f"Cite it in a note as mlsweep:trace/{session_id}")
 
 
 def _cmd_off(sys: Any) -> None:
@@ -954,9 +1026,7 @@ def _cmd_off(sys: Any) -> None:
     from mlsweep._colors import _RESET, _YELLOW
 
     capture_dir().mkdir(parents=True, exist_ok=True)
-    _off_path().write_text(json.dumps({
-        "by": f"{os.getenv('USER', 'user')}@{socket.gethostname()}", "at": time.time(),
-    }))
+    _off_path().write_text(json.dumps({"by": _whoami(), "at": time.time()}))
     _on_path().unlink(missing_ok=True)
     pid = watcher_pid()
     if pid:
@@ -972,8 +1042,17 @@ def _cmd_watch() -> None:
     """The watcher loop: follow requested sessions, spool events, upload when quiet."""
     import signal
 
-
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    # One watcher per machine: two would write followed.json through the same
+    # temp file and upload the same spool.
+    with _flocked(capture_dir() / "watcher.lock", block=False) as mine:
+        if not mine:
+            print("another capture watcher is already running")
+            return
+        _watch_loop()
+
+
+def _watch_loop() -> None:
     client = CaptureClient()
     client.load()
     last_sweep = 0.0
@@ -988,32 +1067,58 @@ def _cmd_watch() -> None:
         manager, token = on_file["manager"], on_file["token"]
         now = time.time()
         specs = agent_specs(list(on_file.get("agents") or AGENT_NAMES))
-        client.follow_requested(specs)
+        client.follow_requested(specs, now)
         client.scan(specs)
         for state in client.due_sessions(now):
             _upload(client, state, manager, token)
         if now - last_sweep > 300:
             last_sweep = now
             # A transcript quiet this long is finished: upload what is left
-            # and tell the manager, once.
+            # and tell the manager, until it has both.
             for state in list(client.sessions.values()):
                 if not state.closed and now - state.last_seen_at > client.CLOSE_SECONDS:
                     state.closed = True
-                if state.closed and client.pending_count(state.session_id):
+                if client.needs_close_upload(state):
                     _upload(client, state, manager, token)
         client.save()
         time.sleep(client.POLL_SECONDS)
 
 
-def _upload(client: CaptureClient, state: SessionState, manager: str, token: str) -> None:
+# One upload request carries at most this much; a longer spool goes in several.
+_UPLOAD_EVENTS = 2000
+_UPLOAD_BYTES = 4 * 1024 * 1024
+
+
+def post_session(manager: str, token: str, meta: dict[str, Any], events: list[dict[str, Any]],
+                 *, batch_events: int = _UPLOAD_EVENTS) -> tuple[int, str | None]:
+    """Send a session's header and *events* in bounded batches, in order.
+
+    Returns (events the manager accepted, error or None).  An error stops at
+    the batch it hit, so the caller can keep the rest and retry.
+    """
     from mlsweep.run_sweep import _http_request
 
+    url = f"{manager.rstrip('/')}/api/capture/sessions"
+    sent = 0
+    while True:
+        batch: list[dict[str, Any]] = []
+        size = 0
+        for event in events[sent:sent + batch_events]:
+            n = len(json.dumps(event, separators=(",", ":")))
+            if batch and size + n > _UPLOAD_BYTES:
+                break
+            batch.append(event)
+            size += n
+        status, resp = _http_request("POST", url, token, json_data={"session": meta, "events": batch})
+        if status not in (200, 201):
+            return sent, f"{status} {resp}"
+        sent += len(batch)
+        if sent >= len(events):
+            return sent, None
+
+
+def _upload(client: CaptureClient, state: SessionState, manager: str, token: str) -> None:
     try:
-        events: list[dict[str, Any]] = []
-        path = client.pending_path(state.session_id)
-        if path.exists():
-            with path.open() as f:
-                events = [json.loads(line) for line in f if line.strip()]
         meta = {
             "session_id": state.session_id, "agent": state.agent,
             "host": socket.gethostname(), "user": os.getenv("USER", "user"),
@@ -1021,17 +1126,14 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
             "started_at": state.started_at, "last_seen_at": state.last_seen_at,
             "state": "closed" if state.closed else "active",
         }
-        status, resp = _http_request(
-            "POST", f"{manager.rstrip('/')}/api/capture/sessions", token,
-            json_data={"session": meta, "events": events})
-        if status in (200, 201):
-            client.mark_uploaded(state, len(events))
-            if state.closed:
-                _http_request(
-                    "POST", f"{manager.rstrip('/')}/api/capture/sessions/{state.session_id}/close",
-                    token, json_data={})
+        sent, error = post_session(manager, token, meta, client.pending_events(state.session_id))
+        if sent:
+            client.mark_uploaded(state, sent)
+        if error:
+            print(f"capture: upload failed for {state.session_id}: {error}", flush=True)
         else:
-            print(f"capture: upload failed for {state.session_id}: {status} {resp}", flush=True)
+            state.last_upload_at = time.time()
+            state.close_reported = state.closed
     except Exception as exc:  # a manager that is down is not a crash
         print(f"capture: upload failed for {state.session_id}: {exc}", flush=True)
 
@@ -1040,16 +1142,16 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
 
 
 def _cmd_ls(args: Any, sys: Any) -> None:
-    from mlsweep._jsonout import emit
-    from mlsweep.run_sweep import _http_request, _manager_url, _resolve_token
+    from urllib.parse import urlencode
 
-    url = _manager_url(args.manager or "http://localhost:7891", "/api/capture")
-    token = _resolve_token(args.token)
-    if not token:
-        print("No token: start the manager or pass --token.", file=sys.stderr)
-        raise SystemExit(2)
-    params = f"?limit={args.limit}&state={args.state}" + (f"&agent={args.agent}" if args.agent else "")
-    status, resp = _http_request("GET", f"{url}/sessions{params}", token)
+    from mlsweep._jsonout import emit
+    from mlsweep.run_sweep import _http_request, _manager_token
+
+    manager, token = _manager_token(args)
+    query = {"limit": args.limit, "state": args.state, **({"agent": args.agent} if args.agent else {}),
+             **({"experiment": args.experiment} if args.experiment else {}),
+             **({"q": args.search} if args.search else {})}
+    status, resp = _http_request("GET", f"{manager}/api/capture/sessions?{urlencode(query)}", token)
     if status != 200:
         print(f"Manager answered {status}: {resp}", file=sys.stderr)
         raise SystemExit(1)
@@ -1066,33 +1168,22 @@ def _cmd_ls(args: Any, sys: Any) -> None:
               + (f"  → {links}" if links else ""))
 
 
-def read_transcript(spec: AgentSpec, path: Path) -> tuple[str, list[dict[str, Any]]]:
-    """A whole transcript file, normalized and numbered: (session_id, events)."""
+def read_transcript(spec: AgentSpec, path: Path) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """A whole transcript file, normalized and numbered: (session_id, events, meta)."""
     meta: dict[str, Any] = {}
-    events: list[dict[str, Any]] = []
     try:
         with path.open("rb") as f:
             raw = f.read(256 * 1024 * 1024)
     except OSError:
-        return "", []
-    for line in raw.split(b"\n"):
-        if not line.strip():
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        events.extend(spec.normalize(parsed, 0, meta))
+        return "", [], meta
+    events = _normalize_raw(spec, raw, meta)
     for seq, event in enumerate(events, start=1):
         event["seq"] = seq
-    native_id = str(meta.get("native_id") or _native_id_from_path(spec.name, path))
-    return session_id_for(spec.name, native_id), events
+    return str(meta.get("native_id") or _native_id_from_path(spec.name, path)), events, meta
 
 
 def session_meta(spec: AgentSpec, path: Path, session_id: str,
-                 events: list[dict[str, Any]]) -> dict[str, Any]:
+                 events: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
     """The session header the manager stores for a whole-transcript import."""
     try:
         mtime = path.stat().st_mtime
@@ -1100,26 +1191,21 @@ def session_meta(spec: AgentSpec, path: Path, session_id: str,
         mtime = time.time()
     first_ts = events[0]["ts"] if events else mtime
     last_ts = events[-1]["ts"] if events else first_ts
-    title = next((e["text"] for e in events if e["kind"] == "user" and e.get("text")), "")[:80]
-    model = next((e.get("model") for e in events if e.get("model")), "")
-    cwd = ""
     return {
         "session_id": session_id, "agent": spec.name, "host": socket.gethostname(),
-        "user": os.getenv("USER", "user"), "cwd": cwd, "title": title, "model": model,
-        "started_at": first_ts, "last_seen_at": last_ts,
+        "user": os.getenv("USER", "user"), "cwd": str(meta.get("cwd") or ""),
+        "title": str(meta.get("title") or title_from_events(events)),
+        "model": str(meta.get("model") or next((e["model"] for e in events if e.get("model")), "")),
+        "started_at": meta.get("started_at") or first_ts, "last_seen_at": last_ts,
     }
 
 
 def _cmd_import(args: Any, sys: Any) -> None:
     """Convert existing transcripts into traces on the manager, marked imported."""
     from mlsweep._colors import _RED, _RESET
-    from mlsweep.run_sweep import _http_request, _manager_url, _resolve_token
+    from mlsweep.run_sweep import _manager_token
 
-    url = _manager_url(args.manager or "http://localhost:7891", "/api/capture")
-    token = _resolve_token(args.token)
-    if not token:
-        print("No token: start the manager or pass --token.", file=sys.stderr)
-        raise SystemExit(2)
+    manager, token = _manager_token(args)
     cutoff = time.time() - (args.days * 86400) if not args.all else 0
     directory = capture_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -1142,20 +1228,18 @@ def _cmd_import(args: Any, sys: Any) -> None:
             if args.dry_run:
                 print(f"would import {path}")
                 continue
-            session_id, events = read_transcript(spec, path)
+            session_id, events, found = read_transcript(spec, path)
             if not events:
                 imported[key] = time.time()  # empty: never look again
                 continue
-            meta = session_meta(spec, path, session_id, events)
-            meta["state"] = "imported"
-            status, resp = _http_request("POST", f"{url}/sessions", token, json_data={
-                "session": meta, "events": events})
-            if status in (200, 201):
+            meta = {**session_meta(spec, path, session_id, events, found), "state": "imported"}
+            _, error = post_session(manager, token, meta, events)
+            if error is None:
                 count += 1
                 imported[key] = time.time()
                 print(f"imported {path} → {session_id} ({len(events)} events)")
             else:
-                print(f"{_RED}failed {path}: {status} {resp}{_RESET}", file=sys.stderr)
+                print(f"{_RED}failed {path}: {error}{_RESET}", file=sys.stderr)
     if not args.dry_run:
         imported_path.write_text(json.dumps(imported))
         print(f"Imported {count} transcript(s).")

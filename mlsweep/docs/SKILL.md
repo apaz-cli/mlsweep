@@ -9,7 +9,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 
 - Never start a CUDA process yourself (smoke tests included) on GPUs a worker owns. Running jobs then OOM or fail with `CUDA-capable device(s) is/are busy`. Submit a 1-run sweep instead.
 - `retry` and `resume` rerun the code submitted with the experiment. After fixing a bug, submit a new sweep with `mlsweep run`. Use `retry` for failures outside the code, such as a lost worker or a full disk.
-- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv`, `outputs` and caches are skipped; symlinks are not followed). Do not commit just to submit. Leave large local folders (old runs, checkpoints) out with `UPLOAD_EXCLUDE = ["/runs"]` in the sweep file or `--exclude`; the run prints how much of the upload was new. `mlsweep code EXP [PATH]` shows the code an experiment ran, and `mlsweep code diff A B` what changed between two.
+- `run` ships the project directory as it is on disk, uncommitted files included (`.git`, `.venv`, `outputs` and caches are skipped; symlinks are not followed). Do not commit just to submit. Leave large local folders (old runs, checkpoints) out with `UPLOAD_EXCLUDE = ["/runs"]` in the sweep file or `--exclude`; the run prints how much of the upload was new. `mlsweep code EXP [PATH]` shows the code an experiment ran (`--lines 40-60` or `-n` numbers it and pages it within a budget, and a note's `mlsweep:code/...` link works as the argument), `mlsweep code search PATTERN [EXP]` finds lines in it or across the campaign, and `mlsweep code diff A B` shows what changed between two.
 - `logger.log()` without `step=` advances the step on every call. Log train and val metrics in one dict, or pass `step=`. Logging a step lower than the last one, or the same key twice at one step, raises `ValueError` (it would overwrite data).
 - A run that exits with an error is not retried automatically. Only runs lost with their worker are, up to `max_retries` (default 2). `retry` re-queues any finished run with a fresh budget, so read its log first.
 
@@ -110,6 +110,7 @@ mlsweep best --experiment <id>                  # top runs by metric (--group-by
 mlsweep metrics --experiment <id> [runs] --keys REGEX [--last|--pivot] [--with-dims] [--json|--csv]  # logged metrics, on demand
 mlsweep fetch --experiment <id> --wait          # block until done, leaderboard, download (exits 1 on failure)
 mlsweep export tensorboard --experiment <id>    # zip of TensorBoard logs
+mlsweep sql "SELECT ..."                        # read-only SQL, for what no command answers (`mlsweep sql` lists tables)
 
 # control your own sweeps
 mlsweep stop <id> --yes                         # abort: cancel every unfinished run
@@ -195,6 +196,14 @@ order: asc
 - Captions: a `Figure: text` line directly under an image or table. Add `{#fig-name}` to fix the anchor and link to it as `[Figure 1](#fig-name)`. Headings take `{#id}` too.
 - Full reference: `mlsweep docs notes`.
 
+## Traces
+
+- A trace is a coding-agent session the manager keeps, linked to the experiments it submitted. `mlsweep capture this` uploads the session you are in and prints its reference. Capture keeps prompts, replies, thinking and a one-line summary of each tool call with its status. It never keeps tool output or file contents.
+- `mlsweep capture ls --experiment <id>` lists the sessions behind an experiment. `mlsweep capture search WORDS` finds events across traces and gives each one's reference.
+- `mlsweep capture show REF` prints one line per event and stops at about 2000 tokens (`--budget`), then gives the command for the next page. `--kind mlsweep` keeps only the mlsweep commands the session ran, and `user`, `assistant`, `thinking` and `tools` work the same way. `--event N`, or `#EN` on the reference, prints one event in full.
+- REF is a trace id, a unique prefix of one, or a note reference like `mlsweep:trace/<id>?kind=mlsweep#E412`. Cite an event in a note with the same reference.
+- `mlsweep capture export REF` writes the trace as ATIF, which other agent tools read.
+
 ## Reading more
 
 `mlsweep docs <topic>` prints each of these. Search them rather than reading them whole.
@@ -203,4 +212,5 @@ order: asc
 - `mlsweep`: the full guide, including instrumentation, environment variables and troubleshooting.
 - `examples`: DDP, multi-node runs, TorchTitan and Prime-RL.
 - `notes`: the Notes tab, its markdown, cloning and lint.
+- `traces`: capture, the Traces tab, and reading traces from the terminal.
 - `readme`: overview and common CLI flags.

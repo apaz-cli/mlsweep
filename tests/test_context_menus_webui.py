@@ -64,9 +64,7 @@ def _ctx_menu(page):
     return page.eval("[...document.querySelectorAll('.ml-ctx-item .l')].map(x => x.textContent)")
 
 
-def _notes_menu(page):
-    page.wait_for("document.getElementById('ctx-menu').classList.contains('show')")
-    return page.eval("[...document.querySelectorAll('#ctx-menu .cm-item > span:first-child')].map(x => x.textContent)")
+_notes_menu = _ctx_menu  # the notes page uses the same menu as every other page
 
 
 def _escape(page):
@@ -194,7 +192,7 @@ def test_logs_run_list(mgr, page):
     page.wait_for("document.querySelectorAll('.job-item').length === 2")
     assert _right_click(page, '.job-item[data-run-id="r2"]')
     labels = _ctx_menu(page)
-    assert labels == ["Show logs", "Download log", "Rename…", "Open artifacts", "Open results", "Copy run ID"], labels
+    assert labels == ["Show logs", "Download log", "Rename…", "Open results", "Open artifacts", "Copy run ID"], labels
     page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent === 'Show logs').click()")
     page.wait_for("document.querySelector('.job-item.selected')?.dataset.runId === 'r2'")
 
@@ -256,7 +254,8 @@ def test_trace_list_and_events(mgr, page):
     # leaves the open trace alone.
     assert _right_click(page, f'.session-item[data-session="{drop}"]')
     labels = _ctx_menu(page)
-    assert labels == ["Open", "Copy note reference", "Copy trace id", "Download transcript", "Delete trace"], labels
+    assert labels == ["Open", "Copy note reference", "Copy trace id", "Download transcript", "Download as ATIF",
+                      "Delete trace"], labels
     page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent === 'Delete trace').click()")
     page.wait_for("!!document.querySelector('.ml-dialog')")
     page.eval("[...document.querySelectorAll('.ml-dialog button')].find(b => b.textContent === 'Confirm').click()")
@@ -297,13 +296,13 @@ def test_notes_panels_and_tables(mgr, page):
     assert labels == ["Open in new tab", "Open to the side", "Reveal in file tree", "Copy path", "Copy wikilink"], labels
 
     # A backlink in the right panel.
-    page.eval("hideMenu(); openFile('ctx/target.md')")
+    page.eval("mlCloseContextMenu(); openFile('ctx/target.md')")
     page.wait_for("[...document.querySelectorAll('.ritem')].some(r => r.title === 'ctx/source.md')")
     page.eval("""(() => { const t = [...document.querySelectorAll('.ritem')].find(r => r.title === 'ctx/source.md');
         t.id = 'backlink-under-test'; })()""")
     assert _right_click(page, "#backlink-under-test")
     assert _notes_menu(page)[0] == "Open in new tab"
-    page.eval("[...document.querySelectorAll('#ctx-menu .cm-item')].find(r => r.textContent === 'Open in new tab').click()")
+    page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(r => r.querySelector('.l').textContent === 'Open in new tab').click()")
     page.wait_for("S.tabs.filter(t => t.path === 'ctx/source.md').length === 1")
 
     # A run in a table block: its pages, and on a metric cell an evidence link.
@@ -313,5 +312,5 @@ def test_notes_panels_and_tables(mgr, page):
     assert labels[:4] == ["Open results", "Open logs", "Open artifacts", "Open code"], labels
     assert labels[-2:] == ["Copy value", "Copy evidence link"], labels
     # The run's own link keeps the browser's menu.
-    page.eval("hideMenu()")
+    page.eval("mlCloseContextMenu()")
     assert not _right_click(page, ".nb-table a.nb-run")

@@ -151,6 +151,12 @@ def _build_help(include_banner: bool = False) -> str:
         ("Capture", [
             ("capture [this|on|off]", "upload this agent session (or sweep-submitting ones) to the Traces tab"),
             ("capture [status|ls|import]", "capture state; traces on the manager; backfill old transcripts"),
+            ("capture show REF", "a trace as a compact ledger (--kind, --event N, --budget)"),
+            ("capture search WORDS", "events across traces, each with its note reference"),
+            ("capture export REF", "a trace as ATIF (or --format jsonl)"),
+        ]),
+        ("Database", [
+            ("sql [\"SELECT …\"]", "read-only SQL over the manager's database; no query lists the tables"),
         ]),
         ("Client", [
             ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),
@@ -758,6 +764,11 @@ def _dispatch(argv: list[str]) -> None:
     if cmd == "capture":
         from mlsweep._capture import _cmd as _capture_main
         _capture_main(rest)
+        return
+
+    if cmd == "sql":
+        from mlsweep._sql_cli import main as _sql_main
+        _sql_main(rest)
         return
 
     if cmd in _CTL_CMDS:

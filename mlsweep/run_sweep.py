@@ -384,6 +384,11 @@ class _WebSocket:
         self._timeout = timeout
         self._sock: socket.socket | None = None
         self._buf = bytearray()
+        # The heartbeat thread pings while the reader answers pongs and the
+        # caller may close.  Two concurrent sendall() calls can interleave
+        # bytes and split a frame, so frames go out one at a time.  RLock lets
+        # close() keep the send/clear pair atomic.
+        self._send_lock = threading.RLock()
 
     def connect(self) -> None:
         """Establish WebSocket connection (TCP + TLS + upgrade handshake)."""
@@ -485,29 +490,31 @@ class _WebSocket:
 
     def send_frame(self, opcode: int, payload: bytes) -> None:
         """Send a masked WebSocket frame (client must mask)."""
-        if not self._sock:
-            return
-        mask_key = secrets.token_bytes(4)
-        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        with self._send_lock:
+            sock = self._sock
+            if not sock:
+                return
+            mask_key = secrets.token_bytes(4)
+            masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
-        frame = bytearray()
-        frame.append(0x80 | opcode)  # FIN + opcode
-        length = len(payload)
-        if length < 126:
-            frame.append(0x80 | length)
-        elif length < 65536:
-            frame.append(0x80 | 126)
-            frame.extend(struct.pack("!H", length))
-        else:
-            frame.append(0x80 | 127)
-            frame.extend(struct.pack("!Q", length))
-        frame.extend(mask_key)
-        frame.extend(masked)
+            frame = bytearray()
+            frame.append(0x80 | opcode)  # FIN + opcode
+            length = len(payload)
+            if length < 126:
+                frame.append(0x80 | length)
+            elif length < 65536:
+                frame.append(0x80 | 126)
+                frame.extend(struct.pack("!H", length))
+            else:
+                frame.append(0x80 | 127)
+                frame.extend(struct.pack("!Q", length))
+            frame.extend(mask_key)
+            frame.extend(masked)
 
-        try:
-            self._sock.sendall(bytes(frame))
-        except OSError:
-            self._sock = None
+            try:
+                sock.sendall(bytes(frame))
+            except OSError:
+                self._sock = None
 
     def send_ping(self) -> None:
         self.send_frame(_WS_OP_PING, b"")
@@ -517,8 +524,10 @@ class _WebSocket:
         self.send_frame(_WS_OP_CLOSE, payload)
 
     def close(self) -> None:
-        sock = self._sock
-        if sock:
+        with self._send_lock:
+            sock = self._sock
+            if not sock:
+                return
             self.send_close(1000)  # clears self._sock if the peer is already gone
             self._sock = None
             try:

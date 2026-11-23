@@ -29,8 +29,11 @@ const S = {
   filter: "", changedOnly: true,
   details: false,
 };
-const manifests = new Map();
+const manifests = new Map();          // snapshot -> Promise<manifest> (one fetch per snapshot)
 const fileCache = new Map();          // snapshot + path -> text (content never changes)
+// Bumped by every navigation (experiment, version, file, popstate).  Async work
+// carries the token it began with and drops its result if the view moved on.
+let navSeq = 0;
 const openDirs = new Set();
 const TREE_ORDER = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });   // as the notes tree sorts
 
@@ -106,9 +109,15 @@ async function getJSON(path) {
   return body;
 }
 
-async function manifestOf(sid) {
-  if (!manifests.has(sid)) manifests.set(sid, (await getJSON(`/api/snapshots/${encodeURIComponent(sid)}`)).manifest);
-  return manifests.get(sid);
+function manifestOf(sid) {
+  let pending = manifests.get(sid);
+  if (!pending) {
+    pending = getJSON(`/api/snapshots/${encodeURIComponent(sid)}`).then(body => body.manifest);
+    // A failed fetch is retryable; a concurrent caller shares this one request.
+    pending.catch(() => manifests.delete(sid));
+    manifests.set(sid, pending);
+  }
+  return pending;
 }
 
 const versions = () => (S.info && S.info.versions) || [];
@@ -290,7 +299,8 @@ async function renderDetails(scrollToDiff) {
   const box = $("details");
   box.classList.toggle("on", S.details);
   if (!S.details) return;
-  const sub = submissionOf(S.snapshot);
+  const token = navSeq, snapshot = S.snapshot;
+  const sub = submissionOf(snapshot);
   box.replaceChildren();
   const grid = el("div", "prov-grid");
   const row = (k, v) => { grid.append(el("div", "k", k)); const d = el("div", "v"); d.append(v); grid.append(d); };
@@ -327,10 +337,14 @@ async function renderDetails(scrollToDiff) {
     box.append(sec);
   }
   if ((vcs && vcs.diff_bytes) || m.sweep_source_bytes) {
-    if (!fullSub || fullSub.submission_id !== sub.submission_id) {
-      try { fullSub = await getJSON(`/api/code/submissions/${sub.submission_id}`); } catch { fullSub = null; }
+    let fullSubForThis = fullSub;
+    if (!fullSubForThis || fullSubForThis.submission_id !== sub.submission_id) {
+      try { fullSubForThis = await getJSON(`/api/code/submissions/${sub.submission_id}`); }
+      catch { fullSubForThis = null; }
     }
-    const full = (fullSub && fullSub.meta) || {};
+    if (token !== navSeq || S.snapshot !== snapshot || !S.details) return;
+    fullSub = fullSubForThis;
+    const full = (fullSubForThis && fullSubForThis.meta) || {};
     if (full.vcs && full.vcs.diff) {
       const sec = el("div", "prov-section");
       sec.append(el("h4", null, "Uncommitted changes" + (full.vcs.diff_truncated ? " (cut at 1 MB)" : "")));
@@ -348,14 +362,18 @@ async function renderDetails(scrollToDiff) {
 
 // ── comparing ────────────────────────────────────────────────────────────────
 
-async function loadCompare() {
+async function loadCompare(token = navSeq) {
+  const compare = S.compare, snapshot = S.snapshot;
   S.diff = null;
-  if (!S.compare) return;
+  if (!compare) return;
   try {
-    S.diff = await getJSON(`/api/code/diff?from=${encodeURIComponent(S.compare)}&to=${encodeURIComponent(S.snapshot)}&context=4`);
+    const diff = await getJSON(`/api/code/diff?from=${encodeURIComponent(compare)}&to=${encodeURIComponent(snapshot)}&context=4`);
+    if (token !== navSeq || S.compare !== compare || S.snapshot !== snapshot) return;
+    S.diff = diff;
   } catch (e) {
-    await mlAlert(`Can't compare with ${S.compare}: ${e.message}`);
-    S.compare = "";
+    if (token !== navSeq || S.compare !== compare || S.snapshot !== snapshot) return;
+    await mlAlert(`Can't compare with ${compare}: ${e.message}`);
+    if (token === navSeq) S.compare = "";
   }
 }
 
@@ -766,10 +784,10 @@ function renderDir(path) {
   $("view").replaceChildren(table);
 }
 
-async function fileText(path, entry) {
-  const key = S.snapshot + "\n" + path;
+async function fileText(path, entry, snapshot = S.snapshot) {
+  const key = snapshot + "\n" + path;
   if (fileCache.has(key)) return fileCache.get(key);
-  const url = `/api/snapshots/${encodeURIComponent(S.snapshot)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const url = `/api/snapshots/${encodeURIComponent(snapshot)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
   const r = await apiFetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const bytes = new Uint8Array(await r.arrayBuffer());
@@ -778,7 +796,11 @@ async function fileText(path, entry) {
   return text;
 }
 
-async function openPath(path, { keepLines = false, push = false } = {}) {
+async function openPath(path, { keepLines = false, push = false, token = null } = {}) {
+  // A click in the tree starts a new navigation; showCode passes its own token
+  // so its follow-up calls are not mistaken for a newer view.
+  const seq = token ?? ++navSeq;
+  const snapshot = S.snapshot;
   S.path = path || "";
   if (!keepLines) S.start = S.end = null;
   if (S.path) revealInTree(S.path);
@@ -834,9 +856,13 @@ async function openPath(path, { keepLines = false, push = false } = {}) {
   }
   view.replaceChildren(el("div", "msg", "Loading…"));
   let text;
-  try { text = await fileText(S.path, entry); }
-  catch (e) { view.replaceChildren(el("div", "msg err", `Could not load ${S.path}: ${e.message}`)); return; }
-  if (S.path !== path) return;   // another file was opened meanwhile
+  try { text = await fileText(S.path, entry, snapshot); }
+  catch (e) {
+    if (seq !== navSeq || S.path !== path || S.snapshot !== snapshot) return;
+    view.replaceChildren(el("div", "msg err", `Could not load ${S.path}: ${e.message}`));
+    return;
+  }
+  if (seq !== navSeq || S.path !== path || S.snapshot !== snapshot) return;   // another file was opened meanwhile
   if (text == null) {
     meta.textContent = fmtSize(entry[2]);
     view.replaceChildren(el("div", "msg", `Binary file, ${fmtSize(entry[2])}. The download button next to the path has it.`));
@@ -896,6 +922,7 @@ function defaultPath() {
 }
 
 async function showCode(sid, job, { push = false, path = null, lines = "", compare = null } = {}) {
+  const seq = ++navSeq;
   S.runId = job ? job.run_id : null;
   renderJobs();
   if (!sid) {
@@ -909,16 +936,21 @@ async function showCode(sid, job, { push = false, path = null, lines = "", compa
     syncUrl(push);
     return;
   }
+  let manifest;
   try {
-    S.manifest = await manifestOf(sid);
+    manifest = await manifestOf(sid);
   } catch (e) {
+    if (seq !== navSeq) return;
     showMessage(`Could not load this code: ${e.message}`, true);
     return;
   }
+  if (seq !== navSeq) return;
+  S.manifest = manifest;
   S.snapshot = sid;
   if (compare !== null) S.compare = compare;
   if (S.compare === sid) S.compare = "";
-  await loadCompare();
+  await loadCompare(seq);
+  if (seq !== navSeq) return;
   if (path !== null) { S.path = path; [S.start, S.end] = parseLines(lines); }
   const known = !S.path || fileEntry(S.path) || isDir(S.path) || changeOf(S.path);
   if (!known || (path === null && !S.path)) { S.path = known && S.path ? S.path : defaultPath(); S.start = S.end = null; }
@@ -928,23 +960,31 @@ async function showCode(sid, job, { push = false, path = null, lines = "", compa
   $("code-header").style.display = "";
   $("code-inner").style.display = "";
   renderTree();
-  await openPath(S.path, { keepLines: true, push });
+  await openPath(S.path, { keepLines: true, push, token: seq });
 }
 
-async function loadExperimentData(expId) {
-  [S.jobs, S.info] = await Promise.all([
+async function loadExperimentData(expId, token = navSeq) {
+  const [jobs, info] = await Promise.all([
     getJSON(`/api/experiments/${encodeURIComponent(expId)}/jobs`),
     getJSON(`/api/experiments/${encodeURIComponent(expId)}/code`),
   ]);
+  if (token !== navSeq || S.expId !== expId) return false;
+  S.jobs = jobs; S.info = info;
+  return true;
 }
 
 async function selectExperiment(expId, want = {}) {
+  const token = ++navSeq;
   S.snapOnly = false; S.usage = null;
   S.expId = expId;
   S.jobs = []; S.info = null; S.runId = null;
   $("job-list").innerHTML = `<div class="job-list-msg">Loading…</div>`;
-  try { await loadExperimentData(expId); }
-  catch (e) { showMessage(`Could not load ${expId}: ${e.message}`, true); return; }
+  try { if (!await loadExperimentData(expId, token)) return; }
+  catch (e) {
+    if (token !== navSeq) return;
+    showMessage(`Could not load ${expId}: ${e.message}`, true);
+    return;
+  }
   const job = want.run && S.jobs.find(j => j.run_id === want.run);
   let sid = job ? job.artifact_id : latestSnapshot();
   if (!job && want.snap) {
@@ -956,13 +996,16 @@ async function selectExperiment(expId, want = {}) {
 }
 
 async function showSnapshotOnly(target, want = {}) {
+  const token = ++navSeq;
   let res;
   try { res = await getJSON(`/api/code/resolve?ref=${encodeURIComponent("code/" + target)}`); }
   catch (e) { res = { ok: false, error: e.message }; }
+  if (token !== navSeq) return;
   if (!res.ok) { showMessage(res.error || "not found", true); return; }
   S.snapOnly = true;
   S.expId = null; S.jobs = []; S.info = null;
   try { S.usage = await getJSON(`/api/snapshots/${encodeURIComponent(res.snapshot)}/usage`); } catch { S.usage = null; }
+  if (token !== navSeq) return;
   expSelect.value = "";
   await showCode(res.snapshot, null, { path: want.path ?? null, lines: want.lines || "", compare: want.compare ?? "" });
 }
@@ -979,12 +1022,17 @@ async function showCampaign(want) {
   if (chosen !== S.expId || S.snapOnly || want) await selectExperiment(chosen, want || {});
 }
 
+let expsSeq = 0;
 async function loadExperiments() {
+  const seq = ++expsSeq;
   try {
-    S.exps = await getJSON("/api/experiments");
+    const exps = await getJSON("/api/experiments");
+    if (seq !== expsSeq) return false;
+    S.exps = exps;
     setConnStatus("connected");
     return true;
   } catch {
+    if (seq !== expsSeq) return false;
     setConnStatus("disconnected");
     return false;
   }
@@ -1008,7 +1056,8 @@ expSelect.addEventListener("change", () => { S.path = ""; S.compare = ""; select
 $("refresh-btn").addEventListener("click", async () => {
   await loadExperiments();
   if (S.expId && !S.snapOnly) {
-    try { await loadExperimentData(S.expId); } catch { return; }
+    const expId = S.expId, token = ++navSeq;
+    try { if (!await loadExperimentData(expId, token)) return; } catch { return; }
     const job = S.runId && S.jobs.find(j => j.run_id === S.runId);
     const latest = latestSnapshot();
     await showCode(job ? job.artifact_id : (versionNumber(S.snapshot) ? S.snapshot : latest), job || null);

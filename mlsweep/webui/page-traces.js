@@ -59,17 +59,19 @@ let current = null;           // the open session's header, as the manager last 
 let events = [];
 let eventsBySeq = new Map();  // seq -> event
 let rowsBySeq = new Map();    // seq -> <tr> (only rows the current filter shows)
-let toolRowByCallId = new Map();
 let resultByToolId = new Map();
 let toolSeqById = new Map();  // tool_id -> seq of the call (its result folds into that row)
 let turnOfSeq = new Map();    // seq -> turn number
 let turnStarts = [];          // seq of each user prompt, in order
-let turnCount = 0;            // turns seen so far (also the counter while appending)
 let cmdSeqs = [];             // seq of each tool call that runs mlsweep, in order
+let cmdSet = new Set();       // the same seqs, to test one
 let kindFilter = params.get("kind") || "";  // "" | user | assistant | thinking | tools | mlsweep
 let linksExpanded = false;    // the header lists every linked experiment, not the first few
 let selectedSeq = null;
 let pollTimer = null;
+let openToken = 0;            // bumped by each openSession: a late answer for another trace is dropped
+let desiredSession = null;    // the trace the reader asked for, even while its load is in flight
+let listSeq = 0;              // bumped by each loadSessions: an older list answer is dropped
 let pinned = false;           // the user is reading the tail: follow new events
 let notesCache = new Map();   // session id -> how many notes cite it
 let notesEnabled = true;      // the manager answered 404: no notes served
@@ -113,10 +115,6 @@ function fmtDuration(seconds) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-}
-
-function sessionTitle(s) {
-  return s.title || (s.cwd ? s.cwd.split("/").filter(Boolean).pop() : s.session_id);
 }
 
 function agentLabel(s) {
@@ -179,7 +177,7 @@ function sessionRow(s) {
   dot.title = s.state || "";
   const title = document.createElement("span");
   title.className = "session-title";
-  title.textContent = sessionTitle(s);
+  title.textContent = traceName(s);
   title.title = s.session_id;
   top.append(dot, title);
 
@@ -287,29 +285,35 @@ function matchesFilters(s) {
 }
 
 async function loadSessions() {
+  const seq = ++listSeq;
   const q = searchEl.value.trim();
+  const isSearch = !!q;
   const atTop = sessionList.scrollTop;
   try {
     let r;
-    if (q) {
-      searching = true;
+    if (isSearch) {
       r = await apiFetch(`/api/capture/search?q=${encodeURIComponent(q)}&limit=50`);
     } else {
-      searching = false;
       const query = new URLSearchParams({ limit: String(listLimit), state: stateFilter });
       if (agentFilter) query.set("agent", agentFilter);
       if (experimentFilter) query.set("experiment", experimentFilter);
       r = await apiFetch(`/api/capture/sessions?${query}`);
     }
+    // Typing, a filter or a poll started another list request; this answer is stale.
+    if (seq !== listSeq) return;
+    let next;
     if (r.status === 404) {
       captureOff = true;
-      sessions = [];
+      next = [];
     } else {
       if (!r.ok) return;
       captureOff = false;
-      sessions = await r.json();
-      if (searching) sessions = sessions.filter(matchesFilters);
+      next = await r.json();
+      if (seq !== listSeq) return;
+      if (isSearch) next = next.filter(matchesFilters);
     }
+    searching = isSearch;
+    sessions = next;
     renderSessions();
     renderListInfo();
     sessionList.scrollTop = atTop;
@@ -357,25 +361,37 @@ function indexEvents() {
   toolSeqById = new Map();
   turnOfSeq = new Map();
   turnStarts = [];
-  turnCount = 0;
   cmdSeqs = [];
+  cmdSet = new Set();
   for (const e of events) indexOne(e);
 }
 
 function indexOne(e) {
-  if (e.kind === "user") {
-    turnCount += 1;
-    turnStarts.push(e.seq);
-  }
-  turnOfSeq.set(e.seq, turnCount);
+  if (e.kind === "user") turnStarts.push(e.seq);
+  turnOfSeq.set(e.seq, turnStarts.length);
   eventsBySeq.set(e.seq, e);
   if (e.kind === "tool_result" && e.tool_id) resultByToolId.set(e.tool_id, e);
   if (e.kind === "tool" && e.tool_id) toolSeqById.set(e.tool_id, e.seq);
-  if (isMlsweep(e)) cmdSeqs.push(e.seq);
+  if (e.kind === "tool" && MLSWEEP_RE.test(e.text || "")) {
+    cmdSeqs.push(e.seq);
+    cmdSet.add(e.seq);
+  }
 }
 
+// Whether a (indexed) event is a tool call that runs mlsweep.
 function isMlsweep(e) {
-  return e.kind === "tool" && MLSWEEP_RE.test(e.text || "");
+  return cmdSet.has(e.seq);
+}
+
+// Forget the open trace's events and rows (the header is the caller's).
+function resetTrace() {
+  events = [];
+  indexEvents();
+  rowsBySeq.clear();
+  selectedSeq = null;
+  inspector.classList.remove("open");
+  inFilter.value = "";
+  ledger.querySelector("tbody").replaceChildren();
 }
 
 // The mlsweep invocations in a command, each from the word `mlsweep` to the
@@ -521,27 +537,30 @@ function makeRow(e) {
 
 // A tool call shows its result inline (status and how long); the result gets
 // no row of its own unless its call is missing from the trace.
-function decorateToolRows() {
-  for (const [toolId, tr] of toolRowByCallId) {
-    const result = resultByToolId.get(toolId);
-    if (!result) continue;
-    const line = tr.querySelector(".content-line");
-    if (!line) continue;
-    let status = line.querySelector(".event-status");
-    if (!status) {
-      status = document.createElement("span");
-      status.className = "event-status";
-      line.append(status);
-    }
-    const ok = result.ok !== false;
-    const mark = document.createElement("span");
-    mark.className = "mark";
-    mark.textContent = ok ? "✓" : "✗";
-    status.replaceChildren(mark, result.duration_ms != null ? fmtMs(result.duration_ms) : (ok ? "ok" : "error"));
-    status.title = ok ? "Succeeded" : "Failed";
-    status.classList.toggle("ok", ok);
-    status.classList.toggle("err", !ok);
+function decorateToolRow(toolId) {
+  const result = resultByToolId.get(toolId);
+  const line = rowsBySeq.get(toolSeqById.get(toolId))?.querySelector(".content-line");
+  if (!result || !line) return;
+  let status = line.querySelector(".event-status");
+  if (!status) {
+    status = document.createElement("span");
+    status.className = "event-status";
+    line.append(status);
   }
+  const ok = result.ok !== false;
+  const mark = document.createElement("span");
+  mark.className = "mark";
+  mark.textContent = ok ? "✓" : "✗";
+  status.replaceChildren(mark, result.duration_ms != null ? fmtMs(result.duration_ms) : (ok ? "ok" : "error"));
+  status.title = ok ? "Succeeded" : "Failed";
+  status.classList.toggle("ok", ok);
+  status.classList.toggle("err", !ok);
+}
+
+function addRow(e, tbody) {
+  const tr = makeRow(e);
+  tbody.append(tr);
+  rowsBySeq.set(e.seq, tr);
 }
 
 function buildLedger({ keepScroll = false } = {}) {
@@ -549,16 +568,11 @@ function buildLedger({ keepScroll = false } = {}) {
   const tbody = ledger.querySelector("tbody");
   tbody.replaceChildren();
   rowsBySeq.clear();
-  toolRowByCallId.clear();
   const needle = inFilter.value.trim().toLowerCase();
   for (const e of events) {
-    if (!shownByFilters(e, needle)) continue;
-    const tr = makeRow(e);
-    tbody.append(tr);
-    rowsBySeq.set(e.seq, tr);
-    if (e.kind === "tool" && e.tool_id) toolRowByCallId.set(e.tool_id, tr);
+    if (shownByFilters(e, needle)) addRow(e, tbody);
   }
-  decorateToolRows();
+  for (const toolId of resultByToolId.keys()) decorateToolRow(toolId);
   updateKindCounts();
   if (!events.length) {
     showNoSelection("This trace is empty.");
@@ -576,16 +590,14 @@ function appendEvents(fresh) {
   const wasPinned = pinned || atBottom();
   const needle = inFilter.value.trim().toLowerCase();
   const tbody = ledger.querySelector("tbody");
+  const last = events.length ? events[events.length - 1].seq : 0;
   for (const e of fresh) {
+    if (e.seq <= last || eventsBySeq.has(e.seq)) continue;  // already shown
     events.push(e);
     indexOne(e);
-    if (!shownByFilters(e, needle)) continue;
-    const tr = makeRow(e);
-    tbody.append(tr);
-    rowsBySeq.set(e.seq, tr);
-    if (e.kind === "tool" && e.tool_id) toolRowByCallId.set(e.tool_id, tr);
+    if (shownByFilters(e, needle)) addRow(e, tbody);
+    if (e.tool_id) decorateToolRow(e.tool_id);  // a result lands on its call's row
   }
-  decorateToolRows();
   updateKindCounts();
   if (current) {
     current.event_count = Math.max(current.event_count || 0, events.length);
@@ -599,13 +611,18 @@ function atBottom() {
   return ledgerWrap.scrollTop + ledgerWrap.clientHeight >= ledgerWrap.scrollHeight - 12;
 }
 
+// Rows are in document order, so the first one in view is a binary search.
 function firstVisibleSeq() {
+  const rows = ledger.tBodies[0].rows;
   const top = ledgerWrap.getBoundingClientRect().top;
-  for (const e of events) {
-    const tr = rowsBySeq.get(e.seq);
-    if (tr && tr.getBoundingClientRect().bottom > top) return e.seq;
+  let lo = 0;
+  let hi = rows.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (rows[mid].getBoundingClientRect().bottom > top) hi = mid;
+    else lo = mid + 1;
   }
-  return null;
+  return lo < rows.length ? Number(rows[lo].dataset.seq) : null;
 }
 
 function scrollRowToTop(tr) {
@@ -633,34 +650,33 @@ function readingSeq() {
   return firstVisibleSeq();
 }
 
-function currentTurn() {
+function currentTurn(seq = readingSeq()) {
   if (!turnStarts.length) return 0;
-  const seq = readingSeq();
   return seq == null ? 1 : Math.max(1, turnOfSeq.get(seq) || 0);
 }
 
 function updateTurnNav() {
+  const at = current ? readingSeq() : null;
   const total = turnStarts.length;
   const show = Boolean(current) && total > 0;
   turnNav.style.display = show ? "" : "none";
   if (show) {
-    const turn = Math.min(total, Math.max(1, currentTurn()));
+    const turn = Math.min(total, Math.max(1, currentTurn(at)));
     turnPos.textContent = `${turn} / ${total}`;
     turnPrev.disabled = turn <= 1;
     turnNext.disabled = turn >= total;
   }
-  updateCmdNav();
+  updateCmdNav(at);
 }
 
 // The mlsweep stepper: which command the reader is at or past, of how many.
-function updateCmdNav() {
+function updateCmdNav(at) {
   const total = cmdSeqs.length;
   const show = Boolean(current) && total > 0;
   cmdNav.style.display = show ? "" : "none";
   if (!show) return;
-  const at = readingSeq();
   const passed = at == null ? 0 : cmdSeqs.filter(seq => seq <= at).length;
-  const on = at != null && cmdSeqs.includes(at);
+  const on = at != null && cmdSet.has(at);
   cmdPos.textContent = `${on ? passed : passed ? `${passed}+` : "–"} / ${total}`;
   cmdPrev.disabled = at == null || !cmdSeqs.some(seq => seq < at);
   cmdNext.disabled = at != null && !cmdSeqs.some(seq => seq > at);
@@ -698,8 +714,9 @@ function gotoPrompt(delta) {
 // ── Selection and inspector ──────────────────────────────────────────────────
 
 function selectEvent(seq, { open = false } = {}) {
+  rowsBySeq.get(selectedSeq)?.classList.remove("selected");
   selectedSeq = seq;
-  for (const [rowSeq, tr] of rowsBySeq) tr.classList.toggle("selected", rowSeq === seq);
+  rowsBySeq.get(seq)?.classList.add("selected");
   const event = eventsBySeq.get(seq);
   if (event && (open || inspector.classList.contains("open"))) inspect(event);
   syncURL();
@@ -776,8 +793,8 @@ function inspect(e) {
 
 function closeInspector() {
   inspector.classList.remove("open");
+  rowsBySeq.get(selectedSeq)?.classList.remove("selected");
   selectedSeq = null;
-  for (const tr of rowsBySeq.values()) tr.classList.remove("selected");
   syncURL();
   updateTurnNav();
 }
@@ -822,9 +839,9 @@ function renderHeader(s, { notes = true } = {}) {
   const started = s.started_at ? new Date(s.started_at * 1000).toLocaleString() : "";
   const duration = s.started_at && s.last_seen_at > s.started_at
     ? ` · ${fmtDuration(s.last_seen_at - s.started_at)}` : "";
-  traceTitle.textContent = sessionTitle(s) || "Trace";
+  traceTitle.textContent = traceName(s) || "Trace";
   traceTitle.title = s.session_id;
-  document.title = `mlsweep — ${sessionTitle(s) || "Trace"}`;
+  document.title = `mlsweep — ${traceName(s) || "Trace"}`;
   traceAgent.style.display = "";
   traceAgent.textContent = agentLabel(s);
   traceState.style.display = "";
@@ -901,6 +918,8 @@ function openMenu() {
     { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
     { label: "Download transcript",
       run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
+    { label: "Download as ATIF", hint: "for other agent tools",
+      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/atif?download=1`), "_blank") },
     "-",
     { label: "Delete trace", danger: true, run: deleteCurrent },
   ]);
@@ -921,12 +940,14 @@ sessionList.addEventListener("contextmenu", ev => {
   const isOpen = current && current.session_id === sid;
   const s = sessions.find(x => x.session_id === sid);
   mlContextMenu(ev, [
-    { title: s ? sessionTitle(s) : sid },
+    { title: s ? traceName(s) : sid },
     isOpen ? null : { label: "Open", run: () => openSession(sid) },
     { label: "Copy note reference", hint: "mlsweep:trace/…", run: () => copyText(traceRef("", null, sid), "Copied trace reference") },
     { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
     { label: "Download transcript",
       run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
+    { label: "Download as ATIF", hint: "for other agent tools",
+      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/atif?download=1`), "_blank") },
     "-",
     { label: "Delete trace", danger: true, run: () => deleteTrace(sid) },
   ]);
@@ -976,35 +997,28 @@ function markSelectedSession() {
 }
 
 async function openSession(id, { eventSeq = null } = {}) {
+  desiredSession = id;
+  const token = ++openToken;
   const r = await apiFetch(`/api/capture/sessions/${encodeURIComponent(id)}`);
+  if (token !== openToken) return;  // another trace was opened meanwhile
   if (r.status === 404) {
+    if (desiredSession === id) desiredSession = null;
     await loadSessions();
-    showNoSelection("That trace is gone.", "Pick another from the left.");
+    if (token === openToken) showNoSelection("That trace is gone.", "Pick another from the left.");
     return;
   }
   if (!r.ok) return;
   const s = await r.json();
+  if (token !== openToken) return;  // the body arrived after another trace was opened
   if (!current || current.session_id !== s.session_id) linksExpanded = false;
   current = s;
   clearInterval(pollTimer);
-  selectedSeq = null;
-  inspector.classList.remove("open");
-  inFilter.value = "";
   // Nothing from the previous trace survives the switch, even if the load fails.
-  events = [];
-  eventsBySeq.clear();
-  rowsBySeq.clear();
-  toolRowByCallId.clear();
-  resultByToolId.clear();
-  toolSeqById.clear();
-  turnOfSeq.clear();
-  turnStarts = [];
-  turnCount = 0;
-  cmdSeqs = [];
-  ledger.querySelector("tbody").replaceChildren();
+  resetTrace();
   showNoSelection("Loading trace…", "");
   markSelectedSession();
   await loadEvents(s, 0);
+  if (token !== openToken) return;
   renderHeader(s);
   updateTurnNav();
   markSelectedSession();
@@ -1014,26 +1028,35 @@ async function openSession(id, { eventSeq = null } = {}) {
 }
 
 async function refreshCurrent() {
-  if (!current) return;
+  // If the reader picked another trace whose load is still in flight, refresh
+  // that one rather than the trace still on screen.
+  const id = desiredSession || (current && current.session_id);
+  if (!id) return;
   const keep = selectedSeq;
-  await openSession(current.session_id);
-  if (keep != null) jumpToSeq(keep);
+  await openSession(id);
+  if (keep != null && current && current.session_id === id) jumpToSeq(keep);
 }
 
+const EVENTS_PAGE = 1000;
+
 async function loadEvents(s, fromSeq) {
-  // Pages of 1000 until the session is caught up.  The page that ends the loop
-  // is empty, and must not replace the pages that came before it.
+  // Pages until a short one says the session is caught up.  What arrived
+  // before a failed page is still shown.
+  const token = openToken;
   const loaded = [];
   let next = fromSeq;
-  for (let page = 0; page < 20; page++) {
+  for (;;) {
     const r = await apiFetch(
-      `/api/capture/sessions/${encodeURIComponent(s.session_id)}/events?from_seq=${next}&limit=1000`);
-    if (!r.ok) return;
+      `/api/capture/sessions/${encodeURIComponent(s.session_id)}/events?from_seq=${next}&limit=${EVENTS_PAGE}`);
+    if (token !== openToken) return;  // the reader moved on to another trace
+    if (!r.ok) break;
     const body = await r.json();
-    if (!body.events.length) break;
+    if (token !== openToken) return;
     loaded.push(...body.events);
     next = body.next_from_seq;
+    if (body.events.length < EVENTS_PAGE) break;
   }
+  if (token !== openToken) return;
   if (fromSeq === 0) {
     events = loaded;
     indexEvents();
@@ -1046,21 +1069,31 @@ async function loadEvents(s, fromSeq) {
 function startPoll() {
   clearInterval(pollTimer);
   if (!current || current.state !== "active") return;
-  pollTimer = setInterval(async () => {
-    if (!current || document.hidden) return;
-    const r = await apiFetch(`/api/capture/sessions/${encodeURIComponent(current.session_id)}`);
-    if (r.status === 404) { clearInterval(pollTimer); return; }
-    if (!r.ok) return;
-    const s = await r.json();
-    const grew = (s.event_count || 0) > events.length;
-    const stateChanged = s.state !== current.state;
-    current = s;
-    renderHeader(s, { notes: false });
-    if (grew) {
-      await loadEvents(s, events.length ? events[events.length - 1].seq + 1 : 0);
+  let busy = false;
+  const timer = pollTimer = setInterval(async () => {
+    if (!current || document.hidden || busy) return;
+    const token = openToken;
+    const sid = current.session_id;
+    busy = true;
+    try {
+      const r = await apiFetch(`/api/capture/sessions/${encodeURIComponent(sid)}`);
+      if (token !== openToken) return;  // another trace is open now
+      if (r.status === 404) { clearInterval(timer); return; }
+      if (!r.ok) return;
+      const s = await r.json();
+      if (token !== openToken || !current || current.session_id !== sid) return;
+      const grew = (s.event_count || 0) > events.length;
+      const stateChanged = s.state !== current.state;
+      current = s;
+      renderHeader(s, { notes: false });
+      if (grew) {
+        await loadEvents(s, events.length ? events[events.length - 1].seq + 1 : 0);
+      }
+      if (stateChanged) updateTurnNav();
+      if (s.state !== "active") clearInterval(timer);
+    } catch { /* offline: try again next tick */ } finally {
+      busy = false;
     }
-    if (stateChanged) updateTurnNav();
-    if (s.state !== "active") clearInterval(pollTimer);
   }, POLL_MS);
 }
 
@@ -1080,20 +1113,10 @@ async function deleteTrace(id) {
   notesCache.delete(id);
   if (!current || current.session_id !== id) { await loadSessions(); return; }
   clearInterval(pollTimer);
+  openToken += 1;  // a load still in flight is for the trace just deleted
+  desiredSession = null;
   current = null;
-  events = [];
-  eventsBySeq.clear();
-  rowsBySeq.clear();
-  toolRowByCallId.clear();
-  resultByToolId.clear();
-  toolSeqById.clear();
-  turnOfSeq.clear();
-  turnStarts = [];
-  turnCount = 0;
-  cmdSeqs = [];
-  selectedSeq = null;
-  inspector.classList.remove("open");
-  inFilter.value = "";
+  resetTrace();
   inFilter.style.display = "none";
   ledgerBar.style.display = "none";
   ledger.querySelector("tbody").replaceChildren();
@@ -1108,7 +1131,7 @@ async function deleteTrace(id) {
   traceNotes.style.display = "none";
   dlBtn.style.display = "none";
   menuBtn.style.display = "none";
-  turnNav.style.display = "none";
+  updateTurnNav();
   showNoSelection();
   syncURL();
   await loadSessions();
@@ -1233,19 +1256,18 @@ document.addEventListener("keydown", e => {
 });
 
 function moveSelection(delta) {
-  const rows = [...ledger.querySelectorAll("tbody tr")];
+  const rows = ledger.tBodies[0].rows;
   if (!rows.length) return;
-  const at = rows.findIndex(r => Number(r.dataset.seq) === selectedSeq);
-  const index = at < 0 ? (delta > 0 ? 0 : rows.length - 1)
-    : Math.min(rows.length - 1, Math.max(0, at + delta));
-  const tr = rows[index];
+  const at = rowsBySeq.get(selectedSeq);
+  const tr = !at ? rows[delta > 0 ? 0 : rows.length - 1]
+    : (delta > 0 ? at.nextElementSibling : at.previousElementSibling) || at;
   scrollRowIntoView(tr);
   selectEvent(Number(tr.dataset.seq), { open: inspector.classList.contains("open") });
   pinned = atBottom();
 }
 
 function moveSelectionTo(index) {
-  const rows = [...ledger.querySelectorAll("tbody tr")];
+  const rows = ledger.tBodies[0].rows;
   if (!rows.length) return;
   const tr = index === 0 ? rows[0] : rows[rows.length - 1];
   scrollRowIntoView(tr);

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _api_status
 from mlsweep import _capture
 
 # ── pi normalizer ─────────────────────────────────────────────────────────────
@@ -66,7 +67,7 @@ def _normalize(spec_name, lines):
     meta: dict = {}
     events: list = []
     for line in lines:
-        events.extend(spec.normalize(line, 0, meta))
+        events.extend(spec.normalize(line, meta))
     return meta, events
 
 
@@ -101,14 +102,13 @@ def test_pi_normalizer_produces_expected_events():
     # A tool result keeps its status, never its output.
     assert result["ok"] is True and result["duration_ms"] == 24
     assert "output" not in json.dumps(result)
-    # Within one line the events number onward; across lines the caller
-    # renumbers (see read_transcript).
-    assert [e["seq"] for e in events] == [0, 0, 0, 1, 2, 3, 0]
+    # The caller numbers events across the session (see read_transcript).
+    assert not any("seq" in e for e in events)
 
 
 def test_pi_session_id_is_the_native_id_without_prefix():
     spec = _capture.agent_specs(["pi"])[0]
-    session_id, _ = _capture.read_transcript(spec, _write_transcript([
+    session_id, _, _ = _capture.read_transcript(spec, _write_transcript([
         PI_SESSION_LINE, PI_USER_LINE,
     ]))
     assert session_id == "01a2047e-e683-706c-8e4d-58c9e737378e"  # no agent prefix
@@ -116,7 +116,7 @@ def test_pi_session_id_is_the_native_id_without_prefix():
 
 def test_pi_prompt_is_kept_tool_output_is_not():
     spec = _capture.agent_specs(["pi"])[0]
-    _, events = _capture.read_transcript(spec, _write_transcript([
+    _, events, _ = _capture.read_transcript(spec, _write_transcript([
         PI_SESSION_LINE, PI_USER_LINE, PI_ASSISTANT_LINE, PI_TOOL_RESULT_LINE,
     ]))
     text = json.dumps(events)
@@ -203,37 +203,15 @@ def test_attribution_reads_a_gone_ancestor_as_nothing():
 
 
 def _post(url, token, path, data):
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        f"{url}{path}", data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+    return _api_status(url, token, "POST", path, data)
 
 
 def _get(url, token, path):
-    req = urllib.request.Request(f"{url}{path}", headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+    return _api_status(url, token, "GET", path)
 
 
 def _delete(url, token, path, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(f"{url}{path}", data=body, method="DELETE", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read())
+    return _api_status(url, token, "DELETE", path, data)
 
 
 _SESSION = {
@@ -306,20 +284,14 @@ def test_capture_oversized_event_is_trimmed_not_broken(manager_server):
     assert status == 200 and "oversized-1" in json.dumps(hits)
 
 
-def test_capture_requires_a_session_before_events(manager_server):
-    server, url = manager_server
-    status, _ = _post(url, server.token,
-                      "/api/capture/sessions/no-such-trace/close", {})
-    assert status == 404
-
-
 def test_capture_close_and_state_transitions(manager_server):
     server, url = manager_server
     token = server.token
     status, _ = _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": _EVENTS})
     assert status == 201
-    status, body = _post(url, token, f"/api/capture/sessions/{_SESSION['session_id']}/close", {})
-    assert status == 200 and body["state"] == "closed"
+    closed = {**_SESSION, "state": "closed"}
+    status, body = _post(url, token, "/api/capture/sessions", {"session": closed, "events": []})
+    assert status == 201 and body["state"] == "closed"
 
     # An active upload never revives a closed session (imported wins too).
     active = {**_SESSION, "state": "active"}
@@ -346,6 +318,51 @@ def test_capture_auto_link_experiment(manager_server):
     # And back the other way.
     status, body = _get(url, token, f"/api/capture/sessions/{_SESSION['session_id']}")
     assert body["experiments"] == ["sweep_test_1"]
+
+
+def test_capture_link_made_before_the_session_uploads(manager_server):
+    # A sweep is submitted before the watcher has uploaded its session; the
+    # link waits for the trace instead of being dropped.
+    server, url = manager_server
+    token = server.token
+    status, _ = _post(url, token, "/api/experiments", {
+        "experiment_id": "sweep_early_1", "campaign": "main",
+        "capture_session": _SESSION["session_id"]})
+    assert status == 201
+    status, body = _get(url, token, "/api/capture/counts")
+    assert body["experiments"] == {}  # no trace yet, so nothing to count
+    _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": _EVENTS})
+    status, body = _get(url, token, f"/api/capture/sessions/{_SESSION['session_id']}")
+    assert body["experiments"] == ["sweep_early_1"]
+    status, body = _get(url, token, "/api/capture/counts")
+    assert body["experiments"] == {"sweep_early_1": 1}
+
+
+def test_capture_search_spans_batches_and_tool_names(manager_server):
+    server, url = manager_server
+    token = server.token
+    _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": _EVENTS[:1]})
+    _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": [
+        {"seq": 2, "ts": 1001.0, "kind": "tool", "name": "frobnicate", "text": "x=1"},
+        {"seq": 3, "ts": 1002.0, "kind": "assistant", "text": "sweep again"}]})
+    status, body = _get(url, token, "/api/capture/search?q=sweep")
+    assert status == 200 and len(body) == 1  # one hit per session, not per batch
+    status, body = _get(url, token, "/api/capture/search?q=frobnicate")
+    assert status == 200 and [s["session_id"] for s in body] == [_SESSION["session_id"]]
+
+
+def test_capture_transcript_has_every_event(manager_server):
+    server, url = manager_server
+    token = server.token
+    events = [{"seq": i, "ts": float(i), "kind": "user", "text": f"p{i}"} for i in range(1, 2502)]
+    status, _ = _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": events})
+    assert status == 201
+    req = urllib.request.Request(
+        f"{url}/api/capture/sessions/{_SESSION['session_id']}/transcript",
+        headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        lines = resp.read().decode().splitlines()
+    assert len(lines) == 2501 and json.loads(lines[-1])["seq"] == 2501
 
 
 def test_capture_has_no_manual_link(manager_server):
@@ -430,14 +447,14 @@ def test_note_trace_links_resolve_prefixes():
     import aiosqlite
 
     from mlsweep._manager_capture import resolve_trace_refs
-    from mlsweep._manager_db import init_db, upsert_capture_session
+    from mlsweep._manager_db import init_db, store_capture_batch
 
     async def run():
         async with aiosqlite.connect(":memory:") as db:
             await init_db(db)
             for sid in ("9f6c0e22-aaaa-4000-8000-000000000001", "9f6c0e22-bbbb-4000-8000-000000000002",
                         "12345678-cccc-4000-8000-000000000003"):
-                await upsert_capture_session(db, {**_SESSION, "session_id": sid})
+                await store_capture_batch(db, {**_SESSION, "session_id": sid}, [])
             return await resolve_trace_refs(db, [
                 "trace/12345678", "trace/9f6c0e22", "trace/9f6c0e22-bbbb-4000-8000-000000000002",
                 "trace/00000000"])
@@ -472,15 +489,14 @@ def test_trace_links_to_an_event_resolve_it():
     import aiosqlite
 
     from mlsweep._manager_capture import resolve_trace_refs
-    from mlsweep._manager_db import init_db, insert_capture_events, upsert_capture_session
+    from mlsweep._manager_db import init_db, store_capture_batch
 
     sid = _SESSION["session_id"]
 
     async def run():
         async with aiosqlite.connect(":memory:") as db:
             await init_db(db)
-            await upsert_capture_session(db, _SESSION)
-            await insert_capture_events(db, sid, _EVENTS)
+            await store_capture_batch(db, _SESSION, _EVENTS)
             return await resolve_trace_refs(db, [
                 f"trace/{sid[:8]}#E3", f"trace/{sid}?kind=tools", f"trace/{sid}#E99",
                 f"trace/{sid}#Efoo"])
@@ -518,7 +534,6 @@ def test_capture_wrong_token_is_401(manager_server):
 
 def test_lint_checks_trace_refs():
     import tempfile
-    from pathlib import Path
 
     from mlsweep import _notes_lint
 
@@ -552,7 +567,6 @@ def test_trace_ref_resolution_shape():
 
 def _write_transcript(lines):
     import tempfile
-    from pathlib import Path
 
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
         for line in lines:
@@ -597,7 +611,7 @@ def test_watcher_uploads_session_end_to_end(manager_server, tmp_path):
 
     client = _capture.CaptureClient(directory=tmp_path / "capture")
     specs = _capture.agent_specs(["pi"], root=sessions_root)
-    session_id = _capture.session_id_for("pi", "01a1cbca-f65f-71f6-888e-e3d1da5280ff")
+    session_id = "01a1cbca-f65f-71f6-888e-e3d1da5280ff"
     _capture.request_follow(session_id, client.follow_dir, why="test")
     client.follow_requested(specs)
     client.scan(specs)
@@ -619,6 +633,25 @@ def test_watcher_uploads_session_end_to_end(manager_server, tmp_path):
     kinds = [e["kind"] for e in events["events"]]
     assert kinds == ["user", "thinking", "assistant", "tool", "tool", "tool_result"]
     assert not any("lots of output" in json.dumps(e) for e in events["events"])
+
+
+    # Quiet long enough, it closes; with nothing left to send, the close
+    # still reaches the manager, once.
+    state.closed = True
+    assert client.needs_close_upload(state)
+    _capture._upload(client, state, url, token)
+    assert not client.needs_close_upload(state)
+    status, body = _get(url, token, f"/api/capture/sessions/{state.session_id}")
+    assert body["state"] == "closed" and body["event_count"] == 6
+
+
+def test_post_session_sends_a_long_spool_in_batches(manager_server):
+    server, url = manager_server
+    events = [{"seq": i, "ts": float(i), "kind": "user", "text": f"p{i}"} for i in range(1, 6)]
+    sent, error = _capture.post_session(url, server.token, _SESSION, events, batch_events=2)
+    assert (sent, error) == (5, None)
+    status, body = _get(url, server.token, f"/api/capture/sessions/{_SESSION['session_id']}")
+    assert body["event_count"] == 5
 
 
 # ── which sessions the watcher reads ──────────────────────────────────────────
@@ -811,5 +844,15 @@ def test_traces_page_renders_a_session(tmp_path_factory):
         b.wait_for("document.querySelectorAll('.session-item').length === 1")
         info = b.eval("document.getElementById('list-info').textContent")
         assert info.startswith("1 trace") and "exp sweep_traced_1" in info, info
+
+        # The palette finds the trace by its text; a source filter keeps to
+        # the sources it names.
+        b.wait_for("typeof MLSearch === 'object' && typeof MLChrome.pages === 'object'")
+        kinds = ("(async q => (await MLSearch.search(q)).items.map(i => i.kind))")
+        assert "trace" in b.eval(f"{kinds}('sweep')")
+        assert set(b.eval(f"{kinds}('trace:sweep')")) == {"trace"}
+        assert "trace" not in b.eval(f"{kinds}('docs:sweep')")
+        assert b.eval("[...document.querySelectorAll('.session-item .session-title')]"
+                      ".map(x => x.textContent)") == ["Run the sweep"]
     finally:
         b.close()
