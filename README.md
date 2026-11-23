@@ -301,7 +301,7 @@ mlsweep notes lint                   mlsweep notes links|mentions|search|history
 # capture (coding-agent traces, on the dashboard's Traces tab; mlsweep docs traces)
 mlsweep capture this                 mlsweep capture status
 mlsweep capture on|off               mlsweep capture ls
-mlsweep capture link EXP             mlsweep capture import --days 30
+mlsweep capture import --days 30
 
 # docs
 mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, notes, traces, skill
@@ -407,7 +407,7 @@ other way round (watching live is the exception; `mlsweep watch` and
 | System: workers, devices, jobs per GPU, placement | `mlsweep workers ...`, `mlsweep scheduler --placement` |
 | System: storage cleanup | `mlsweep gc` |
 | Notes | `mlsweep notes ...` (see [notes.md](docs/notes.md)) |
-| Traces | `mlsweep capture this\|on\|off\|status\|ls\|link\|import` (see [traces.md](docs/traces.md)) |
+| Traces | `mlsweep capture this\|on\|off\|status\|ls\|import` (see [traces.md](docs/traces.md)) |
 
 ## Running an agent
 

@@ -88,8 +88,8 @@
 
   function groupResults(results) {
     const groups = new Map();
-    const order = ["answer", "action", "run", "experiment", "artifact", "note", "doc", "page", "saved"];
-    const labels = { answer: "Answers", action: "Actions", run: "Runs", experiment: "Experiments", artifact: "Artifacts", note: "Notes", doc: "Docs", page: "Pages", saved: "Saved" };
+    const order = ["answer", "action", "run", "experiment", "artifact", "note", "trace", "doc", "page", "saved"];
+    const labels = { answer: "Answers", action: "Actions", run: "Runs", experiment: "Experiments", artifact: "Artifacts", note: "Notes", trace: "Traces", doc: "Docs", page: "Pages", saved: "Saved" };
     for (const it of results) {
       const k = it.kind === "saved" || it.kind === "recent" ? "saved" : it.kind;
       if (!groups.has(k)) groups.set(k, []);
@@ -124,7 +124,7 @@
       return;
     }
     const seq = ++searchSeq;
-    items = [{ group: "Search" }, { kind: "loading", id: "loading", title: "Searching…", sub: "experiments, runs, notes, docs", icon: "…", actions: [] }];
+    items = [{ group: "Search" }, { kind: "loading", id: "loading", title: "Searching…", sub: "experiments, runs, notes, traces, docs", icon: "…", actions: [] }];
     render();
     debounceTimer = setTimeout(async () => {
       if (!window.MLSearch) return;

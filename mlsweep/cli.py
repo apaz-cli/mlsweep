@@ -150,7 +150,7 @@ def _build_help(include_banner: bool = False) -> str:
         ]),
         ("Capture", [
             ("capture [this|on|off]", "upload this agent session (or sweep-submitting ones) to the Traces tab"),
-            ("capture [status|ls|link|import]", "capture state; traces on the manager; link one to EXP"),
+            ("capture [status|ls|import]", "capture state; traces on the manager; backfill old transcripts"),
         ]),
         ("Client", [
             ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),

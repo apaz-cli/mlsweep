@@ -29,7 +29,7 @@ import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, TypeVar, get_args
+from typing import Any, Callable, Coroutine, Iterable, Literal, NamedTuple, Sequence, TypeVar, get_args
 
 import aiosqlite
 
@@ -636,8 +636,12 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
     # A code snapshot (``snap:`` ID) keeps its manifest here; a legacy
-    # tarball (``sha256:`` ID) has none.
-    await _add_missing_columns(db, "artifacts", {"manifest": "TEXT"})
+    # tarball (``sha256:`` ID) has none.  file_count is the manifest's length,
+    # kept so listings can show it without parsing every manifest.
+    await _add_missing_columns(db, "artifacts", {"manifest": "TEXT", "file_count": "INTEGER"})
+    await db.execute(
+        "UPDATE artifacts SET file_count = json_array_length(manifest, '$.files') "
+        "WHERE file_count IS NULL AND manifest IS NOT NULL")
 
     # ── code_submissions ────────────────────────────────────────────
     # One row per submission of code to an experiment: which snapshot, and the
@@ -979,13 +983,14 @@ async def register_snapshot(
     """
     await db.execute(
         """
-        INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, manifest)
-        VALUES (?, ?, ?, 0, ?)
+        INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, manifest, file_count)
+        VALUES (?, ?, ?, 0, ?, json_array_length(?, '$.files'))
         ON CONFLICT (artifact_id) DO UPDATE SET
             stored_at = EXCLUDED.stored_at,
-            manifest = COALESCE(artifacts.manifest, EXCLUDED.manifest)
+            manifest = COALESCE(artifacts.manifest, EXCLUDED.manifest),
+            file_count = COALESCE(artifacts.file_count, EXCLUDED.file_count)
         """,
-        (artifact_id, size_bytes, _now_epoch(), manifest),
+        (artifact_id, size_bytes, _now_epoch(), manifest, manifest),
     )
     await db.commit()
 
@@ -994,6 +999,17 @@ async def get_snapshot_manifest(db: aiosqlite.Connection, artifact_id: str) -> s
     """The snapshot's manifest JSON, or None for a legacy tarball or an unknown ID."""
     row = await _exec_one(db, "SELECT manifest FROM artifacts WHERE artifact_id = ?", (artifact_id,))
     return row[0] if row is not None else None
+
+
+async def snapshot_file_counts(db: aiosqlite.Connection, artifact_ids: Iterable[str | None]) -> dict[str, int]:
+    """``{artifact_id: file count}`` for those of *artifact_ids* that are stored snapshots."""
+    ids = sorted({a for a in artifact_ids if a})
+    if not ids:
+        return {}
+    rows = await _exec_all(
+        db, f"SELECT artifact_id, file_count FROM artifacts WHERE artifact_id IN ({_marks(ids)}) "
+            "AND file_count IS NOT NULL", tuple(ids))
+    return {aid: int(n) for aid, n in rows}
 
 
 async def snapshot_stats(db: aiosqlite.Connection, artifact_id: str) -> tuple[int, int]:
@@ -1171,6 +1187,18 @@ _JOB_COUNT_COLUMNS = ",\n               ".join(
 # Runs with an artifact archive, added only to the experiments listing (the
 # campaign listing has no use for it, and its shape is asserted in tests).
 _ARTIFACT_COUNT_COLUMN = "SUM(CASE WHEN j.artifact_id IS NOT NULL THEN 1 ELSE 0 END) AS artifacts_jobs"
+
+
+# Files in the experiment's latest code, the snapshot the code page opens on:
+# the last one submitted to it, else the one its newest run used.  NULL when
+# it has no snapshot.
+_CODE_FILES_COLUMN = """COALESCE(
+               (SELECT a.file_count FROM code_submissions c JOIN artifacts a ON a.artifact_id = c.artifact_id
+                WHERE c.experiment_id = e.experiment_id
+                ORDER BY c.submit_time DESC, c.submission_id DESC LIMIT 1),
+               (SELECT a.file_count FROM jobs j2 JOIN artifacts a ON a.artifact_id = j2.artifact_id
+                WHERE j2.experiment_id = e.experiment_id
+                ORDER BY j2.submit_time DESC LIMIT 1)) AS code_files"""
 
 
 def _job_counts(row: Any, artifacts: bool = False) -> dict[str, int]:
@@ -2448,7 +2476,8 @@ async def list_experiments_with_counts(
         f"""
         SELECT e.*,
                {_JOB_COUNT_COLUMNS},
-               {_ARTIFACT_COUNT_COLUMN}
+               {_ARTIFACT_COUNT_COLUMN},
+               {_CODE_FILES_COLUMN}
         FROM experiments e
         LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
         {where}
@@ -2464,6 +2493,7 @@ async def list_experiments_with_counts(
         d = dataclasses.asdict(exp)
         d["submit_time"] = exp.submit_time.isoformat()
         d["job_counts"] = _job_counts(r, artifacts=True)
+        d["code_files"] = r["code_files"]
         d["manager_note"] = manager_note(exp)
         result.append(d)
     return result
@@ -3556,6 +3586,33 @@ async def unlink_capture(db: aiosqlite.Connection, session_id: str, experiment_i
 async def get_capture_session(db: aiosqlite.Connection, session_id: str) -> dict[str, Any] | None:
     row = await _exec_one(db, "SELECT * FROM capture_sessions WHERE session_id = ?", (session_id,))
     return dict(row) if row else None
+
+
+# A note may name a trace by the start of its id, like a short git hash.
+CAPTURE_PREFIX_MIN = 6
+
+
+async def find_capture_session(
+    db: aiosqlite.Connection, ref: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The trace *ref* names: its exact id, or else a unique prefix of one.
+
+    Returns (session, error); error is "no such trace" or says the prefix is
+    ambiguous or too short.
+    """
+    exact = await get_capture_session(db, ref)
+    if exact is not None:
+        return exact, None
+    if len(ref) < CAPTURE_PREFIX_MIN:
+        return None, "no such trace"
+    rows = await _exec_all(
+        db, "SELECT * FROM capture_sessions WHERE substr(session_id, 1, ?) = ? LIMIT 2",
+        (len(ref), ref))
+    if not rows:
+        return None, "no such trace"
+    if len(rows) > 1:
+        return None, f"{ref} is the start of more than one trace id; write more of it"
+    return dict(rows[0]), None
 
 
 # How many sessions one page may ask for.  The sidebar pages through them, so

@@ -816,10 +816,12 @@ function postProcess(root, srcPath, depth, opts = {}) {
     if (a.classList.contains("wikilink") || a.dataset.path) return;
     const href = a.getAttribute("href");
     if (/^mlsweep:trace\//i.test(href)) {
-      // A trace link: opens that session on the Traces tab.
-      a.href = pageHref("traces.html", { session: href.slice("mlsweep:trace/".length) });
+      // A trace link: opens that session on the Traces tab, at an event
+      // (#E<seq>) and filtered to a kind (?kind=) when it says so.
+      a.href = traceHref(href.slice("mlsweep:".length));
       a.classList.add("trace-ev");
-      a.title = "Open this trace";
+      a.dataset.traceRef = href.slice("mlsweep:".length);
+      a.title = "Checking the trace link…";
       return;
     }
     if (/^mlsweep:code\//i.test(href) && typeof annotateCode === "function") {
@@ -863,6 +865,7 @@ function postProcess(root, srcPath, depth, opts = {}) {
   linkExperiments(root);
   if (typeof annotateEvidence === "function") annotateEvidence(root);
   if (typeof annotateCode === "function") annotateCode(root);
+  if (typeof annotateTraces === "function") annotateTraces(root);
   renderMath(root);
 }
 
@@ -1438,4 +1441,20 @@ async function showMerge(t) {
   back.addEventListener("keydown", e => { if (e.key === "Escape") back.remove(); });
   document.body.append(back);
   acts.lastChild.focus();
+}
+
+// The Traces tab URL for a note's `trace/<id>[?kind=<kind>][#E<seq>]`; *sessionId*
+// replaces the id once the manager has said which trace a short id names.
+function traceHref(ref, sessionId) {
+  const body = ref.replace(/^trace\//i, "");
+  const hash = body.indexOf("#");
+  const fragment = hash < 0 ? "" : body.slice(hash + 1);
+  const rest = hash < 0 ? body : body.slice(0, hash);
+  const q = rest.indexOf("?");
+  const params = { session: sessionId || (q < 0 ? rest : rest.slice(0, q)) };
+  const kind = q < 0 ? "" : new URLSearchParams(rest.slice(q + 1)).get("kind");
+  if (kind) params.kind = kind;
+  const event = /^E(\d+)$/.exec(fragment);
+  if (event) params.event = event[1];
+  return pageHref("traces.html", params);
 }

@@ -12,6 +12,7 @@ route.  Writes go through the ``DbWriter`` actor like every other write.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,8 @@ from mlsweep._manager_db import (
     capture_counts,
     capture_sessions_for_experiment,
     get_capture_events,
+    find_capture_session,
     get_capture_session,
-    get_experiment,
     list_capture_sessions,
     search_capture,
     validate_capture_id,
@@ -115,33 +116,6 @@ async def handle_capture_close(request: web.Request) -> web.Response:
     return _json_response(row)
 
 
-@capture_routes.post("/api/capture/link")
-async def handle_capture_link(request: web.Request) -> web.Response:
-    if not _enabled(request):
-        return _refuse()
-    db = request.config_dict[DB_KEY]
-    state: Any = request.config_dict[STATE_KEY]
-    body = await _json_body(request)
-    session_id, experiment_id, source = (
-        body.get("session_id"), body.get("experiment_id"), body.get("source", "manual"))
-    if not isinstance(session_id, str) or not isinstance(experiment_id, str):
-        return _bad_request("'session_id' and 'experiment_id' are required strings")
-    try:
-        validate_capture_id(session_id)
-        _sanitize_experiment_id(experiment_id)
-    except ValueError as exc:
-        return _bad_request(str(exc))
-    if source not in ("auto", "manual"):
-        return _bad_request("'source' must be 'auto' or 'manual'")
-    if not await get_capture_session(db, session_id):
-        raise _not_found_exc("trace")
-    if not await get_experiment(db, experiment_id):
-        raise _not_found_exc("experiment")
-    created = await state.db_writer.link_capture(session_id, experiment_id, source)
-    return _json_response({"session_id": session_id, "experiment_id": experiment_id,
-                           "linked": created}, status=201)
-
-
 @capture_routes.delete("/api/capture/link")
 async def handle_capture_unlink(request: web.Request) -> web.Response:
     if not _enabled(request):
@@ -216,12 +190,16 @@ async def handle_capture_get(request: web.Request) -> web.Response:
         validate_capture_id(session_id)
     except ValueError as exc:
         return _bad_request(str(exc))
-    session = await get_capture_session(db, session_id)
+    # A note's link may give only the start of the id; the answer has all of it.
+    session, error = await find_capture_session(db, session_id)
     if session is None:
+        if error and error != "no such trace":
+            return _bad_request(error)
         raise _not_found_exc("trace")
     session["experiments"] = [
         row[0] for row in await _simple_query(
-            db, "SELECT experiment_id FROM capture_links WHERE session_id = ?", (session_id,))]
+            db, "SELECT experiment_id FROM capture_links WHERE session_id = ?",
+            (session["session_id"],))]
     return _json_response(session)
 
 
@@ -312,27 +290,75 @@ async def link_experiment_to_capture(state: Any, session_id: str, experiment_id:
     await writer.link_capture(session_id, experiment_id, "auto")
 
 
+# What a trace link may filter its trace to, as the Traces tab's kind buttons do.
+TRACE_LINK_KINDS = ("user", "assistant", "thinking", "tools", "mlsweep")
+_TRACE_EVENT_RE = re.compile(r"E(\d{1,12})")
+
+
+def parse_trace_ref(ref: str) -> tuple[str, str, int | None]:
+    """``trace/<id>[?kind=<kind>][#E<seq>]`` -> (id, kind, seq).
+
+    The id may be a unique prefix.  ``kind`` is "" when the link shows every
+    event, and ``seq`` None when it opens no particular event.  Raises
+    ValueError, worded for the note's author, on anything else.
+    """
+    body = ref[len("trace/"):] if ref.startswith("trace/") else ref
+    body, _, fragment = body.partition("#")
+    session_id, _, query = body.partition("?")
+    kind = ""
+    for part in filter(None, query.split("&")):
+        key, _, value = part.partition("=")
+        if key != "kind" or value not in TRACE_LINK_KINDS:
+            raise ValueError(f"`?{part}` is not a trace option; write ?kind= with one of "
+                             + ", ".join(TRACE_LINK_KINDS))
+        kind = value
+    seq = None
+    if fragment:
+        m = _TRACE_EVENT_RE.fullmatch(fragment)
+        if m is None:
+            raise ValueError(f"`#{fragment}` does not name an event; write #E and its number, "
+                             "as the Traces tab's Copy note link does")
+        seq = int(m.group(1))
+    validate_capture_id(session_id)
+    return session_id, kind, seq
+
+
 async def resolve_trace_refs(db: Any, refs: list[str]) -> dict[str, dict[str, Any]]:
-    """``trace/<session_id>`` references from notes: what the trace names."""
+    """``trace/<session_id>[?kind=…][#E<seq>]`` references from notes: what the
+    trace names, and the event when the link opens one."""
     out: dict[str, dict[str, Any]] = {}
     for ref in refs:
-        session_id = ref[len("trace/"):]
         try:
-            validate_capture_id(session_id)
+            session_id, kind, seq = parse_trace_ref(ref)
         except ValueError as exc:
             out[ref] = {"ok": False, "ref": ref, "error": str(exc)}
             continue
-        session = await get_capture_session(db, session_id)
+        session, error = await find_capture_session(db, session_id)
         if session is None:
-            out[ref] = {"ok": False, "ref": ref, "error": "no such trace"}
+            out[ref] = {"ok": False, "ref": ref, "error": error or "no such trace"}
             continue
-        out[ref] = {
-            "ok": True, "ref": ref, "session_id": session_id,
+        session_id = session["session_id"]
+        result: dict[str, Any] = {
+            "ok": True, "ref": ref, "session_id": session_id, "kind": kind,
             "agent": session["agent"], "title": session.get("title") or "",
             "state": session.get("state"), "event_count": session.get("event_count"),
             "experiments": [r[0] for r in await _simple_query(
                 db, "SELECT experiment_id FROM capture_links WHERE session_id = ?", (session_id,))],
         }
+        if seq is not None:
+            rows = await _simple_query(
+                db, "SELECT data FROM capture_events WHERE session_id = ? AND seq = ?", (session_id, seq))
+            if not rows:
+                out[ref] = {"ok": False, "ref": ref, "session_id": session_id,
+                            "error": f"trace {session_id[:8]} has no event {seq}"}
+                continue
+            event = json.loads(rows[0][0])
+            text = str(event.get("text") or "")
+            result["event"] = {
+                "seq": seq, "kind": event.get("kind"), "name": event.get("name"),
+                "ts": event.get("ts"), "text": text[:200] + ("…" if len(text) > 200 else ""),
+            }
+        out[ref] = result
     return out
 
 

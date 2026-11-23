@@ -1043,3 +1043,41 @@ def test_experiment_counts_include_runs_with_artifacts():
             await db.close()
 
     asyncio.run(run())
+
+
+def test_code_file_counts():
+    """A snapshot's file count is kept with it, backfilled for older rows, and the
+    experiments listing gives the count of the code its code page opens on."""
+    from mlsweep._manager_db import insert_code_submission, register_snapshot, snapshot_file_counts
+
+    def manifest(n):
+        return '{"files": [%s]}' % ",".join(f'{{"path": "f{i}.py"}}' for i in range(n))
+
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
+            await create_experiment(db, experiment_id="nocode", name="t", campaign="test")
+            await register_snapshot(db, artifact_id="snap:old", manifest=manifest(2), size_bytes=1)
+            await register_snapshot(db, artifact_id="snap:new", manifest=manifest(5), size_bytes=1)
+            await insert_job(db, run_id="r1", experiment_id="exp1", command=["echo"], artifact_id="snap:old")
+            await insert_code_submission(db, "exp1", {"snapshot": "snap:old"})
+            rows = {r["experiment_id"]: r for r in await list_experiments_with_counts(db)}
+            assert rows["exp1"]["code_files"] == 2 and rows["nocode"]["code_files"] is None
+
+            # Appended with newer code: the latest submission's snapshot counts.
+            await insert_code_submission(db, "exp1", {"snapshot": "snap:new"})
+            rows = {r["experiment_id"]: r for r in await list_experiments_with_counts(db)}
+            assert rows["exp1"]["code_files"] == 5
+            assert await snapshot_file_counts(db, ["snap:old", "snap:new", None, "sha256:x"]) == {
+                "snap:old": 2, "snap:new": 5}
+
+            # A database from before the column: opening it fills the count in.
+            await db.execute("UPDATE artifacts SET file_count = NULL")
+            await db.commit()
+            await init_db(db)
+            assert await snapshot_file_counts(db, ["snap:old"]) == {"snap:old": 2}
+        finally:
+            await db.close()
+
+    asyncio.run(run())

@@ -52,7 +52,7 @@
       body: "Pack fills busy GPUs first, keeping whole machines free. Spread puts each job on the least busy GPU." },
   ];
 
-  const ICONS = { run: "▶", experiment: "◈", note: "✎", artifact: "▣", doc: "▤", answer: "◎", action: "⚡", page: "▦" };
+  const ICONS = { run: "▶", experiment: "◈", note: "✎", artifact: "▣", doc: "▤", trace: "∿", answer: "◎", action: "⚡", page: "▦" };
 
   let exps = null, expsAt = 0, expMap = new Map();
   let jobs = null, jobsAt = 0;
@@ -132,8 +132,8 @@
 
   function parseQuery(raw) {
     let text = String(raw || "").trim();
-    const filters = { status: "", campaign: "", worker: "", type: "", has: "", file: "", log: "", note: "", docs: "", since: null };
-    for (const m of text.matchAll(/\b(status|campaign|worker|type|has|file|log|note|docs):("([^"]*)"|\S+)/gi)) {
+    const filters = { status: "", campaign: "", worker: "", type: "", has: "", file: "", log: "", note: "", docs: "", trace: "", since: null };
+    for (const m of text.matchAll(/\b(status|campaign|worker|type|has|file|log|note|docs|trace):("([^"]*)"|\S+)/gi)) {
       const key = m[1].toLowerCase();
       const val = (m[3] ?? m[2]).replace(/^["']|["']$/g, "");
       filters[key] = val;
@@ -357,6 +357,35 @@
     };
   }
 
+  // Trace search snippets mark matches with \x01 … \x02 (SEARCH_MARK_* in _manager_db.py).
+  const unmark = s => String(s || "").replace(/[\x01\x02]/g, "");
+  const markHtml = s => esc(s).replace(/\x01/g, "<mark>").replace(/\x02/g, "</mark>");
+  function traceHref(s) { return qs("traces", { session: s.session_id }); }
+  function traceItem(s) {
+    const title = s.title || (s.cwd ? s.cwd.split("/").filter(Boolean).pop() : s.session_id);
+    const linked = s.experiments || [];
+    const snippet = unmark(s.snippet).replace(/\s+/g, " ").trim();
+    return {
+      kind: "trace", id: `trace:${s.session_id}`, title,
+      sub: `${s.agent || "trace"} · ${s.state || ""}${snippet && snippet !== title ? " · " + snippet.slice(0, 100) : ""}`,
+      icon: ICONS.trace, href: traceHref(s),
+      preview: `<div class="sp-title">${esc(title)}</div>
+        <div class="sp-row"><span class="sp-k">Agent</span>${esc(s.agent || "—")}</div>
+        <div class="sp-row"><span class="sp-k">State</span>${esc(s.state || "—")}</div>
+        <div class="sp-row"><span class="sp-k">Directory</span>${esc(s.cwd || "—")}</div>
+        <div class="sp-row"><span class="sp-k">Experiments</span>${esc(linked.map(id => expMap.get(id)?.name || id).join(", ") || "—")}</div>
+        ${s.snippet ? `<div class="sp-body">${markHtml(s.snippet)}</div>` : ""}`,
+      actions: [
+        { label: "Open trace", icon: "∿", run: () => go(traceHref(s)) },
+        ...linked.slice(0, 3).map(id => {
+          const e = expMap.get(id);
+          return { label: `Open experiment ${e?.name || id}`, icon: "◈", run: () => go(e ? expResultsHref(e) : qs("results", { experiment: id })) };
+        }),
+        { label: "Copy trace ID", icon: "⧉", run: () => copy(s.session_id, "Trace ID copied") },
+      ],
+    };
+  }
+
   function answerItem(title, sub, preview, actions = []) {
     return { kind: "answer", id: `answer:${title}`, title, sub, icon: ICONS.answer, preview, actions };
   }
@@ -367,6 +396,19 @@
       const r = await apiFetch(`/api/notes/search?q=${encodeURIComponent(q)}&limit=20`);
       if (!r.ok) return [];
       return (await r.json()).results || [];
+    } catch { return []; }
+  }
+
+  // A 404 means the manager runs with --no-capture; that is just "no traces".
+  async function searchTraces(q, scope) {
+    if (!q || q.length < 2) return [];
+    try {
+      const r = await apiFetch(`/api/capture/search?q=${encodeURIComponent(q)}&limit=20`);
+      if (!r.ok) return [];
+      const ctx = context();
+      const found = await r.json();
+      return scope === "experiment" && ctx.experiment
+        ? found.filter(s => (s.experiments || []).includes(ctx.experiment)) : found;
     } catch { return []; }
   }
 
@@ -511,8 +553,10 @@
     const onlyDocs = !!p.filters.docs;
     const onlyFiles = !!p.filters.file;
     const onlyLogs = !!p.filters.log;
-    const onlyAnswer = !p.text && !onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && Object.keys(p.answer).length > 0;
-    if (!onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && !onlyAnswer) {
+    const onlyTraces = !!p.filters.trace;
+    const onlyAnswer = !p.text && !onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && !onlyTraces && Object.keys(p.answer).length > 0;
+    const typeIs = (...names) => !p.filters.type || names.includes(p.filters.type.toLowerCase());
+    if (!onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && !onlyTraces && !onlyAnswer) {
       const jobsToShow = allJobs.filter(j => matchJob(j, p, scope)).sort((a, b) => (b.status === "running") - (a.status === "running") || new Date(b.submit_time || 0) - new Date(a.submit_time || 0));
       for (const j of jobsToShow.slice(0, opts.limit || 20)) items.push(runItem(j));
 
@@ -520,12 +564,17 @@
       for (const e of expsToShow.slice(0, opts.limit || 12)) items.push(expItem(e));
     }
 
-    if (!onlyDocs && (!p.filters.type || ["note", "notes"].includes(p.filters.type.toLowerCase()))) {
+    if (!onlyDocs && !onlyTraces && typeIs("note", "notes")) {
       const notes = await searchNotes(p.filters.note || p.text);
       for (const n of notes.slice(0, opts.limit || 10)) items.push(noteItem(n));
     }
 
-    if (!onlyNotes && (!p.filters.type || ["doc", "docs", "help"].includes(p.filters.type.toLowerCase()))) {
+    if (!onlyNotes && !onlyDocs && !onlyFiles && !onlyLogs && typeIs("trace", "traces")) {
+      const traces = await searchTraces(p.filters.trace || p.text, scope);
+      for (const s of traces.slice(0, opts.limit || 10)) items.push(traceItem(s));
+    }
+
+    if (!onlyNotes && !onlyTraces && typeIs("doc", "docs", "help")) {
       const q = (p.filters.docs || p.text).toLowerCase();
       const docs = q ? DOCS.filter(d => `${d.title} ${d.keys}`.toLowerCase().includes(q) || q.split(/\s+/).every(t => `${d.title} ${d.keys} ${d.body}`.toLowerCase().includes(t))) : [];
       for (const d of docs.slice(0, 10)) items.push(docItem(d));
@@ -550,7 +599,7 @@
   window.MLSearch = {
     search, parseQuery, searchNotes, savedSearches, saveSearch, removeSearch,
     getExperiments, getAllJobs, getWorkers, docs: DOCS, context,
-    href: { run: runHref, logs: logsHref, files: filesHref, results: expResultsHref },
+    href: { run: runHref, logs: logsHref, files: filesHref, results: expResultsHref, trace: traceHref },
     icons: ICONS,
   };
 })();

@@ -19,7 +19,6 @@ const traceAgent = document.getElementById("trace-agent");
 const traceState = document.getElementById("trace-state");
 const traceMeta = document.getElementById("trace-meta");
 const traceLinks = document.getElementById("trace-links");
-const linkBtn = document.getElementById("link-btn");
 const traceNotes = document.getElementById("trace-notes");
 const inFilter = document.getElementById("in-filter");
 const dlBtn = document.getElementById("dl-btn");
@@ -29,6 +28,12 @@ const turnNav = document.getElementById("turn-nav");
 const turnPrev = document.getElementById("turn-prev");
 const turnNext = document.getElementById("turn-next");
 const turnPos = document.getElementById("turn-pos");
+const cmdNav = document.getElementById("cmd-nav");
+const cmdPrev = document.getElementById("cmd-prev");
+const cmdNext = document.getElementById("cmd-next");
+const cmdPos = document.getElementById("cmd-pos");
+const ledgerBar = document.getElementById("ledger-bar");
+const kindChips = document.getElementById("kind-chips");
 const ledgerWrap = document.getElementById("ledger-wrap");
 const ledger = document.getElementById("ledger");
 const noSel = document.getElementById("no-sel");
@@ -38,6 +43,7 @@ const inspectorWhere = document.getElementById("inspector-where");
 const inspectorText = document.getElementById("inspector-text");
 const inspectorOverview = document.getElementById("inspector-overview");
 const inspectorCopy = document.getElementById("inspector-copy");
+const inspectorLink = document.getElementById("inspector-link");
 const inspectorClose = document.getElementById("inspector-close");
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -55,9 +61,13 @@ let eventsBySeq = new Map();  // seq -> event
 let rowsBySeq = new Map();    // seq -> <tr> (only rows the current filter shows)
 let toolRowByCallId = new Map();
 let resultByToolId = new Map();
+let toolSeqById = new Map();  // tool_id -> seq of the call (its result folds into that row)
 let turnOfSeq = new Map();    // seq -> turn number
 let turnStarts = [];          // seq of each user prompt, in order
 let turnCount = 0;            // turns seen so far (also the counter while appending)
+let cmdSeqs = [];             // seq of each tool call that runs mlsweep, in order
+let kindFilter = params.get("kind") || "";  // "" | user | assistant | thinking | tools | mlsweep
+let linksExpanded = false;    // the header lists every linked experiment, not the first few
 let selectedSeq = null;
 let pollTimer = null;
 let pinned = false;           // the user is reading the tail: follow new events
@@ -66,6 +76,14 @@ let notesEnabled = true;      // the manager answered 404: no notes served
 
 const AGENT_LABELS = { pi: "pi", claude_code: "claude code" };
 const MAX_LIST = 1000;
+const KINDS = ["user", "assistant", "thinking", "tools", "mlsweep"];
+const LINKS_SHOWN = 3;        // experiment chips in the header before "+N more"
+
+// A tool call that runs the mlsweep CLI: the word in command position (start
+// of the command, or after ; && || | ( $( or a newline), past env assignments
+// and wrappers like env/timeout/uv run, or `python -m mlsweep…`.  A path that
+// merely ends in /mlsweep (cd ~/git/mlsweep) is not one.
+const MLSWEEP_RE = /(?:^|[;&|(`\n]\s*|\$\(\s*)(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:sudo|env|nohup|uv\s+run|timeout\s+\S+)\s+)*(?:[^\s=]*\/)?(?:mlsweep(?=\s|$)|python[0-9.]*\s+-m\s+mlsweep\b)/;
 const POLL_MS = 5000;
 
 // Search snippets mark matches with these (see SEARCH_MARK_* in _manager_db.py).
@@ -111,6 +129,7 @@ function syncURL() {
   const q = new URLSearchParams();
   if (current) q.set("session", current.session_id);
   if (selectedSeq != null) q.set("event", String(selectedSeq));
+  if (current && kindFilter) q.set("kind", kindFilter);
   if (searchEl.value.trim()) q.set("q", searchEl.value.trim());
   if (agentFilter) q.set("agent", agentFilter);
   if (stateFilter && stateFilter !== "all") q.set("state", stateFilter);
@@ -162,23 +181,23 @@ function sessionRow(s) {
   title.className = "session-title";
   title.textContent = sessionTitle(s);
   title.title = s.session_id;
-  const agent = document.createElement("span");
-  agent.className = "session-agent";
-  agent.textContent = agentLabel(s) || "?";
-  top.append(dot, title, agent);
+  top.append(dot, title);
 
   const bottom = document.createElement("div");
   bottom.className = "session-item-bottom";
   const cwd = document.createElement("span");
   cwd.className = "session-cwd";
   cwd.textContent = s.cwd || "";
+  const agent = document.createElement("span");
+  agent.className = "session-agent";
+  agent.textContent = agentLabel(s) || "?";
   const when = document.createElement("span");
   when.textContent = timeAgo(s.last_seen_at);
   when.title = new Date((s.last_seen_at || 0) * 1000).toLocaleString();
-  bottom.append(cwd, when);
+  bottom.append(cwd, agent, when);
   if (s.event_count) {
     const n = document.createElement("span");
-    n.textContent = `${s.event_count}`;
+    n.textContent = `${s.event_count} ev`;
     n.title = `${s.event_count} events`;
     bottom.append(n);
   }
@@ -335,9 +354,11 @@ function showNoSelection(message, hint) {
 function indexEvents() {
   eventsBySeq = new Map();
   resultByToolId = new Map();
+  toolSeqById = new Map();
   turnOfSeq = new Map();
   turnStarts = [];
   turnCount = 0;
+  cmdSeqs = [];
   for (const e of events) indexOne(e);
 }
 
@@ -349,6 +370,85 @@ function indexOne(e) {
   turnOfSeq.set(e.seq, turnCount);
   eventsBySeq.set(e.seq, e);
   if (e.kind === "tool_result" && e.tool_id) resultByToolId.set(e.tool_id, e);
+  if (e.kind === "tool" && e.tool_id) toolSeqById.set(e.tool_id, e.seq);
+  if (isMlsweep(e)) cmdSeqs.push(e.seq);
+}
+
+function isMlsweep(e) {
+  return e.kind === "tool" && MLSWEEP_RE.test(e.text || "");
+}
+
+// The mlsweep invocations in a command, each from the word `mlsweep` to the
+// end of its pipeline stage: what an mlsweep row shows instead of the whole
+// script around it.
+function mlsweepCalls(text) {
+  const out = [];
+  const re = new RegExp(MLSWEEP_RE.source, "g");
+  for (let m; (m = re.exec(text)) && out.length < 4;) {
+    const start = m.index + m[0].length - "mlsweep".length;
+    const rest = text.slice(start);
+    const stop = rest.search(/\s*(?:;|&&|\|\||\||\n|\)|`)/);
+    // Redirections (2>&1, >/dev/null) are noise next to the subcommand.
+    const call = (stop < 0 ? rest : rest.slice(0, stop)).replace(/\s+\d*(?:>>?|<)&?\s*\S+/g, "").trim();
+    out.push(call.length > 160 ? call.slice(0, 159) + "…" : call);
+    if (re.lastIndex === m.index) re.lastIndex += 1;
+  }
+  return out;
+}
+
+function matchesKind(e) {
+  if (!kindFilter) return true;
+  if (kindFilter === "mlsweep") return isMlsweep(e);
+  if (kindFilter === "tools") return e.kind === "tool" || e.kind === "tool_result";
+  return e.kind === kindFilter;
+}
+
+function shownByFilters(e, needle) {
+  return !hiddenRow(e) && matchesKind(e) && (!needle || matchesEventFilter(e, needle));
+}
+
+// The kind buttons, each with how many rows it would show.
+function updateKindCounts() {
+  const counts = { "": 0 };
+  for (const k of KINDS) counts[k] = 0;
+  for (const e of events) {
+    if (hiddenRow(e)) continue;
+    counts[""] += 1;
+    if (isMlsweep(e)) counts.mlsweep += 1;
+    const k = e.kind === "tool" || e.kind === "tool_result" ? "tools" : e.kind;
+    if (k in counts && k !== "mlsweep") counts[k] += 1;
+  }
+  kindChips.querySelectorAll("button").forEach(b => {
+    const k = b.dataset.kind || "";
+    const on = k === kindFilter;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", String(on));
+    let n = b.querySelector(".n");
+    if (!n) { n = document.createElement("span"); n.className = "n"; b.append(n); }
+    n.textContent = String(counts[k] ?? 0);
+    b.disabled = !on && !counts[k];
+  });
+}
+
+// Rows the ledger leaves out: thinking with no text (Claude Code records
+// redacted thinking as an empty block).
+function hiddenRow(e) {
+  return foldedInto(e) != null || (e.kind === "thinking" && !(e.text || "").trim());
+}
+
+// A result whose call is in the trace shows on the call's row, not its own.
+function foldedInto(e) {
+  if (e.kind !== "tool_result" || !e.tool_id) return null;
+  return toolSeqById.get(e.tool_id) ?? null;
+}
+
+function resultStatus(result) {
+  const ok = result.ok !== false;
+  return { ok, text: (ok ? "ok" : "error") + (result.duration_ms != null ? ` · ${fmtMs(result.duration_ms)}` : "") };
+}
+
+function fmtMs(ms) {
+  return ms < 1000 ? `${ms} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : fmtDuration(ms / 1000);
 }
 
 function matchesEventFilter(e, needle) {
@@ -359,7 +459,11 @@ function shortText(e) {
   if (e.kind === "tool_result") {
     const status = e.ok === false ? "error" : "ok";
     return `<span class="event-${e.ok === false ? "err" : "ok"}">${escHtml(status)}</span>`
-      + (e.duration_ms != null ? `<span class="event-arrow">·</span>${e.duration_ms} ms` : "");
+      + (e.duration_ms != null ? `<span class="event-arrow">·</span>${escHtml(fmtMs(e.duration_ms))}` : "");
+  }
+  if (isMlsweep(e)) {
+    const calls = mlsweepCalls(e.text || "");
+    if (calls.length) return calls.map(c => `<span class="cmd">${escHtml(c)}</span>`).join('<span class="event-arrow">·</span>');
   }
   return escHtml(e.text || "");
 }
@@ -373,7 +477,7 @@ function kindLabel(e) {
 function makeRow(e) {
   const turn = turnOfSeq.get(e.seq) || 0;
   const tr = document.createElement("tr");
-  tr.className = `event kind-${e.kind}` + (e.kind === "user" ? " turn-start" : "");
+  tr.className = `event ev-${e.kind}` + (e.kind === "user" ? " turn-start" : "");
   tr.dataset.seq = e.seq;
   tr.dataset.turn = String(turn);
   if (e.seq === selectedSeq) tr.classList.add("selected");
@@ -385,54 +489,56 @@ function makeRow(e) {
 
   const tag = document.createElement("td");
   tag.className = "tag-col";
+  const pill = document.createElement("span");
+  const cmd = isMlsweep(e);
+  if (cmd) tr.classList.add("is-mlsweep");
+  pill.className = `kind-tag kind-${cmd ? "mlsweep" : e.kind}`;
+  pill.textContent = cmd ? "mlsweep" : kindLabel(e);
+  pill.title = cmd ? `${kindLabel(e)}: runs mlsweep` : kindLabel(e);
+  tag.append(pill);
   if (e.kind === "user") {
     const label = document.createElement("span");
     label.className = "turn-label";
     label.textContent = `#${turn}`;
     tag.append(label);
   }
-  const pill = document.createElement("span");
-  pill.className = `kind-tag kind-${e.kind}`;
-  pill.textContent = kindLabel(e);
-  tag.append(pill);
 
   const content = document.createElement("td");
   content.className = "content-col";
+  const line = document.createElement("div");
+  line.className = "content-line";
   const text = document.createElement("span");
   text.className = "event-text";
   text.innerHTML = shortText(e);
-  content.append(text);
-  if (e.kind === "tool" && e.text) {
-    const arrow = document.createElement("span");
-    arrow.className = "event-arrow";
-    arrow.textContent = "→";
-    arrow.title = "result below";
-    content.append(arrow);
-  }
+  if (e.kind === "tool") text.title = e.text || "";
+  line.append(text);
+  content.append(line);
 
   tr.append(time, tag, content);
   tr.addEventListener("click", () => selectEvent(e.seq, { open: true }));
   return tr;
 }
 
-// A tool call shows its result inline (status and how long), as well as in its
-// own `result` row: the pairing is what people look for.
+// A tool call shows its result inline (status and how long); the result gets
+// no row of its own unless its call is missing from the trace.
 function decorateToolRows() {
   for (const [toolId, tr] of toolRowByCallId) {
     const result = resultByToolId.get(toolId);
     if (!result) continue;
-    const content = tr.querySelector(".content-col");
-    if (!content) continue;
-    let status = content.querySelector(".event-status");
+    const line = tr.querySelector(".content-line");
+    if (!line) continue;
+    let status = line.querySelector(".event-status");
     if (!status) {
       status = document.createElement("span");
       status.className = "event-status";
-      status.title = "Show the result";
-      status.addEventListener("click", ev => { ev.stopPropagation(); jumpToSeq(result.seq); });
-      content.append(status);
+      line.append(status);
     }
     const ok = result.ok !== false;
-    status.textContent = `${ok ? "✓" : "✗"}${result.duration_ms != null ? ` ${result.duration_ms} ms` : ""}`;
+    const mark = document.createElement("span");
+    mark.className = "mark";
+    mark.textContent = ok ? "✓" : "✗";
+    status.replaceChildren(mark, result.duration_ms != null ? fmtMs(result.duration_ms) : (ok ? "ok" : "error"));
+    status.title = ok ? "Succeeded" : "Failed";
     status.classList.toggle("ok", ok);
     status.classList.toggle("err", !ok);
   }
@@ -446,13 +552,14 @@ function buildLedger({ keepScroll = false } = {}) {
   toolRowByCallId.clear();
   const needle = inFilter.value.trim().toLowerCase();
   for (const e of events) {
-    if (needle && !matchesEventFilter(e, needle)) continue;
+    if (!shownByFilters(e, needle)) continue;
     const tr = makeRow(e);
     tbody.append(tr);
     rowsBySeq.set(e.seq, tr);
     if (e.kind === "tool" && e.tool_id) toolRowByCallId.set(e.tool_id, tr);
   }
   decorateToolRows();
+  updateKindCounts();
   if (!events.length) {
     showNoSelection("This trace is empty.");
   } else {
@@ -472,13 +579,14 @@ function appendEvents(fresh) {
   for (const e of fresh) {
     events.push(e);
     indexOne(e);
-    if (needle && !matchesEventFilter(e, needle)) continue;
+    if (!shownByFilters(e, needle)) continue;
     const tr = makeRow(e);
     tbody.append(tr);
     rowsBySeq.set(e.seq, tr);
     if (e.kind === "tool" && e.tool_id) toolRowByCallId.set(e.tool_id, tr);
   }
   decorateToolRows();
+  updateKindCounts();
   if (current) {
     current.event_count = Math.max(current.event_count || 0, events.length);
     renderHeader(current, { notes: false });
@@ -514,42 +622,77 @@ function scrollRowIntoView(tr) {
 
 // ── Turns ────────────────────────────────────────────────────────────────────
 
+// Where the reader is: the selected row while it is on screen, else the first
+// row in view.
+function readingSeq() {
+  if (selectedSeq != null && rowsBySeq.has(selectedSeq)) {
+    const box = rowsBySeq.get(selectedSeq).getBoundingClientRect();
+    const wrap = ledgerWrap.getBoundingClientRect();
+    if (box.bottom > wrap.top && box.top < wrap.bottom) return selectedSeq;
+  }
+  return firstVisibleSeq();
+}
+
 function currentTurn() {
-  if (selectedSeq != null && turnOfSeq.has(selectedSeq)) {
-    const tr = rowsBySeq.get(selectedSeq);
-    if (tr) {
-      const box = tr.getBoundingClientRect();
-      const wrap = ledgerWrap.getBoundingClientRect();
-      if (box.bottom > wrap.top && box.top < wrap.bottom) return turnOfSeq.get(selectedSeq);
-    }
-  }
   if (!turnStarts.length) return 0;
-  const wrapTop = ledgerWrap.getBoundingClientRect().top + 8;
-  let seen = 0;
-  for (const seq of turnStarts) {
-    const tr = rowsBySeq.get(seq);
-    if (!tr) continue;                       // filtered out, not proof it is past
-    if (tr.getBoundingClientRect().top <= wrapTop) seen = turnOfSeq.get(seq);
-    else break;
-  }
-  return seen || 1;
+  const seq = readingSeq();
+  return seq == null ? 1 : Math.max(1, turnOfSeq.get(seq) || 0);
 }
 
 function updateTurnNav() {
   const total = turnStarts.length;
   const show = Boolean(current) && total > 0;
   turnNav.style.display = show ? "" : "none";
+  if (show) {
+    const turn = Math.min(total, Math.max(1, currentTurn()));
+    turnPos.textContent = `${turn} / ${total}`;
+    turnPrev.disabled = turn <= 1;
+    turnNext.disabled = turn >= total;
+  }
+  updateCmdNav();
+}
+
+// The mlsweep stepper: which command the reader is at or past, of how many.
+function updateCmdNav() {
+  const total = cmdSeqs.length;
+  const show = Boolean(current) && total > 0;
+  cmdNav.style.display = show ? "" : "none";
   if (!show) return;
-  const turn = Math.min(total, Math.max(1, currentTurn()));
-  turnPos.textContent = `${turn} / ${total}`;
-  turnPrev.disabled = turn <= 1;
-  turnNext.disabled = turn >= total;
+  const at = readingSeq();
+  const passed = at == null ? 0 : cmdSeqs.filter(seq => seq <= at).length;
+  const on = at != null && cmdSeqs.includes(at);
+  cmdPos.textContent = `${on ? passed : passed ? `${passed}+` : "–"} / ${total}`;
+  cmdPrev.disabled = at == null || !cmdSeqs.some(seq => seq < at);
+  cmdNext.disabled = at != null && !cmdSeqs.some(seq => seq > at);
+}
+
+function gotoCommand(delta) {
+  if (!current || !cmdSeqs.length) return;
+  const at = readingSeq();
+  const target = at == null ? cmdSeqs[0]
+    : delta > 0 ? cmdSeqs.find(seq => seq > at)
+    : [...cmdSeqs].reverse().find(seq => seq < at);
+  if (target != null) jumpToSeq(target);
+}
+
+// The first row the filters show in turn *turn*: its prompt, or (when the
+// kind filter hides prompts) the turn's first shown event.
+function firstRowOfTurn(turn) {
+  const start = turnStarts[turn - 1];
+  if (rowsBySeq.has(start)) return start;
+  for (const e of events) {
+    if (e.seq > start && turnOfSeq.get(e.seq) === turn && rowsBySeq.has(e.seq)) return e.seq;
+    if (turnOfSeq.get(e.seq) > turn) break;
+  }
+  return null;
 }
 
 function gotoPrompt(delta) {
   if (!current || !turnStarts.length) return;
-  const target = Math.min(turnStarts.length, Math.max(1, currentTurn() + delta));
-  jumpToSeq(turnStarts[target - 1]);
+  for (let t = currentTurn() + delta; t >= 1 && t <= turnStarts.length; t += delta) {
+    const seq = firstRowOfTurn(t);
+    if (seq != null) { jumpToSeq(seq); return; }
+  }
 }
 
 // ── Selection and inspector ──────────────────────────────────────────────────
@@ -564,9 +707,18 @@ function selectEvent(seq, { open = false } = {}) {
 }
 
 function jumpToSeq(seq) {
-  if (!rowsBySeq.has(seq) && inFilter.value.trim()) {
+  const folded = eventsBySeq.has(seq) ? foldedInto(eventsBySeq.get(seq)) : null;
+  if (folded != null) seq = folded;
+  if (!rowsBySeq.has(seq) && (inFilter.value.trim() || kindFilter)) {
     inFilter.value = "";
+    kindFilter = "";
     buildLedger({ keepScroll: true });
+    syncURL();
+  }
+  // An event the ledger never shows (empty thinking) opens the next row that is shown.
+  if (!rowsBySeq.has(seq)) {
+    const next = events.find(e => e.seq > seq && rowsBySeq.has(e.seq));
+    if (next) seq = next.seq;
   }
   const tr = rowsBySeq.get(seq);
   if (!tr) return;
@@ -580,10 +732,11 @@ function inspect(e) {
   inspectorKind.className = `kind-tag kind-${e.kind}`;
   inspectorKind.textContent = kindLabel(e);
   inspectorWhere.textContent = `event ${e.seq} · ${e.ts ? new Date(e.ts * 1000).toLocaleString() : "no timestamp"}`;
-  inspectorText.className = "event-full" + (e.kind === "tool" ? " tool" : "");
-  inspectorText.textContent = e.kind === "tool_result"
-    ? (e.ok === false ? "error" : "ok") + (e.duration_ms != null ? ` · ${e.duration_ms} ms` : "")
-    : (e.text || "");
+  const status = e.kind === "tool_result" ? resultStatus(e) : null;
+  inspectorText.className = "event-full"
+    + (e.kind === "tool" ? " tool" : e.kind === "thinking" ? " thinking" : "")
+    + (status ? ` result ${status.ok ? "ok" : "err"}` : "");
+  inspectorText.textContent = status ? status.text : (e.text || "");
   const rows = [];
   const put = (key, value) => { if (value != null && value !== "") rows.push([key, String(value)]); };
   put("seq", e.seq);
@@ -593,13 +746,11 @@ function inspect(e) {
   put("tool id", e.tool_id);
   if (e.kind === "tool_result") {
     put("result", e.ok === false ? "error" : "ok");
-    put("duration", e.duration_ms != null ? `${e.duration_ms} ms` : null);
+    put("duration", e.duration_ms != null ? fmtMs(e.duration_ms) : null);
   }
   const result = e.kind === "tool" && e.tool_id ? resultByToolId.get(e.tool_id) : null;
   if (e.kind === "tool") {
-    rows.push(["result", result
-      ? (result.ok === false ? "error" : "ok") + (result.duration_ms != null ? ` · ${result.duration_ms} ms` : "")
-      : "not recorded", result ? () => jumpToSeq(result.seq) : null]);
+    rows.push(["result", result ? resultStatus(result).text : "not recorded", null]);
   }
   inspectorOverview.replaceChildren(...rows.map(([key, value, run]) => {
     const wrap = document.createElement("div");
@@ -635,7 +786,10 @@ function closeInspector() {
 
 function renderLinks(s) {
   traceLinks.replaceChildren();
-  for (const eid of s.experiments || []) {
+  const all = s.experiments || [];
+  const shown = linksExpanded ? all : all.slice(0, LINKS_SHOWN);
+  traceLinks.classList.toggle("expanded", linksExpanded && all.length > LINKS_SHOWN);
+  for (const eid of shown) {
     const wrap = document.createElement("span");
     wrap.className = "chip-wrap";
     const link = document.createElement("a");
@@ -653,6 +807,15 @@ function renderLinks(s) {
     wrap.append(link, unlink);
     traceLinks.append(wrap);
   }
+  if (all.length > LINKS_SHOWN) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "more-links";
+    more.textContent = linksExpanded ? "show fewer" : `+${all.length - LINKS_SHOWN} more`;
+    more.title = linksExpanded ? "" : `${all.length} experiments in all`;
+    more.addEventListener("click", () => { linksExpanded = !linksExpanded; renderLinks(s); });
+    traceLinks.append(more);
+  }
 }
 
 function renderHeader(s, { notes = true } = {}) {
@@ -667,16 +830,27 @@ function renderHeader(s, { notes = true } = {}) {
   traceState.style.display = "";
   traceState.className = `trace-state ${s.state || ""}`.trim();
   traceState.textContent = s.state || "";
-  traceMeta.textContent = [
-    s.model, s.cwd, `${events.length || s.event_count || 0} events${duration}`, started,
-  ].filter(Boolean).join("  ·  ");
+  const parts = [
+    [s.model, "mono"], [s.cwd, "mono"],
+    [`${events.length || s.event_count || 0} events${duration}`], [started],
+  ].filter(([text]) => text);
+  traceMeta.replaceChildren(...parts.flatMap(([text, cls], i) => {
+    const span = document.createElement("span");
+    if (cls) span.className = cls;
+    span.textContent = text;
+    if (!i) return [span];
+    const sep = document.createElement("span");
+    sep.className = "sep";
+    sep.textContent = "·";
+    return [sep, span];
+  }));
   renderLinks(s);
   traceLinks.style.display = (s.experiments || []).length ? "" : "none";
-  linkBtn.style.display = "";
   dlBtn.style.display = "";
   dlBtn.href = authURL(`/api/capture/sessions/${encodeURIComponent(s.session_id)}/transcript`);
   menuBtn.style.display = "";
   inFilter.style.display = "";
+  ledgerBar.style.display = "";
   if (notes) loadNotes(s);
 }
 
@@ -704,32 +878,6 @@ function showNotes(count, id) {
   traceNotes.style.display = "";
 }
 
-async function linkExperiment() {
-  if (!current) return;
-  try {
-    if (!linkExperiment.exps) {
-      const r = await apiFetch("/api/experiments");
-      if (!r.ok) return;
-      linkExperiment.exps = await r.json();
-    }
-    const items = mlExperimentItems(linkExperiment.exps, { exclude: current.experiments || [] });
-    const pick = await mlPick("Link this trace to an experiment:", items,
-      { placeholder: "Search experiments" });
-    if (!pick) return;
-    const r = await apiFetch("/api/capture/link", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: current.session_id, experiment_id: pick, source: "manual" }),
-    });
-    if (!r.ok) {
-      const body = await r.json().catch(() => ({}));
-      await mlAlert(body.error || `Link failed (${r.status})`);
-      return;
-    }
-    await refreshCurrent();
-  } catch { /* linking is a convenience */ }
-}
-
 async function unlinkExperiment(id) {
   if (!current) return;
   const r = await apiFetch("/api/capture/link", {
@@ -748,14 +896,73 @@ function openMenu() {
     clientX: rect.left, clientY: rect.bottom + 2,
     preventDefault() {}, stopPropagation() {},
   }, [
-    { label: "Copy note reference", hint: "mlsweep:trace/…",
-      run: () => copyText(`mlsweep:trace/${sid}`, "Copied trace reference") },
+    { label: "Copy note reference", hint: kindFilter ? `mlsweep:trace/…?kind=${kindFilter}` : "mlsweep:trace/…",
+      run: () => copyText(traceRef(kindFilter, null), "Copied trace reference") },
     { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
     { label: "Download transcript",
       run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
     "-",
     { label: "Delete trace", danger: true, run: deleteCurrent },
   ]);
+}
+
+// ── Note links ───────────────────────────────────────────────────────────────
+
+// `mlsweep:trace/<id>`, filtered to *kind* and opened at *seq* when given.
+function traceRef(kind, seq, sid = current.session_id) {
+  return `mlsweep:trace/${sid}` + (kind ? `?kind=${kind}` : "") + (seq != null ? `#E${seq}` : "");
+}
+
+// Right-click a trace in the list: what the ⋯ menu offers for the open one.
+sessionList.addEventListener("contextmenu", ev => {
+  const item = ev.target.closest(".session-item");
+  if (!item || mlNativeMenuWanted(ev, item)) return;
+  const sid = item.dataset.session;
+  const isOpen = current && current.session_id === sid;
+  const s = sessions.find(x => x.session_id === sid);
+  mlContextMenu(ev, [
+    { title: s ? sessionTitle(s) : sid },
+    isOpen ? null : { label: "Open", run: () => openSession(sid) },
+    { label: "Copy note reference", hint: "mlsweep:trace/…", run: () => copyText(traceRef("", null, sid), "Copied trace reference") },
+    { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
+    { label: "Download transcript",
+      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
+    "-",
+    { label: "Delete trace", danger: true, run: () => deleteTrace(sid) },
+  ]);
+});
+
+// Right-click an event: inspect it or copy a way back to it.
+ledger.addEventListener("contextmenu", ev => {
+  const tr = ev.target.closest("tr.event");
+  if (!tr || !current || mlNativeMenuWanted(ev, tr)) return;
+  const e = eventsBySeq.get(Number(tr.dataset.seq));
+  if (!e) return;
+  selectEvent(e.seq);
+  mlContextMenu(ev, [
+    { label: "Inspect", hint: "Enter", run: () => selectEvent(e.seq, { open: true }) },
+    { label: "Copy text", run: () => copyText(e.text || "", "Copied event") },
+    { label: "Copy note link", hint: `#E${e.seq}`, run: () => copyText(eventNoteLink(e), "Copied note link") },
+    { label: "Copy note reference", run: () => copyText(traceRef("", e.seq), "Copied trace reference") },
+  ]);
+});
+
+// A markdown link to one event, its text a short description a note can keep.
+function eventNoteLink(e) {
+  const clip = (text, n) => {
+    const one = String(text || "").replace(/\s+/g, " ").trim();
+    return one.length > n ? one.slice(0, n - 1) + "…" : one;
+  };
+  let label;
+  if (isMlsweep(e)) {
+    const calls = mlsweepCalls(e.text || "");
+    label = clip(calls.find(c => /^mlsweep\s+run\b/.test(c)) || calls[0] || e.text, 60);
+  }
+  else if (e.kind === "user") label = `“${clip(e.text, 50)}”`;
+  else if (e.kind === "tool") label = `${e.name || "tool"} call ${e.seq}`;
+  else label = `${kindLabel(e)} ${e.seq}`;
+  label = label.replace(/[[\]]/g, "") || `event ${e.seq}`;
+  return `[${label}](${traceRef("", e.seq)})`;
 }
 
 // ── Opening, loading, polling ────────────────────────────────────────────────
@@ -777,6 +984,7 @@ async function openSession(id, { eventSeq = null } = {}) {
   }
   if (!r.ok) return;
   const s = await r.json();
+  if (!current || current.session_id !== s.session_id) linksExpanded = false;
   current = s;
   clearInterval(pollTimer);
   selectedSeq = null;
@@ -788,9 +996,11 @@ async function openSession(id, { eventSeq = null } = {}) {
   rowsBySeq.clear();
   toolRowByCallId.clear();
   resultByToolId.clear();
+  toolSeqById.clear();
   turnOfSeq.clear();
   turnStarts = [];
   turnCount = 0;
+  cmdSeqs = [];
   ledger.querySelector("tbody").replaceChildren();
   showNoSelection("Loading trace…", "");
   markSelectedSession();
@@ -855,8 +1065,11 @@ function startPoll() {
 }
 
 async function deleteCurrent() {
-  if (!current) return;
-  const id = current.session_id;
+  if (current) await deleteTrace(current.session_id);
+}
+
+// Delete a trace; the open one also clears the view.
+async function deleteTrace(id) {
   const yes = await mlConfirm(`Delete trace ${id}? Its events and experiment links go with it.`);
   if (!yes) return;
   const r = await apiFetch(`/api/capture/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -864,6 +1077,8 @@ async function deleteCurrent() {
     await mlAlert(`Delete failed (${r.status})`);
     return;
   }
+  notesCache.delete(id);
+  if (!current || current.session_id !== id) { await loadSessions(); return; }
   clearInterval(pollTimer);
   current = null;
   events = [];
@@ -871,14 +1086,16 @@ async function deleteCurrent() {
   rowsBySeq.clear();
   toolRowByCallId.clear();
   resultByToolId.clear();
+  toolSeqById.clear();
   turnOfSeq.clear();
   turnStarts = [];
   turnCount = 0;
+  cmdSeqs = [];
   selectedSeq = null;
-  notesCache.delete(id);
   inspector.classList.remove("open");
   inFilter.value = "";
   inFilter.style.display = "none";
+  ledgerBar.style.display = "none";
   ledger.querySelector("tbody").replaceChildren();
   traceTitle.textContent = "No trace selected";
   traceTitle.title = "";
@@ -888,7 +1105,6 @@ async function deleteCurrent() {
   traceState.style.display = "none";
   traceLinks.replaceChildren();
   traceLinks.style.display = "none";
-  linkBtn.style.display = "none";
   traceNotes.style.display = "none";
   dlBtn.style.display = "none";
   menuBtn.style.display = "none";
@@ -936,12 +1152,24 @@ inFilter.addEventListener("input", () => {
 });
 
 turnPrev.addEventListener("click", () => gotoPrompt(-1));
+cmdPrev.addEventListener("click", () => gotoCommand(-1));
+cmdNext.addEventListener("click", () => gotoCommand(1));
+kindChips.addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b || b.disabled) return;
+  kindFilter = b.dataset.kind || "";
+  buildLedger({ keepScroll: true });
+  syncURL();
+});
 turnNext.addEventListener("click", () => gotoPrompt(1));
-linkBtn.addEventListener("click", linkExperiment);
 menuBtn.addEventListener("click", openMenu);
 refreshBtn.addEventListener("click", () => { loadSessions(); if (current) refreshCurrent(); });
 
 inspectorCopy.addEventListener("click", () => copyText(inspectorText.textContent, "Copied event"));
+inspectorLink.addEventListener("click", () => {
+  const e = eventsBySeq.get(selectedSeq);
+  if (current && e) copyText(eventNoteLink(e), "Copied note link");
+});
 inspectorClose.addEventListener("click", closeInspector);
 
 let scrollQueued = false;
@@ -953,7 +1181,8 @@ ledgerWrap.addEventListener("scroll", () => {
 }, { passive: true });
 
 // Keyboard: / searches, j/k (or arrows) move, Enter opens the inspector,
-// Esc closes it, g/G jump to the ends, [ and ] step between prompts.
+// Esc closes it, g/G jump to the ends, [ and ] step between prompts, m/M to
+// the next/previous mlsweep command.
 document.addEventListener("keydown", e => {
   const target = e.target;
   const typing = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA"
@@ -991,6 +1220,9 @@ document.addEventListener("keydown", e => {
   } else if (e.key === "G") {
     e.preventDefault();
     moveSelectionTo(-1);
+  } else if (e.key === "m" || e.key === "M") {
+    e.preventDefault();
+    gotoCommand(e.key === "m" ? 1 : -1);
   } else if (e.key === "[") {
     e.preventDefault();
     gotoPrompt(-1);
@@ -1025,6 +1257,7 @@ function moveSelectionTo(index) {
 searchEl.value = params.get("q") || "";
 if (!["all", "active", "closed", "imported"].includes(stateFilter)) stateFilter = "all";
 if (!AGENT_LABELS[agentFilter]) agentFilter = "";
+if (!KINDS.includes(kindFilter)) kindFilter = "";
 updateChips(agentChips, "agent", agentFilter);
 updateChips(stateChips, "state", stateFilter);
 

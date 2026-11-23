@@ -10,7 +10,7 @@ Which sessions
 --------------
 Only followed sessions are ever read.  A session is followed when it asks to
 be (``mlsweep capture this``, run inside it) or, while capture is on, when it
-submits or links an experiment (``mlsweep run``, ``mlsweep capture link``).
+submits an experiment (``mlsweep run``).
 Every other transcript on the machine is never opened.  A followed session is
 uploaded from its first line, so its trace holds the whole conversation.
 Follow requests are files in ``<capture-dir>/follow/``, one per session, so a
@@ -722,7 +722,7 @@ def _same_manager(a: str, b: str) -> bool:
 
 
 def follow_if_on(session_id: str | None, *, why: str, manager: str) -> bool:
-    """Follow a session that submitted or linked something, if capture is on.
+    """Follow a session that submitted a sweep, if capture is on.
 
     Only for the manager capture uploads to: a sweep sent elsewhere (a test
     manager, another cluster) has no business pulling its session onto this
@@ -776,7 +776,7 @@ def _read_off_marker() -> dict[str, Any] | None:
 
 
 def _cmd(argv: list[str]) -> None:
-    """`mlsweep capture`: this / on / off / watch / status / ls / link / import."""
+    """`mlsweep capture`: this / on / off / watch / status / ls / import."""
     import argparse
     import sys
 
@@ -816,12 +816,6 @@ def _cmd(argv: list[str]) -> None:
     ls.add_argument("--token")
     ls.add_argument("--json", action="store_true", dest="as_json")
 
-    link = sub.add_parser("link", help="Link a trace to an experiment")
-    link.add_argument("experiment_id")
-    link.add_argument("--session", help="Trace id (default: the session this command runs in)")
-    link.add_argument("--manager")
-    link.add_argument("--token")
-
     imp = sub.add_parser("import", help="Upload transcripts you already have (backfill)")
     imp.add_argument("--days", type=int, default=30, help="Look this many days back (default: 30)")
     imp.add_argument("--all", action="store_true", help="Every transcript, however old")
@@ -844,8 +838,6 @@ def _cmd(argv: list[str]) -> None:
         _cmd_status(args, sys)
     elif action in ("ls", "list"):
         _cmd_ls(args, sys)
-    elif action == "link":
-        _cmd_link(args, sys)
     elif action == "import":
         _cmd_import(args, sys)
 
@@ -1044,7 +1036,7 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
         print(f"capture: upload failed for {state.session_id}: {exc}", flush=True)
 
 
-# ── ls / link / import ────────────────────────────────────────────────────────
+# ── ls / import ────────────────────────────────────────────────────────
 
 
 def _cmd_ls(args: Any, sys: Any) -> None:
@@ -1072,29 +1064,6 @@ def _cmd_ls(args: Any, sys: Any) -> None:
         print(f"{when}  {s.get('agent', '?'):12}  {s.get('state', '?'):8}  "
               f"{s.get('session_id', ''):40}  {str(title)[:60]}"
               + (f"  → {links}" if links else ""))
-
-
-def _cmd_link(args: Any, sys: Any) -> None:
-    from mlsweep.run_sweep import _http_request, _manager_url, _resolve_token
-
-    url = _manager_url(args.manager or "http://localhost:7891", "/api/capture")
-    token = _resolve_token(args.token)
-    if not token:
-        print("No token: start the manager or pass --token.", file=sys.stderr)
-        raise SystemExit(2)
-    session_id = args.session or resolve_capture_session()
-    if not session_id:
-        print("No agent session here: run this inside the agent, or pass --session.",
-              file=sys.stderr)
-        raise SystemExit(2)
-    status, resp = _http_request("POST", f"{url}/link", token, json_data={
-        "session_id": session_id, "experiment_id": args.experiment_id, "source": "manual"})
-    if status in (200, 201):
-        print(f"Linked {session_id} → {args.experiment_id}")
-        follow_if_on(session_id, why=f"linked {args.experiment_id}", manager=url)
-    else:
-        print(f"Manager answered {status}: {resp}", file=sys.stderr)
-        raise SystemExit(1)
 
 
 def read_transcript(spec: AgentSpec, path: Path) -> tuple[str, list[dict[str, Any]]]:

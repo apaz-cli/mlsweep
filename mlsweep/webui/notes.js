@@ -455,6 +455,23 @@ $("tree").addEventListener("contextmenu", e => {
   showMenu(e.clientX, e.clientY, items);
 });
 
+// A right-click on a file named outside the tree (a search hit, a link, a
+// change): ways to open it, then what the caller adds for that place.
+function fileMenu(e, path, extra = []) {
+  e.preventDefault();
+  e.stopPropagation();
+  const items = [];
+  if (S.fileMap.has(path)) {
+    items.push({ label: "Open in new tab", run: () => openFile(path, { newTab: true }) },
+      { label: "Open to the side", run: () => openToSide(path) },
+      { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(path); } }, "-");
+  }
+  items.push({ label: "Copy path", run: () => copyText(path) });
+  if (isMd(path)) items.push({ label: "Copy wikilink", run: () => copyText(`[[${stemOf(path)}]]`) });
+  if (extra.length) items.push("-", ...extra);
+  showMenu(e.clientX, e.clientY, items);
+}
+
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast("Copied"); }
   catch { await mlPrompt("Copy this:", t, { okLabel: "Done" }); }

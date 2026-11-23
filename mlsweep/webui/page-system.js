@@ -397,7 +397,7 @@ function renderWorkers(workers) {
     const maxJobs  = w.max_jobs_per_gpu || 0;
     const gpus = allGpusOf(w);
 
-    return `<div class="worker-card${isLive ? "" : " offline"}">
+    return `<div class="worker-card${isLive ? "" : " offline"}" data-worker="${escHtml(w.worker_id)}">
       <div class="worker-header">
         <span class="worker-host">${escHtml(w.host)}${w.port ? `:${escHtml(w.port)}` : ""}</span>
         ${badge(status)}
@@ -466,6 +466,12 @@ async function applyGpus(workerId, how, gpus) {
 }
 
 function toggleWorkerMenu(workerId) {
+  toggleMenu(this, `worker:${workerId}`, workerItems(workerId));
+}
+
+// The worker's pool changes; withLifecycle adds Update and Disconnect, which
+// the card shows as buttons of their own.
+function workerItems(workerId, withLifecycle = false) {
   const w = lastWorkers.find(x => x.worker_id === workerId);
   const all = w ? allGpusOf(w) : [];
   const live = w?.status === "connected";
@@ -476,7 +482,38 @@ function toggleWorkerMenu(workerId) {
     if (inPool.length) items.push({ label: "Drain all GPUs", title: "Nothing new starts here; runs finish", act: act("applyGpus", workerId, "drain", inPool) });
     if (outPool.length) items.push({ label: "Return all GPUs to the pool", act: act("applyGpus", workerId, "add", outPool) });
   }
-  toggleMenu(this, `worker:${workerId}`, items.length ? items : [{ label: "No pool changes for an offline worker", disabled: true }]);
+  if (withLifecycle && w) {
+    const status = w.status || "offline";
+    const more = [];
+    if (w.outdated && (status === "dead" || live)) more.push({ label: "Update worker", act: act("updateWorker", workerId, live) });
+    if (status !== "dead" && status !== "updating") more.push({ label: "Disconnect", act: act("disconnectWorker", workerId), danger: true });
+    more.push({ label: "Copy worker ID", act: act("copyId", workerId, "Copied the worker ID") });
+    return joinMenus(items, more);
+  }
+  return items.length ? items : [{ label: "No pool changes for an offline worker", disabled: true }];
+}
+
+function copyId(id, toast) { copyText(id, toast); }
+
+// One GPU's own pool changes, for a right-click on its tile.
+function gpuItems(w, g) {
+  const st = gpuState(w, g);
+  if (w.status !== "connected") return [];
+  if (HELD.has(st)) return [{ label: `GPU ${g} is ${STATE_LABEL[st].toLowerCase()}`, disabled: true,
+                              title: st === "unhealthy" ? (w.unhealthy_reasons || {})[g] || "" : "" }];
+  const runs = ((w.gpu_runs || {})[g] || []).length;
+  const sel = selectedGpus.get(w.worker_id)?.has(g);
+  const items = [];
+  if (st === "pool") {
+    items.push({ label: `Drain GPU ${g}`, title: "Nothing new starts here; its runs finish", act: act("applyGpus", w.worker_id, "drain", [g]) });
+    items.push({ label: `Remove GPU ${g} now${runs ? ` (requeue ${runs})` : ""}`, danger: true,
+                 title: "Out of the pool now; its runs restart elsewhere", act: act("applyGpus", w.worker_id, "remove", [g]) });
+  } else {
+    items.push({ label: `Return GPU ${g} to the pool`, act: act("applyGpus", w.worker_id, "add", [g]) });
+  }
+  items.push({ label: sel ? "Deselect" : "Select", title: "Select several GPUs to change them together",
+               act: act("toggleGpuSelect", w.worker_id, g), divider: true });
+  return items;
 }
 
 // ── Moving runs ───────────────────────────────────────────────────────────────
@@ -514,6 +551,12 @@ function workerName(w) {
 }
 
 function toggleChipMenu(workerId, expId, runId) {
+  const chip = this.closest(".run-chip");
+  chip?.classList.add("menu-open");
+  toggleMenu(this, `chip:${expId}/${runId}`, chipItems(workerId, expId, runId));
+}
+
+function chipItems(workerId, expId, runId) {
   const targets = [];
   for (const w of lastWorkers) {
     if (w.status !== "connected") continue;
@@ -527,16 +570,31 @@ function toggleChipMenu(workerId, expId, runId) {
       });
     }
   }
-  const chip = this.closest(".run-chip");
-  chip?.classList.add("menu-open");
-  toggleMenu(this, `chip:${expId}/${runId}`, [
+  return [
     ...targets,
     { label: "Requeue anywhere", act: act("requeueRun", expId, runId), divider: targets.length > 0 },
     { label: "Logs", icon: "logs", href: pageHref("logs.html", { experiment: expId, run: runId }), divider: true },
     { label: "Results", icon: "results", href: pageHref("results.html", { experiment: expId, run: runId }) },
     { label: "Cancel run", act: act("cancelInFlight", expId, runId), danger: true, divider: true },
-  ]);
+  ];
 }
+
+// Right-click a run chip, a GPU tile or the rest of a worker card.
+bindRowContextMenu(document.getElementById("workers-grid"), ".run-chip[data-run], .gpu-tile, .worker-card", el => {
+  const card = el.closest(".worker-card");
+  const w = lastWorkers.find(x => x.worker_id === card?.dataset.worker);
+  if (!w) return null;
+  if (el.classList.contains("run-chip")) {
+    el.classList.add("menu-open");
+    const { exp, run } = el.dataset;
+    return [`ctxchip:${exp}/${run}`, chipItems(w.worker_id, exp, run)];
+  }
+  if (el.classList.contains("gpu-tile")) {
+    const items = gpuItems(w, +el.dataset.gpu);
+    if (items.length) return [`ctxgpu:${w.worker_id}/${el.dataset.gpu}`, items];
+  }
+  return [`ctxworker:${w.worker_id}`, workerItems(w.worker_id, true)];
+});
 
 // Drag a run chip onto a GPU tile in the pool.
 const grid = document.getElementById("workers-grid");
@@ -573,15 +631,19 @@ grid.addEventListener("drop", e => {
   const { expId, runId } = dragging;
   moveRunTo(expId, runId, tile.dataset.worker, +tile.dataset.gpu);
 });
-document.addEventListener("click", () => {
-  // The chip menu closed (rowmenu.js closes on any click): let refreshes redraw.
+// The chip menu closed (rowmenu.js closes on any click, Esc or right-click
+// elsewhere): let refreshes redraw.
+function releaseChips() {
   setTimeout(() => {
-    if (!rowMenu) {
+    if (!rowMenu || !rowMenu.dataset.for.includes("chip:")) {
       grid.querySelectorAll(".run-chip.menu-open").forEach(c => c.classList.remove("menu-open"));
       if (pendingRender) renderWorkers(lastWorkers);
     }
   }, 0);
-});
+}
+document.addEventListener("click", releaseChips);
+document.addEventListener("keydown", e => { if (e.key === "Escape") releaseChips(); });
+document.addEventListener("contextmenu", releaseChips);
 
 // ── Render in-flight jobs ──────────────────────────────────────────────────────
 let inFlight = [];
@@ -593,7 +655,7 @@ function renderInFlight(jobs) {
     tbody.innerHTML = `<tr><td colspan="7" class="no-data">No jobs currently running.</td></tr>`;
     return;
   }
-  tbody.innerHTML = jobs.map(j => `<tr>
+  tbody.innerHTML = jobs.map(j => `<tr data-exp-id="${escHtml(j.experiment_id)}" data-run-id="${escHtml(j.run_id)}">
     <td class="mono id-cell">${runNameHtml(j)}</td>
     <td class="mono id-cell">${escHtml(j.experiment_id || "—")}</td>
     <td>${badge(j.status)}</td>
@@ -601,7 +663,7 @@ function renderInFlight(jobs) {
     <td class="mono">${j.dispatched_gpu_ids ? escHtml(JSON.parse(j.dispatched_gpu_ids || "[]").join(",")) : "—"}</td>
     <td>${j.elapsed != null ? fmtElapsed(j.elapsed) : elapsedSince(j.start_time) || "—"}</td>
     <td class="actions-cell"><div class="actions">
-      <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", j.experiment_id, j.run_id)}>View ▾</button>
+      <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", j.experiment_id, j.run_id, j.code_files ?? null)}>View ▾</button>
       <button class="btn-link btn-manage" aria-haspopup="true" title="Rename or cancel" ${act("toggleInFlightMenu", j.experiment_id, j.run_id)}>Manage</button>
     </div></td>
   </tr>`).join("");
@@ -610,11 +672,21 @@ function renderInFlight(jobs) {
 // Every in-flight run is dispatched or running, so Manage offers what applies
 // to an active run.  Moving and deleting wait until it finishes.
 function toggleInFlightMenu(expId, runId) {
-  toggleMenu(this, `run:${expId}/${runId}`, [
+  toggleMenu(this, `run:${expId}/${runId}`, inFlightItems(expId, runId));
+}
+
+function inFlightItems(expId, runId) {
+  return [
     { label: "Rename…", act: act("renameInFlight", expId, runId) },
     { label: "Cancel", act: act("cancelInFlight", expId, runId), danger: true },
-  ]);
+  ];
 }
+
+bindRowContextMenu(document.getElementById("inflight-tbody"), "tr[data-run-id]", row => {
+  const { expId, runId } = row.dataset;
+  return [`ctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, jobOf(expId, runId)?.code_files),
+    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...inFlightItems(expId, runId)])];
+});
 
 async function renameInFlight(expId, runId) {
   const job = inFlight.find(j => j.experiment_id === expId && j.run_id === runId);
@@ -696,7 +768,7 @@ document.getElementById("gc-run").onclick = () => runGc(false);
 
 bindActions({
   disconnectWorker, updateWorker, toggleRunView, toggleInFlightMenu, renameInFlight, cancelInFlight,
-  toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun,
+  toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun, copyId,
 });
 bindActions({
   toggleGpuPool(workerId, g, inPool) { toggleGpuPool(workerId, g, inPool); },

@@ -524,10 +524,16 @@ Code that ran from a tarball, from before snapshots, can't be linked.
 The sweep came out of [that idea about warmup](mlsweep:trace/9f6c0e22).
 ```
 
-The link opens the session trace named by its id (the agent's own session id; the
-prefix is optional when it is unique). The tab checks the link and marks it ⚠ with
-the reason when the trace isn't there. Lint reports a trace link that does not
-resolve, like every other `mlsweep:` link. See [traces.md](traces.md).
+The link opens the session trace named by its id, which is the agent's own session
+id. Like a git hash, the id can be cut to its first 6 or more characters as long as
+no other trace starts the same way. The tab checks the link and marks it ⚠ with the
+reason when the trace isn't there or the short id matches more than one.
+`#E412` after the id opens event 412, and `?kind=mlsweep` (or user, assistant,
+thinking, tools) shows only that kind, as in
+`[the second sweep](mlsweep:trace/9f6c0e22#E412)`. The Traces tab's **Copy note
+link** writes the event form for you. Lint reports a trace link that does not
+resolve, or names an event the trace lacks, like every other `mlsweep:` link.
+See [traces.md](traces.md).
 
 ### Code and diff blocks
 

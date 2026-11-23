@@ -40,8 +40,8 @@ mlsweep capture this
 That session uploads from its first prompt, and its new turns follow. If capture
 was never set up on this machine, `capture this` turns it on.
 
-With capture on, a session also uploads once it submits or links an
-experiment, so a `mlsweep run` typed by the agent brings its trace along:
+With capture on, a session also uploads once it submits an experiment, so a
+`mlsweep run` typed by the agent brings its trace along:
 
 ```sh
 mlsweep capture on           # sweep-submitting sessions upload too; reads nothing yet
@@ -79,8 +79,8 @@ Nothing is guessed from working directories or recent files. Two agents in one
 directory are two sessions and never cross-link, and a human running
 `mlsweep run` links nothing.
 
-`mlsweep capture link EXP_ID` links the current session (or `--session ID`) to
-an experiment by hand, and follows it while capture is on.
+Links are only ever made this way, by the submission itself. There is no
+command or button that links a trace to an experiment by hand.
 
 ## Reading traces
 
@@ -88,20 +88,25 @@ The Traces tab lists the sessions every linked machine uploaded, newest
 activity first. The sidebar filters by agent and by state (live, closed,
 imported), and its search box searches every trace's text, title and working
 directory; a second box filters the open trace's events. A trace too far down
-the list is reached with "Show more traces".
+the list is reached with "Show more traces". The Ctrl+K search palette finds traces
+too, by the same text; `trace:WORDS` searches only traces.
 
 A trace page is a ledger: a time column, the event tag, then the content —
 your prompts, the agent's replies, its thinking collapsed and dimmed, tool
 calls one line each with their result's status and duration. Clicking an event
 opens the inspector with the full text and its metadata (model, tokens), and a
-copy button. The turn counter in the header steps between prompts (`[` and
-`]`); `j`/`k` or the arrow keys move through events, `Enter` opens one, `Esc`
-closes the inspector, and `/` jumps to the search box. The page's URL names the
-open trace and the selected event, so a copied link comes back to them.
+copy button. The bar above the ledger shows one kind of event at a time
+(user, assistant, thinking, tools, or mlsweep, each with its count). The
+mlsweep kind is the tool calls that run the mlsweep CLI, shown as just those
+invocations. Its steppers move between prompts (`[` and `]`) and between
+mlsweep commands (`m` and `M`). `j`/`k` or the arrow keys move through events,
+`Enter` opens one, `Esc` closes the inspector, and `/` jumps to the search box.
+The page's URL names the open trace, the selected event and the kind shown, so a
+copied link comes back to them.
 
-A trace records the experiments it submitted, and each chip links to one. `+`
-links a trace the auto-link missed (choose the experiment from a list), and the
-chip's `×` unlinks it. The `⋮` menu copies the trace id or its
+A trace records the experiments it submitted, and each chip links to one.
+Past three, the rest fold behind `+N more`. A chip's `×` removes a link that
+is wrong. The `⋮` menu copies the trace id or its
 `mlsweep:trace/<id>` reference for a note, downloads the transcript, or deletes
 the trace. When notes are served, the header also says how many notes cite the
 trace.
@@ -117,8 +122,20 @@ A note can link to a trace with the evidence-link syntax:
 The sweep came out of [that idea about warmup](mlsweep:trace/9f6c0e22).
 ```
 
+A link can also open one event, or show one kind of event:
+
+```markdown
+It submitted [the second sweep](mlsweep:trace/9f6c0e22#E412).
+Every [mlsweep command it ran](mlsweep:trace/9f6c0e22?kind=mlsweep).
+```
+
+`#E412` is event 412, and the trace opens there with the inspector showing it.
+`?kind=` takes user, assistant, thinking, tools or mlsweep. The inspector's
+**Copy note link** button gives a link to the selected event, and the `⋮`
+menu's reference keeps the kind the ledger is showing.
+
 `mlsweep notes lint` checks that the trace exists on the manager, like every
-other `mlsweep:` link. (Yes, a trace shows the very session writing the link
+other `mlsweep:` link, and that the event a link names is in it. (Yes, a trace shows the very session writing the link
 that points at itself.)
 
 ## Importing history instead

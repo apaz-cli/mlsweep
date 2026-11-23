@@ -7,6 +7,59 @@ let allExperiments = [];  // every experiment, for the campaign list
 let expSearch = "";       // words to match in name, ID and note
 let expFilter = "all";    // all | running | completed | failed
 
+// ── Experiment descriptions ─────────────────────────────────────────────────
+// A note is the experiment's description. It used to sit beside the name,
+// taking width and height in every row. It now appears in a large tooltip on
+// hover instead. The tooltip lives on <body>: the table's scroll container
+// would otherwise clip it.
+const expNoteTip = document.createElement("div");
+expNoteTip.className = "exp-note-tip";
+expNoteTip.setAttribute("role", "tooltip");
+expNoteTip.hidden = true;
+document.body.appendChild(expNoteTip);
+let expNoteTrigger = null;
+
+function expNoteTriggerOf(target) {
+  return target?.closest?.(".exp-name[data-note]") || null;
+}
+
+function hideExpNoteTip() {
+  expNoteTrigger = null;
+  expNoteTip.hidden = true;
+}
+
+function showExpNoteTip(trigger) {
+  const note = trigger.dataset.note;
+  if (!note || trigger === expNoteTrigger) return;
+  expNoteTrigger = trigger;
+  expNoteTip.textContent = note;
+  expNoteTip.hidden = false;
+
+  const r = trigger.getBoundingClientRect();
+  const gap = 8, margin = 10;
+  const w = expNoteTip.offsetWidth, h = expNoteTip.offsetHeight;
+  const left = Math.max(margin, Math.min(r.left, window.innerWidth - w - margin));
+  let top = r.bottom + gap;
+  if (top + h > window.innerHeight - margin) top = r.top - h - gap;
+  expNoteTip.style.left = `${Math.round(left)}px`;
+  expNoteTip.style.top = `${Math.round(Math.max(margin, top))}px`;
+}
+
+document.addEventListener("pointerover", e => {
+  const trigger = expNoteTriggerOf(e.target);
+  if (trigger) showExpNoteTip(trigger);
+});
+document.addEventListener("pointerout", e => {
+  const trigger = expNoteTriggerOf(e.target);
+  if (!trigger || trigger !== expNoteTrigger) return;
+  const next = e.relatedTarget;
+  if (next && trigger.contains(next)) return;
+  hideExpNoteTip();
+});
+window.addEventListener("scroll", hideExpNoteTip, true);
+window.addEventListener("resize", hideExpNoteTip);
+
+
 // What the View menu's entries lead to, counted the way each page lists them:
 // results and export are finished runs, logs are every run, artifacts are the
 // runs with artifact files.
@@ -21,29 +74,44 @@ function expCounts(expId) {
 }
 
 function toggleExpView(expId) {
+  toggleMenu(this, `view:${expId}`, expViewItems(expId));
+}
+
+function expViewItems(expId) {
   const n = expCounts(expId);
-  toggleMenu(this, `view:${expId}`, [
+  const exp = allExperiments.find(e => e.experiment_id === expId) || {};
+  return [
     { label: "Results", icon: "results", count: n.finished, href: pageHref("results.html", { experiment: expId }) },
     { label: "Logs", icon: "logs", count: n.total, href: pageHref("logs.html", { experiment: expId }) },
     { label: "Artifacts", icon: "artifacts", count: n.withArtifacts, href: pageHref("files.html", { experiment: expId }) },
-    { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId }),
-      title: "The code this experiment ran, with its file tree and where it came from" },
+    { ...codeItem(pageHref("code.html", { experiment: expId }), exp.code_files),
+      title: "The code this experiment ran, with its file tree and where it came from"
+        + (exp.code_files != null ? ` (${exp.code_files} file${exp.code_files === 1 ? "" : "s"})` : "") },
     notesItem(expId),
     tracesItem(expId),
     { label: "Export", icon: "export", count: n.finished, href: pageHref("export.html", { experiment: expId }) },
-  ].filter(Boolean));
+  ].filter(Boolean);
 }
 
 function toggleExpMenu(expId) {
-  toggleMenu(this, `exp:${expId}`, [
+  toggleMenu(this, `exp:${expId}`, expManageItems(expId));
+}
+
+function expManageItems(expId) {
+  return [
     { label: "Rename…", act: act("renameExperiment", expId) },
     { label: "Move to campaign…", act: act("moveExperiment", expId) },
     { label: "Delete…", act: act("deleteExperiment", expId), danger: true, divider: true },
-  ]);
+  ];
 }
 
-
 function toggleRunMenu(expId, runId) {
+  toggleMenu(this, `run:${expId}/${runId}`, runManageItems(expId, runId));
+}
+
+function copyId(id, toast) { copyText(id, toast); }
+
+function runManageItems(expId, runId) {
   const j = (jobsCache[expId] || []).find(x => x.run_id === runId) || {};
   const items = [{ label: "Rename…", act: act("renameJob", expId, runId) }];
   if (ACTIVE_RUN.includes(j.status)) {
@@ -56,8 +124,23 @@ function toggleRunMenu(expId, runId) {
     items.push({ label: "Move to experiment…", act: act("moveRun", expId, runId), divider: true });
     items.push({ label: "Delete…", act: act("purgeRun", expId, runId), danger: true });
   }
-  toggleMenu(this, `run:${expId}/${runId}`, items);
+  return items;
 }
+
+// Right-click an experiment or one of its runs: its View and Manage menus in one.
+// The expanded details row under a run counts as that run.
+bindRowContextMenu(document.getElementById("exp-tbody"), ".exp-row, .run-row, .job-detail-row", row => {
+  if (row.classList.contains("exp-row")) {
+    const expId = row.dataset.expId;
+    return [`ctx:${expId}`, joinMenus(expViewItems(expId),
+      [{ label: "Copy experiment ID", act: act("copyId", expId, "Copied the experiment ID") }, ...expManageItems(expId)])];
+  }
+  const { expId, runId } = row.dataset;
+  if (!expId || !runId) return null;
+  const j = (jobsCache[expId] || []).find(x => x.run_id === runId);
+  return [`ctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, j?.code_files),
+    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...runManageItems(expId, runId)])];
+});
 
 async function deleteExperiment(expId) {
   if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
@@ -254,26 +337,34 @@ function toggleJobDetail(expId, runId) {
   }
 }
 
-// A pencil and count beside a name that notes mention, linking to those notes.
+// The notes badge: a pencil and how many notes mention it, linking to them.
+// It shows once the mentions are loaded; zero is red, with nowhere to go.
 function noteRefHtml(expId, runId) {
-  const n = notesEnabled ? noteCount(expId, runId) : 0;
-  if (!n) return "";
-  const what = runId || expId;
-  const title = runId
-    ? `${n} note${n === 1 ? "" : "s"} mention this run`
-    : `${n} note${n === 1 ? "" : "s"} mention this experiment or its runs`;
-  return `<a class="note-ref" href="${escHtml(pageHref("notes.html", { mentions: what }))}" title="${title}" data-act="">`
+  if (!notesEnabled) return "";
+  const n = noteCount(expId, runId);
+  const what = runId ? "run" : "experiment or its runs";
+  if (!n) return `<span class="note-ref zero" title="No note mentions this ${what}">${VIEW_ICONS.notes}0</span>`;
+  const title = `${n} note${n === 1 ? "" : "s"} mention this ${what}`;
+  return `<a class="note-ref" href="${escHtml(pageHref("notes.html", { mentions: runId || expId }))}" title="${title}" data-act="">`
     + `${VIEW_ICONS.notes}${n}</a>`;
 }
 
-// The traces icon and count beside an experiment that agent sessions submitted,
-// linking to those traces.  Traces link to experiments, not runs.
+// The traces badge: how many agent sessions submitted the experiment, linking
+// to them.  Traces link to experiments, not runs.
 function traceRefHtml(expId) {
-  const n = captureEnabled ? (traceCounts[expId] || 0) : 0;
-  if (!n) return "";
+  if (!captureEnabled || !traceCounts.__loaded) return "";
+  const n = traceCounts[expId] || 0;
+  if (!n) return `<span class="note-ref trace-ref zero" title="No agent trace submitted this experiment">${VIEW_ICONS.traces}0</span>`;
   const title = `${n} trace${n === 1 ? "" : "s"} submitted this experiment`;
   return `<a class="note-ref trace-ref" href="${escHtml(pageHref("traces.html", { experiment: expId }))}" title="${title}" data-act="">`
     + `${VIEW_ICONS.traces}${n}</a>`;
+}
+
+// The Refs cell: notes that mention it and, for an experiment, the traces
+// that submitted it.  Runs have no traces of their own.
+function refsHtml(expId, runId) {
+  const refs = noteRefHtml(expId, runId) + (runId ? "" : traceRefHtml(expId));
+  return refs ? `<div class="refs">${refs}</div>` : "";
 }
 
 // ── Render runs ───────────────────────────────────────────────────────────────
@@ -286,26 +377,25 @@ function runsHtml(expId) {
     const comboStr = escHtml(Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" "));
     const key = `${expId}/${j.run_id}`;
     const isOpen = expandedJobs.has(key);
-    return `<tr class="run-row" style="cursor:pointer" ${act("toggleJobDetail", expId, j.run_id)}>
+    return `<tr class="run-row" style="cursor:pointer" data-exp-id="${escHtml(expId)}" data-run-id="${escHtml(j.run_id)}" ${act("toggleJobDetail", expId, j.run_id)}>
       <td class="mono"><span class="job-toggle" id="${escHtml(`job-toggle-${expId}-${j.run_id}`)}">${isOpen ? "▼" : "▶"}</span>${runNameHtml(j)}</td>
       <td${j.reason ? ` title="${escHtml(j.reason)}"` : ""}>${badge(j.status)}</td>
       <td colspan="2">${j.worker_id ? escHtml(j.worker_id.split(":")[0]) : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
-      <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
-      <td class="traces-cell"></td>
+      <td class="refs-cell" data-act="">${refsHtml(expId, j.run_id)}</td>
       <td class="actions-cell" data-act=""><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes, Traces" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes, Traces" ${act("toggleRunView", expId, j.run_id, j.code_files ?? null)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
-    <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
-      <td colspan="11">${isOpen ? renderJobDetail(j) : ""}</td>
+    <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" data-exp-id="${escHtml(expId)}" data-run-id="${escHtml(j.run_id)}" style="display:${isOpen ? "" : "none"}">
+      <td colspan="10">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
   const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
-      <td>Elapsed</td><td colspan="3">Combo</td><td>Notes</td><td></td><td></td></tr>`;
-  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="11">No jobs</td></tr>`);
+      <td>Elapsed</td><td colspan="3">Combo</td><td>Refs</td><td></td></tr>`;
+  return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="10">No jobs</td></tr>`);
 }
 
 // Experiment controls (the same as mlsweep pause/unpause/stop/retry/cancel/purge).
@@ -323,7 +413,7 @@ function runTools(expId, jobs) {
   if (active) btns.push(b(`Cancel active (${active})`, ["bulkRuns", expId, "cancel"], "Cancel pending and running runs (mlsweep cancel --all)", "btn-delete"));
   if (purgeable) btns.push(b(`Delete failed (${purgeable})`, ["bulkRuns", expId, "purge"], "Delete failed, cancelled and xfailed runs with their files (mlsweep purge)", "btn-delete"));
   if (!btns.length) return "";
-  return `<tr class="runs-tools"><td colspan="11"><div class="actions">${btns.join("")}</div></td></tr>`;
+  return `<tr class="runs-tools"><td colspan="10"><div class="actions">${btns.join("")}</div></td></tr>`;
 }
 
 function runRowsOf(expId) {
@@ -517,8 +607,7 @@ function renderExperiments(exps) {
     const html = `<td>
         <div class="exp-name-cell">
           <span class="exp-toggle" ${act("toggleExpand", expId)}>${isExpanded ? "▼" : "▶"}</span>
-          <span class="exp-name" ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
-          ${exp.note ? `<span class="exp-note">${escHtml(exp.note)}</span>` : ""}
+          <span class="exp-name${exp.note ? " has-note" : ""}" ${exp.note ? `data-note="${escHtml(exp.note)}"` : ""} ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
           ${exp.manager_note ? `<span class="exp-manager-note${exp.status === "paused" ? " paused" : ""}" title="${escHtml(exp.manager_note)}">${escHtml(exp.manager_note)}</span>` : ""}
           ${MLCampaign.get() === MLCampaign.ALL ? `<span class="campaign-tag">${escHtml(MLCampaign.campaignOf(exp))}</span>` : ""}
         </div>
@@ -530,8 +619,7 @@ function renderExperiments(exps) {
       <td class="count-cell">${running ? `<span style="color:var(--ok)">${running}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${total ? `${(c.done||0)+(c.pruned||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
-      <td class="notes-cell">${noteRefHtml(expId)}</td>
-      <td class="traces-cell">${traceRefHtml(expId)}</td>
+      <td class="refs-cell">${refsHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
         <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Traces, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
@@ -555,6 +643,12 @@ function renderExperiments(exps) {
 
     if (isExpanded) renderRuns(expId);
   });
+
+  // A refresh replaces the hovered name element. Keep the open tooltip on the
+  // new one, or close it if the pointer is no longer over an experiment name.
+  const hovered = document.querySelector(".exp-name[data-note]:hover");
+  if (hovered) showExpNoteTip(hovered);
+  else if (expNoteTrigger && !expNoteTrigger.isConnected) hideExpNoteTip();
 }
 
 // ── Fetch and refresh ─────────────────────────────────────────────────────────
@@ -608,5 +702,5 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 bindActions({
   toggleJobDetail, renameJob, runAction, moveRun, purgeRun, setExpStatus, bulkRuns,
   toggleExpand, renameExperiment, moveExperiment, deleteExperiment,
-  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters,
+  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters, copyId,
 });

@@ -348,24 +348,31 @@ def test_capture_auto_link_experiment(manager_server):
     assert body["experiments"] == ["sweep_test_1"]
 
 
-def test_capture_link_to_unknown_trace_is_refused(manager_server):
+def test_capture_has_no_manual_link(manager_server):
+    # Links come only from the submission that names its session.
     server, url = manager_server
     _post(url, server.token, "/api/capture/sessions", {"session": _SESSION, "events": []})
-    status, _ = _post(url, server.token, "/api/capture/link",
-                      {"session_id": "ghost", "experiment_id": "sweep_test_2"})
-    assert status == 404
+    _post(url, server.token, "/api/experiments",
+          {"experiment_id": "sweep_test_2", "campaign": "main"})
+    req = urllib.request.Request(
+        f"{url}/api/capture/link", method="POST",
+        data=json.dumps({"session_id": _SESSION["session_id"], "experiment_id": "sweep_test_2"}).encode(),
+        headers={"Authorization": f"Bearer {server.token}", "Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as refused:
+        urllib.request.urlopen(req, timeout=10)
+    assert refused.value.code in (404, 405)
+    status, body = _get(url, server.token, f"/api/capture/sessions/{_SESSION['session_id']}")
+    assert body["experiments"] == []
 
 
-def test_capture_manual_link_and_unlink(manager_server):
+def test_capture_unlink_a_wrong_auto_link(manager_server):
     server, url = manager_server
     token = server.token
     _post(url, token, "/api/capture/sessions", {"session": _SESSION, "events": []})
-    _post(url, token, "/api/experiments",
-          {"experiment_id": "sweep_link_1", "campaign": "main"})
-    status, body = _post(url, token, "/api/capture/link",
-                         {"session_id": _SESSION["session_id"], "experiment_id": "sweep_link_1",
-                          "source": "manual"})
-    assert status == 201 and body["linked"] is True
+    status, _ = _post(url, token, "/api/experiments",
+                      {"experiment_id": "sweep_link_1", "campaign": "main",
+                       "capture_session": _SESSION["session_id"]})
+    assert status == 201
     status, body = _get(url, token, f"/api/capture/sessions/{_SESSION['session_id']}")
     assert body["experiments"] == ["sweep_link_1"]
     status, body = _delete(url, token, "/api/capture/link",
@@ -376,7 +383,7 @@ def test_capture_manual_link_and_unlink(manager_server):
     assert body["experiments"] == []
 
 
-def test_capture_search_titles_counts_and_link_errors(manager_server):
+def test_capture_search_titles_and_counts(manager_server):
     server, url = manager_server
     token = server.token
     session = {**_SESSION, "session_id": "searchme", "title": "Warmup investigation"}
@@ -393,16 +400,99 @@ def test_capture_search_titles_counts_and_link_errors(manager_server):
     assert status == 200
 
     # Counts drive the View menus, without listing every session.
-    _post(url, token, "/api/experiments", {"experiment_id": "sweep_counts_1", "campaign": "main"})
-    _post(url, token, "/api/capture/link",
-          {"session_id": "searchme", "experiment_id": "sweep_counts_1", "source": "manual"})
+    _post(url, token, "/api/experiments", {"experiment_id": "sweep_counts_1", "campaign": "main",
+                                           "capture_session": "searchme"})
     status, body = _get(url, token, "/api/capture/counts")
     assert status == 200 and body == {"sessions": 1, "experiments": {"sweep_counts_1": 1}}
 
-    # Linking to an experiment the manager does not have is a 404, not a 500.
-    status, _ = _post(url, token, "/api/capture/link",
-                      {"session_id": "searchme", "experiment_id": "no_such_experiment"})
+
+def test_trace_found_by_a_unique_prefix_of_its_id(manager_server):
+    # A note may write mlsweep:trace/<first 8 characters>, like a short git hash.
+    server, url = manager_server
+    token = server.token
+    for sid in ("abcdef01-1111-4000-8000-000000000001", "abcdef01-2222-4000-8000-000000000002",
+                "fedcba98-3333-4000-8000-000000000003"):
+        _post(url, token, "/api/capture/sessions", {"session": {**_SESSION, "session_id": sid},
+                                                     "events": []})
+    status, body = _get(url, token, "/api/capture/sessions/fedcba98")
+    assert status == 200 and body["session_id"] == "fedcba98-3333-4000-8000-000000000003"
+    status, body = _get(url, token, "/api/capture/sessions/abcdef01-2")
+    assert status == 200 and body["session_id"] == "abcdef01-2222-4000-8000-000000000002"
+    status, body = _get(url, token, "/api/capture/sessions/abcdef01")
+    assert status == 400 and "more than one" in body["error"]
+    status, _ = _get(url, token, "/api/capture/sessions/fedcb")  # too short to guess from
     assert status == 404
+
+
+def test_note_trace_links_resolve_prefixes():
+    import asyncio
+
+    import aiosqlite
+
+    from mlsweep._manager_capture import resolve_trace_refs
+    from mlsweep._manager_db import init_db, upsert_capture_session
+
+    async def run():
+        async with aiosqlite.connect(":memory:") as db:
+            await init_db(db)
+            for sid in ("9f6c0e22-aaaa-4000-8000-000000000001", "9f6c0e22-bbbb-4000-8000-000000000002",
+                        "12345678-cccc-4000-8000-000000000003"):
+                await upsert_capture_session(db, {**_SESSION, "session_id": sid})
+            return await resolve_trace_refs(db, [
+                "trace/12345678", "trace/9f6c0e22", "trace/9f6c0e22-bbbb-4000-8000-000000000002",
+                "trace/00000000"])
+
+    out = asyncio.run(run())
+    assert out["trace/12345678"]["ok"] and out["trace/12345678"]["session_id"].startswith("12345678-")
+    assert not out["trace/9f6c0e22"]["ok"] and "more than one" in out["trace/9f6c0e22"]["error"]
+    assert out["trace/9f6c0e22-bbbb-4000-8000-000000000002"]["ok"]
+    assert out["trace/00000000"] == {"ok": False, "ref": "trace/00000000", "error": "no such trace"}
+
+
+def test_trace_ref_parses_kind_and_event():
+    import pytest
+
+    from mlsweep._manager_capture import parse_trace_ref
+
+    assert parse_trace_ref("trace/abc12345") == ("abc12345", "", None)
+    assert parse_trace_ref("trace/abc12345#E42") == ("abc12345", "", 42)
+    assert parse_trace_ref("trace/abc12345?kind=mlsweep") == ("abc12345", "mlsweep", None)
+    assert parse_trace_ref("trace/abc12345?kind=user#E7") == ("abc12345", "user", 7)
+    with pytest.raises(ValueError, match="#E and its number"):
+        parse_trace_ref("trace/abc12345#L10")
+    with pytest.raises(ValueError, match="not a trace option"):
+        parse_trace_ref("trace/abc12345?kind=bash")
+    with pytest.raises(ValueError, match="not a trace option"):
+        parse_trace_ref("trace/abc12345?seq=3")
+
+
+def test_trace_links_to_an_event_resolve_it():
+    import asyncio
+
+    import aiosqlite
+
+    from mlsweep._manager_capture import resolve_trace_refs
+    from mlsweep._manager_db import init_db, insert_capture_events, upsert_capture_session
+
+    sid = _SESSION["session_id"]
+
+    async def run():
+        async with aiosqlite.connect(":memory:") as db:
+            await init_db(db)
+            await upsert_capture_session(db, _SESSION)
+            await insert_capture_events(db, sid, _EVENTS)
+            return await resolve_trace_refs(db, [
+                f"trace/{sid[:8]}#E3", f"trace/{sid}?kind=tools", f"trace/{sid}#E99",
+                f"trace/{sid}#Efoo"])
+
+    out = asyncio.run(run())
+    hit = out[f"trace/{sid[:8]}#E3"]
+    assert hit["ok"] and hit["session_id"] == sid, hit
+    assert hit["event"]["kind"] == "tool" and hit["event"]["name"] == "bash" and hit["event"]["text"] == "ls -la"
+    assert out[f"trace/{sid}?kind=tools"]["ok"] and out[f"trace/{sid}?kind=tools"]["kind"] == "tools"
+    gone = out[f"trace/{sid}#E99"]
+    assert not gone["ok"] and "no event 99" in gone["error"], gone
+    assert not out[f"trace/{sid}#Efoo"]["ok"]
 
 
 def test_capture_delete(manager_server):
@@ -437,15 +527,18 @@ def test_lint_checks_trace_refs():
         note = Path(root) / "a.md"
         note.write_text(
             f"The sweep came out of [an idea](mlsweep:trace/{good}).\n\n"
-            "And [a ghost](mlsweep:trace/ghost-0001).\n")
+            "And [a ghost](mlsweep:trace/ghost-0001).\n\n"
+            f"And [an event it lacks](mlsweep:trace/{good}#E99).\n")
         text = note.read_text()
     evidence = {
         f"trace/{good}": {"ok": True, "ref": f"trace/{good}"},
         "trace/ghost-0001": {"ok": False, "ref": "trace/ghost-0001", "error": "no such trace"},
+        f"trace/{good}#E99": {"ok": False, "ref": f"trace/{good}#E99", "error": "trace 01a2047e has no event 99"},
     }
     findings = []
     _notes_lint._check_blocks("a.md", text, None, None, evidence, findings)
-    assert not any(f.kind == "evidence-ref" and good in f.message for f in findings)
+    assert not any(f.kind == "evidence-ref" and f"mlsweep:trace/{good}:" in f.message for f in findings)
+    assert any(f.kind == "evidence-ref" and "no event 99" in f.message for f in findings)
     assert any(f.kind == "evidence-ref" and "ghost-0001" in f.message for f in findings)
 
 
@@ -691,6 +784,13 @@ def test_traces_page_renders_a_session(tmp_path_factory):
         assert b.eval("[...document.querySelectorAll('#ledger .time-col')]"
                       ".every(td => td.textContent.length > 0)")
         assert b.eval("document.getElementById('turn-pos').textContent") == "1 / 1"
+        # The kind buttons narrow the ledger to one kind, and say how many.
+        b.eval("document.querySelector('#kind-chips [data-kind=user]').click()")
+        b.wait_for("document.querySelectorAll('#ledger tbody tr').length === 1")
+        assert "kind=user" in b.eval("location.search")
+        assert b.eval("document.querySelector('#kind-chips [data-kind=tools] .n').textContent") == "1"
+        b.eval("document.querySelector('#kind-chips [data-kind=\"\"]').click()")
+        b.wait_for(f"document.querySelectorAll('#ledger tbody tr').length === {len(_EVENTS)}")
         # The More menu carries the note reference; deleting lives there, not
         # next to Refresh.
         b.eval("document.getElementById('menu-btn').click()")

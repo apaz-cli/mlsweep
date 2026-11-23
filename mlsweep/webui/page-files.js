@@ -105,17 +105,87 @@ function renderRunList() {
     bdg.textContent = j.status;
 
     item.append(cb, info, bdg);
+    item.dataset.runId = j.run_id;
     item.addEventListener("click", e => {
       if (e.target === cb) return;
-      browseRun = j.run_id; browseFile = null;
-      document.querySelectorAll(".run-item").forEach(el => el.classList.remove("browse-hl"));
-      item.classList.add("browse-hl");
-      switchTab("browse");
-      loadBrowse(j.run_id);
+      browseRunFiles(j.run_id);
     });
     list.appendChild(item);
   }
 }
+
+function browseRunFiles(runId) {
+  browseRun = runId; browseFile = null;
+  document.querySelectorAll(".run-item").forEach(el => el.classList.toggle("browse-hl", el.dataset.runId === runId));
+  switchTab("browse");
+  loadBrowse(runId);
+}
+
+function downloadURL(url, name) {
+  Object.assign(document.createElement("a"), { href: authURL(url), download: name || "" }).click();
+}
+
+function setChecked(runId, on) {
+  on ? checkedRuns.add(runId) : checkedRuns.delete(runId);
+  renderRunList();
+  if (activeTab === "compare") renderCompareGrid();
+}
+
+function compareAcrossRuns(path) {
+  compareFile = path;
+  rebuildFileSel();
+  document.getElementById("file-path-sel").value = path;
+  switchTab("compare");
+  renderCompareGrid();
+}
+
+// A run's menu, from the sidebar or a compare card.  path: the file the card shows.
+function runMenu(e, j, path) {
+  const eid = expId(), q = { experiment: eid, run: j.run_id };
+  const go = page => () => { location.href = pageHref(page, q); };
+  const checked = checkedRuns.has(j.run_id);
+  mlContextMenu(e, [
+    { title: j.label || j.run_id },
+    path ? { label: "Download this file", run: () => downloadURL(artifactURL(eid, j.run_id, path), path.split("/").pop()) } : null,
+    path ? { label: "Open this file in a new tab", run: () => window.open(authURL(artifactURL(eid, j.run_id, path)), "_blank", "noopener") } : null,
+    path ? "-" : null,
+    { label: "Browse files", run: () => browseRunFiles(j.run_id) },
+    { label: checked ? "Leave out of the comparison" : "Add to the comparison", run: () => setChecked(j.run_id, !checked) },
+    { label: "Download all files (.zip)", run: () => downloadURL(runZipURL(eid, j.run_id), `${j.run_id}.zip`) },
+    "-",
+    { label: "Open logs", run: go("logs.html") },
+    j.artifact_id ? { label: "Open code", run: go("code.html") } : null,
+    { label: "Copy run ID", run: () => copyText(j.run_id, "Copied the run ID") },
+  ]);
+}
+
+document.getElementById("run-list").addEventListener("contextmenu", e => {
+  const item = e.target.closest(".run-item");
+  const j = item && jobs.find(x => x.run_id === item.dataset.runId);
+  if (j && !mlNativeMenuWanted(e, item)) runMenu(e, j, null);
+});
+document.getElementById("compare-grid").addEventListener("contextmenu", e => {
+  const card = e.target.closest(".run-card");
+  const j = card && jobs.find(x => x.run_id === card.dataset.runId);
+  if (!j || mlNativeMenuWanted(e, card)) return;
+  const found = (fileCache[j.run_id] || []).some(f => f.path === compareFile);
+  runMenu(e, j, found ? compareFile : null);
+});
+document.getElementById("file-tree").addEventListener("contextmenu", e => {
+  const row = e.target.closest(".file-row");
+  if (!row || !browseRun || mlNativeMenuWanted(e, row)) return;
+  const runId = browseRun, path = row.dataset.path, eid = expId();
+  const f = (fileCache[runId] || []).find(x => x.path === path);
+  mlContextMenu(e, [
+    { title: path },
+    f && browseFile !== path ? { label: "Preview", run: () => row.click() } : null,
+    { label: "Download", run: () => downloadURL(artifactURL(eid, runId, path), path.split("/").pop()) },
+    { label: "Open in a new tab", run: () => window.open(authURL(artifactURL(eid, runId, path)), "_blank", "noopener") },
+    { label: "Compare across runs", run: () => compareAcrossRuns(path) },
+    "-",
+    { label: "Copy path", run: () => copyText(path, "Copied the path") },
+  ]);
+});
 
 document.getElementById("sel-all").onclick = () => {
   jobs.forEach(j => checkedRuns.add(j.run_id)); renderRunList();
@@ -167,7 +237,7 @@ function rebuildFileSel() {
     sel.appendChild(opt);
   }
   const target = prev || compareFile;
-  if (target && [...all].has(target)) sel.value = target;
+  if (target && all.has(target)) sel.value = target;
 }
 
 document.getElementById("file-path-sel").addEventListener("change", e => {
@@ -212,6 +282,7 @@ async function renderCompareGrid() {
     const combo = comboStr(j);
     const card  = document.createElement("div");
     card.className = "run-card";
+    card.dataset.runId = j.run_id;
 
     const dlHref = found ? escHtml(authURL(artifactURL(expId(), j.run_id, compareFile))) : "";
     const fname  = compareFile.split("/").pop();

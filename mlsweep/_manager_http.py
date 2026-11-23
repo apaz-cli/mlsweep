@@ -77,6 +77,7 @@ from mlsweep._manager_db import (
     list_campaigns,
     list_experiments_with_counts,
     list_jobs_by_experiment,
+    snapshot_file_counts,
     list_jobs_by_status,
     list_jobs_since,
     list_pending_jobs,
@@ -1167,10 +1168,12 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
     experiment_id = request.match_info["experiment_id"]
     status_filter = _status_param(request)
     jobs = await list_jobs_by_experiment(db, experiment_id, status=status_filter)  # type: ignore[arg-type]
+    code_files = await snapshot_file_counts(db, (j.artifact_id for j in jobs))
     now = time.time()
     out: list[dict[str, Any]] = []
     for job in jobs:
         d = dataclasses.asdict(job)
+        d["code_files"] = code_files.get(job.artifact_id or "")  # files in the run's code snapshot
         if job.status == "running":
             run = state.runs.get((experiment_id, job.run_id))
             if run is not None:
@@ -1275,7 +1278,9 @@ async def handle_list_jobs(request: web.Request) -> web.Response:
     else:
         jobs = await list_jobs_by_status(db, status, limit=limit, campaign=campaign)  # type: ignore[arg-type]
 
-    return _json_response(jobs)
+    code_files = await snapshot_file_counts(db, (j.artifact_id for j in jobs))
+    return _json_response([{**dataclasses.asdict(j), "code_files": code_files.get(j.artifact_id or "")}
+                           for j in jobs])
 
 
 @routes.post("/api/jobs")

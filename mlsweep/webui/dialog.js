@@ -328,6 +328,17 @@
     menu.style.top = Math.max(4, Math.min(event.clientY, innerHeight - h - 4)) + "px";
     ctx = menu;
   };
+  // A right-click on a link, a field or selected text inside a row keeps the
+  // browser's own menu (open in new tab, copy, paste); the row's menu is for
+  // the rest of the row.  Pass the row so a row that is itself a link counts.
+  window.mlNativeMenuWanted = function (event, row) {
+    const t = event.target;
+    if (!t.closest) return false;
+    const inner = t.closest("a[href], input, textarea, select");
+    if ((inner && inner !== row) || t.isContentEditable) return true;
+    const sel = getSelection();
+    return !!(sel && !sel.isCollapsed && String(sel).trim() && sel.containsNode(t, true));
+  };
   document.addEventListener("mousedown", e => { if (ctx && !ctx.contains(e.target)) closeCtx(); }, true);
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeCtx(); });
   window.addEventListener("blur", closeCtx);

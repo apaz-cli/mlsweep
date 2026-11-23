@@ -333,9 +333,12 @@ function nbTableBox(data) {
           else td.textContent = text;
           tr.append(td);
         } else {
-          tr.append(nbMetricCell(row.metrics ? row.metrics[c.key] : null, spec.agg));
+          const td = nbMetricCell(row.metrics ? row.metrics[c.key] : null, spec.agg);
+          td.dataset.metric = c.key;
+          tr.append(td);
         }
       }
+      tr.oncontextmenu = e => nbRunMenu(e, row, spec);
       tbody.append(tr);
     }
     for (const h of headers) {
@@ -366,6 +369,34 @@ function nbTableBox(data) {
   drawBody();
   wrap.append(table);
   return wrap;
+}
+
+// Right-click a table row: the run's pages, and on a metric cell, its value
+// or an evidence link a note can cite.
+function nbRunMenu(e, row, spec) {
+  if (mlNativeMenuWanted(e, null)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const q = { experiment: row.experiment, run: row.run };
+  const go = page => () => { location.href = pageHref(page, q); };
+  const items = [
+    { label: "Open results", run: go("results.html") },
+    { label: "Open logs", run: go("logs.html") },
+    { label: "Open artifacts", run: go("files.html") },
+    { label: "Open code", run: go("code.html") },
+    "-",
+    { label: "Copy run ID", run: () => copyText(row.run) },
+  ];
+  const metric = e.target.closest("td[data-metric]")?.dataset.metric;
+  const summary = metric && row.metrics ? row.metrics[metric] : null;
+  const value = summary ? (summary.value != null ? summary.value : summary.final) : null;
+  if (value != null) {
+    const at = ["min", "max", "mean"].includes(spec.agg) ? spec.agg : "final";
+    items.push({ label: "Copy value", run: () => copyText(String(value)) },
+      { label: "Copy evidence link", key: `@${at}`,
+        run: () => copyText(`[${nbNum(value)}](mlsweep:${row.experiment}/${row.run}/${metric}@${at})`) });
+  }
+  showMenu(e.clientX, e.clientY, items);
 }
 
 // ── block wiring ─────────────────────────────────────────────────────────────
@@ -682,6 +713,57 @@ async function annotateCode(root) {
     const what = res.kind === "tree" ? `the code (${res.files} files)` : res.kind === "dir" ? `${res.path}/` : res.path + lines;
     a.title = `${what} as ${res.experiment || "snapshot"} ran it · ${res.short}`
       + (res.versions > 1 ? ` (latest of ${res.versions} code versions)` : "");
+  }
+}
+
+// ── trace links ──────────────────────────────────────────────────────────────
+
+// Says which session a trace link opens; marks it ⚠ when the trace is gone or a
+// short id matches more than one.
+async function annotateTraces(root) {
+  const anchors = [...root.querySelectorAll("a[data-trace-ref]")];
+  if (!anchors.length) return;
+  const refs = [...new Set(anchors.map(a => a.dataset.traceRef))];
+  const missing = refs.filter(r => {
+    const hit = EV_CACHE.get(r);
+    return !hit || Date.now() - hit.at >= EV_CACHE_MS;
+  });
+  if (missing.length) {
+    try {
+      const r = await apiFetch("/api/notes/evidence", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refs: missing }),
+      });
+      const body = await r.json();
+      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
+      for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
+    } catch (e) {
+      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
+    }
+  }
+  for (const a of anchors) {
+    const hit = EV_CACHE.get(a.dataset.traceRef);
+    const res = hit && hit.data;
+    a.querySelectorAll(".ev-mark").forEach(m => m.remove());
+    a.classList.remove("trace-ok", "trace-bad");
+    if (!res || !res.ok) {
+      a.classList.add("trace-bad");
+      a.append(el("span", "ev-mark", "⚠"));
+      a.title = (res && res.error) || "could not check this trace link";
+      continue;
+    }
+    a.classList.add("trace-ok");
+    // A short id opens the full one, so the Traces tab's URL names the trace.
+    if (res.session_id) a.href = traceHref(a.dataset.traceRef, res.session_id);
+    const exps = res.experiments || [];
+    const trace = `${res.agent} trace${res.title ? `: ${res.title}` : ""}`;
+    const ev = res.event;
+    a.title = ev
+      ? `${ev.kind === "tool" ? ev.name || "tool" : ev.kind} event ${ev.seq} of ${trace}`
+        + (ev.text ? `\n${ev.text}` : "")
+      : `${trace} · ${res.event_count ?? 0} events`
+        + (exps.length ? ` · ${exps.length} experiment${exps.length === 1 ? "" : "s"}` : "")
+        + (res.kind ? ` · showing ${res.kind} only` : "");
   }
 }
 

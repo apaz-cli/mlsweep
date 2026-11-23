@@ -238,6 +238,36 @@ function renderJobList() {
   });
 }
 
+// Right-click a run: show it, rename it, or go to its other pages.
+jobListEl.addEventListener("contextmenu", e => {
+  const item = e.target.closest(".job-item");
+  const job = item && jobsData.find(j => j.run_id === item.dataset.runId);
+  if (!job || mlNativeMenuWanted(e, item)) return;
+  const go = (page, q) => () => { location.href = pageHref(page, q); };
+  const q = { experiment: job.experiment_id, run: job.run_id };
+  mlContextMenu(e, [
+    { title: job.label || job.run_id },
+    job.run_id === currentRunId ? null : { label: "Show logs", run: () => selectJob(job) },
+    { label: "Download log", run: () => {
+      const a = Object.assign(document.createElement("a"), {
+        href: authURL(`/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`),
+        download: `${job.run_id}.log`,
+      });
+      a.click();
+    } },
+    { label: "Rename…", run: async () => {
+      const label = await mlRenameRun(job.experiment_id, job.run_id, job.label);
+      if (label !== undefined) setJobLabel(job.run_id, label);
+    } },
+    "-",
+    job.artifact_id ? { label: "Open code", run: go("code.html", q) } : null,
+    { label: "Open artifacts", run: go("files.html", q) },
+    { label: "Open results", run: go("results.html", { experiment: job.experiment_id }) },
+    "-",
+    { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
+  ]);
+});
+
 // Show a run's new display name in the list and, if selected, the header.
 function setJobLabel(runId, label) {
   const job = jobsData.find(j => j.run_id === runId);

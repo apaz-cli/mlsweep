@@ -195,20 +195,23 @@ wbSubmit.addEventListener("click", async () => {
   }
 });
 
+let lastExports = [];
+
 function renderExports(exports) {
+  lastExports = exports;
   document.getElementById("export-list-title").classList.toggle("hidden", !exports.length);
   exportList.innerHTML = exports.map(e => {
     const dest = (e.entity ? e.entity + "/" : "") + e.project;
     const pct = e.total ? Math.round(100 * e.done / e.total) : 0;
     const many = e.scope !== "experiment";
-    const runs = e.runs.filter(r => r.status !== "pending").map(r => {
+    const runs = e.runs.map((r, ri) => [r, ri]).filter(([r]) => r.status !== "pending").map(([r, ri]) => {
       const detail = r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">open</a>`
                    : r.error ? `<span class="err">${esc(r.error)}</span>`
                    : `<span>${esc(r.status)}</span>`;
       const name = many ? `${r.experiment} / ${r.run_id}` : r.run_id;
-      return `<div class="export-run"><span class="rid" title="${esc(name)}">${esc(name)}</span>${detail}</div>`;
+      return `<div class="export-run" data-run="${ri}"><span class="rid" title="${esc(name)}">${esc(name)}</span>${detail}</div>`;
     }).join("");
-    return `<div class="export-item">
+    return `<div class="export-item" data-export="${esc(e.export_id)}">
       <div class="export-top">
         <span class="badge badge-${esc(e.status)}">${esc(e.status)}</span>
         <span class="export-dest" title="${esc(e.scope_label)} → ${esc(dest)}">${esc(e.scope_label)} → <code>${esc(dest)}</code></span>
@@ -228,6 +231,36 @@ exportList.addEventListener("click", async ev => {
   ev.target.disabled = true;
   await apiFetch(`/api/exports/${encodeURIComponent(id)}/cancel`, { method: "POST" }).catch(() => {});
   pollExports();
+});
+
+async function cancelExport(id) {
+  await apiFetch(`/api/exports/${encodeURIComponent(id)}/cancel`, { method: "POST" }).catch(() => {});
+  pollExports();
+}
+
+// Right-click an upload: cancel it or copy where it went.  On one of its
+// runs: open that run's upload, logs, or copy its ID or error.
+exportList.addEventListener("contextmenu", ev => {
+  const item = ev.target.closest(".export-item");
+  const e = item && lastExports.find(x => x.export_id === item.dataset.export);
+  if (!e || mlNativeMenuWanted(ev, item)) return;
+  const dest = (e.entity ? e.entity + "/" : "") + e.project;
+  const runEl = ev.target.closest(".export-run");
+  const r = runEl ? e.runs[+runEl.dataset.run] : null;
+  const exp = r ? r.experiment_id : null;
+  mlContextMenu(ev, [
+    r ? { title: r.run_id } : null,
+    r?.url ? { label: "Open in W&B", run: () => window.open(r.url, "_blank", "noopener") } : null,
+    r && exp ? { label: "Open logs", run: () => { location.href = pageHref("logs.html", { experiment: exp, run: r.run_id }); } } : null,
+    r ? { label: "Copy run ID", run: () => copyText(r.run_id, "Copied the run ID") } : null,
+    r?.url ? { label: "Copy W&B link", run: () => copyText(r.url, "Copied the link") } : null,
+    r?.error ? { label: "Copy error", run: () => copyText(r.error, "Copied the error") } : null,
+    r ? "-" : null,
+    { title: e.scope_label },
+    e.status === "running" ? { label: "Cancel upload", danger: true, run: () => cancelExport(e.export_id) } : null,
+    { label: "Copy destination", hint: dest, run: () => copyText(dest, "Copied the destination") },
+    e.error ? { label: "Copy error", run: () => copyText(e.error, "Copied the error") } : null,
+  ]);
 });
 
 // Every recent upload is listed, whatever the scope.  Poll every 2s while

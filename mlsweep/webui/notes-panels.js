@@ -126,6 +126,7 @@ const doSearch = debounce(async () => {
       // An open tab keeps its view (Live, Source or Split); a new one opens Live.
       const isOpen = () => S.tabs.some(t => t.type === "file" && t.path === res.path);
       box.onclick = () => openFile(res.path, { mode: !isOpen() && res.kind === "md" ? "live" : null });
+      box.oncontextmenu = e => fileMenu(e, res.path);
       for (const m of res.matches.slice(0, 5)) {
         const line = el("div", "sr-line");
         line.append(el("span", "ln", m.line));
@@ -172,6 +173,7 @@ async function loadFeed(reset = false) {
       head.append(avatar(c.author), el("span", "commit-author", c.author), t);
       head.style.cursor = "pointer"; head.title = c.subject + "\nClick for the full diff";
       head.onclick = () => openDiff(c, null);
+      head.oncontextmenu = e => commitMenu(e, c);
       box.append(head);
       const files = el("div", "commit-files");
       for (const f of (c.files || []).slice(0, 12)) {
@@ -182,6 +184,10 @@ async function loadFeed(reset = false) {
         row.append(db);
         row.title = f.path;
         row.onclick = () => f.status === "D" ? openDiff(c, f.path) : openFile(f.path);
+        row.oncontextmenu = e => fileMenu(e, f.path, [
+          { label: "Show this change", run: () => openDiff(c, f.path) },
+          { label: "View this version", run: () => showVersion(f.path, c.hash, c) },
+          ...commitItems(c)]);
         files.append(row);
       }
       if ((c.files || []).length > 12) files.append(el("div", "cf", `… ${c.files.length - 12} more`));
@@ -196,6 +202,18 @@ async function loadFeed(reset = false) {
       feed.append(more);
     }
   } catch (e) { feed.innerHTML = ""; feed.append(el("div", "tree-empty", "Could not load history: " + e.message)); }
+}
+
+// A commit's own entries, for the menus on a change.
+function commitItems(c) {
+  return [
+    { label: "Show the whole commit", run: () => openDiff(c, null) },
+    { label: "Copy commit hash", run: () => copyText(c.hash) },
+  ];
+}
+function commitMenu(e, c) {
+  e.preventDefault();
+  showMenu(e.clientX, e.clientY, [...commitItems(c), { label: "Copy message", run: () => copyText(c.subject || "") }]);
 }
 
 // ── Diff view ──────────────────────────────────────────────────────────────────
@@ -380,6 +398,7 @@ async function refreshRight() {
       for (const l of ls.slice(0, 2)) it.append(el("div", "ctx", l.context || ""));
       it.title = src;
       it.onclick = () => openFile(src, { line: ls[0].line });
+      it.oncontextmenu = e => fileMenu(e, src);
       bb.append(it);
     }
     body.append(bs);
@@ -396,6 +415,14 @@ async function refreshRight() {
       const tt = el("div", "t" + (l.resolved ? "" : " missing"), l.resolved ? titleFor(l.resolved) : l.target);
       it.append(tt); it.title = l.resolved || `Missing: ${l.target}`;
       it.onclick = () => l.resolved ? openFile(l.resolved) : newNote(dirname(path), basename(l.target));
+      it.oncontextmenu = e => {
+        if (l.resolved) return fileMenu(e, l.resolved);
+        e.preventDefault();
+        showMenu(e.clientX, e.clientY, [
+          { label: "Create this note", run: () => newNote(dirname(path), basename(l.target)) },
+          { label: "Copy link target", run: () => copyText(l.target) },
+        ]);
+      };
       lb.append(it);
     }
     body.append(ls);
@@ -413,7 +440,10 @@ async function refreshRight() {
     const users = Object.entries(idx2.links).filter(([, ls]) => ls.some(l => l.resolved === path)).map(([s]) => s);
     const [us, ub] = rsec("usedby", "Linked from", users.length);
     if (!users.length) ub.append(el("div", "rempty", "No note links to this file."));
-    for (const s of users) { const it = el("div", "ritem"); it.append(el("div", "t", titleFor(s))); it.onclick = () => openFile(s); ub.append(it); }
+    for (const s of users) {
+      const it = el("div", "ritem"); it.append(el("div", "t", titleFor(s)));
+      it.onclick = () => openFile(s); it.oncontextmenu = e => fileMenu(e, s); ub.append(it);
+    }
     body.append(us);
   }
 
@@ -433,6 +463,16 @@ async function refreshRight() {
       it.title = `${new Date(c.time * 1000).toLocaleString()}\n${c.subject}`;
       if (c.path && c.path !== path) it.title += `\n(then named ${c.path})`;
       it.onclick = () => openDiff(c, c.path || path, path);
+      it.oncontextmenu = e => {
+        e.preventDefault();
+        const then = c.path || path;
+        showMenu(e.clientX, e.clientY, [
+          { label: "Show this change", run: () => openDiff(c, then, path) },
+          { label: "View this version", run: () => showVersion(then, c.hash, c) },
+          { label: "Restore this version…", run: () => restoreVersion(then, c.hash, c, path) },
+          "-", ...commitItems(c),
+        ]);
+      };
       hb.append(it);
     }
   } catch { hb.append(el("div", "rempty", "History unavailable.")); }
@@ -556,6 +596,8 @@ function renderLint() {
         it.append(el("div", "loc", f.line ? `${f.path}:${f.line}` : f.path), el("div", "msg", f.message));
         if (f.detail && f.detail.context) it.append(el("div", "ctx", f.detail.context));
         it.onclick = () => S.fileMap.has(f.path) && openFile(f.path, { mode: isMd(f.path) && f.line ? "split" : null, line: f.line || null });
+        it.oncontextmenu = e => fileMenu(e, f.path, [
+          { label: "Copy finding", run: () => copyText(`${f.line ? `${f.path}:${f.line}` : f.path}: ${f.message}`) }]);
         list.append(it);
       }
       body.append(g);
@@ -574,6 +616,7 @@ function renderLint() {
     const ic = el("span", "ficon"); ic.innerHTML = ICONS.md; ic.querySelector("svg").style.cssText = "width:12px;height:12px";
     it.append(ic, el("span", "", titleFor(r.path)), el("span", "commit-time", ago(r.mtime)));
     it.onclick = () => openFile(r.path);
+    it.oncontextmenu = e => fileMenu(e, r.path);
     body.append(it);
   }
 }
