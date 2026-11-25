@@ -103,6 +103,9 @@ def search(manager: str, token: str, args: Any, campaign: str | None) -> None:
         return
     for target, why in (resp.get("errors") or {}).items():
         print(f"{target}: {why}", file=sys.stderr)
+    if resp.get("timed_out"):
+        print("The pattern took too long and the search stopped early; "
+              "a simpler regex, --path or fewer experiments may help.", file=sys.stderr)
     hits = resp["hits"]
     if not hits:
         print(f"No matches in {resp['files_searched']} files.")

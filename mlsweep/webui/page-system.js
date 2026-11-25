@@ -698,6 +698,75 @@ async function cancelInFlight(expId, runId) {
   await refresh();
 }
 
+// ── Render the job queue ───────────────────────────────────────────────────────
+// Pending runs in the order the scheduler takes them (priority, then submit
+// time).  A paused experiment's runs keep their place but are held.
+const QUEUE_LIMIT = 200;
+let queued = [];
+
+function renderQueue(jobs, total, pausedExps) {
+  queued = jobs;
+  const tbody = document.getElementById("queue-tbody");
+  document.getElementById("queue-count").textContent = total ? `(${total})` : "";
+  const more = document.getElementById("queue-more");
+  more.classList.toggle("hidden", total <= jobs.length);
+  more.textContent = total > jobs.length ? `Showing the first ${jobs.length} of ${total}.` : "";
+  if (!jobs.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="no-data">The queue is empty.</td></tr>`;
+    return;
+  }
+  let pos = 0;
+  tbody.innerHTML = jobs.map(j => {
+    const held = pausedExps.has(j.experiment_id);
+    if (!held) pos++;
+    const gpus = j.gpus_per_run === 0 ? "CPU" : j.nodes_per_run > 1 ? `${j.gpus_per_run} × ${j.nodes_per_run} nodes` : String(j.gpus_per_run);
+    const status = held ? badge("paused", "held")
+      : j.retry_count ? badge("pending", `retry ${j.retry_count}`) : badge("pending");
+    return `<tr class="${held ? "held" : ""}" data-exp-id="${escHtml(j.experiment_id)}" data-run-id="${escHtml(j.run_id)}"${held ? ' title="Its experiment is paused; resume it to schedule this run"' : ""}>
+    <td class="mono">${held ? "—" : pos}</td>
+    <td class="mono id-cell">${runNameHtml(j)}</td>
+    <td class="mono id-cell">${escHtml(j.experiment_id || "—")}</td>
+    <td>${status}</td>
+    <td class="mono">${escHtml(gpus)}</td>
+    <td class="mono">${j.priority}</td>
+    <td>${elapsedSince(j.submit_time) || "—"}</td>
+    <td class="actions-cell"><div class="actions">
+      <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Notes" ${act("toggleRunView", j.experiment_id, j.run_id, j.code_files ?? null)}>View ▾</button>
+      <button class="btn-link btn-manage" aria-haspopup="true" title="Rename or cancel" ${act("toggleQueuedMenu", j.experiment_id, j.run_id)}>Manage</button>
+    </div></td>
+  </tr>`;
+  }).join("");
+}
+
+function queuedItems(expId, runId) {
+  return [
+    { label: "Rename…", act: act("renameQueued", expId, runId) },
+    { label: "Cancel", act: act("cancelQueued", expId, runId), danger: true },
+  ];
+}
+
+function toggleQueuedMenu(expId, runId) {
+  toggleMenu(this, `queued:${expId}/${runId}`, queuedItems(expId, runId));
+}
+
+bindRowContextMenu(document.getElementById("queue-tbody"), "tr[data-run-id]", row => {
+  const { expId, runId } = row.dataset;
+  const job = queued.find(j => j.experiment_id === expId && j.run_id === runId);
+  return [`qctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, job?.code_files),
+    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...queuedItems(expId, runId)])];
+});
+
+async function renameQueued(expId, runId) {
+  const job = queued.find(j => j.experiment_id === expId && j.run_id === runId);
+  if (await mlRenameRun(expId, runId, job?.label) !== undefined) await refresh();
+}
+
+async function cancelQueued(expId, runId) {
+  if (!await mlConfirm(`Cancel queued run ${runId}?`, { confirmLabel: "Cancel run", cancelLabel: "Keep it" })) return;
+  await postRunAction(expId, runId, "cancel");
+  await refresh();
+}
+
 watchNoteMentions(() => {});
 watchTraceCounts(() => {});
 
@@ -706,20 +775,22 @@ let refreshSeq = 0;
 async function refresh() {
   const seq = ++refreshSeq;
   try {
-    const [wRes, jRes, dRes, sRes] = await Promise.all([
+    const responses = await Promise.all([
       apiFetch("/api/workers"),
       apiFetch("/api/jobs?status=running"),
       apiFetch("/api/jobs?status=dispatched"),
       apiFetch("/api/scheduler"),
+      apiFetch(`/api/jobs?status=pending&limit=${QUEUE_LIMIT}`),
+      apiFetch("/api/experiments?status=paused"),
+      apiFetch("/api/health"),
     ]);
     if (seq !== refreshSeq) return;   // a newer refresh owns the page now
-    if (!wRes.ok || !jRes.ok || !dRes.ok || !sRes.ok) {
+    if (!responses.every(r => r.ok)) {
       setConnStatus("disconnected");
       return;
     }
-    const [workers, running, dispatched, scheduler] = await Promise.all([
-      wRes.json(), jRes.json(), dRes.json(), sRes.json(),
-    ]);
+    const [workers, running, dispatched, scheduler, pending, paused, health] =
+      await Promise.all(responses.map(r => r.json()));
     if (seq !== refreshSeq) return;
 
     // The two job queries are separate snapshots.  A run that changed status
@@ -736,6 +807,7 @@ async function refresh() {
     renderPlacement(scheduler.placement);
     renderInFlight([...byRun.values()]);   // first: the worker cards name runs from it
     renderWorkers(workers);
+    renderQueue(pending, Math.max(health.jobs_pending, pending.length), new Set(paused.map(e => e.experiment_id)));
   } catch (e) {
     if (seq === refreshSeq) setConnStatus("disconnected");
   }
@@ -788,6 +860,7 @@ document.getElementById("gc-run").onclick = () => runGc(false);
 
 bindActions({
   disconnectWorker, updateWorker, toggleRunView, toggleInFlightMenu, renameInFlight, cancelInFlight,
+  toggleQueuedMenu, renameQueued, cancelQueued,
   toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun, copyId,
 });
 bindActions({

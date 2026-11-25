@@ -222,14 +222,16 @@ async function loadLogHistory(job) {
   historyLoading = false;
   const buffered = pendingLogEvents;
   pendingLogEvents = [];
-  // A failed reload keeps what is already shown.
-  if (text == null && logRaw) return;
   const scroll = logOutput.scrollTop;
-  resetLog();
-  appendLog(text || "");
+  // A failed reload keeps what is already shown, and adds what streamed in
+  // meanwhile on top of it.
+  if (text != null || !logRaw) {
+    resetLog();
+    appendLog(text || "");
+  }
   for (const evt of buffered) {
     if (evt.run_id !== currentRunId) continue;
-    if (lastSeq >= 0 && typeof evt.seq === "number" && evt.seq <= lastSeq) continue;
+    if (text != null && lastSeq >= 0 && typeof evt.seq === "number" && evt.seq <= lastSeq) continue;
     if (evt.data) appendLog(evt.data);
   }
   if (!autoScrollCb.checked) logOutput.scrollTop = scroll;

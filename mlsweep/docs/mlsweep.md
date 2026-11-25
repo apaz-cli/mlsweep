@@ -507,7 +507,8 @@ mlsweep code checkout EXP DIR           # write EXP's code out to DIR
 With `--lines` or `-n`, a file prints with line numbers and stops at about 2000 tokens
 (`--budget`). The last lines give the note reference for what was shown and the command for
 the next page. Without either, the file prints raw, so `> FILE` saves it as it was. `search`
-matches text, or a regular expression with `-E`, and gives each line with its
+matches text, or a regular expression with `-E` (given 20 seconds, after which it stops and
+keeps what it found), and gives each line with its
 `mlsweep:code/EXP/path#L12` reference. With no experiment named it searches the campaign's
 experiments, newest first, each as its latest code. A file several of them share is searched
 once, and its hits name the newest experiment and count the others. Binary files and files

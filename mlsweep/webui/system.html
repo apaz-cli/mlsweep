@@ -163,6 +163,11 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .mono { font-family: monospace; font-size: 11px; }
 .jobs-table td.id-cell { overflow-wrap: anywhere; }
 .no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
+.section-count { color: var(--text-muted); font-weight: 400; font-size: 0.85em; }
+.queue-more { color: var(--text-muted); font-size: 11px; padding: 8px 10px; }
+.queue-more.hidden { display: none; }
+.jobs-table tr.held td { opacity: 0.6; }
+.jobs-table tr.held td.actions-cell { opacity: 1; }
 
 /* Connection indicator */
 </style>
@@ -199,6 +204,14 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
       <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th><th>Actions</th></tr></thead>
       <tbody id="inflight-tbody"><tr><td colspan="7" class="no-data">Loading…</td></tr></tbody>
     </table>
+  </div>
+  <div>
+    <h3>Queued Jobs <span class="section-count" id="queue-count"></span></h3>
+    <table class="jobs-table">
+      <thead><tr><th>#</th><th>Run ID</th><th>Experiment</th><th>Status</th><th>GPUs</th><th>Priority</th><th>Queued</th><th>Actions</th></tr></thead>
+      <tbody id="queue-tbody"><tr><td colspan="8" class="no-data">Loading…</td></tr></tbody>
+    </table>
+    <div class="queue-more hidden" id="queue-more"></div>
   </div>
   <div>
     <div class="section-header">

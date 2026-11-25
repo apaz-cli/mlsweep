@@ -293,10 +293,15 @@ def test_capture_close_and_state_transitions(manager_server):
     status, body = _post(url, token, "/api/capture/sessions", {"session": closed, "events": []})
     assert status == 201 and body["state"] == "closed"
 
-    # An active upload never revives a closed session (imported wins too).
+    # An import never replaces the live state.
+    imported = {**_SESSION, "state": "imported"}
+    status, body = _post(url, token, "/api/capture/sessions", {"session": imported, "events": []})
+    assert status == 201 and body["state"] == "closed"
+
+    # The watcher saw the session resume: it is active again.
     active = {**_SESSION, "state": "active"}
     status, body = _post(url, token, "/api/capture/sessions", {"session": active, "events": []})
-    assert status == 201 and body["state"] == "closed"
+    assert status == 201 and body["state"] == "active"
 
 
 def test_capture_auto_link_experiment(manager_server):

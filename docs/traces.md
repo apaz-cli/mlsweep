@@ -189,4 +189,4 @@ mlsweep capture import --days 30     # --all for everything, --dry-run to look
 ```
 
 Each imported file becomes a trace marked `imported`, and is never imported
-twice.
+twice. A session the watcher also follows keeps its live state.

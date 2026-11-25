@@ -3474,7 +3474,8 @@ CAPTURE_ID_RE = re.compile(r"[A-Za-z0-9_.:\-]{1,200}")
 CAPTURE_STATES = ("active", "closed", "imported")
 
 # Events a session keeps.  A far larger bound would not be a transcript any
-# more, so the manager refuses the excess and the watcher retries smaller.
+# more; events past it are dropped (the header still updates), so the
+# watcher does not retry them forever.
 _MAX_EVENTS_PER_SESSION = 100_000
 _MAX_EVENT_JSON_BYTES = 64 * 1024
 
@@ -3500,8 +3501,10 @@ def _capture_fts_text(events: Sequence[dict[str, Any]]) -> str:
 async def _upsert_capture_session(db: aiosqlite.Connection, meta: dict[str, Any]) -> None:
     """Create or update one session's header.  The caller commits.
 
-    Blank fields keep what is stored.  A session only ever moves forward:
-    closed and imported never go back to active.
+    Blank fields keep what is stored.  The live watcher's state wins: an
+    import never replaces it, and a live upload replaces 'imported'.  A closed
+    session goes back to active when the watcher sees it resume.  The start is
+    the earliest one either side reported.
     """
     session_id = validate_capture_id(meta.get("session_id"))
     state = meta.get("state")
@@ -3519,11 +3522,11 @@ async def _upsert_capture_session(db: aiosqlite.Connection, meta: dict[str, Any]
                cwd=CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE capture_sessions.cwd END,
                title=CASE WHEN excluded.title != '' THEN excluded.title ELSE capture_sessions.title END,
                model=CASE WHEN excluded.model != '' THEN excluded.model ELSE capture_sessions.model END,
-               started_at=CASE WHEN excluded.started_at != 0 THEN excluded.started_at
-                               ELSE capture_sessions.started_at END,
+               started_at=CASE WHEN excluded.started_at = 0 THEN capture_sessions.started_at
+                               WHEN capture_sessions.started_at = 0 THEN excluded.started_at
+                               ELSE MIN(excluded.started_at, capture_sessions.started_at) END,
                last_seen_at=MAX(excluded.last_seen_at, capture_sessions.last_seen_at),
-               state=CASE WHEN capture_sessions.state = 'imported'
-                               OR (capture_sessions.state = 'closed' AND excluded.state = 'active')
+               state=CASE WHEN excluded.state = 'imported'
                           THEN capture_sessions.state ELSE excluded.state END""",
         {
             "session_id": session_id,
@@ -3543,15 +3546,24 @@ def _capped_event_json(event: dict[str, Any]) -> str:
     says it was cut.  Cutting the JSON itself would leave a row nothing can
     parse.
     """
-    data = json.dumps(event, separators=(",", ":"))
+    def dump(obj: dict[str, Any]) -> str:
+        return json.dumps(obj, separators=(",", ":"))
+    data = dump(event)
     if len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
         return data
     text = event.get("text")
     if isinstance(text, str):
-        overflow = len(data.encode()) - _MAX_EVENT_JSON_BYTES + 256
-        keep = text.encode()[: max(0, len(text.encode()) - overflow)].decode(errors="ignore")
-        data = json.dumps({**event, "text": keep, "truncated": True}, separators=(",", ":"))
-        if len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
+        # The longest start of the text that fits, measured on the JSON itself:
+        # escaping makes one character cost from 1 to 12 bytes.
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(dump({**event, "text": text[:mid], "truncated": True})) <= _MAX_EVENT_JSON_BYTES:
+                lo = mid
+            else:
+                hi = mid - 1
+        data = dump({**event, "text": text[:lo], "truncated": True})
+        if lo and len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
             return data
     # Nothing to shorten (or still too big): keep the bare shape of the event.
     bare = {k: event[k] for k in ("seq", "ts", "kind", "name", "tool_id", "ok") if k in event}
@@ -3582,8 +3594,10 @@ async def _insert_capture_events(
         return 0, None
     count = await _exec_one(db, "SELECT event_count FROM capture_sessions WHERE session_id = ?",
                             (session_id,))
-    if count is not None and int(count[0]) + len(new) > _MAX_EVENTS_PER_SESSION:
-        return 0, f"a trace keeps at most {_MAX_EVENTS_PER_SESSION} events"
+    room = _MAX_EVENTS_PER_SESSION - (int(count[0]) if count is not None else 0)
+    new = new[:max(0, room)]
+    if not new:
+        return 0, None
     await db.executemany(
         "INSERT OR IGNORE INTO capture_events (session_id, seq, data) VALUES (?, ?, ?)",
         [(session_id, e["seq"], _capped_event_json(e)) for e in new])

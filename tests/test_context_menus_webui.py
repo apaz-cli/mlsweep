@@ -186,6 +186,38 @@ def test_system_page_rows(mgr, page):
     _escape(page)
 
 
+def test_job_queue(mgr, page):
+    # No worker connects, so pending runs stay queued.  A paused experiment's
+    # runs are listed as held and take no place in the queue order.
+    def queued(runs):
+        eid = uid("queue")
+        ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": eid, "name": eid})
+        for rid in runs:
+            ok(mgr, "POST", "/api/jobs", {"experiment_id": eid, "run_id": rid, "command": ["echo"]})
+        return eid
+    eid, held = queued(["q_a", "q_b"]), queued(["q_held"])
+    ok(mgr, "PUT", f"/api/experiments/{held}/status", {"status": "paused"})
+    page.goto(static_url(mgr, "system.html"))
+    row = '#queue-tbody tr[data-run-id="{}"]'
+    page.wait_for(f"!!document.querySelector({json.dumps(row.format('q_held'))})")
+    assert page.eval(f"document.querySelector({json.dumps(row.format('q_held'))}).classList.contains('held')")
+    assert page.eval(f"document.querySelector({json.dumps(row.format('q_held'))}).cells[0].textContent") == "—"
+    pos = [page.eval(f"+document.querySelector({json.dumps(row.format(r))}).cells[0].textContent") for r in ("q_a", "q_b")]
+    assert pos[0] >= 1 and pos[1] == pos[0] + 1, pos
+    assert _right_click(page, row.format("q_b") + " td")
+    labels = _row_menu(page)
+    assert labels[-3:] == ["Copy run ID", "Rename…", "Cancel"], labels
+    _escape(page)
+
+    # Cancel takes the run off the queue.
+    page.eval(f"void cancelQueued({json.dumps(eid)}, 'q_b')")
+    page.wait_for("!!document.querySelector('.ml-dialog .ml-btn-danger')")
+    page.eval("document.querySelector('.ml-dialog .ml-btn-danger').click()")
+    page.wait_for(f"!document.querySelector({json.dumps(row.format('q_b'))})")
+    ok(mgr, "PUT", f"/api/experiments/{held}/status", {"status": "aborted"})
+    ok(mgr, "POST", f"/api/jobs/q_a/cancel?experiment_id={eid}")
+
+
 def test_logs_run_list(mgr, page):
     eid = _experiment(mgr, ["r1", "r2"])
     page.goto(static_url(mgr, "logs.html", experiment=eid))

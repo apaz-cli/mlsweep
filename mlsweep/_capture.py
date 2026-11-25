@@ -54,6 +54,7 @@ back on replaces the marker; what was never uploaded stays local.
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import os
 import re
@@ -92,15 +93,26 @@ def _iso_to_epoch(ts: Any) -> float | None:
     try:
         from datetime import datetime, timezone
 
-        text = ts.strip().rstrip("Z")
-        if "." in text:
-            base, frac = text.split(".", 1)
-            frac = re.sub(r"\D", "", frac)[:6]
-            text = f"{base}.{frac}"
-        dt = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        text = ts.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        # Python before 3.11 takes at most 6 fraction digits; keep the offset.
+        m = re.match(r"^(.*?\.)(\d+)(.*)$", text)
+        if m:
+            text = m.group(1) + m.group(2)[:6].ljust(6, "0") + m.group(3)
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except (ValueError, OverflowError):
         return None
+
+
+# Arguments that carry file contents or edit text, dropped from summaries.
+_CONTENT_KEYS = frozenset({
+    "content", "contents", "text", "new_source", "old_string", "new_string",
+    "oldText", "newText", "old_text", "new_text", "edits", "patch", "diff", "input",
+})
 
 
 def _summarize_args(name: str, args: Any) -> str:
@@ -119,6 +131,11 @@ def _summarize_args(name: str, args: Any) -> str:
     parts: list[str] = []
     for key, value in args.items():
         if value is None:
+            continue
+        if key in _CONTENT_KEYS:
+            # File contents and edit text are never sent, however short.
+            size = len(value) if isinstance(value, (str, list, dict)) else 0
+            parts.append(f"{key}<{size}>" if not isinstance(value, str) else f"{key}<{size} chars>")
             continue
         if isinstance(value, str):
             if len(value) <= 120 and "\n" not in value:
@@ -350,8 +367,12 @@ def _normalize_raw(spec: AgentSpec, raw: bytes, meta: dict[str, Any]) -> list[di
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict):
+        if not isinstance(parsed, dict):
+            continue
+        try:
             events.extend(spec.normalize(parsed, meta))
+        except Exception as exc:  # a line of an unexpected shape is skipped, not fatal
+            print(f"capture: skipped a {spec.name} transcript line: {exc!r}", flush=True)
     return events
 
 
@@ -405,7 +426,8 @@ def find_transcript(specs: list[AgentSpec], session_id: str) -> tuple[AgentSpec,
     for spec in specs:
         if not spec.directory.is_dir():
             continue
-        pattern = f"*/*_{session_id}.jsonl" if spec.name == "pi" else f"*/{session_id}.jsonl"
+        sid = glob.escape(session_id)
+        pattern = f"*/*_{sid}.jsonl" if spec.name == "pi" else f"*/{sid}.jsonl"
         for path in sorted(spec.directory.glob(pattern)):
             return spec, path
     return None
@@ -467,6 +489,8 @@ class CaptureClient:
         self._saved = ""
         # Follow requests whose transcript is not on disk yet: when to look again.
         self._retry_at: dict[str, float] = {}
+        # Sessions whose last upload failed: (failures in a row, when to try again).
+        self._upload_backoff: dict[str, tuple[int, float]] = {}
 
     # ── persistence ──────────────────────────────────────────────────
 
@@ -522,7 +546,7 @@ class CaptureClient:
         state = SessionState(
             session_id=session_id, agent=spec.name, path=str(path),
             native_id=_native_id_from_path(spec.name, path),
-            started_at=stat.st_ctime, last_seen_at=stat.st_mtime,
+            last_seen_at=stat.st_mtime,  # started_at: the header or first event
         )
         self.sessions[session_id] = state
         return state
@@ -555,27 +579,41 @@ class CaptureClient:
         by_name = {spec.name: spec for spec in specs}
         for state in self.sessions.values():
             spec = by_name.get(state.agent)
-            if spec is None or state.closed:
+            if spec is None:
                 continue
-            path = Path(state.path)
             try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if stat.st_size < state.offset:  # truncated or replaced: read it again
-                state.offset = 0
-            state.last_seen_at = stat.st_mtime
-            if stat.st_size <= state.offset:
-                continue
+                self._scan_one(state, spec)
+            except Exception as exc:  # one session's trouble must not stop the others
+                print(f"capture: could not read {state.session_id}: {exc!r}", flush=True)
+
+    def _scan_one(self, state: SessionState, spec: AgentSpec) -> None:
+        path = Path(state.path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        if stat.st_size < state.offset:  # truncated or replaced: read it again
+            state.offset = 0
+        if stat.st_size <= state.offset:
+            return
+        if state.closed:
+            # Work resumed in a session that went quiet long enough to be
+            # called finished: follow it again.
+            state.closed = False
+            state.close_reported = False
+        state.last_seen_at = stat.st_mtime
+        try:
             with path.open("rb") as f:
                 f.seek(state.offset)
                 raw = f.read(stat.st_size - state.offset)
-            # Only whole lines: a line the agent is still writing waits.
-            cut = raw.rfind(b"\n") + 1
-            if not cut:
-                continue
-            state.offset += cut
-            self._consume(state, spec, raw[:cut])
+        except OSError:
+            return  # deleted or unreadable between stat and open
+        # Only whole lines: a line the agent is still writing waits.
+        cut = raw.rfind(b"\n") + 1
+        if not cut:
+            return
+        state.offset += cut
+        self._consume(state, spec, raw[:cut])
 
     def _consume(self, state: SessionState, spec: AgentSpec, raw: bytes) -> None:
         meta: dict[str, Any] = {
@@ -590,11 +628,16 @@ class CaptureClient:
             state.title = title_from_events(events)
         if not events:
             return
+        if not state.started_at:
+            state.started_at = float(events[0]["ts"])
         # Renumber across reads: seq continues from uploaded + still-pending.
         first = state.uploaded_seq + self.pending_count(state.session_id) + 1
         for seq, event in enumerate(events, start=first):
             event["seq"] = seq
         self._spool(state, events)
+        # The offset goes to disk with the spool: a watcher killed between the
+        # two would read these lines again and spool them under new seqs.
+        self.save()
 
     def _apply_meta(self, state: SessionState, meta: dict[str, Any]) -> None:
         for key in ("cwd", "title", "model", "native_id"):
@@ -626,6 +669,8 @@ class CaptureClient:
                 continue
             if not self.pending_count(state.session_id):
                 continue
+            if self._upload_backoff.get(state.session_id, (0, 0.0))[1] > now:
+                continue
             idle = now - state.last_seen_at
             if idle >= self.IDLE_SECONDS or now - state.last_upload_at >= self.FORCE_SECONDS:
                 out.append(state)
@@ -644,6 +689,20 @@ class CaptureClient:
         else:
             path.unlink(missing_ok=True)
         self._pending[state.session_id] = len(left)
+
+    def upload_failed(self, state: SessionState, now: float | None = None) -> float:
+        """Note a failed upload; returns the seconds until the next try (2 s doubling to 10 min)."""
+        now = time.time() if now is None else now
+        fails = self._upload_backoff.get(state.session_id, (0, 0.0))[0] + 1
+        delay: float = min(600.0, self.POLL_SECONDS * float(2 ** min(fails, 10)))
+        self._upload_backoff[state.session_id] = (fails, now + delay)
+        return delay
+
+    def upload_succeeded(self, state: SessionState) -> None:
+        self._upload_backoff.pop(state.session_id, None)
+
+    def upload_waiting(self, state: SessionState, now: float) -> bool:
+        return self._upload_backoff.get(state.session_id, (0, 0.0))[1] > now
 
     def needs_close_upload(self, state: SessionState) -> bool:
         """A closed session whose last events, or the close itself, the manager lacks."""
@@ -799,6 +858,11 @@ def _off_path() -> Path:
 
 def watcher_pid() -> int | None:
     """The running watcher's pid, or None (including a stale record)."""
+    # A live watcher holds watcher.lock.  The pid record alone could name an
+    # unrelated process that reused the pid after the watcher died.
+    with _flocked(capture_dir() / "watcher.lock", block=False) as free:
+        if free:
+            return None
     try:
         pid = int(json.loads((capture_dir() / "watcher.json").read_text())["pid"])
     except (OSError, ValueError, KeyError):
@@ -945,6 +1009,7 @@ def _turn_on(manager: str, token_arg: str | None, agents: list[str], sys: Any) -
 def ensure_watcher() -> int:
     """The watcher's pid, starting it in the background if it is not running."""
     import subprocess
+    import sys as _sys  # this interpreter, since `mlsweep` may not be on PATH
 
     # Two clients turning capture on together would otherwise both see no
     # watcher and both start one.  The check, spawn and record happen under
@@ -956,7 +1021,7 @@ def ensure_watcher() -> int:
         log = capture_dir() / "watcher.log"
         with log.open("ab") as f:
             proc = subprocess.Popen(
-                ["mlsweep", "capture", "watch"], stdout=f, stderr=f,
+                [_sys.executable, "-m", "mlsweep", "capture", "watch"], stdout=f, stderr=f,
                 stdin=subprocess.DEVNULL, start_new_session=True)
         (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
         return proc.pid
@@ -1042,13 +1107,19 @@ def _cmd_watch() -> None:
     """The watcher loop: follow requested sessions, spool events, upload when quiet."""
     import signal
 
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    # `capture off` sends SIGTERM.  Exit by raising in the main thread, so the
+    # lock is released; the offset is saved with each spool write, so no
+    # transcript lines are read twice.
+    def _stop(*_: Any) -> None:
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _stop)
     # One watcher per machine: two would write followed.json through the same
     # temp file and upload the same spool.
     with _flocked(capture_dir() / "watcher.lock", block=False) as mine:
         if not mine:
             print("another capture watcher is already running")
             return
+        (capture_dir() / "watcher.json").write_text(json.dumps({"pid": os.getpid()}))
         _watch_loop()
 
 
@@ -1064,24 +1135,33 @@ def _watch_loop() -> None:
             on_file = json.loads(_on_path().read_text())
         except (OSError, ValueError):
             return
-        manager, token = on_file["manager"], on_file["token"]
-        now = time.time()
-        specs = agent_specs(list(on_file.get("agents") or AGENT_NAMES))
-        client.follow_requested(specs, now)
-        client.scan(specs)
-        for state in client.due_sessions(now):
-            _upload(client, state, manager, token)
-        if now - last_sweep > 300:
-            last_sweep = now
-            # A transcript quiet this long is finished: upload what is left
-            # and tell the manager, until it has both.
-            for state in list(client.sessions.values()):
-                if not state.closed and now - state.last_seen_at > client.CLOSE_SECONDS:
-                    state.closed = True
-                if client.needs_close_upload(state):
-                    _upload(client, state, manager, token)
-        client.save()
+        try:
+            last_sweep = _watch_once(client, on_file, last_sweep)
+        except Exception as exc:  # log and keep watching; a restart would hit it again
+            print(f"capture: watcher pass failed: {exc!r}", flush=True)
         time.sleep(client.POLL_SECONDS)
+
+
+def _watch_once(client: CaptureClient, on_file: dict[str, Any], last_sweep: float) -> float:
+    """One pass of the watcher; returns when the close sweep last ran."""
+    manager, token = on_file["manager"], on_file["token"]
+    now = time.time()
+    specs = agent_specs(list(on_file.get("agents") or AGENT_NAMES))
+    client.follow_requested(specs, now)
+    client.scan(specs)
+    for state in client.due_sessions(now):
+        _upload(client, state, manager, token)
+    if now - last_sweep > 300:
+        last_sweep = now
+        # A transcript quiet this long is finished: upload what is left
+        # and tell the manager, until it has both.
+        for state in list(client.sessions.values()):
+            if not state.closed and now - state.last_seen_at > client.CLOSE_SECONDS:
+                state.closed = True
+            if client.needs_close_upload(state) and not client.upload_waiting(state, now):
+                _upload(client, state, manager, token)
+    client.save()
+    return last_sweep
 
 
 # One upload request carries at most this much; a longer spool goes in several.
@@ -1130,12 +1210,17 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
         if sent:
             client.mark_uploaded(state, sent)
         if error:
-            print(f"capture: upload failed for {state.session_id}: {error}", flush=True)
+            delay = client.upload_failed(state)
+            print(f"capture: upload failed for {state.session_id}: {error} "
+                  f"(next try in {delay:.0f}s)", flush=True)
         else:
+            client.upload_succeeded(state)
             state.last_upload_at = time.time()
             state.close_reported = state.closed
     except Exception as exc:  # a manager that is down is not a crash
-        print(f"capture: upload failed for {state.session_id}: {exc}", flush=True)
+        delay = client.upload_failed(state)
+        print(f"capture: upload failed for {state.session_id}: {exc} "
+              f"(next try in {delay:.0f}s)", flush=True)
 
 
 # ── ls / import ────────────────────────────────────────────────────────
