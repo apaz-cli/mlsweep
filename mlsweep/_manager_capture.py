@@ -158,6 +158,10 @@ async def handle_capture_get(request: web.Request) -> web.Response:
             return _bad_request(error)
         raise _not_found_exc("trace")
     await _attach_experiment_links(db, [session])
+    # Traces that continue this one: their transcripts start with its events.
+    cursor = await db.execute("SELECT session_id FROM capture_sessions WHERE continues = ? ORDER BY started_at",
+                              (session["session_id"],))
+    session["continued_by"] = [r[0] for r in await cursor.fetchall()]
     return _json_response(session)
 
 

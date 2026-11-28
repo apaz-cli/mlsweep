@@ -116,6 +116,11 @@ def _header(session: dict[str, Any]) -> list[str]:
         bits.append("experiments " + ", ".join(session["experiments"]))
     if bits:
         lines.append("  " + "  ·  ".join(bits))
+    if session.get("continues"):
+        lines.append(f"  continues {trace_ref(session['continues'])}: the events before this trace's first "
+                     "are there")
+    for later in session.get("continued_by") or []:
+        lines.append(f"  continued in {trace_ref(later)}")
     lines.append(f"  cite as {trace_ref(sid)}")
     return lines
 

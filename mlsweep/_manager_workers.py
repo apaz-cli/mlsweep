@@ -37,6 +37,8 @@ import aiosqlite
 
 from mlsweep._manager_controls import PruneTracker, metric_value, missing_metric_reason
 from mlsweep._manager_optimizer import advance_optimizers_locked, give_up_locked
+from mlsweep._manager_db import RunEvent, list_due_moves
+from mlsweep._shared import _resolve_safe_subpath, validate_run_id
 from mlsweep._manager_db import (
     MISSING_METRIC_REASON,
     JobRecord,
@@ -46,6 +48,7 @@ from mlsweep._manager_db import (
     count_jobs_by_status,
     experiment_concurrency_caps,
     get_experiment,
+    get_job,
     get_metrics_for_run,
     get_worker,
     last_log_seq,
@@ -82,6 +85,7 @@ from mlsweep._shared import (
     MsgRun,
     MsgShutdown,
     MsgStarted,
+    MsgHeartbeat,
     MsgSyncReq,
     MsgWorkerHello,
     PROTOCOL_VERSION,
@@ -122,7 +126,7 @@ def _parse_workers_file(
     """Parse a TOML workers file.
 
     Each ``[[workers]]`` entry requires ``host`` and ``remote_dir``.
-    Optional fields: gpus, jobs, devices, pass, ssh_key, venv, port, scratch_dir.
+    Optional fields: gpus, jobs, devices, pass, ssh_key, venv, port, scratch_dir, tunnel.
 
     Returns a list of dicts suitable for ``launch_worker()``.
     """
@@ -156,6 +160,7 @@ def _parse_workers_file(
                 "venv": entry.get("venv") or remote_dir,
                 "port": entry.get("port", 7890),
                 "scratch_dir": entry.get("scratch_dir"),
+                "tunnel": bool(entry.get("tunnel", False)),
             }
         )
     return result
@@ -496,6 +501,111 @@ def _relay_worker_output(proc: asyncio.subprocess.Process, label: str) -> None:
             task.add_done_callback(_output_relays.discard)
 
 
+def _free_local_port() -> int:
+    """A loopback port nothing listens on right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+class PortForward:
+    """``ssh -L`` from a loopback port here to a port on a worker's host.
+
+    For a worker the manager can reach only over SSH, such as a cloud machine
+    whose firewall lets in nothing else: the manager connects to the local end
+    instead of dialing the worker's port.  ``open`` points it at the worker's
+    port (restarting ssh if it pointed elsewhere or died), ``connect`` makes a
+    connection through it, and ``close`` ends ssh.  *spawn* starts ssh
+    (default ``asyncio.create_subprocess_exec``).
+    """
+
+    def __init__(self, host: str, *, ssh_key: str | None = None, password: str | None = None,
+                 spawn: Spawn | None = None) -> None:
+        self.host = host
+        self.ssh_key = ssh_key
+        self.password = password
+        self.spawn = spawn or asyncio.create_subprocess_exec
+        self.proc: Any = None
+        self.local_port = 0
+        self.remote_port = 0
+
+    def command(self, local_port: int, remote_port: int) -> list[str]:
+        sshpass_args, _ = _sshpass_args(self.password)
+        return [
+            *sshpass_args, "ssh", "-N",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
+            *(["-i", self.ssh_key] if self.ssh_key else []),
+            "--", self.host,
+        ]
+
+    async def open(self, remote_port: int) -> None:
+        """Forward a fresh local port to *remote_port* on the host, unless it already does."""
+        if self.proc is not None and self.proc.returncode is None and self.remote_port == remote_port:
+            return
+        self.close()
+        self.local_port, self.remote_port = _free_local_port(), remote_port
+        _, env = _sshpass_args(self.password)
+        self.proc = await self.spawn(
+            *self.command(self.local_port, remote_port),
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE, env=env, preexec_fn=_die_with_parent,
+        )
+
+    async def connect(
+        self, timeout: float, *, required: bool = True,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        """A connection to the worker through the forward.
+
+        ssh accepts locally even when nothing listens on the far end, then
+        closes the connection, so one that stays open with nothing to read
+        for a moment has reached the worker (which waits for the manager's
+        hello before it says anything).  Retries until *timeout*; then raises
+        RuntimeError, or returns None if not *required*.
+        """
+        deadline = time.monotonic() + timeout
+        why = "nothing answered on the worker's port"
+        while time.monotonic() < deadline:
+            if self.proc is None or self.proc.returncode is not None:
+                why = await self._exit_reason()
+                break
+            conn = await _try_connect("127.0.0.1", self.local_port)
+            if conn is not None:
+                reader, writer = conn
+                try:
+                    data = await asyncio.wait_for(reader.read(1), timeout=1.5)
+                except asyncio.TimeoutError:
+                    return reader, writer
+                except OSError:
+                    data = b""
+                _close_writer(writer)
+                if data:
+                    why = "something other than a worker answered on its port"
+                    break
+            await asyncio.sleep(0.25)
+        if not required:
+            return None
+        raise RuntimeError(f"could not reach the worker on {self.host} port {self.remote_port} "
+                           f"through the SSH tunnel: {why}")
+
+    async def _exit_reason(self) -> str:
+        if self.proc is None:
+            return "ssh did not start"
+        err = b""
+        if self.proc.stderr is not None:
+            with contextlib.suppress(asyncio.TimeoutError, OSError):
+                err = await asyncio.wait_for(self.proc.stderr.read(), timeout=1.0)
+        lines = [ln.strip() for ln in err.decode(errors="replace").splitlines() if ln.strip()]
+        return lines[-1] if lines else f"ssh exited with code {self.proc.returncode}"
+
+    def close(self) -> None:
+        _terminate_proc(self.proc)
+        self.proc = None
+
+
 async def launch_worker(
     host: str,
     remote_dir: str,
@@ -509,6 +619,7 @@ async def launch_worker(
     port: int = 0,
     wheels: WheelCache | None = None,
     spawn: Spawn | None = None,
+    tunnel: "PortForward | None" = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, int]:
     """Launch a worker process and return connected streams + port.
 
@@ -518,7 +629,9 @@ async def launch_worker(
 
     Returns ``(reader, writer, port)`` where *reader* and *writer* are
     asyncio stream objects connected to the worker's TCP port.  *wheels* and
-    *spawn* are as for ``_bootstrap_worker_venv``.
+    *spawn* are as for ``_bootstrap_worker_venv``.  With *tunnel*, the
+    connection goes through that SSH forward instead of to the host's port,
+    for a worker behind a firewall that lets only SSH in.
     """
     spawn = spawn or asyncio.create_subprocess_exec
     validate_worker_host(host)
@@ -532,7 +645,11 @@ async def launch_worker(
 
     # ── Try to reuse an existing worker at the fixed port ────────────────
     if bind_port != 0:
-        conn = await _try_connect(connect_host, bind_port)
+        if tunnel is not None:
+            await tunnel.open(bind_port)
+            conn = await tunnel.connect(timeout=5.0, required=False)
+        else:
+            conn = await _try_connect(connect_host, bind_port)
         if conn is not None:
             return conn[0], conn[1], bind_port
 
@@ -621,11 +738,27 @@ async def launch_worker(
     worker_port = int(line.split("=")[1])
     _relay_worker_output(proc, f"{host}:{worker_port}")
 
+    if tunnel is not None:
+        await tunnel.open(worker_port)
+        conn = await tunnel.connect(timeout=20.0)
+        assert conn is not None
+        return conn[0], conn[1], worker_port
+
     # Connect to the worker's TCP port
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(connect_host, worker_port),
-        timeout=10.0,
-    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(connect_host, worker_port),
+            timeout=10.0,
+        )
+    except (OSError, asyncio.TimeoutError) as e:
+        why = str(e) or "timed out after 10s"
+        remote = host != "localhost"
+        raise RuntimeError(
+            f"the worker started and listens on port {worker_port}, but the manager could not "
+            f"connect to {connect_host}:{worker_port} ({why})."
+            + (" A firewall that lets only SSH in would do this; add the worker with --tunnel "
+               "(tunnel = true in workers.toml) to connect over SSH instead." if remote else "")
+        ) from None
     return reader, writer, worker_port
 
 
@@ -818,7 +951,7 @@ async def _reconnect_worker(
             reader, writer, _ = await launch_worker(
                 host=wc.host, remote_dir=wc.remote_dir, token=state.token,
                 scratch_dir=wc.scratch_dir, devices=wc.gpus, max_jobs_per_gpu=wc.max_jobs_per_gpu,
-                password=wc.password, ssh_key=wc.ssh_key, venv=wc.venv, port=wc.port,
+                password=wc.password, ssh_key=wc.ssh_key, venv=wc.venv, port=wc.port, tunnel=wc.forward,
             )
         except Exception:
             continue
@@ -848,7 +981,8 @@ async def declare_worker_dead(
         keys = {run.key for run in state.runs_on(worker_id)}
         keys |= {j.key for j in await list_active_jobs(db, worker_id)}
         # Cancels go out before the worker is marked dead (dead workers get no messages).
-        await requeue_runs_locked(db, state, sorted(keys), lost=not shutdown)
+        await requeue_runs_locked(db, state, sorted(keys), lost=not shutdown,
+                                  why=f"worker {worker_id} {'was removed' if shutdown else 'died: ' + reason}")
         if wc is not None and wc.status != "dead":
             wc.status = "dead"
             _disconnect(wc, shutdown=shutdown)
@@ -867,6 +1001,9 @@ def _close_tunnel(wc: WorkerConn) -> None:
         task.cancel()
     proc, wc.tunnel_proc = wc.tunnel_proc, None
     _terminate_proc(proc)
+    forward, wc.forward = wc.forward, None
+    if forward is not None:
+        forward.close()
 
 
 def _terminate_proc(proc: "asyncio.subprocess.Process | None") -> None:
@@ -955,8 +1092,10 @@ async def _handle_worker_hello(
             if key in completed:
                 results.append(from_obj(report))
         # A run that never started has not really been tried; one that started has.
-        await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "dispatched"], lost=False)
-        await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "running"], lost=True)
+        await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "dispatched"], lost=False,
+                                  why="its worker reconnected without it, before it started")
+        await requeue_runs_locked(db, state, [j.key for j in lost if j.status == "running"], lost=True,
+                                  why="its worker reconnected without it (the worker restarted)")
 
         wc.status = "connected"
         wc.reconnect_attempts = 0
@@ -978,6 +1117,7 @@ async def _handle_worker_hello(
             devices=json.dumps(wc.gpus),
             unhealthy_devices=json.dumps(wc.unhealthy_gpus),
             status="connected",
+            tunnel=wc.forward is not None,
         )
         print(f"  {_GREEN}OK{_RESET}    {wc.host}: {_health_summary(wc)}")
         n_resumed = len(resuming.keys() & expected.keys())
@@ -1096,7 +1236,7 @@ async def _handle_metric(
     if run is None:
         return
     run.last_progress = time.time()
-    run.note_step(msg.step, msg.step_seconds, run.last_progress)
+    run.note_step(msg.step, msg.step_seconds, run.last_progress, msg.total_steps)
     await state.db_writer.insert_metric(run.job_key, run.attempt, msg.step, msg.data)
     state.broadcast(run.experiment_id, {
         "type": "metric", "run_id": run.run_id, "step": msg.step, "data": msg.data,
@@ -1191,10 +1331,16 @@ async def _handle_result(
             status, reason = run.ending if run.ending is not None else (None, None)
             if status is not None:
                 success = False
-            await state.db_writer.finish_job(
+            finished_job = await state.db_writer.finish_job(
                 rid, eid, success=success, exit_code=msg.exit_code, elapsed=elapsed,
                 status=status, reason=reason,
             )
+            ended_as = status or (finished_job.status if finished_job is not None else
+                                  ("done" if success else "failed"))
+            await state.db_writer.add_run_events([RunEvent(
+                eid, rid, "finished", "manager",
+                f"{ended_as}, exit {msg.exit_code}, after {format_duration(elapsed or 0)}"
+                + (f": {reason}" if reason else ""), run.attempt)])
             if nodes:
                 await state.db_writer.delete_job_nodes(rid, eid)
             # A pruned run ran fine, so for skip rules it is a success.
@@ -1278,7 +1424,17 @@ async def _handle_gpu_stats(
     wc.gpu_stats = {s["gpu"]: s for s in msg.stats if "gpu" in s}
 
 
+async def _handle_heartbeat(
+    db: aiosqlite.Connection, state: ManagerState, wc: WorkerConn, msg: MsgHeartbeat,
+) -> None:
+    """The script said it is still working: restart its stall clock."""
+    run = _find_run(state, wc, msg.experiment, msg.run_id, msg.attempt)
+    if run is not None:
+        run.last_progress = time.time()
+
+
 _HANDLERS: dict[type, Any] = {
+    MsgHeartbeat: _handle_heartbeat,
     MsgStarted: _handle_started,
     MsgLog: _handle_log,
     MsgMetric: _handle_metric,
@@ -1340,25 +1496,45 @@ async def cancel_runs_locked(
 
 async def requeue_runs_locked(
     db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey], *, lost: bool,
+    why: str = "", source: str = "manager",
 ) -> None:
     """Take in-flight runs off their workers and put the jobs back to pending.
 
     *lost*: the run died with its worker, which spends a retry (a job with none
     left fails).  Otherwise the manager took the run away, e.g. to free a GPU,
-    and no retry is spent.
+    and no retry is spent.  *why* and *source* go in the run's history.
     """
     if not keys:
         return
     # A run being stopped is not run again: it ends as what it was stopped for.
+    ended: set[RunKey] = set()
     for key in [k for k in keys if (r := state.runs.get(k)) is not None and r.ending is not None]:
         ending = state.runs[key].ending
         assert ending is not None
         await end_runs_locked(db, state, [key], *ending)
-    keys = [k for k in keys if k in state.runs]
+        ended.add(key)
+    # Keys with no in-flight state are requeued too: after a manager restart a
+    # run is known only from its row until a hello adopts it, and its worker
+    # may never send one.  requeue_jobs leaves rows that are no longer active.
+    keys = [k for k in keys if k not in ended]
     if not keys:
         return
+    where: dict[RunKey, str] = {}
+    attempts: dict[RunKey, int] = {}
+    for k in keys:
+        if (run := state.runs.get(k)) is not None:
+            where[k], attempts[k] = ", ".join(run.nodes), run.attempt
+        elif (job := await get_job(db, k[1], k[0])) is not None:
+            where[k], attempts[k] = job.worker_id or "", job.attempt
     _detach_locked(state, keys)
     requeued, failed = await state.db_writer.requeue_jobs(keys, spend_retry=lost)
+    because = why or ("its worker was lost" if lost else "taken off its worker")
+    await state.db_writer.add_run_events(
+        [RunEvent(j.experiment_id, j.run_id, "requeued", source,
+                  f"from {where.get(j.key) or '?'}: {because}"
+                  + (" (spends a retry)" if lost else ""), attempts.get(j.key)) for j in requeued]
+        + [RunEvent(j.experiment_id, j.run_id, "finished", "manager",
+                    f"failed: {because}, and no retries were left", attempts.get(j.key)) for j in failed])
     for job in requeued:
         if lost:
             print(f"  {_YELLOW}RETRY{_RESET} {job.run_id} (attempt {job.retry_count}/{job.max_retries})")
@@ -1373,10 +1549,63 @@ async def requeue_runs_locked(
     state.request_schedule()
 
 
+async def move_runs_locked(
+    state: ManagerState, source: str, target: str, run_ids: Sequence[str], *, source_of_move: str = "manager",
+) -> tuple[list[str], list[str]]:
+    """Move finished or pending runs of *source* to *target*, with their files.
+
+    The caller has checked that *target* exists and has none of these run IDs.
+    Returns ``(moved, files_not_moved)``.  Hold ``state.lock``.
+    """
+    moved = await state.db_writer.move_jobs(source, target, run_ids)
+    for rid in moved:
+        state.pins.pop((source, rid), None)
+    base = state.output_dir
+
+    def move_dirs() -> list[str]:
+        failed = []
+        for rid in moved:
+            try:
+                validate_run_id(rid)
+                src = Path(_resolve_safe_subpath(base, f"{source}/{rid}"))
+                if not src.exists():
+                    continue
+                dst = Path(_resolve_safe_subpath(base, f"{target}/{rid}"))
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+            except (OSError, ValueError) as exc:
+                print(f"  {_YELLOW}WARN{_RESET}  moving files of {source}/{rid}: {exc}")
+                failed.append(rid)
+        return failed
+
+    failed = await asyncio.to_thread(move_dirs) if base else []
+    await state.db_writer.add_run_events(
+        [RunEvent(source, rid, "moved", source_of_move, f"to {target}") for rid in moved]
+        + [RunEvent(target, rid, "moved", source_of_move, f"from {source}") for rid in moved])
+    for eid in (source, target):
+        state.broadcast(eid, {"type": "jobs_moved", "run_ids": moved, "source": source, "target": target})
+    return moved, failed
+
+
 async def _check_experiments_complete_locked(
     db: aiosqlite.Connection, state: ManagerState, experiment_ids: set[str],
 ) -> None:
-    """Mark running experiments completed once none of their jobs can still run."""
+    """Mark running experiments completed once none of their jobs can still run.
+
+    First, runs marked to move (``mlsweep move`` of an in-flight run) that have
+    now finished go to their new experiment.
+    """
+    experiment_ids = set(experiment_ids)
+    for eid, rid, target in await list_due_moves(db, experiment_ids):
+        if await get_experiment(db, target) is None or await get_job(db, rid, target) is not None:
+            await state.db_writer.set_move_to(eid, [rid], None)
+            await state.db_writer.add_run_events([RunEvent(
+                eid, rid, "move failed", "manager",
+                f"{target} " + ("no longer exists" if await get_experiment(db, target) is None
+                                else "already has a run with this ID") + "; it stays here")])
+            continue
+        await move_runs_locked(state, eid, target, [rid])
+        experiment_ids.add(target)
     for eid in experiment_ids:
         exp = await get_experiment(db, eid)
         if exp is None or exp.status != "running":
@@ -1415,6 +1644,10 @@ async def end_runs_locked(
     runs = [r for k in keys if (r := state.runs.get(k)) is not None]
     _detach_locked(state, keys)
     ended = await state.db_writer.end_jobs(keys, status, reason)
+    attempts = {r.key: r.attempt for r in runs}
+    await state.db_writer.add_run_events([
+        RunEvent(j.experiment_id, j.run_id, "finished", "manager", f"{status} without its result: {reason}",
+                 attempts.get((j.experiment_id, j.run_id))) for j in ended])
     for run in runs:
         await state.db_writer.pack_metrics(run.job_key, run.attempt)
     for job in ended:
@@ -1600,7 +1833,7 @@ async def requeue_jobs_of_unknown_workers(db: aiosqlite.Connection, state: Manag
             j.key for j in await list_active_jobs(db)
             if j.worker_id not in state.workers and j.worker_id not in state.launching
         ]
-        await requeue_runs_locked(db, state, keys, lost=True)
+        await requeue_runs_locked(db, state, keys, lost=True, why="its worker is no longer configured")
 
 
 # ===============================================================================
@@ -1646,6 +1879,7 @@ async def connect_workers(
             devices=cfg.get("devices"),
             max_jobs_per_gpu=cfg["jobs"] if cfg.get("jobs") is not None else 1,
             manager_port=manager_port,
+            tunnel=bool(cfg.get("tunnel")),
         )
         for wid, cfg, ok in zip(ids, configs, reserved) if ok
     ))
@@ -1718,6 +1952,7 @@ async def connect_single_worker(
     max_jobs_per_gpu: int = 1,
     manager_port: int = 0,
     launch: Callable[..., Any] | None = None,
+    tunnel: bool = False,
 ) -> WorkerConn | None:
     """Launch and connect to a worker, register it, and start its tasks.
 
@@ -1725,10 +1960,12 @@ async def connect_single_worker(
     claim is released here.  Returns ``None`` if the launch failed (the worker
     is then marked dead with the reason, and jobs the database had running on
     it are requeued).  *launch* starts the worker (default ``launch_worker``).
+    With *tunnel*, the manager reaches the worker through an SSH forward.
     """
     reader: asyncio.StreamReader | None
     writer: asyncio.StreamWriter | None
     reason = ""
+    forward = PortForward(host, ssh_key=ssh_key, password=password) if tunnel and host != "localhost" else None
     try:
         # Every worker has a row from its first launch on, so the System page
         # lists one that fails to start (and its retry or update has a target).
@@ -1737,7 +1974,10 @@ async def connect_single_worker(
                 worker_id=worker_id, host=host, remote_dir=remote_dir, scratch_dir=scratch_dir,
                 port=port, ssh_key=ssh_key, venv=venv,
                 devices=json.dumps(devices) if devices else None, status="offline",
+                tunnel=forward is not None,
             )
+        # Only a tunnelled worker passes it, so a *launch* that predates tunnels still works.
+        extra: dict[str, Any] = {"tunnel": forward} if forward is not None else {}
         try:
             reader, writer, actual_port = await (launch or launch_worker)(
                 host=host,
@@ -1750,10 +1990,13 @@ async def connect_single_worker(
                 ssh_key=ssh_key,
                 venv=venv,
                 port=port,
+                **extra,
             )
         except Exception as e:
-            reason = f"cannot start on {host}: {e}"
+            reason = f"cannot start on {host}: {e or type(e).__name__}"
             if not (port and await list_active_jobs(db, worker_id)):
+                if forward is not None:
+                    forward.close()
                 await declare_worker_dead(db, state, worker_id, reason)
                 return None
             # A worker on a fixed port outlives the manager and may still be
@@ -1772,6 +2015,7 @@ async def connect_single_worker(
             ssh_key=ssh_key,
             venv=venv,
             max_jobs_per_gpu=max_jobs_per_gpu,
+            forward=forward,
         )
         if host != "localhost" and manager_port:
             wc.tunnel_proc = await _launch_tunnel(host, manager_port, ssh_key=ssh_key, password=password)
@@ -1849,6 +2093,7 @@ def _relaunch_args(state: ManagerState, record: WorkerRecord) -> dict[str, Any]:
         port=record.port,
         devices=json.loads(record.devices) if record.devices else None,
         max_jobs_per_gpu=wc.max_jobs_per_gpu if wc is not None else 1,
+        tunnel=record.tunnel,
     )
 
 
@@ -1874,7 +2119,21 @@ async def update_worker(
             return
         args = _relaunch_args(state, record)
         print(f"  {_CYAN}UPDATE{_RESET} {record.host}: relaunching the worker", flush=True)
-        if record.port:
+        if record.port and record.tunnel:
+            # The old worker's port is only reachable through SSH.
+            probe = PortForward(record.host, ssh_key=record.ssh_key, password=args["password"])
+            try:
+                await probe.open(record.port)
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    conn = await probe.connect(timeout=2.0, required=False)
+                    if conn is None:
+                        break
+                    _close_writer(conn[1])
+                    await asyncio.sleep(0.5)
+            finally:
+                probe.close()
+        elif record.port:
             # The launch reuses a worker it finds on a fixed port, so let the old
             # one finish shutting down first.
             await _wait_until_closed(_bare_host(record.host), record.port)
@@ -1917,8 +2176,15 @@ async def scheduler_loop(db: aiosqlite.Connection, state: ManagerState) -> None:
 
 
 async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -> None:
-    """Dispatch every pending job that fits, in priority order."""
-    connected = [wc for wc in state.workers.values() if wc.status == "connected"]
+    """Dispatch every pending job that fits, in priority order.
+
+    Nothing starts while scheduling is paused, and nothing starts on a paused
+    worker.  A job pinned to a paused worker waits for it to be unpaused.
+    """
+    if state.paused:
+        return
+    connected = [wc for wc in state.workers.values()
+                 if wc.status == "connected" and wc.worker_id not in state.paused_workers]
     if not connected:
         return
     occupancy = {wc.worker_id: state.occupancy(wc) for wc in connected}
@@ -1927,7 +2193,9 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
         for wc in connected for n in occupancy[wc.worker_id].values()
     )
     now = time.time()
-    for key in [k for k, p in state.pins.items() if now - p.made > PIN_TTL_SECONDS]:
+    # A pin to a paused worker does not age: it is where someone put the job.
+    for key in [k for k, p in state.pins.items()
+                if now - p.made > PIN_TTL_SECONDS and p.worker_id not in state.paused_workers]:
         del state.pins[key]
     # A pinned job goes to its GPUs even when every GPU is at its cap.
     pending = await list_schedulable_jobs(db, cpu_only=not gpu_free and not state.pins)
@@ -1950,6 +2218,8 @@ async def _schedule_pass_locked(db: aiosqlite.Connection, state: ManagerState) -
         if cap and running.get(job.experiment_id, 0) >= cap:
             continue
         pin = state.pins.get((job.experiment_id, job.run_id))
+        if pin is not None and pin.worker_id in state.paused_workers:
+            continue
         placements = _pinned_placement(job, pin, state) if pin is not None else None
         if pin is not None and placements is None:
             # The worker left or the GPUs left its pool: place it as usual.
@@ -2057,6 +2327,10 @@ async def _dispatch_locked(
         nodes={wc.worker_id: gpus for wc, gpus in placements},
     )
     state.runs[run.key] = run
+    where = "; ".join(f"{wc.worker_id} GPU{'s' if len(g) != 1 else ''} {','.join(map(str, g)) or '-'}"
+                      for wc, g in placements)
+    await state.db_writer.add_run_events([RunEvent(
+        job.experiment_id, job.run_id, "dispatched", "manager", f"to {where}", claimed.attempt)])
 
     command = json.loads(claimed.command)
     if isinstance(command, str):

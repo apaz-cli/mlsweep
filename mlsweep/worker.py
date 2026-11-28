@@ -63,6 +63,7 @@ from mlsweep._shared import (
     MsgRun,
     MsgShutdown,
     MsgStarted,
+    MsgHeartbeat,
     MsgSyncReq,
     MsgWorkerHello,
     LOG_CHUNK_BYTES,
@@ -1251,13 +1252,19 @@ def _handle_ipc_msg(msg: dict[str, Any], state: RunState | None) -> None:
         except OSError:
             pass
         secs = msg.get("step_seconds")
+        total = msg.get("total_steps")
         _send_run_msg(encode(MsgMetric(
             run_id=run_id, experiment=state.experiment, attempt=state.attempt, step=step, data=data,
-            step_seconds=float(secs) if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None)))
+            step_seconds=float(secs) if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None,
+            total_steps=int(total) if isinstance(total, int) and not isinstance(total, bool) else None)))
 
     elif msg_type == "sync":
         _send_run_msg(encode(MsgSyncReq(run_id=run_id, experiment=state.experiment,
                                         attempt=state.attempt)))
+
+    elif msg_type == "heartbeat":
+        _send_run_msg(encode(MsgHeartbeat(run_id=run_id, experiment=state.experiment,
+                                          attempt=state.attempt)))
 
 
 # ── GPU stats polling ─────────────────────────────────────────────────────────

@@ -42,7 +42,7 @@ import zipfile
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncContextManager, Callable, Awaitable, TypeGuard
+from typing import Any, AsyncContextManager, Awaitable, Callable, Iterable, TypeGuard
 
 import aiosqlite
 from aiohttp import WSMsgType, web
@@ -63,6 +63,8 @@ from mlsweep._manager_db import (
     ACTIVE_JOB_STATUSES,
     FINISHED_JOB_STATUSES,
     JOB_STATUSES,
+    RunEvent,
+    list_run_events,
     WorkerRecord,
     count_pending_jobs,
     experiment_summary,
@@ -91,8 +93,9 @@ from mlsweep._manager_optimizer import (
     read_progress,
     status_view,
 )
-from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState, Pin
+from mlsweep._manager_state import PLACEMENTS, InFlightRun, ManagerState, Pin, RunKey
 from mlsweep._manager_workers import (
+    move_runs_locked,
     _check_experiments_complete_locked,
     _detach_locked,
     cancel_runs_locked,
@@ -549,6 +552,20 @@ async def audit_middleware(
             }))
 
 
+def _source(request: web.Request) -> str:
+    """Who asked, for a run's history: ``cli`` and ``dashboard`` say so in a header."""
+    value = request.headers.get("X-Mlsweep-Client", "").strip().lower()
+    return value if value in ("cli", "dashboard") else "api"
+
+
+async def _record(request: web.Request, experiment_id: str, run_ids: Iterable[str | None], action: str,
+                  detail: str | None = None) -> None:
+    """Add *action* to the history of each of *run_ids* (None: the experiment itself)."""
+    state: ManagerState = request.config_dict[STATE_KEY]
+    source = _source(request)
+    await state.db_writer.add_run_events([RunEvent(experiment_id, r, action, source, detail) for r in run_ids])
+
+
 def setup_audit_log(mlsweep_dir: Path) -> None:
     """Send the audit log to ``<mlsweep_dir>/audit.log``, keeping a few old files."""
     for old in list(_audit.handlers):
@@ -751,6 +768,7 @@ async def handle_update_experiment_campaign(request: web.Request) -> web.Respons
     if exp is None:
         return _not_found("experiment")
     _broadcast_experiment_event(request, experiment_id, "campaign_updated", campaign=target)
+    await _record(request, experiment_id, [None], "moved", f"to campaign {target}")
     return _json_response(exp)
 
 
@@ -943,15 +961,21 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
             if controls.pop("note", None) is not None:  # why the manager paused it
                 await state.db_writer.update_experiment_controls(experiment_id, controls)
         # Aborting stops the sweep for good, so cancel everything unfinished.
+        stopped: list[RunKey] = []
         if status == "aborted":
             pending = await list_jobs_by_experiment(db, experiment_id, status="pending")
-            await cancel_runs_locked(db, state, [*state.runs_of(experiment_id), *(j.key for j in pending)])
+            stopped = [*state.runs_of(experiment_id), *(j.key for j in pending)]
+            await cancel_runs_locked(db, state, stopped)
         # Its last job may have finished while it was paused.
         await _check_experiments_complete_locked(db, state, {experiment_id})
     state.request_schedule()
 
     # Broadcast event
     _broadcast_experiment_event(request, experiment_id, "status_updated", status=status)
+    action = {"paused": "paused", "aborted": "stopped", "running": "unpaused"}.get(status, f"status {status}")
+    await _record(request, experiment_id, [None], action,
+                  f"cancelled {len(stopped)} unfinished run(s)" if stopped else None)
+    await _record(request, experiment_id, [k[1] for k in stopped], "cancelled", "the experiment was stopped")
     return _json_response(exp)
 
 
@@ -1105,6 +1129,28 @@ async def handle_update_experiment_name(request: web.Request) -> web.Response:
     return _json_response(exp)
 
 
+@routes.put("/api/experiments/{experiment_id}/description")
+async def handle_update_experiment_description(request: web.Request) -> web.Response:
+    """Set an experiment's description, or clear it with null or "".
+
+    The database calls it the experiment's ``note``; experiment JSON keeps that key.
+    """
+    state: ManagerState = request.config_dict[STATE_KEY]
+    experiment_id = request.match_info["experiment_id"]
+    body = await _json_body(request)
+    if "description" not in body:
+        return _error_response("'description' is required (null or \"\" clears it)")
+    description = body["description"]
+    if description is not None and not isinstance(description, str):
+        return _error_response("'description' must be a string or null")
+    description = (description or "").strip() or None
+    exp = await state.db_writer.update_experiment_note(experiment_id, description)
+    if exp is None:
+        return _not_found("experiment")
+    _broadcast_experiment_event(request, experiment_id, "description_updated", description=description)
+    return _json_response(exp)
+
+
 @routes.put("/api/experiments/{experiment_id}/max_concurrent")
 async def handle_update_experiment_max_concurrent(request: web.Request) -> web.Response:
     """Set an experiment's max concurrent running jobs (0 = unlimited).
@@ -1140,12 +1186,36 @@ async def handle_delete_experiment(request: web.Request) -> web.Response:
 
     async with state.lock:
         # Stop in-flight runs for this experiment before deleting their rows.
-        _detach_locked(state, state.runs_of(experiment_id))
+        in_flight = state.runs_of(experiment_id)
+        _detach_locked(state, in_flight)
         existed = await state.db_writer.delete_experiment(experiment_id)
     state.request_schedule()
     if not existed:
         return _not_found("experiment")
+    names = ", ".join(sorted(k[1] for k in in_flight))
+    await _record(request, experiment_id, [None], "deleted",
+                  f"stopped {len(in_flight)} in-flight run(s): {names}" if in_flight else None)
     return _json_response({"deleted": experiment_id})
+
+
+@routes.get("/api/history")
+async def handle_history(request: web.Request) -> web.Response:
+    """What happened to an experiment's runs, oldest first: ``?experiment_id=`` (required),
+    ``run_id=`` for one run (with the experiment-wide entries), ``limit=`` (default 1000).
+
+    Answers for a deleted experiment too, since its history outlives it.
+    """
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    experiment_id = request.query.get("experiment_id", "")
+    if not experiment_id:
+        return _error_response("'experiment_id' is required")
+    try:
+        limit = max(1, min(int(request.query.get("limit", "1000")), 20000))
+    except ValueError:
+        return _error_response("'limit' must be a number")
+    events = await list_run_events(db, experiment_id, request.query.get("run_id") or None, limit)
+    return _json_response({"experiment_id": experiment_id, "exists": await get_experiment(db, experiment_id)
+                           is not None, "events": events})
 
 
 @routes.get("/api/experiments/{experiment_id}/summary")
@@ -1183,9 +1253,11 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
     default threshold), merged from in-memory run state.  Once a metric has
     arrived this session they also carry ``last_step``, ``step_age_seconds``
     (seconds since that step first arrived), ``step_seconds`` (wall seconds
-    per step as the run's logger measured it, or null until it has one) and
+    per step as the run's logger measured it, or null until it has one),
     ``avg_step_seconds`` (wall seconds per step since the first step this
-    session, or null until the step has advanced).
+    session, or null until the step has advanced), ``total_steps`` (the step
+    the run ends at, if the script told its logger) and ``eta_seconds`` (the
+    time left at the average pace, or null without ``total_steps``).
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -1209,6 +1281,8 @@ async def handle_list_experiment_jobs(request: web.Request) -> web.Response:
                     d["step_age_seconds"] = max(0.0, now - run.last_step_time)
                     d["step_seconds"] = run.step_seconds
                     d["avg_step_seconds"] = run.avg_step_seconds
+                    d["total_steps"] = run.total_steps
+                    d["eta_seconds"] = run.eta_seconds(now)
         out.append(d)
     return _json_response(out)
 
@@ -1344,6 +1418,7 @@ async def handle_insert_job(request: web.Request) -> web.Response:
         return _job_insert_refused(exc)
 
     state.request_schedule()
+    await _record(request, job.experiment_id, [job.run_id], "submitted")
 
     return _json_response(job, status=201)
 
@@ -1371,6 +1446,8 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
         return _job_insert_refused(exc)
 
     state.request_schedule()
+    for eid in sorted({r.experiment_id for r in records}):
+        await _record(request, eid, [r.run_id for r in records if r.experiment_id == eid], "submitted")
 
     return _json_response(records, status=201)
 
@@ -1415,6 +1492,8 @@ async def handle_create_experiment_with_jobs(request: web.Request) -> web.Respon
         )
 
     state.request_schedule()
+    await _record(request, experiment_id, [r.run_id for r in records], "submitted",
+                  f"with {len(records)} run(s) in this submission")
     return _json_response({"experiment": exp, "jobs": records}, status=201)
 
 
@@ -1479,6 +1558,7 @@ async def handle_update_job_status(request: web.Request) -> web.Response:
             return _error_response("job is in flight; cancel it instead", status=409)
         await _check_experiments_complete_locked(db, state, {experiment_id})
     state.request_schedule()
+    await _record(request, experiment_id, [run_id], "marked", status)
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -1510,6 +1590,7 @@ async def handle_update_job_priority(request: web.Request) -> web.Response:
         return _not_found("job")
 
     state.request_schedule()
+    await _record(request, experiment_id, [run_id], "priority", str(priority))
 
     # Broadcast event
     _broadcast_experiment_event(
@@ -1537,6 +1618,7 @@ async def handle_update_job_label(request: web.Request) -> web.Response:
     job = await state.db_writer.update_job_label(run_id, experiment_id, label)
     if job is None:
         return _not_found("job")
+    await _record(request, experiment_id, [run_id], "renamed", label or "name cleared")
     _broadcast_experiment_event(
         request, job.experiment_id, "job_updated",
         run_id=run_id, label=label,
@@ -1562,6 +1644,8 @@ async def handle_cancel_job(request: web.Request) -> web.Response:
         await cancel_runs_locked(db, state, [(experiment_id, run_id)])
 
     updated = await get_job(db, run_id, experiment_id)
+    if job.status in ("pending", "dispatched", "running"):
+        await _record(request, experiment_id, [run_id], "cancelled", f"while {job.status}")
     return _json_response(updated if updated is not None else job)
 
 
@@ -1630,7 +1714,12 @@ async def handle_reschedule_job(request: web.Request) -> web.Response:
             pin = Pin(worker_id=worker_id, gpus=sorted(chosen))
         requeued = key in state.runs
         if requeued:
-            await requeue_runs_locked(db, state, [key], lost=False)
+            await requeue_runs_locked(
+                db, state, [key], lost=False, source=_source(request),
+                why=f"rescheduled to {pin.worker_id} GPUs {','.join(map(str, pin.gpus))}" if pin else "rescheduled")
+        elif pin is not None:
+            await _record(request, job.experiment_id, [run_id], "pinned",
+                          f"starts next on {pin.worker_id} GPUs {','.join(map(str, pin.gpus))}")
         if pin is not None:
             state.pins[key] = pin
         else:
@@ -1668,6 +1757,7 @@ async def handle_retry_job(request: web.Request) -> web.Response:
                 f"job is {current.status}; only finished jobs can be retried", status=409,
             )
 
+    await _record(request, job.experiment_id, [run_id], "retried")
     # Broadcast event
     _broadcast_experiment_event(
         request, job.experiment_id, "job_retried", run_id=run_id,
@@ -1698,6 +1788,8 @@ async def handle_delete_job(request: web.Request) -> web.Response:
         await cancel_runs_locked(db, state, [(experiment_id, run_id)])
 
     updated = await get_job(db, run_id, experiment_id)
+    if job.status in ("pending", "dispatched", "running"):
+        await _record(request, experiment_id, [run_id], "cancelled", f"while {job.status}")
     return _json_response(updated if updated is not None else job)
 
 
@@ -1729,11 +1821,15 @@ def _run_conflict(problems: dict[str, str]) -> web.Response:
 
 @routes.post("/api/experiments/{experiment_id}/jobs/move")
 async def handle_move_jobs(request: web.Request) -> web.Response:
-    """Move finished runs to another experiment, with their metrics, logs and files.
+    """Move runs to another experiment, with their metrics, logs and files.
 
-    Body: ``{"run_ids": [...], "to": TARGET_EXPERIMENT}``.  Refused (409) if a
-    run is still pending or running, or if TARGET already has a run with the
-    same ID.  With ``?campaign=``, both experiments must be in that campaign.
+    Body: ``{"run_ids": [...], "to": TARGET, "after_finish": bool, "create": bool}``.
+    Finished and pending runs move now.  A run still dispatched or running is
+    refused (409) unless ``after_finish``, which marks it to move when it
+    finishes.  ``create`` makes TARGET if it doesn't exist, in the source's
+    campaign with its metric, goal and run controls.  Refused (409) if TARGET
+    already has a run with one of these IDs.  With ``?campaign=``, both
+    experiments must be in that campaign.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
@@ -1741,60 +1837,72 @@ async def handle_move_jobs(request: web.Request) -> web.Response:
     body = await _json_body(request)
     run_ids = _run_ids_from(body)
     target = body.get("to")
+    after_finish = body.get("after_finish", False)
+    create = body.get("create", False)
     if run_ids is None or not isinstance(target, str) or not target:
         return _error_response("expected {run_ids: [...], to: EXPERIMENT_ID}")
+    if not isinstance(after_finish, bool) or not isinstance(create, bool):
+        return _error_response("'after_finish' and 'create' must be true or false")
     if target == source:
         return _error_response("source and target are the same experiment")
-    src_exp, dst_exp = await get_experiment(db, source), await get_experiment(db, target)
-    if src_exp is None:
-        return _not_found("experiment")
-    if dst_exp is None:
-        return _not_found(f"target experiment {target!r}")
-    campaign = request.query.get("campaign")
-    if campaign is not None and dst_exp.campaign != campaign:
-        return _wrong_campaign(target, dst_exp.campaign, campaign)
     try:
         _sanitize_experiment_id(target)
     except ValueError as exc:
         return _error_response(str(exc))
+    src_exp, dst_exp = await get_experiment(db, source), await get_experiment(db, target)
+    if src_exp is None:
+        return _not_found("experiment")
+    campaign = request.query.get("campaign")
+    if dst_exp is None and not create:
+        return _not_found(f"target experiment {target!r}")
+    if dst_exp is not None and campaign is not None and dst_exp.campaign != campaign:
+        return _wrong_campaign(target, dst_exp.campaign, campaign)
 
     mlsweep_dir: Path = request.config_dict[DIR_KEY]
     async with state.lock:
-        problems = await _not_finished(db, state, source, run_ids)
-        taken = await job_statuses(db, target, run_ids)
+        statuses = await job_statuses(db, source, run_ids)
+        taken = await job_statuses(db, target, run_ids) if dst_exp is not None else {}
 
         def _dirs_taken() -> set[str]:
             return {rid for rid in run_ids if _run_dir_exists(mlsweep_dir, target, rid)}
         dirs_taken = await asyncio.to_thread(_dirs_taken)
+        problems: dict[str, str] = {}
+        now: list[str] = []
+        later: list[str] = []
         for rid in run_ids:
-            if rid in problems:
-                continue
-            if rid in taken:
+            status = statuses.get(rid)
+            if status is None:
+                problems[rid] = f"{rid}: no such run in {source}"
+            elif rid in taken:
                 problems[rid] = f"{rid}: {target} already has a run with this ID"
             elif rid in dirs_taken:
                 problems[rid] = f"{rid}: {target} already has files for a run with this ID"
+            elif status in ("dispatched", "running") or (source, rid) in state.runs:
+                if after_finish:
+                    later.append(rid)
+                else:
+                    problems[rid] = f"{rid}: still {status}; move it when it finishes (after_finish), or cancel it"
+            else:
+                now.append(rid)
         if problems:
             return _run_conflict(problems)
-        moved = await state.db_writer.move_jobs(source, target, run_ids)
-
-        def _move_dirs() -> list[str]:
-            failed = []
-            for rid in moved:
-                try:
-                    src_dir = _run_dir(mlsweep_dir, source, rid)
-                    if not src_dir.exists():
-                        continue
-                    dst_dir = _run_dir(mlsweep_dir, target, rid)
-                    dst_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src_dir), str(dst_dir))
-                except (OSError, ValueError) as exc:
-                    logger.warning("moving files of %s/%s: %s", source, rid, exc)
-                    failed.append(rid)
-            return failed
-        failed = await asyncio.to_thread(_move_dirs)
-    for eid in (source, target):
-        _broadcast_experiment_event(request, eid, "jobs_moved", run_ids=moved, source=source, target=target)
-    result: dict[str, Any] = {"moved": moved, "from": source, "to": target}
+        created = False
+        if dst_exp is None:
+            controls = json.loads(src_exp.controls) if src_exp.controls else None
+            if isinstance(controls, dict):
+                controls.pop("note", None)
+            await state.db_writer.create_experiment(
+                experiment_id=target, name=target, campaign=src_exp.campaign, metric=src_exp.metric,
+                goal=src_exp.goal, controls=controls or None, note=f"runs moved from {source}")
+            created = True
+            await _record(request, target, [None], "created", f"by moving runs from {source}")
+        moved, failed = await move_runs_locked(state, source, target, now, source_of_move=_source(request))
+        marked = await state.db_writer.set_move_to(source, later, target)
+        await _record(request, source, marked, "will move", f"to {target} when it finishes")
+        await _check_experiments_complete_locked(db, state, {source, target})
+    state.request_schedule()
+    result: dict[str, Any] = {"moved": moved, "will_move": marked, "from": source, "to": target,
+                              "created": created}
     if failed:
         result["files_not_moved"] = failed
     return _json_response(result)
@@ -1835,6 +1943,7 @@ async def handle_purge_jobs(request: web.Request) -> web.Response:
         return freed
     freed = await asyncio.to_thread(_rm)
     _broadcast_experiment_event(request, experiment_id, "jobs_purged", run_ids=purged)
+    await _record(request, experiment_id, purged, "purged")
     return _json_response({"purged": purged, "bytes_freed": freed})
 
 
@@ -2594,8 +2703,10 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         d["max_jobs_per_gpu"] = 1
     # Every GPU's runs, including GPUs out of the pool whose runs are finishing,
     # and the jobs pinned to start here next.
+    now = time.time()
     d["gpu_runs"] = {
-        str(g): [{"run_id": r.run_id, "experiment_id": r.experiment_id} for r in runs]
+        str(g): [{"run_id": r.run_id, "experiment_id": r.experiment_id, "eta_seconds": r.eta_seconds(now)}
+                 for r in runs]
         for g, runs in state.runs_by_gpu(wr.worker_id).items()
     }
     d["pins"] = [
@@ -2603,6 +2714,7 @@ def _enrich_worker(wr: WorkerRecord, state: ManagerState) -> dict[str, Any]:
         for key, pin in state.pins.items() if pin.worker_id == wr.worker_id
     ]
     d["outdated"] = worker_outdated(state, wr.worker_id)
+    d["paused"] = wr.worker_id in state.paused_workers
     return d
 
 
@@ -2638,8 +2750,9 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     """Add a new worker dynamically.
 
     Accepts JSON body: {host (required), remote_dir?, ssh_key?, venv?,
-    port?, devices?, scratch_dir?}.  Generates a worker_id from the host, upserts into the DB,
-    and spawns a background task to connect to the worker.
+    port?, devices?, scratch_dir?, tunnel?}.  Generates a worker_id from the host, upserts into the DB,
+    and spawns a background task to connect to the worker.  With ``tunnel``, the
+    manager reaches the worker through an SSH forward instead of dialing its port.
 
     ``remote_dir`` is optional: the training code is shipped as an artifact and
     the worker falls back to its own working directory when it is empty.
@@ -2672,6 +2785,11 @@ async def handle_add_worker(request: web.Request) -> web.Response:
     if devices is not None and not (isinstance(devices, list) and all(
             isinstance(d, int) and not isinstance(d, bool) for d in devices)):
         return _error_response("'devices' must be a list of GPU indices")
+    tunnel = body.get("tunnel", False)
+    if not isinstance(tunnel, bool):
+        return _error_response("'tunnel' must be true or false")
+    if tunnel and host == "localhost":
+        return _error_response("'tunnel' is for a remote worker; a local one is reached directly")
 
     # Use explicit worker_id (reconnect) or derive from host/port (new worker),
     # and claim it so a concurrent add of the same worker is refused.
@@ -2696,6 +2814,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
             port=port,
             devices=json.dumps(devices) if devices else None,
             status="offline",
+            tunnel=tunnel,
         )
     except Exception:
         state.launching.discard(worker_id)
@@ -2713,6 +2832,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
         port=port,
         devices=devices,
         manager_port=state.manager_port,
+        tunnel=tunnel,
     ))
 
     return _json_response(worker, status=201)
@@ -2736,6 +2856,11 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     # Cancels its runs (requeued without spending retries), tells the worker
     # to exit, and marks it dead.
     await declare_worker_dead(db, state, worker_id, "", shutdown=True)
+    # A worker added again later starts unpaused.
+    async with state.lock:
+        if worker_id in state.paused_workers:
+            state.paused_workers.discard(worker_id)
+            await _save_pauses(state)
 
     return _json_response({"worker_id": worker_id, "status": "dead"})
 
@@ -2835,7 +2960,8 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
         evict = [r for r in state.runs_on(worker_id) if remove_set & set(r.nodes[worker_id])]
         wc.gpus = sorted((set(wc.gpus) - remove_set - set(drain_gpus)) | set(add_gpus))
         # A pin to a GPU that just left the pool is dropped by the next pass.
-        await requeue_runs_locked(db, state, [r.key for r in evict], lost=False)
+        await requeue_runs_locked(db, state, [r.key for r in evict], lost=False, source=_source(request),
+                                  why=f"GPUs {','.join(map(str, sorted(remove_set)))} were removed from {worker_id}")
         await state.db_writer.update_worker_devices(worker_id, json.dumps(wc.gpus))
         gpus = list(wc.gpus)
         to_evict = [r.run_id for r in evict]
@@ -2849,11 +2975,20 @@ async def handle_patch_worker_devices(request: web.Request) -> web.Response:
 # ── Scheduler ──────────────────────────────────────────────────────────────────
 
 
+def _scheduler_settings(state: ManagerState) -> dict[str, Any]:
+    return {"placement": state.placement, "paused": state.paused,
+            "paused_workers": sorted(state.paused_workers)}
+
+
 @routes.get("/api/scheduler")
 async def handle_get_scheduler(request: web.Request) -> web.Response:
-    """Return the scheduler settings: ``{"placement": "pack" | "spread"}``."""
+    """Return the scheduler settings.
+
+    ``{"placement": "pack" | "spread", "paused": bool, "paused_workers": [str]}``.
+    ``paused`` means nothing starts anywhere; ``paused_workers`` start nothing new.
+    """
     state: ManagerState = request.config_dict[STATE_KEY]
-    return _json_response({"placement": state.placement})
+    return _json_response(_scheduler_settings(state))
 
 
 @routes.patch("/api/scheduler")
@@ -2874,6 +3009,76 @@ async def handle_patch_scheduler(request: web.Request) -> web.Response:
         state.placement = placement
     state.request_schedule()
     return _json_response({"placement": placement})
+
+
+async def _save_pauses(state: ManagerState) -> None:
+    await state.db_writer.set_setting("paused", "1" if state.paused else "0")
+    await state.db_writer.set_setting("paused_workers", json.dumps(sorted(state.paused_workers)))
+
+
+async def _pause_target(request: web.Request) -> str | web.Response:
+    """The worker id the body names, ``""`` for the whole cluster, or an error response."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    state: ManagerState = request.config_dict[STATE_KEY]
+    body = await _json_body(request) if request.can_read_body else {}
+    worker_id = body.get("worker_id") or ""
+    if not isinstance(worker_id, str):
+        return _error_response("'worker_id' must be a string")
+    if worker_id and worker_id not in state.workers and await get_worker(db, worker_id) is None:
+        return _not_found("worker")
+    return worker_id
+
+
+@routes.post("/api/scheduler/pause")
+async def handle_pause_scheduler(request: web.Request) -> web.Response:
+    """Stop starting jobs, on one worker or everywhere.
+
+    Accepts JSON: {"worker_id": str} to pause one worker (online or not), or
+    no body to pause the whole cluster.  Running jobs carry on.  A job pinned
+    by hand while paused (``reschedule --to``, a drag on the System page)
+    waits on its pin until the pause is lifted.  Saved across restarts.
+    """
+    state: ManagerState = request.config_dict[STATE_KEY]
+    target = await _pause_target(request)
+    if isinstance(target, web.Response):
+        return target
+    async with state.lock:
+        if target:
+            state.paused_workers.add(target)
+        else:
+            state.paused = True
+        await _save_pauses(state)
+        settings = _scheduler_settings(state)
+    return _json_response(settings)
+
+
+@routes.post("/api/scheduler/unpause")
+async def handle_unpause_scheduler(request: web.Request) -> web.Response:
+    """Start scheduling again, on one worker or everywhere.
+
+    Accepts JSON: {"worker_id": str} to unpause one worker, or no body to
+    lift every pause (the cluster's and each worker's).  Pins made during
+    the pause start counting toward their expiry again from now.
+    """
+    state: ManagerState = request.config_dict[STATE_KEY]
+    target = await _pause_target(request)
+    if isinstance(target, web.Response):
+        return target
+    async with state.lock:
+        resumed = {target} if target else set(state.paused_workers)
+        if target:
+            state.paused_workers.discard(target)
+        else:
+            state.paused = False
+            state.paused_workers.clear()
+        now = time.time()
+        for pin in state.pins.values():
+            if not target or pin.worker_id in resumed:
+                pin.made = now
+        await _save_pauses(state)
+        settings = _scheduler_settings(state)
+    state.request_schedule()
+    return _json_response(settings)
 
 
 # ── Artifacts ──────────────────────────────────────────────────────────────────

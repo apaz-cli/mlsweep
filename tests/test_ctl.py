@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from conftest import _api_get, _api_post, _api_request
+from conftest import _api_get, _api_post, _api_request, _api_status
 from recording_server import RecordingServer
 
 from mlsweep import ctl
@@ -605,6 +605,286 @@ def test_wait_stalled_ignores_fresh_runs():
     assert ctl.wait_outcome("e", jobs, "stalled", 900, _no_experiment).code == ctl.WAIT_EXIT_STALLED
 
 
+def _verdict(outcome, code, runs=()):
+    return ctl.WaitVerdict(code, outcome, outcome, [dict(r) for r in runs])
+
+
+def test_combine_waits_for_every_experiment_to_settle():
+    done = _verdict("settled", ctl.WAIT_EXIT_SETTLED)
+    assert ctl.combine_wait_verdicts({"a": done, "b": None}, "done") is None
+    both = ctl.combine_wait_verdicts({"a": done, "b": _verdict("cancelled", ctl.WAIT_EXIT_CANCELLED)}, "done")
+    assert both.code == ctl.WAIT_EXIT_CANCELLED
+    failed = _verdict("failure", ctl.WAIT_EXIT_FAILURE, [{"run_id": "r"}])
+    worst = ctl.combine_wait_verdicts({"a": done, "b": failed}, "done")
+    assert worst.code == ctl.WAIT_EXIT_FAILURE and worst.runs == [{"run_id": "r", "experiment_id": "b"}]
+
+
+def test_combine_settled_with_failures_does_not_end_any_done():
+    # Under any-done, an experiment that settled with failures keeps waiting for the rest.
+    failed = _verdict("failure", ctl.WAIT_EXIT_FAILURE, [{"run_id": "r"}])
+    assert ctl.combine_wait_verdicts({"a": failed, "b": None}, "any-done") is None
+    # Under any-failure it is the answer.
+    assert ctl.combine_wait_verdicts({"a": failed, "b": None}, "any-failure").code == ctl.WAIT_EXIT_FAILURE
+
+
+def test_combine_reports_finished_runs_from_every_experiment():
+    a = _verdict("run_finished", 0, [{"run_id": "r1", "status": "done"}])
+    b = _verdict("run_finished", 0, [{"run_id": "r2", "status": "failed"}])
+    v = ctl.combine_wait_verdicts({"a": a, "b": b, "c": None}, "any-done")
+    assert v.outcome == "run_finished" and v.code == ctl.WAIT_EXIT_SETTLED
+    assert [(j["experiment_id"], j["run_id"]) for j in v.runs] == [("a", "r1"), ("b", "r2")]
+    assert "a/r1 (done)" in v.message and "b/r2 (failed)" in v.message
+    # A pause needs a person, so it wins over a finished run.
+    paused = _verdict("paused", ctl.WAIT_EXIT_FAILURE)
+    assert ctl.combine_wait_verdicts({"a": a, "b": paused}, "any-done").outcome == "paused"
+
+
+def test_campaign_candidates_are_active_or_recently_finished():
+    def exp(eid, active=0, last=None, **kw):
+        return {"experiment_id": eid, "status": "running" if active else "completed",
+                "job_counts": {"running": active}, "last_finish_time": last, **kw}
+    listing = [exp("live", active=2), exp("old", last="2026-01-01T00:00:00+00:00"),
+               exp("fresh", last="2026-06-01T00:00:00+00:00"), exp("never"),
+               exp("bayes", optimize='{"budget": 4}', status="running", job_counts={})]
+    since = ctl._parse_since("2026-03-01T00:00:00+00:00")
+    assert ctl.campaign_wait_candidates(listing, since, set(), True) == ["live", "fresh", "bayes"]
+    # One already watched stays, so its last run's finish is not missed.
+    assert "old" in ctl.campaign_wait_candidates(listing, since, {"old"}, False)
+    # An older manager reports no finish times: check everything once.
+    bare = [{k: v for k, v in e.items() if k != "last_finish_time"} for e in listing]
+    assert len(ctl.campaign_wait_candidates(bare, since, set(), True)) == 5
+    assert ctl.campaign_wait_candidates(bare, since, set(), False) == ["live", "bayes"]
+
+
+def test_any_failure_with_fail_since_ignores_old_failures():
+    jobs = [{"run_id": "r1", "status": "failed", "finish_time": "2026-01-01T00:00:00+00:00"},
+            {"run_id": "r2", "status": "running"}]
+    since = ctl._parse_since("2026-03-01T00:00:00+00:00")
+    assert ctl.wait_outcome("e", jobs, "any-failure", 900, _no_experiment, fail_since=since) is None
+    assert ctl.wait_outcome("e", jobs, "any-failure", 900, _no_experiment).code == ctl.WAIT_EXIT_FAILURE
+
+
+def _json_tail(out):
+    """The JSON value at the end of *out*; in-process, the text verdict is printed before it."""
+    return json.loads(out[out.index("\n{") + 1:] if not out.startswith("{") else out)
+
+
+def _sleeper(url, eid, rid, seconds):
+    """A real run of *seconds* on the fixture's worker (no GPU needed)."""
+    _api_post(url, _TOKEN, "/api/jobs", {
+        "run_id": rid, "experiment_id": eid, "gpus_per_run": 0,
+        "command": [sys.executable, "-c", f"import time; time.sleep({seconds})"]})
+
+
+def test_wait_any_done_over_two_experiments(manager_with_worker, capsys):
+    server, url = manager_with_worker
+    for eid, seconds in (("a", 120), ("b", 1)):
+        _mk_exp(url, eid)
+        _sleeper(url, eid, "r1", seconds)
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["a", "b", "--until", "any-done", "--json",
+                                           "--interval", "0.2", "--timeout", "60"])
+    out = _json_tail(capsys.readouterr().out)
+    assert exc.value.code == ctl.WAIT_EXIT_SETTLED, out
+    assert out["outcome"] == "run_finished" and out["experiment_ids"] == ["a", "b"]
+    assert [(r["experiment_id"], r["run_id"], r["status"]) for r in out["runs"]] == [("b", "r1", "done")]
+    # The cursor picks up where this call left off: nothing new yet, so it times out.
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["a", "b", "--until", "any-done", "--since", str(out["cursor"]),
+                                           "--timeout", "0.5", "--interval", "0.1"])
+    assert exc.value.code == ctl.WAIT_EXIT_TIMEOUT
+
+
+def test_wait_with_no_ids_follows_the_campaign(manager_with_worker, capsys):
+    server, url = manager_with_worker
+    _mk_exp(url, "old")
+    _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": "old", "gpus_per_run": 0,
+                                         "command": [sys.executable, "-c", "raise SystemExit(1)"]})
+    deadline = time.monotonic() + 60
+    while _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=old")["status"] != "failed":
+        assert time.monotonic() < deadline, "the old run never failed"
+        time.sleep(0.1)
+    _mk_exp(url, "live")
+    _sleeper(url, "live", "r1", 120)
+
+    def submit_later():
+        _mk_exp(url, "later")
+        _sleeper(url, "later", "r1", 0)
+
+    timer = threading.Timer(1.0, submit_later)
+    timer.start()
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["--until", "any-done", "--json", "--interval", "0.2", "--timeout", "60"])
+    timer.join()
+    out = _json_tail(capsys.readouterr().out)
+    assert exc.value.code == ctl.WAIT_EXIT_SETTLED, out
+    assert out["campaign"] == "test" and "old" not in out["experiment_ids"]
+    assert [(r["experiment_id"], r["run_id"]) for r in out["runs"]] == [("later", "r1")]
+
+
+_COUNTS_DOWN = """
+import time
+from mlsweep.logger import MLSweepLogger
+with MLSweepLogger(total_steps=100) as logger:
+    for step in range(1, 6):
+        logger.log({"loss": 1.0 / step}, step=step)
+        time.sleep(0.2)
+    time.sleep(120)
+"""
+
+
+def test_a_running_runs_total_steps_reaches_the_jobs_listing(manager_with_worker):
+    server, url = manager_with_worker
+    _mk_exp(url, "eta")
+    _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r1", "experiment_id": "eta", "gpus_per_run": 0,
+                                         "command": [sys.executable, "-c", _COUNTS_DOWN]})
+    deadline = time.monotonic() + 60
+    while True:
+        [job] = _api_get(url, _TOKEN, "/api/experiments/eta/jobs")
+        if job.get("last_step") == 5:
+            break
+        assert time.monotonic() < deadline, job
+        time.sleep(0.1)
+    assert job["total_steps"] == 100
+    assert 0 < job["eta_seconds"] < 95 * 0.2 * 3  # 95 steps left at about 0.2 s each
+
+
+_QUIET = """
+import sys, time
+from mlsweep.logger import MLSweepLogger
+ticks = iter(range(0, 10**6, 11))  # every heartbeat() call is 11 s after the last
+with MLSweepLogger(clock=lambda: float(next(ticks))) as logger:
+    logger.log({"loss": 1.0}, step=1)
+    while True:
+        time.sleep(0.2)
+        if sys.argv[1] == "beat":
+            logger.heartbeat()
+"""
+
+
+def test_a_heartbeat_keeps_a_quiet_run_from_looking_stalled(manager_with_worker):
+    server, url = manager_with_worker
+    _mk_exp(url, "hb")
+    for rid in ("beat", "quiet"):
+        _api_post(url, _TOKEN, "/api/jobs", {"run_id": rid, "experiment_id": "hb", "gpus_per_run": 0,
+                                             "command": [sys.executable, "-c", _QUIET, rid]})
+    deadline = time.monotonic() + 60
+    while True:
+        jobs = {j["run_id"]: j for j in _api_get(url, _TOKEN, "/api/experiments/hb/jobs")}
+        if all(j.get("last_step") == 1 for j in jobs.values()) and jobs["quiet"]["stall_seconds"] > 3:
+            break
+        assert time.monotonic() < deadline, jobs
+        time.sleep(0.2)
+    assert jobs["beat"]["stall_seconds"] < 1.5, jobs["beat"]
+
+
+def test_wait_with_no_ids_and_nothing_active_settles(manager_server):
+    server, url = manager_server
+    _mk_exp(url, "old")
+    _mk_job(url, "old", "r1")
+    _set_status(url, "old", "r1", "done")
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["--interval", "0.05"])
+    assert exc.value.code == ctl.WAIT_EXIT_SETTLED
+
+
+def test_wait_started_needs_a_logged_step_from_every_run():
+    running = {"status": "running", "last_step": 3}
+    quiet = {"status": "running"}  # started, but no metric yet
+    queued = {"status": "pending"}
+    done = {"status": "done", "finish_time": "2026-01-01T00:00:00+00:00"}
+    ok = ctl.wait_outcome("e", [{**running, "run_id": "a"}, {**done, "run_id": "b"}], "started", 900,
+                          _no_experiment)
+    assert ok.code == ctl.WAIT_EXIT_SETTLED and ok.outcome == "started"
+    for other in (quiet, queued):
+        jobs = [{**running, "run_id": "a"}, {**other, "run_id": "b"}]
+        assert ctl.wait_outcome("e", jobs, "started", 900, lambda: {"status": "running"}) is None
+    failed = [{**running, "run_id": "a"}, {"status": "failed", "run_id": "b"}]
+    assert ctl.wait_outcome("e", failed, "started", 900, _no_experiment).code == ctl.WAIT_EXIT_FAILURE
+
+
+def test_combine_started_over_several_experiments():
+    started = _verdict("started", ctl.WAIT_EXIT_SETTLED)
+    assert ctl.combine_wait_verdicts({"a": started, "b": None}, "started") is None
+    both = ctl.combine_wait_verdicts({"a": started, "b": _verdict("settled", 0)}, "started")
+    assert both.outcome == "started" and both.code == ctl.WAIT_EXIT_SETTLED
+    failed = _verdict("failure", ctl.WAIT_EXIT_FAILURE, [{"run_id": "r"}])
+    assert ctl.combine_wait_verdicts({"a": failed, "b": None}, "started").code == ctl.WAIT_EXIT_FAILURE
+
+
+_STEPS_THEN_SLEEPS = """
+import sys, time
+from mlsweep.logger import MLSweepLogger
+with MLSweepLogger() as logger:
+    if sys.argv[1] == "fail":
+        raise SystemExit(1)
+    time.sleep(float(sys.argv[1]))
+    logger.log({"loss": 1.0}, step=1)
+    time.sleep(120)
+"""
+
+
+def test_wait_until_started_end_to_end(manager_with_worker):
+    server, url = manager_with_worker
+    _mk_exp(url, "st")
+    for rid, arg in (("quick", "0"), ("slow", "1.5")):
+        _api_post(url, _TOKEN, "/api/jobs", {"run_id": rid, "experiment_id": "st", "gpus_per_run": 0,
+                                             "command": [sys.executable, "-c", _STEPS_THEN_SLEEPS, arg]})
+    start = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["st", "--until", "started", "--interval", "0.2", "--timeout", "60"])
+    assert exc.value.code == ctl.WAIT_EXIT_SETTLED
+    assert time.monotonic() - start >= 1.0  # it waited for the slow one's first step
+    assert {j["run_id"]: j.get("last_step") for j in _api_get(url, _TOKEN, "/api/experiments/st/jobs")} == {
+        "quick": 1, "slow": 1}
+    _mk_exp(url, "bad")
+    _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r", "experiment_id": "bad", "gpus_per_run": 0,
+                                         "command": [sys.executable, "-c", _STEPS_THEN_SLEEPS, "fail"]})
+    with pytest.raises(SystemExit) as exc:
+        ctl.wait_cmd(_base(url, server) + ["bad", "--until", "started", "--interval", "0.2", "--timeout", "60"])
+    assert exc.value.code == ctl.WAIT_EXIT_FAILURE
+
+
+def test_finished_since_takes_a_duration_or_a_time():
+    now = ctl._parse_since("2026-11-26T12:00:00+00:00")
+    assert ctl.parse_since_or_ago("2h", now=now) == now - 7200
+    assert ctl.parse_since_or_ago("2026-11-26T11:00:00+00:00", now=now) == now - 3600
+    assert ctl.parse_since_or_ago(str(now - 60), now=now) == now - 60
+    with pytest.raises(ValueError):
+        ctl.parse_since_or_ago("yesterday", now=now)
+
+
+def test_finished_since_keeps_runs_that_finished_after_it():
+    jobs = [{"run_id": "old", "status": "done", "finish_time": "2026-11-26T09:00:00+00:00"},
+            {"run_id": "new", "status": "failed", "finish_time": "2026-11-26T11:30:00+00:00"},
+            {"run_id": "newer", "status": "done", "finish_time": "2026-11-26T11:45:00+00:00"},
+            {"run_id": "busy", "status": "running", "finish_time": None}]
+    since = ctl._parse_since("2026-11-26T10:00:00+00:00")
+    assert [j["run_id"] for j in ctl.finished_since(jobs, since)] == ["new", "newer"]
+
+
+def test_ls_finished_since_across_the_campaign(manager_with_worker, capsys):
+    server, url = manager_with_worker
+    for eid, code in (("x", 0), ("y", 1)):
+        _mk_exp(url, eid)
+        _api_post(url, _TOKEN, "/api/jobs", {"run_id": "r", "experiment_id": eid, "gpus_per_run": 0,
+                                             "command": [sys.executable, "-c", f"raise SystemExit({code})"]})
+    deadline = time.monotonic() + 60
+    while {j["status"] for e in ("x", "y") for j in _api_get(url, _TOKEN, f"/api/experiments/{e}/jobs")} \
+            != {"done", "failed"}:
+        assert time.monotonic() < deadline
+        time.sleep(0.1)
+    capsys.readouterr()
+    ctl.ls_cmd(_base(url, server) + ["--finished-since", "1h", "--json"])
+    rows = json.loads(capsys.readouterr().out)
+    assert sorted((r["experiment_id"], r["status"]) for r in rows) == [("x", "done"), ("y", "failed")]
+    ctl.ls_cmd(_base(url, server) + ["--finished-since", "1h"])
+    out = capsys.readouterr().out
+    assert out.index("## Failed (1)") < out.index("## Done (1)") and "y/r" in out and "Finished" in out
+    ctl.ls_cmd(_base(url, server) + ["x", "--finished-since", "1h", "--json"])
+    assert [r["experiment_id"] for r in json.loads(capsys.readouterr().out)] == ["x"]
+
+
 def test_resolve_ranking_prefers_experiment_then_defaults(manager_server):
     server, url = manager_server
     _api_post(url, _TOKEN, "/api/experiments",
@@ -796,6 +1076,50 @@ def test_rename_sets_and_clears_name(manager_server, capsys):
     assert _api_get(url, _TOKEN, "/api/jobs/r1?experiment_id=e")["label"] is None
 
 
+def test_rename_sets_the_description_and_name_together_and_clears_it(manager_server, capsys):
+    server, url = manager_server
+    _mk_exp(url, "e")
+    ctl.rename_cmd(_base(url, server) + ["e", "--experiment-name", "warmup", "--description", " Does warmup help? ",
+                                         "--json"])
+    captured = capsys.readouterr()
+    said = captured.out + captured.err
+    assert "renamed experiment e to 'warmup'" in said and "set the description of e" in said
+    assert json.loads(captured.out[captured.out.index("{"):]) == {
+        "experiment_id": "e", "name": "warmup", "description": "Does warmup help?"}
+    exp = _api_get(url, _TOKEN, "/api/experiments/e")
+    assert (exp["name"], exp["note"]) == ("warmup", "Does warmup help?")
+
+    ctl.ls_cmd(_base(url, server) + ["e"])
+    assert "Description: Does warmup help?" in capsys.readouterr().out
+
+    ctl.rename_cmd(_base(url, server) + ["e", "--clear-description"])
+    assert "cleared the description of e" in capsys.readouterr().out
+    assert _api_get(url, _TOKEN, "/api/experiments/e")["note"] is None
+
+
+@pytest.mark.parametrize("args,err", [
+    (["--description", "x", "--clear-description"], "not both"),
+    (["--description", "  "], "must not be empty"),
+    (["r1", "--description", "x"], "take no RUN"),
+])
+def test_rename_description_argument_errors(manager_server, capsys, args, err):
+    server, url = manager_server
+    with pytest.raises(SystemExit) as exc:
+        ctl.rename_cmd(_base(url, server) + ["e", *args])
+    assert exc.value.code == 2
+    assert err in capsys.readouterr().err
+
+
+def test_description_route_validates_and_clears(manager_server):
+    _, url = manager_server
+    _mk_exp(url, "e")
+    assert _api_put(url, _TOKEN, "/api/experiments/e/description", {"description": "why"})["note"] == "why"
+    assert _api_put(url, _TOKEN, "/api/experiments/e/description", {"description": ""})["note"] is None
+    for bad in ({}, {"description": 3}):
+        assert _api_status(url, _TOKEN, "PUT", "/api/experiments/e/description", bad)[0] == 400
+    assert _api_status(url, _TOKEN, "PUT", "/api/experiments/missing/description", {"description": "x"})[0] == 404
+
+
 @pytest.mark.parametrize("args", [["r1"], ["r1", "  "], ["r1", "x", "--clear"]])
 def test_rename_needs_exactly_one_of_name_or_clear(manager_server, capsys, args):
     server, url = manager_server
@@ -952,6 +1276,43 @@ def test_ls_shows_each_running_runs_step_and_average_step_time():
     # Before the step has advanced there is no average yet.
     assert ctl._run_bullet({**job, "avg_step_seconds": None}, set(), set(), "e", "test")[0].endswith(
         "step 1200.")
+
+
+def test_ls_shows_the_gpu_and_the_time_left():
+    job = {"run_id": "r1", "status": "running", "start_time": None, "last_step": 500, "total_steps": 1500,
+           "avg_step_seconds": 2.0, "eta_seconds": 2000.0, "combo": "{}", "worker_id": "w:7890",
+           "dispatched_gpu_ids": "[3]"}
+    [line] = ctl._run_bullet(job, set(), set(), "e", "test")
+    assert "step 500 of 1500 at 2 s/step on average, about 33m20s left on w:7890 GPU 3." in line
+    two = {**job, "dispatched_gpu_ids": "[0, 1]", "total_steps": None, "eta_seconds": None}
+    [line] = ctl._run_bullet(two, set(), set(), "e", "test")
+    assert line.endswith("step 500 at 2 s/step on average on w:7890 GPUs 0,1.")
+
+
+def test_in_flight_runs_estimate_the_time_left():
+    from mlsweep._manager_state import InFlightRun
+
+    run = InFlightRun(experiment_id="e", run_id="r", job_key=1, attempt=1, primary="w")
+    run.note_step(10, None, 100.0)
+    run.note_step(20, None, 120.0)
+    assert run.eta_seconds(120.0) is None  # the script never said where it ends
+    run.note_step(30, None, 140.0, total_steps=100)
+    assert run.eta_seconds(140.0) == 140.0  # 70 steps at 2 s
+    assert run.eta_seconds(150.0) == 130.0  # still falling between steps
+    assert run.eta_seconds(1e6) == 0.0
+
+
+def test_status_says_when_each_gpu_frees_up():
+    from mlsweep.cli import gpu_free_lines
+
+    runs = {"1": [{"run_id": "a", "eta_seconds": 600.0}, {"run_id": "b", "eta_seconds": 7200.0}],
+            "0": [{"run_id": "c", "eta_seconds": 60.0}, {"run_id": "d", "eta_seconds": None}],
+            "2": [{"run_id": "e"}], "3": []}
+    assert gpu_free_lines(runs) == [
+        "GPU 0: 2 runs, next ends in about 1m00s (1 without an estimate)",
+        "GPU 1: 2 runs, next ends in about 10m00s, free in about 2h00m",
+        "GPU 2: 1 run, no estimate (the script sets total_steps on its MLSweepLogger)",
+    ]
 
 
 def test_in_flight_runs_average_their_step_time():

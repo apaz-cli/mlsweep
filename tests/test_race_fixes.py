@@ -34,15 +34,18 @@ def test_move_jobs_skips_a_job_that_is_not_finished():
         try:
             for eid in ("src", "dst"):
                 await create_experiment(db, experiment_id=eid, name=eid, campaign="test")
-            await _job(db, "src", "pending", "pending")
+            await _job(db, "src", "busy", "running")
             await _job(db, "src", "done", "done")
+            await _job(db, "src", "queued", "pending")
 
-            moved = await move_jobs(db, "src", "dst", ["pending", "done"])
+            # A running job is left alone (it moves when it finishes, see set_move_to);
+            # a pending one has nothing in flight, so it moves.
+            moved = await move_jobs(db, "src", "dst", ["busy", "done", "queued"])
 
-            assert moved == ["done"]
-            pending = await get_job(db, "pending", "src")
+            assert sorted(moved) == ["done", "queued"]
+            busy = await get_job(db, "busy", "src")
             done = await get_job(db, "done", "dst")
-            assert pending is not None and pending.status == "pending"
+            assert busy is not None and busy.status == "running"
             assert done is not None and done.status == "done"
         finally:
             await db.close()

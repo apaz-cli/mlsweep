@@ -45,6 +45,7 @@ mlsweep run sweeps/my_sweep.py --validate   # or: print all combos without submi
 mlsweep status                             # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                       # live terminal status
 mlsweep ls                                 # experiments grouped by status (`mlsweep ls EXP_ID` lists runs, --all lifts the cap of 20 settled)
+mlsweep ls --finished-since 2h             # runs that finished lately, across the campaign (failures first)
 mlsweep logs EXP_ID RUN_ID                # tail a run's training.log
 mlsweep metrics --experiment EXP_ID --keys 'val/nll@r(\d+)' --pivot   # reshape keys (--last, --with-dims, 2-group --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM, --table D1,D2)
@@ -298,11 +299,23 @@ The manager runs the sweep, so `mlsweep run` submits it and exits. It chooses ne
 ```python
 from mlsweep.logger import MLSweepLogger
 
-with MLSweepLogger() as logger:
+with MLSweepLogger(total_steps=num_steps) as logger:
     for step in range(1, num_steps + 1):
         logger.log({"loss": 0.42, "lr": 1e-3}, step=step)  # step auto-increments if omitted
         logger.sync()  # fire-and-forget rsync of MLSWEEP_RUN_DIR artifacts mid-training
 ```
+
+A run that logs no metric and prints nothing for `--stalled-after` seconds counts as stalled
+for `mlsweep wait --until stalled`. A script with a long quiet stretch, such as a long
+evaluation or a phase that doesn't log, calls `logger.heartbeat()` inside it. At most one
+heartbeat every 10 seconds goes out, however often it's called. A background thread that sends
+heartbeats would hide a real hang, so put the call in the work itself.
+
+`total_steps` is optional. It tells the manager where the run ends, so `mlsweep ls EXP`
+shows the time each running run has left (`step 500 of 1500 at 2 s/step on average,
+about 33m20s left`), and `mlsweep status` says when each GPU's runs end. The estimate is
+the average time per step so far. If the script learns the number later, set
+`logger.total_steps` before the next `log()`.
 
 Steps never go backwards and each metric is logged at most once per step: `log()` raises `ValueError` instead of silently overwriting a value it already recorded. Several calls at one step are fine when their keys differ, e.g. `log({"loss": l}, step=s)` then `log({"val_loss": v}, step=s)`. This holds when running the script directly too, so the mistake shows up before you launch a sweep.
 
@@ -311,6 +324,37 @@ Steps never go backwards and each metric is logged at most once per step: `log()
 If the script doesn't use the logger at all, mlsweep still dispatches the job and captures stdout/stderr to `training.log`. Metrics plots will be empty.
 
 Save checkpoints to `os.environ["MLSWEEP_RUN_DIR"]`. They're rsynced to the experiment output directory at run end and immediately on `logger.sync()`.
+
+## Reading metrics
+
+`mlsweep metrics` prints what runs logged, fetched when you ask. Without a view it prints
+each run's last steps as a table. The views below give one row per run instead, with the
+run's latest step in a `step` column:
+
+```sh
+mlsweep metrics --experiment EXP --keys 'loss' --last                    # each key's latest value
+mlsweep metrics --experiment EXP --keys 'loss|diverged' --agg final --agg max:diverged
+mlsweep metrics --experiment EXP --keys '^val_loss$' --agg min           # best value, with its step
+mlsweep metrics --experiment EXP --keys '^val_loss$' --step 500,1000,1500
+mlsweep metrics --experiment EXP --keys '^val_loss$' --x tokens --at 1e8,2e8
+mlsweep metrics --experiment A,B --keys '^val_loss$' --last              # several experiments
+mlsweep metrics --active --keys '^val_loss$' --last                      # those with runs still going
+```
+
+`--last` gives each key's latest value. A value logged before the run's latest step shows
+that step, as in `4.10 @1000` for a run at step 1250 that last evaluated at 1000. `--agg`
+takes `final`, `min`, `max` or `mean` over all of a key's steps. `FN:REGEX` applies FN to
+the keys REGEX matches, and the flag repeats, so `max:diverged` says whether a run ever
+diverged while the losses stay final. `min` and `max` show the step they came from.
+`--step` takes the value at each step listed, or the latest logged before it. `--x KEY --at
+V` compares at the first step where KEY reaches V, for comparisons at equal tokens, FLOPs or
+seconds rather than at equal steps, and adds a `step@KEY=V` column for that step.
+
+With several experiments, each run is named `EXPERIMENT/RUN`. `--csv` gives the same table
+with a `<column> step` column next to each value that has one. `--json` gives each run's
+`step`, `values` and the `steps` they came from (and `last` for `--last`), and every run
+names its `experiment_id`. `--pivot` reshapes keys by their capture groups, as before, and
+`--step` with one step caps the steps it uses.
 
 ## Environment variables injected into each run
 
@@ -341,6 +385,7 @@ jobs = 2                         # worker-level cap: max concurrent jobs per GPU
 devices = [0, 1, 2, 3]           # GPU IDs to use (default: all visible)
 venv = "/path/to/venv"           # prefer this venv over the auto-bootstrapped one
 scratch_dir = "/scratch/mlsweep" # run working files (default: /tmp/mlsweep)
+tunnel = true                    # reach the worker over SSH (see below)
 ```
 
 ```bash
@@ -348,6 +393,14 @@ mlsweep_manager --workers workers.toml
 ```
 
 The manager bootstraps mlsweep on remote machines automatically; no manual install is needed. Requires passwordless SSH. Test with `ssh -o BatchMode=yes user@host1 nvidia-smi`.
+
+The manager then connects to the worker's port directly. A cloud machine whose firewall
+lets in only SSH refuses that, and the worker dies with `the worker started and listens on
+port N, but the manager could not connect`. For such a machine, set `tunnel = true`, or
+add it with `mlsweep workers add user@host --tunnel`. The manager then reaches the worker
+through `ssh -L` from a loopback port, so only port 22 has to be open, and the machine's
+address can change between restarts as long as `host` (or an entry in `~/.ssh/config`)
+follows it. The worker reaches the manager through its own SSH tunnel either way.
 
 When a worker starts, it probes each candidate GPU by creating a real CUDA
 context on it. A device can show up in `nvidia-smi` as idle and still be unusable
@@ -374,7 +427,9 @@ itself restricted.
 ## Moving, deleting and cleaning up
 
 ```sh
-mlsweep move EXP RUN... --to EXP2       # also --done --failed --cancelled --xfailed
+mlsweep move EXP RUN... --to EXP2       # also --done --failed --cancelled --xfailed --pending --running
+mlsweep move EXP --running --to EXP2 --create   # make EXP2 first; running runs move when they finish
+mlsweep history EXP [RUN]               # what happened to its runs, and who did it
 mlsweep purge EXP --failed              # lists what would go; add --yes to delete
 mlsweep delete EXP --yes                # the experiment and its runs
 mlsweep gc                              # lists what nothing refers to
@@ -382,9 +437,25 @@ mlsweep gc --yes [--vacuum]             # deletes it; --vacuum also shrinks the 
 mlsweep gc --downloads                  # also this machine's downloads of deleted experiments
 ```
 
-`move` takes finished runs, with their metrics, logs and files. It refuses a run still
-pending or running, and one whose ID the target already has. `purge` removes finished runs
-for good. `delete` leaves the experiment's files on disk until `gc --yes`.
+`move` takes runs with their metrics, logs and files. Finished and pending runs move at
+once, and a pending one is then scheduled under its new experiment. A run still running is
+marked, keeps running where it is, and moves when it finishes. `--now-only` refuses it
+instead. `--create` makes the target if it doesn't exist, in the same campaign, with the
+source's metric, goal and run controls. A run whose ID the target already has is refused,
+and a marked run whose target has since gained that ID stays put, which its history says.
+So splitting an experiment into several is one `move` per new experiment, with no
+resubmitting. `purge` removes finished runs for good. `delete` leaves the experiment's
+files on disk until `gc --yes`.
+
+`mlsweep history EXP [RUN]` lists what happened to an experiment's runs, oldest first, and
+who did it. The source is `manager`, `dashboard`, `cli`, or `api` for any other client. The manager
+records each submission, each dispatch with its worker and GPUs, each result, and each
+requeue with its reason (a lost worker, removed GPUs, a reschedule). It also records
+people's cancels, retries, reschedules, moves, purges, renames, priority changes, pauses,
+stops and deletes. A deleted experiment keeps its history, including which runs
+were still going when it was deleted. `--json` gives the entries, and `GET
+/api/history?experiment_id=EXP[&run_id=RUN]` is the same over HTTP. A client names itself
+with the `X-Mlsweep-Client` header (`cli` or `dashboard`).
 
 `gc` finds files of deleted experiments and runs, database rows of deleted runs, code
 snapshots no run uses, and stored files that no remaining snapshot lists. Anything used in
@@ -430,11 +501,12 @@ upload prints its export ID when it starts, and `export cancel` stops it.
 
 ```sh
 mlsweep workers                         # list
-mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1]
+mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1] [--port P] [--tunnel]
 mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0] [--drain-devices 1]
 mlsweep workers update WORKER
 mlsweep workers rm WORKER
 mlsweep scheduler [--placement pack|spread]
+mlsweep scheduler --pause [WORKER|all]      # --unpause [WORKER|all] undoes it
 mlsweep reschedule EXP RUN [--to WORKER [--gpus 2,3]]
 ```
 
@@ -442,6 +514,20 @@ A worker's GPUs are each in its pool or out of it, and the scheduler only places
 GPUs in the pool. `--drain-devices` takes GPUs out of the pool and lets the runs already on
 them finish. `--remove-devices` takes them out and requeues their runs at once, without
 spending a retry. `--add-devices` puts GPUs back.
+
+`mlsweep scheduler --pause` stops the scheduler from starting new jobs anywhere, and
+`--pause WORKER` stops it on one worker. Use it to place runs by hand without the scheduler
+filling the GPUs first. Runs already going keep running. A run pinned with
+`reschedule --to` waits until its worker is unpaused, and the pin does not expire during the
+pause. `--unpause WORKER` lifts one worker's pause. `--unpause` on its own lifts every pause,
+the cluster's and each worker's. Pauses are saved across manager restarts. On the System
+page, the Pause scheduling button pauses every worker, and a worker's ⋯ menu pauses that
+worker alone.
+
+`workers add` waits up to `--wait` seconds (default 300) for the worker to connect, then prints
+its GPUs, or the reason it didn't connect and exits 1. `--tunnel` is the SSH connection
+described under [Remote workers](#remote-workers), and `--port` fixes the port the worker
+listens on.
 
 `mlsweep workers update` installs the manager's mlsweep on a worker that runs older code and
 restarts it. Its in-flight runs are requeued without spending a retry.
@@ -459,7 +545,8 @@ menu.
 
 `pack` fills busy GPUs first, keeping whole GPUs and machines free for big jobs. `spread`
 puts each job on the least busy GPU. `mlsweep rename EXP --experiment-name NAME` renames an
-experiment; its ID never changes.
+experiment; its ID never changes. `--description TEXT` sets its description (the
+two can go together), and `--clear-description` removes it.
 
 ## Code snapshots
 

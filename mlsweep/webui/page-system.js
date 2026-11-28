@@ -14,6 +14,7 @@
     ["fw-host","fw-remote-dir","fw-venv","fw-ssh-key","fw-devices"].forEach(id => {
       document.getElementById(id).value = "";
     });
+    document.getElementById("fw-tunnel").checked = false;
     errEl.textContent = "";
     errEl.classList.add("hidden");
   }
@@ -74,7 +75,7 @@
           worker_id: w.worker_id,
           host: w.host, remote_dir: w.remote_dir,
           venv: w.venv || null, ssh_key: w.ssh_key || null,
-          devices,
+          devices, port: w.port || 0, tunnel: !!w.tunnel,
         }),
       });
       const data = await res.json();
@@ -110,6 +111,7 @@
     const ssh_key    = document.getElementById("fw-ssh-key").value.trim() || null;
     const devStr     = document.getElementById("fw-devices").value.trim();
     const devices    = devStr ? devStr.split(",").map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)) : null;
+    const tunnel     = document.getElementById("fw-tunnel").checked;
 
     if (!host) {
       errEl.textContent = "Host is required.";
@@ -125,7 +127,7 @@
       const res = await apiFetch("/api/workers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host, remote_dir, venv, ssh_key, devices }),
+        body: JSON.stringify({ host, remote_dir, venv, ssh_key, devices, tunnel }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -223,6 +225,35 @@ async function setPlacement(placement) {
 for (const btn of document.querySelectorAll("#placement-toggle button")) {
   btn.addEventListener("click", () => setPlacement(btn.dataset.placement));
 }
+
+// ── Scheduling pause ───────────────────────────────────────────────────────────
+// Paused, the scheduler starts nothing new (on one worker, or anywhere), so
+// runs can be placed by hand; running jobs carry on.  Unpausing everywhere
+// also lifts each worker's own pause.
+let clusterPaused = false;
+
+function renderPause(scheduler) {
+  clusterPaused = !!scheduler.paused;
+  const btn = document.getElementById("btn-pause");
+  btn.textContent = clusterPaused ? "Unpause scheduling" : "Pause scheduling";
+  btn.classList.toggle("active", clusterPaused);
+  btn.title = clusterPaused
+    ? "Start scheduling again everywhere, including on workers paused one by one"
+    : "Start no new jobs on any worker, so you can place runs by hand. Running jobs carry on.";
+  document.getElementById("pause-banner").classList.toggle("hidden", !clusterPaused);
+}
+
+async function setPaused(workerId, paused) {
+  try {
+    renderPause(await apiJSON("POST", `/api/scheduler/${paused ? "pause" : "unpause"}`,
+                              workerId ? { worker_id: workerId } : {}));
+  } catch (e) {
+    await mlAlert("Failed: " + e.message);
+  }
+  await refresh();
+}
+
+document.getElementById("btn-pause").addEventListener("click", () => setPaused(null, !clusterPaused));
 
 // ── Workers: GPU pools ────────────────────────────────────────────────────────
 // Each card shows every GPU the worker reports.  A GPU is in the pool (the
@@ -401,11 +432,12 @@ function renderWorkers(workers) {
       <div class="worker-header">
         <span class="worker-host">${escHtml(w.host)}${w.port ? `:${escHtml(w.port)}` : ""}</span>
         ${badge(status)}
+        ${w.paused ? `<span title="The scheduler starts no new jobs here">${badge("paused")}</span>` : ""}
         <span class="worker-summary">${poolSummary(w)}</span>
         ${isLive ? `<label class="jobs-per-gpu" title="Most runs the scheduler puts on one GPU (0 = no limit)">jobs/GPU
           <input class="worker-control-input worker-control-narrow" type="number" min="0" value="${escHtml(maxJobs)}"
             ${act("workerConcurrencyChanged", w.worker_id)}></label>` : ""}
-        <button class="btn-link btn-manage" aria-haspopup="true" title="Pool, update, disconnect" ${act("toggleWorkerMenu", w.worker_id)}>⋯</button>
+        <button class="btn-link btn-manage" aria-haspopup="true" title="Pause, pool, update, disconnect" ${act("toggleWorkerMenu", w.worker_id)}>⋯</button>
       </div>
       ${w.last_error ? `<div class="worker-error">${escHtml(w.last_error)}</div>` : ""}
       ${w.outdated && isLive ? `<div class="worker-warning">Runs older mlsweep code than the manager.</div>` : ""}
@@ -416,6 +448,7 @@ function renderWorkers(workers) {
           ${w.remote_dir  ? `<div><span>dir</span> ${escHtml(w.remote_dir)}</div>` : ""}
           ${w.venv        ? `<div><span>venv</span> ${escHtml(w.venv)}</div>` : ""}
           ${w.ssh_key     ? `<div><span>key</span> ${escHtml(w.ssh_key)}</div>` : ""}
+          ${w.tunnel      ? `<div><span>via</span> SSH tunnel</div>` : ""}
           ${w.scratch_dir ? `<div><span>scratch</span> ${escHtml(w.scratch_dir)}</div>` : ""}
         </div>
         <span class="worker-actions-buttons">
@@ -476,12 +509,16 @@ function workerItems(workerId, withLifecycle = false) {
   const all = w ? allGpusOf(w) : [];
   const live = w?.status === "connected";
   const items = [];
+  if (w) items.push(w.paused
+    ? { label: "Unpause scheduling here", act: act("setPaused", workerId, false) }
+    : { label: "Pause scheduling here", title: "Start no new jobs here; running jobs carry on", act: act("setPaused", workerId, true) });
   if (live) {
     const inPool = all.filter(g => gpuState(w, g) === "pool");
     const outPool = all.filter(g => ["out", "draining"].includes(gpuState(w, g)));
     if (inPool.length) items.push({ label: "Drain all GPUs", title: "Nothing new starts here; runs finish", act: act("applyGpus", workerId, "drain", inPool) });
     if (outPool.length) items.push({ label: "Return all GPUs to the pool", act: act("applyGpus", workerId, "add", outPool) });
   }
+  if (items.length > 1) items[1].divider = true;
   if (withLifecycle && w) {
     const status = w.status || "offline";
     const more = [];
@@ -490,7 +527,7 @@ function workerItems(workerId, withLifecycle = false) {
     more.push({ label: "Copy worker ID", act: act("copyId", workerId, "Copied the worker ID") });
     return joinMenus(items, more);
   }
-  return items.length ? items : [{ label: "No pool changes for an offline worker", disabled: true }];
+  return items;
 }
 
 
@@ -805,6 +842,7 @@ async function refresh() {
 
     setConnStatus("connected");
     renderPlacement(scheduler.placement);
+    renderPause(scheduler);
     renderInFlight([...byRun.values()]);   // first: the worker cards name runs from it
     renderWorkers(workers);
     renderQueue(pending, Math.max(health.jobs_pending, pending.length), new Set(paused.map(e => e.experiment_id)));
@@ -862,6 +900,7 @@ bindActions({
   disconnectWorker, updateWorker, toggleRunView, toggleInFlightMenu, renameInFlight, cancelInFlight,
   toggleQueuedMenu, renameQueued, cancelQueued,
   toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun, copyId,
+  setPaused,
 });
 bindActions({
   toggleGpuPool(workerId, g, inPool) { toggleGpuPool(workerId, g, inPool); },

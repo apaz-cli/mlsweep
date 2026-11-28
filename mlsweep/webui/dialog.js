@@ -150,18 +150,23 @@
   };
 
   // mlPrompt(message, defaultValue?, opts?) → Promise<string|null>
-  // opts: { okLabel, cancelLabel, placeholder }
+  // opts: { okLabel, cancelLabel, placeholder, multiline }
+  // multiline: a textarea, where Enter is a new line and Ctrl/Cmd+Enter saves.
   window.mlPrompt = function (message, defaultValue = "", opts = {}) {
-    const { okLabel = "OK", cancelLabel = "Cancel", placeholder = "" } = opts;
-    const input = document.createElement("input");
-    input.type = "text";
+    const { okLabel = "OK", cancelLabel = "Cancel", placeholder = "", multiline = false } = opts;
+    const input = document.createElement(multiline ? "textarea" : "input");
+    if (!multiline) input.type = "text";
+    else input.rows = 5;
     input.value = defaultValue;
     input.placeholder = placeholder;
-    input.style.cssText = "width:100%;padding:6px 8px;font-size:13px;border:1px solid var(--border-input);border-radius:4px;background:var(--btn-bg);color:var(--text);outline:none;box-sizing:border-box;";
+    input.style.cssText = "width:100%;padding:6px 8px;font-size:13px;border:1px solid var(--border-input);border-radius:4px;background:var(--btn-bg);color:var(--text);outline:none;box-sizing:border-box;"
+      + (multiline ? "resize:vertical;font-family:inherit;line-height:1.4;min-width:min(32rem,80vw);" : "");
     return showDialog({
       message,
       extraContent: input,
-      onExtraKeydown: (e, close) => { if (e.key === "Enter") close(input.value.trim()); },
+      onExtraKeydown: (e, close) => {
+        if (e.key === "Enter" && (!multiline || e.ctrlKey || e.metaKey)) { e.preventDefault(); close(input.value.trim()); }
+      },
       buttons: [
         { label: cancelLabel, value: null, cls: "ml-btn-cancel" },
         { label: okLabel, getValue: () => input.value.trim(), cls: "ml-btn-ok" },
@@ -433,6 +438,24 @@ function runDisplayName(j) {
 function runNameHtml(j) {
   if (!j.label) return escHtml(j.run_id);
   return `${escHtml(j.label)} <span style="color:var(--text-muted);font-size:9px">${escHtml(j.run_id)}</span>`;
+}
+
+// Ask for an experiment's description and save it.  Resolves to the new
+// description (null = cleared), or undefined if cancelled, unchanged, or the save failed.
+async function mlEditDescription(expId, current) {
+  const input = await mlPrompt(`Description of ${expId} (empty removes it):`, current || "",
+    { okLabel: "Save", placeholder: "What is this experiment for?", multiline: true });
+  if (input === null) return undefined;
+  const description = input.trim() || null;
+  if (description === (current || null)) return undefined;
+  const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/description`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ description }),
+  });
+  if (r.ok) return description;
+  await mlAlert(`Saving the description failed: ${r.status}`);
+  return undefined;
 }
 
 // Ask for a run's new display name and save it.  Resolves to the new label

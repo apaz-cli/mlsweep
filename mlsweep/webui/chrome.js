@@ -64,7 +64,8 @@ function el(tag, cls, text) {
 }
 
 async function apiFetch(path, opts = {}) {
-  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+  // X-Mlsweep-Client names the dashboard in a run's history (`mlsweep history`).
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}`, "X-Mlsweep-Client": "dashboard" } });
   if (r.status === 401) showLoginProblem("The manager rejected this page's token. Open the link it printed at startup, or run `mlsweep status` to find it.");
   else if (r.status === 429) showLoginProblem("Too many failed logins from this address. Try again in a minute.");
   return r;

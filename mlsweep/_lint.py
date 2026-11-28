@@ -6,12 +6,17 @@ checks here catch that kind of mistake, plus flags two dims both pass, flag
 values no run can use, and settings that contradict each other.
 
 An error stops ``mlsweep run``; a warning is printed and the sweep goes ahead.
+
+With no files, ``mlsweep lint`` checks everything: each sweep file in the
+project (found by its ``mlsweep_run`` shebang) and each experiment on the
+manager, for which the only check so far is a missing description.
 """
 
 from __future__ import annotations
 
 import collections
 import difflib
+import os
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,9 +146,17 @@ def _variation_findings(variations: list[dict[str, Any]]) -> list[Finding]:
     return out
 
 
-def lint_module(mod: types.ModuleType, path: str | Path) -> list[Finding]:
-    """Every finding for a loaded sweep module, errors first."""
+def lint_module(mod: types.ModuleType, path: str | Path, *, check_description: bool = True) -> list[Finding]:
+    """Every finding for a loaded sweep module, errors first.
+
+    ``mlsweep run`` passes *check_description* False: --description can supply
+    one, so it checks the experiment after submitting instead.
+    """
     findings = _misspelled_settings(mod)
+    description = getattr(mod, "DESCRIPTION", None)
+    if check_description and not (isinstance(description, str) and description.strip()):
+        findings.append(Finding("warning", "no DESCRIPTION, so the experiment has none unless "
+                                           "`mlsweep run` gets --description"))
     key_errors = (_unknown_keys("OPTIMIZE", getattr(mod, "OPTIMIZE", None), OPTIMIZE_KEYS)
                   + _unknown_keys("PRUNE", getattr(mod, "PRUNE", None), PRUNE_KEYS))
     if key_errors:
@@ -189,6 +202,44 @@ def lint_module(mod: types.ModuleType, path: str | Path) -> list[Finding]:
 
 def _sorted(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=lambda f: f.severity != "error")
+
+
+# Directories never searched for sweep files.
+_SKIP_DIRS = frozenset({"node_modules", "__pycache__", "site-packages", "venv", "env"})
+
+
+def is_sweep_file(path: str | Path) -> bool:
+    """True for a file whose first line is an ``mlsweep_run`` shebang."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(200)
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"mlsweep_run" in first
+
+
+def find_sweep_files(root: str | Path) -> list[str]:
+    """Every sweep file under *root*, skipping hidden and virtualenv directories."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in _SKIP_DIRS
+                             and not os.path.exists(os.path.join(dirpath, d, "pyvenv.cfg")))
+        for name in sorted(filenames):
+            if name.endswith(".py") and is_sweep_file(os.path.join(dirpath, name)):
+                found.append(os.path.relpath(os.path.join(dirpath, name)))
+    return found
+
+
+def lint_experiments(experiments: list[dict[str, Any]]) -> dict[str, list[Finding]]:
+    """Findings for the manager's experiments, keyed ``campaign/experiment_id``."""
+    out: dict[str, list[Finding]] = {}
+    for e in experiments:
+        findings = []
+        if not str(e.get("note") or "").strip():
+            findings.append(Finding("warning", "no description. Add one with: mlsweep rename "
+                                               f"{e['experiment_id']} --description \"...\""))
+        out[f"{e.get('campaign') or '?'}/{e['experiment_id']}"] = findings
+    return out
 
 
 def lint_file(path: str | Path) -> list[Finding]:

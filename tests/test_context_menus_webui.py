@@ -80,7 +80,7 @@ def test_experiment_and_run_rows(mgr, page):
     assert _right_click(page, f"#exp-row-{eid} .count-cell")
     labels = _row_menu(page)
     assert labels[:4] == ["Results", "Logs", "Artifacts", "Code"], labels
-    assert labels[-4:] == ["Copy experiment ID", "Rename…", "Move to campaign…", "Delete…"], labels
+    assert labels[-5:] == ["Copy experiment ID", "Rename…", "Edit description…", "Move to campaign…", "Delete…"], labels
     # It opens at the pointer, not under the row's buttons.
     left = page.eval("parseFloat(document.querySelector('.row-menu').style.left)")
     cell = page.eval(f"document.querySelector('#exp-row-{eid} .count-cell').getBoundingClientRect().x")
@@ -89,7 +89,7 @@ def test_experiment_and_run_rows(mgr, page):
     _escape(page)
     page.eval(f"document.querySelector('#exp-row-{eid} .btn-manage').click()")
     page.wait_for("!!document.querySelector('.row-menu')")
-    assert _row_menu(page) == ["Rename…", "Move to campaign…", "Delete…"]
+    assert _row_menu(page) == ["Rename…", "Edit description…", "Move to campaign…", "Delete…"]
     _escape(page)
 
     # A run row, and the details row under it, give the run's menu.
@@ -182,7 +182,7 @@ def test_system_page_rows(mgr, page):
 
     page.eval(f"renderInFlight([{json.dumps(job)}]); renderWorkers([{json.dumps(worker)}])")
     assert _right_click(page, ".worker-card .worker-detail")
-    assert _row_menu(page) == ["Drain all GPUs", "Disconnect", "Copy worker ID"]
+    assert _row_menu(page) == ["Pause scheduling here", "Drain all GPUs", "Disconnect", "Copy worker ID"]
     _escape(page)
 
 

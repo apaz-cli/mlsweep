@@ -181,15 +181,16 @@ def test_experiment_max_concurrent_create_and_update(manager_server):
 
 def test_scheduler_placement_get_and_set(manager_server):
     _, url = manager_server
-    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "pack"}
+    unpaused = {"paused": False, "paused_workers": []}
+    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "pack", **unpaused}
     assert _api_request(url, _TOKEN, "PATCH", "/api/scheduler",
                         {"placement": "spread"}) == {"placement": "spread"}
-    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "spread"}
+    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "spread", **unpaused}
 
     with pytest.raises(urllib.error.HTTPError) as exc:
         _api_request(url, _TOKEN, "PATCH", "/api/scheduler", {"placement": "random"})
     assert exc.value.code == 400
-    assert _api_get(url, _TOKEN, "/api/scheduler") == {"placement": "spread"}
+    assert _api_get(url, _TOKEN, "/api/scheduler")["placement"] == "spread"
 
 
 def test_delete_experiment(manager_server):

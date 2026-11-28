@@ -861,3 +861,45 @@ def test_traces_page_renders_a_session(tmp_path_factory):
                       ".map(x => x.textContent)") == ["Run the sweep"]
     finally:
         b.close()
+
+
+# ── continued sessions ────────────────────────────────────────────────────────
+
+
+def test_claude_events_carry_their_transcript_uuid():
+    line = {**CLAUDE_ASSISTANT_LINE, "uuid": "u-1"}
+    _, events = _normalize("claude_code", [line])
+    assert [e["src"] for e in events] == [f"u-1#{i}" for i in range(len(events))]
+    _, untagged = _normalize("claude_code", [CLAUDE_ASSISTANT_LINE])
+    assert all("src" not in e for e in untagged)
+
+
+def test_a_continued_session_does_not_store_the_old_ones_events_again(manager_server):
+    """Claude Code starts a continued session's transcript with a copy of the old one."""
+    server, url = manager_server
+    token = server.token
+    old = {**_SESSION, "session_id": "aaaaaaaa-0000-4000-8000-000000000001", "agent": "claude_code"}
+    new = {**old, "session_id": "bbbbbbbb-0000-4000-8000-000000000002", "started_at": 2000.0}
+    first = [{"seq": i, "ts": 1000.0 + i, "kind": "user", "text": f"turn {i}", "src": f"u{i}#0"}
+             for i in (1, 2, 3)]
+    status, body = _post(url, token, "/api/capture/sessions", {"session": old, "events": first})
+    assert status == 201 and body["events_stored"] == 3
+    copied = [{**e} for e in first[1:]]  # the new file repeats turns 2 and 3, renumbered from 1
+    for i, e in enumerate(copied, start=1):
+        e["seq"] = i
+    fresh = {"seq": 3, "ts": 2001.0, "kind": "user", "text": "the new turn", "src": "u9#0"}
+    status, body = _post(url, token, "/api/capture/sessions", {"session": new, "events": copied + [fresh]})
+    assert status == 201 and body["events_stored"] == 1
+    assert body["continues"] == old["session_id"]
+    status, events = _get(url, token, f"/api/capture/sessions/{new['session_id']}/events")
+    assert [e["text"] for e in events["events"]] == ["the new turn"]
+    status, got = _get(url, token, f"/api/capture/sessions/{old['session_id']}")
+    assert got["continued_by"] == [new["session_id"]]
+    # Uploading the old one again changes nothing; it still has all three.
+    status, body = _post(url, token, "/api/capture/sessions", {"session": old, "events": first})
+    assert body["events_stored"] == 0 and body["event_count"] == 3
+    # Deleting the old trace leaves the new one standing alone.
+    status, _ = _delete(url, token, f"/api/capture/sessions/{old['session_id']}")
+    assert status == 200
+    status, got = _get(url, token, f"/api/capture/sessions/{new['session_id']}")
+    assert got["continues"] == ""

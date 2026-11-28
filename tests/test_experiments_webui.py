@@ -199,8 +199,8 @@ def test_menus_and_citation_counts(notes_mgr):
         # Manage holds the verbs, Delete behind a divider.
         b.eval(f"document.querySelector('#exp-row-{eid} .btn-manage').click()")
         b.wait_for("!!document.querySelector('.row-menu')")
-        assert _menu_items(b) == [["Rename\u2026", None], ["Move to campaign\u2026", None],
-                                  ["Delete\u2026", None]]
+        assert _menu_items(b) == [["Rename\u2026", None], ["Edit description\u2026", None],
+                                  ["Move to campaign\u2026", None], ["Delete\u2026", None]]
         assert b.eval("document.querySelectorAll('.row-menu hr').length") == 1
 
         # An experiment nothing cites still offers Notes (0): visible, inert.

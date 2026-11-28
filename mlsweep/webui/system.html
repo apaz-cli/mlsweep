@@ -108,6 +108,11 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .placement-toggle button { font-size: 12px; padding: 3px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .placement-toggle button + button { border-left: 1px solid var(--border-input); }
 .placement-toggle button:hover { background: var(--btn-hover); }
+.btn-pause { font-size: 12px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border-input); background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.btn-pause:hover { background: var(--btn-hover); }
+.btn-pause.active { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border-input)); background: color-mix(in srgb, var(--warn) 10%, var(--btn-bg)); font-weight: 600; }
+.pause-banner { margin-bottom: 12px; }
+.pause-banner.hidden { display: none; }
 .placement-toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
 
 /* Modal */
@@ -191,9 +196,11 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
             <button data-placement="spread" title="Put each job on the least busy GPU, so every GPU gets one job before any gets a second.">Spread</button>
           </div>
         </div>
+        <button class="btn-pause" id="btn-pause">Pause scheduling</button>
         <button class="btn-connect" id="btn-connect-worker">+ Connect Worker</button>
       </div>
     </div>
+    <div class="worker-warning pause-banner hidden" id="pause-banner">Scheduling is paused. No new jobs start on any worker until you unpause; running jobs carry on.</div>
     <div id="workers-grid" class="workers-grid">
       <div class="no-data">Loading…</div>
     </div>
@@ -261,6 +268,10 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
         <label for="fw-devices">GPU device IDs <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
         <input id="fw-devices" type="text" placeholder="0,1,2,3" autocomplete="off">
         <span class="form-hint">Comma-separated GPU indices. Leave blank to auto-detect.</span>
+      </div>
+      <div class="form-row">
+        <label class="gc-check"><input type="checkbox" id="fw-tunnel"> Connect over SSH</label>
+        <span class="form-hint">For a machine whose firewall lets only SSH in, such as a cloud instance. The manager reaches the worker through an SSH tunnel instead of its port.</span>
       </div>
       <div class="modal-actions" style="margin-top:0">
         <button class="btn-cancel" id="connect-cancel">Cancel</button>

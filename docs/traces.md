@@ -66,6 +66,16 @@ plugin inside the agent and works the same for every one it knows:
 | pi | `~/.pi/agent/sessions/**.jsonl` | `PI_SESSION_ID` |
 | Claude Code | `~/.claude/projects/**.jsonl` | `CLAUDE_CODE_SESSION_ID` |
 
+### Continued sessions
+
+When Claude Code continues a session in a new one, it can start the new
+transcript that begins with a copy of the old one's history. Capture keeps
+each event in one trace. The new trace leaves out the events the old trace already
+has, and its header says `continues` with a link to the old one, which says
+`continued in` back. The new trace's event numbers start where its own events start.
+This applies to traces captured from now on. Traces uploaded before keep any copies
+they have.
+
 ## Attribution
 
 An experiment records the trace it was submitted from. The client reads the

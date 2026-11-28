@@ -851,10 +851,17 @@ function renderHeader(s, { notes = true } = {}) {
     [s.model, "mono"], [s.cwd, "mono"],
     [`${events.length || s.event_count || 0} events${duration}`], [started],
   ].filter(([text]) => text);
-  traceMeta.replaceChildren(...parts.flatMap(([text, cls], i) => {
-    const span = document.createElement("span");
+  // A continued session's transcript repeats the earlier one's events; they stay there.
+  if (s.continues) parts.push([`continues ${s.continues.slice(0, 8)}`, "", s.continues]);
+  for (const later of s.continued_by || []) parts.push([`continued in ${later.slice(0, 8)}`, "", later]);
+  traceMeta.replaceChildren(...parts.flatMap(([text, cls, session], i) => {
+    const span = document.createElement(session ? "a" : "span");
     if (cls) span.className = cls;
     span.textContent = text;
+    if (session) {
+      span.href = pageHref("traces.html", { session });
+      span.title = session;
+    }
     if (!i) return [span];
     const sep = document.createElement("span");
     sep.className = "sep";

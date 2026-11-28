@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import json
 import os
 import signal
 import socket
@@ -302,6 +303,16 @@ async def _async_main(args: argparse.Namespace) -> None:
     for p in PLACEMENTS:
         if p == placement:
             state.placement = p
+    state.paused = await get_setting(read_db, "paused") == "1"
+    try:
+        paused_workers = json.loads(await get_setting(read_db, "paused_workers") or "[]")
+    except json.JSONDecodeError:
+        paused_workers = []
+    state.paused_workers = {w for w in paused_workers if isinstance(w, str)}
+    if state.paused:
+        print("Scheduling is paused; `mlsweep scheduler --unpause` resumes it")
+    elif state.paused_workers:
+        print(f"Scheduling is paused on {', '.join(sorted(state.paused_workers))}")
     for run_id, experiment_id in await unfinished_jobs_with_unsafe_ids(read_db):
         print(f"Failing job {run_id!r} of {experiment_id}: its ID is not safe to use in a path", file=sys.stderr)
         await writer.update_job_status(run_id, experiment_id, "failed")

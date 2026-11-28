@@ -100,7 +100,9 @@ select:focus { outline: none; border-color: var(--accent); }
 #status { font-size: 11px; color: var(--text-muted); }
 
 #sweep-note { font-size: 11px; color: var(--text-muted); font-style: italic;
-              margin-top: 4px; word-break: break-word; }
+              margin-top: 4px; word-break: break-word; white-space: pre-line; cursor: pointer; }
+#sweep-note:hover { color: var(--text); }
+#sweep-note.empty { font-style: normal; opacity: .75; }
 
 /* Highlighted run (curves tab) */
 #run-bar { display: flex; align-items: center; gap: 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); min-height: 36px; }

@@ -243,7 +243,7 @@ def test_reconnect_known_workers_schedules_remote_only():
             "status TEXT NOT NULL DEFAULT 'offline', last_seen REAL, scratch_dir TEXT, "
             "port INTEGER NOT NULL DEFAULT 7890, ssh_key TEXT, venv TEXT, devices TEXT, "
             "unhealthy_devices TEXT, "
-            "last_error TEXT)"
+            "last_error TEXT, tunnel INTEGER NOT NULL DEFAULT 0)"
         )
         await db.commit()
 

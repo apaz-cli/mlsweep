@@ -700,7 +700,9 @@ Files under `sources/` are originals and are not linted.
 The experiment/run ID and evidence-number checks need the manager (`--manager`,
 `MLSWEEP_MANAGER`, default `http://localhost:7891`, and its token as usual).
 Without it, lint still parses the chart/table specs, checks links and reports
-merge leftovers; it leaves the numbers unchecked.
+merge leftovers; it leaves the numbers unchecked. When a check is skipped, the
+report's first line says which and why, with the manager's answer, and `--json`
+gives that line as `note`. An empty report with a note is not a clean bill.
 
 ## Rules for agents
 

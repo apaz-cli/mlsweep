@@ -316,7 +316,7 @@
         <div class="sp-row"><span class="sp-k">Status</span>${esc(e.status || "unknown")}</div>
         <div class="sp-row"><span class="sp-k">Campaign</span>${esc(e.campaign)}</div>
         <div class="sp-row"><span class="sp-k">Runs</span>${c.done || 0} done · ${c.failed || 0} failed · ${(c.running || 0) + (c.dispatched || 0)} active</div>
-        <div class="sp-cmd">${esc(e.note || "No experiment note.")}</div>`,
+        <div class="sp-cmd">${esc(e.note || "No description.")}</div>`,
       actions: [
         { label: "Open results", icon: "▥", run: () => go(expResultsHref(e)) },
         { label: "Open logs", icon: "≡", run: () => go(expLogsHref(e)) },

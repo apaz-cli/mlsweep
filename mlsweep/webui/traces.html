@@ -84,8 +84,8 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .seg .n { margin-left: 5px; font: 10px var(--font-mono); color: var(--text-muted); }
 .seg button.active .n { color: inherit; opacity: .75; }
 .bar-right { margin-left: auto; display: inline-flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px 12px; }
-.nav-group { display: inline-flex; align-items: center; gap: 1px; }
-.nav-label { font-size: 10px; color: var(--text-dim); margin-right: 3px; }
+.jump-group { display: inline-flex; align-items: center; gap: 1px; }
+.jump-label { font-size: 10px; color: var(--text-dim); margin-right: 3px; }
 .more-links { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 10px; background: var(--btn-bg); color: var(--text-dim); cursor: pointer; white-space: nowrap; }
 .more-links:hover { color: var(--accent-text); border-color: var(--accent-border); }
 .trace-links.expanded { max-height: 30vh; overflow-y: auto; flex-basis: 100%; padding: 2px 0; }
@@ -241,14 +241,14 @@ tr.ev-tool td { padding-top: 4px; padding-bottom: 4px; }
         <button type="button" data-kind="mlsweep" title="Tool calls that run the mlsweep CLI">mlsweep</button>
       </span>
       <span class="bar-right">
-      <span class="nav-group" id="turn-nav" style="display:none">
-        <span class="nav-label">prompt</span>
+      <span class="jump-group" id="turn-nav" style="display:none">
+        <span class="jump-label">prompt</span>
         <button class="icon-btn" id="turn-prev" title="Previous prompt (&#91;)">&#8249;</button>
         <span class="turn-pos" id="turn-pos"></span>
         <button class="icon-btn" id="turn-next" title="Next prompt (&#93;)">&#8250;</button>
       </span>
-      <span class="nav-group" id="cmd-nav" style="display:none">
-        <span class="nav-label">mlsweep</span>
+      <span class="jump-group" id="cmd-nav" style="display:none">
+        <span class="jump-label">mlsweep</span>
         <button class="icon-btn" id="cmd-prev" title="Previous mlsweep command (M)">&#8249;</button>
         <span class="turn-pos" id="cmd-pos"></span>
         <button class="icon-btn" id="cmd-next" title="Next mlsweep command (m)">&#8250;</button>

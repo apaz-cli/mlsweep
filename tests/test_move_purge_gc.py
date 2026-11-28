@@ -57,8 +57,10 @@ def test_move_runs(manager_server) -> None:  # type: ignore[no-untyped-def]
     assert (Path(server.mlsweep_dir) / "experiments/dst/r1/training.log").read_text() == "log of r1\n"
     assert not (Path(server.mlsweep_dir) / "experiments/src/r1").exists()
 
+    # A pending run moves at once, and is scheduled under its new experiment.
     status, r = _post(url, "/api/experiments/src/jobs/move", {"run_ids": ["busy"], "to": "dst"})
-    assert status == 409 and "pending" in r["error"]
+    assert status == 200 and r["moved"] == ["busy"] and r["will_move"] == []
+    assert _api_get(url, TOKEN, "/api/jobs/busy?experiment_id=dst")["status"] == "pending"
     status, r = _post(url, "/api/experiments/src/jobs/move", {"run_ids": ["taken"], "to": "dst"})
     assert status == 409 and "already has a run" in r["error"]
     status, r = _post(url, "/api/experiments/src/jobs/move", {"run_ids": ["nope"], "to": "dst"})

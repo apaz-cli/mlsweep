@@ -102,6 +102,7 @@ function toggleExpMenu(expId) {
 function expManageItems(expId) {
   return [
     { label: "Rename…", act: act("renameExperiment", expId) },
+    { label: "Edit description…", act: act("editExpDescription", expId) },
     { label: "Move to campaign…", act: act("moveExperiment", expId) },
     { label: "Delete…", act: act("deleteExperiment", expId), danger: true, divider: true },
   ];
@@ -253,6 +254,15 @@ async function moveExperiment(expId) {
     const body = await r.json().catch(() => ({}));
     await mlAlert(`Move failed: ${body.error || r.status}`);
   }
+}
+
+async function editExpDescription(expId) {
+  const exp = experiments.find(e => e.experiment_id === expId);
+  const description = await mlEditDescription(expId, exp?.note);
+  if (description === undefined) return;
+  if (exp) exp.note = description;
+  hideExpNoteTip();
+  renderCurrent();
 }
 
 async function renameExperiment(expId) {
@@ -620,6 +630,7 @@ function renderExperiments(exps) {
         <div class="exp-name-cell">
           <span class="exp-toggle" ${act("toggleExpand", expId)}>${isExpanded ? "▼" : "▶"}</span>
           <span class="exp-name${exp.note ? " has-note" : ""}" ${exp.note ? `data-note="${escHtml(exp.note)}"` : ""} ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
+          ${exp.note ? "" : `<button type="button" class="exp-no-desc" title="This experiment has no description. Click to add one." ${act("editExpDescription", expId)}>no description</button>`}
           ${exp.manager_note ? `<span class="exp-manager-note${exp.status === "paused" ? " paused" : ""}" title="${escHtml(exp.manager_note)}">${escHtml(exp.manager_note)}</span>` : ""}
           ${MLCampaign.get() === MLCampaign.ALL ? `<span class="campaign-tag">${escHtml(MLCampaign.campaignOf(exp))}</span>` : ""}
         </div>
@@ -718,6 +729,6 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 
 bindActions({
   toggleJobDetail, renameJob, runAction, moveRun, purgeRun, setExpStatus, bulkRuns,
-  toggleExpand, renameExperiment, moveExperiment, deleteExperiment,
+  toggleExpand, renameExperiment, editExpDescription, moveExperiment, deleteExperiment,
   toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters, copyId,
 });

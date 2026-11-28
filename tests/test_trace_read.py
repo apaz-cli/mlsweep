@@ -275,3 +275,12 @@ def test_sql_stops_a_long_query(mgr):
         "sql": "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n",
         "timeout": 0.5})
     assert status == 400 and "stopped after 0.5 s" in data["error"]
+
+
+def test_show_names_the_trace_a_continued_session_continues():
+    from mlsweep._capture_read import _header
+
+    lines = _header({"session_id": "bbbb1111", "agent": "claude_code", "state": "active", "event_count": 4,
+                     "continues": "aaaa0000", "continued_by": ["cccc2222"]})
+    assert "  continues mlsweep:trace/aaaa0000: the events before this trace's first are there" in lines
+    assert "  continued in mlsweep:trace/cccc2222" in lines

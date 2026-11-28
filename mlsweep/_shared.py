@@ -375,7 +375,18 @@ class MsgMetric:
     experiment: str
     attempt: int = 0
     step_seconds: float | None = None  # the logger's wall seconds per step, if known
+    total_steps: int | None = None  # the step the run ends at, if the logger was told
     t: str = "metric"
+
+
+@dataclass
+class MsgHeartbeat:
+    """The script is alive and working, though it logged nothing (``MLSweepLogger.heartbeat``)."""
+
+    run_id: str
+    experiment: str
+    attempt: int = 0
+    t: str = "heartbeat"
 
 
 @dataclass
@@ -441,6 +452,7 @@ _MSG_TYPES: dict[str, type] = {
     "log": MsgLog,
     "metric": MsgMetric,
     "syncreq": MsgSyncReq,
+    "heartbeat": MsgHeartbeat,
     "result": MsgResult,
     "cleaned": MsgCleaned,
     "pong": MsgPong,

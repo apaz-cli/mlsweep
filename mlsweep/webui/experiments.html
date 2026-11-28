@@ -57,6 +57,8 @@ a.note-ref:hover { background: var(--radio-checked-bg); border-color: var(--acce
 .exp-note-tip { position: fixed; z-index: 1200; pointer-events: none; max-width: min(34rem, calc(100vw - 16px)); padding: 10px 13px; border: 1px solid var(--border-input); border-radius: 6px; background: var(--surface); color: var(--text); box-shadow: 0 8px 28px rgba(0,0,0,.28); font-family: system-ui, -apple-system, sans-serif; font-size: 14px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
 .exp-note-tip[hidden] { display: none; }
 .exp-manager-note.paused { color: var(--warn); }
+.exp-no-desc { font: inherit; font-size: 10px; color: var(--text-muted); background: none; border: 1px dashed var(--border-input); border-radius: 3px; padding: 0 5px; margin-left: 8px; cursor: pointer; vertical-align: middle; }
+.exp-no-desc:hover { color: var(--text); border-color: var(--accent); }
 .exp-manager-note { font-size: 11px; color: var(--text-muted); margin-left: 8px; max-width: 48ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 /* Action cells stay table cells (the buttons flex inside a div), so they
    stretch to the row and its bottom border stays one line. */

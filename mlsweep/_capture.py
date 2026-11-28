@@ -255,6 +255,21 @@ def _claude_prompt_text(text: str, line: dict[str, Any]) -> str:
 
 
 def _normalize_claude_line(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """A Claude Code transcript line's events, each tagged ``src`` with the line's uuid.
+
+    Claude Code copies a session's history, uuids and all, into the new
+    session's file when it continues one, so the manager uses ``src`` to keep
+    each event in one trace (see ``_insert_capture_events``).
+    """
+    events = _claude_line_events(line, meta)
+    uuid = line.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        for i, event in enumerate(events):
+            event["src"] = f"{uuid}#{i}"
+    return events
+
+
+def _claude_line_events(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
     kind = line.get("type")
     if line.get("sessionId"):
         meta["native_id"] = str(line["sessionId"])
@@ -1285,6 +1300,13 @@ def session_meta(spec: AgentSpec, path: Path, session_id: str,
     }
 
 
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _cmd_import(args: Any, sys: Any) -> None:
     """Convert existing transcripts into traces on the manager, marked imported."""
     from mlsweep._colors import _RED, _RESET
@@ -1301,7 +1323,9 @@ def _cmd_import(args: Any, sys: Any) -> None:
         imported = {}
     count = 0
     for spec in agent_specs(args.agents.split(",")):
-        for path in spec.sessions():
+        # Oldest first: a session continued from another repeats its events,
+        # and the trace that gets them is the one uploaded first.
+        for path in sorted(spec.sessions(), key=_mtime):
             key = str(path)
             if key in imported:
                 continue

@@ -808,17 +808,30 @@ function buildMetricSelect() {
 
 // ── Init (from visualize.py verbatim, with manager-format data) ───────────────
 
+// The experiment's description under its name; a click edits it.
+function showDescription() {
+  const el = document.getElementById("sweep-note");
+  el.textContent = DATA.note || "No description. Click to add one.";
+  el.classList.toggle("empty", !DATA.note);
+  el.title = "Click to edit the description";
+  el.style.display = "";
+}
+
+document.getElementById("sweep-note").addEventListener("click", async () => {
+  if (!DATA?.experiment) return;
+  const description = await mlEditDescription(DATA.experiment, DATA.note);
+  if (description === undefined) return;
+  DATA.note = description;
+  const exp = ALL_EXPS.find(e => e.experiment_id === DATA.experiment);
+  if (exp) exp.note = description;
+  showDescription();
+});
+
 function init(data) {
   DATA    = data;
   colorBy = Object.keys(DATA.dims)[0] || "_none_";
 
-  const noteEl = document.getElementById("sweep-note");
-  if (DATA.note) {
-    noteEl.textContent = DATA.note;
-    noteEl.style.display = "";
-  } else {
-    noteEl.style.display = "none";
-  }
+  showDescription();
 
   filters = Object.fromEntries(
     Object.entries(DATA.dims).map(([dim, vals]) => [dim, new Set(vals)])
@@ -1350,7 +1363,7 @@ async function loadExperiment(expId) {
       })),
       metricNames: [],
       subDims: {},
-      note: null,
+      note: ALL_EXPS.find(e => e.experiment_id === expId)?.note || null,
     };
 
     // Load all metrics from JSONL files, then discover metric names.
