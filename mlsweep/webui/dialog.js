@@ -18,7 +18,15 @@
   font-size: 13px; color: var(--text); line-height: 1.5; white-space: pre-wrap;
   font-family: system-ui, -apple-system, sans-serif;
 }
+.ml-dialog.ml-dialog-wide { width: min(560px, 95vw); }
+.ml-prompt-body { display: flex; flex-direction: column; gap: 5px; }
+.ml-prompt-hint { font-size: 10.5px; color: var(--text-muted); }
 .ml-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* mlHoverTip: a description that appears next to what it belongs to */
+.ml-hover-tip { position: fixed; z-index: 1200; pointer-events: none; max-width: min(34rem, calc(100vw - 16px)); padding: 8px 11px; border: 1px solid var(--border-input); border-radius: 6px; background: var(--surface); color: var(--text); box-shadow: 0 8px 28px rgba(0,0,0,.28); font-family: system-ui, -apple-system, sans-serif; font-size: 12.5px; line-height: 1.45; white-space: pre-line; overflow-wrap: anywhere; }
+.ml-hover-tip[hidden] { display: none; }
+.ml-hover-tip.placeholder { color: var(--text-muted); font-style: italic; }
 .ml-btn {
   font-size: 12px; padding: 5px 14px; border-radius: 4px; cursor: pointer;
   font-family: system-ui, -apple-system, sans-serif;
@@ -61,6 +69,12 @@
 .ml-ctx-item .h { font-size: 10.5px; color: var(--text-muted); white-space: nowrap; }
 .ml-ctx-item.danger { color: var(--bad); }
 .ml-ctx-item[disabled] { opacity: .45; cursor: default; background: none; }
+a.ml-ctx-item { text-decoration: none; box-sizing: border-box; }
+.ml-ctx-item .i { display: flex; flex-shrink: 0; color: var(--text-dim); }
+.ml-ctx-item .i svg { width: 12px; height: 12px; display: block; }
+.ml-ctx-item:hover .i { color: inherit; }
+.ml-ctx-item .c { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.ml-ctx-item:hover .c { color: var(--text-label); }
 .ml-ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 .ml-ctx-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
@@ -69,13 +83,15 @@
   styleEl.textContent = css;
   document.head.appendChild(styleEl);
 
-  function showDialog({ message, buttons, extraContent = null, onExtraKeydown = null }) {
+  function showDialog({ message, buttons, extraContent = null, onExtraKeydown = null,
+                        dialogClass = "", focusEl = null }) {
+    const extras = extraContent == null ? [] : (Array.isArray(extraContent) ? extraContent : [extraContent]);
     return new Promise(resolve => {
       const backdrop = document.createElement("div");
       backdrop.className = "ml-dialog-backdrop";
 
       const dlg = document.createElement("div");
-      dlg.className = "ml-dialog";
+      dlg.className = dialogClass ? `ml-dialog ${dialogClass}` : "ml-dialog";
       dlg.setAttribute("role", "dialog");
       dlg.setAttribute("aria-modal", "true");
 
@@ -95,8 +111,9 @@
         if (e.key === "Escape") close(null);
       });
 
-      if (extraContent && onExtraKeydown) {
-        extraContent.addEventListener("keydown", e => onExtraKeydown(e, close));
+      if (extras.length && onExtraKeydown) {
+        // Bound to the first extra; keystrokes inside it bubble up to here.
+        extras[0].addEventListener("keydown", e => onExtraKeydown(e, close));
       }
 
       for (const { label, value, getValue, cls } of buttons) {
@@ -107,15 +124,15 @@
         actions.appendChild(btn);
       }
 
-      if (extraContent) dlg.append(msg, extraContent, actions);
-      else dlg.append(msg, actions);
+      dlg.append(msg, ...extras, actions);
       backdrop.appendChild(dlg);
       document.body.appendChild(backdrop);
       // Focus once the dialog is in the document; focusing a detached
       // element does nothing, and keystrokes would go to the page behind.
-      if (extraContent) {
-        extraContent.focus();
-        extraContent.select?.();
+      const focusTarget = focusEl || extras[0];
+      if (focusTarget?.focus) {
+        focusTarget.focus();
+        focusTarget.select?.();
       } else {
         actions.querySelector("button:last-child").focus();
       }
@@ -159,11 +176,25 @@
     else input.rows = 5;
     input.value = defaultValue;
     input.placeholder = placeholder;
-    input.style.cssText = "width:100%;padding:6px 8px;font-size:13px;border:1px solid var(--border-input);border-radius:4px;background:var(--btn-bg);color:var(--text);outline:none;box-sizing:border-box;"
-      + (multiline ? "resize:vertical;font-family:inherit;line-height:1.4;min-width:min(32rem,80vw);" : "");
+    input.style.cssText = "width:100%;padding:6px 8px;font-size:13px;border:1px solid var(--border-input);"
+      + "border-radius:4px;background:var(--btn-bg);color:var(--text);outline:none;box-sizing:border-box;"
+      + (multiline ? "resize:vertical;font-family:inherit;line-height:1.4;" : "");
+    // A textarea does not fit the default width, and a mouse is not the only way
+    // to save, so a multi-line prompt widens its dialog and says how.
+    const body = document.createElement("div");
+    body.className = "ml-prompt-body";
+    body.append(input);
+    if (multiline) {
+      const hint = document.createElement("div");
+      hint.className = "ml-prompt-hint";
+      hint.textContent = "Ctrl+Enter saves · Esc cancels";
+      body.append(hint);
+    }
     return showDialog({
       message,
-      extraContent: input,
+      extraContent: body,
+      focusEl: input,
+      dialogClass: multiline ? "ml-dialog-wide" : "",
       onExtraKeydown: (e, close) => {
         if (e.key === "Enter" && (!multiline || e.ctrlKey || e.metaKey)) { e.preventDefault(); close(input.value.trim()); }
       },
@@ -172,6 +203,67 @@
         { label: okLabel, getValue: () => input.value.trim(), cls: "ml-btn-ok" },
       ],
     });
+  };
+
+  // mlHoverTip(trigger, opts?) → { setText(text, opts?) }
+  // A description that appears next to *trigger* on hover or keyboard focus and
+  // wraps long text.  It ignores the mouse, so it never flickers over the
+  // trigger or swallows a click on it.  opts: { text, placeholder }.
+  window.mlHoverTip = function (trigger, opts = {}) {
+    const tip = document.createElement("div");
+    tip.className = "ml-hover-tip";
+    tip.setAttribute("role", "tooltip");
+    tip.hidden = true;
+    document.body.appendChild(tip);
+
+    let text = opts.text || "";
+    let placeholder = !!opts.placeholder;
+    const gap = 8, margin = 10;
+
+    function render() {
+      tip.textContent = text;
+      tip.classList.toggle("placeholder", placeholder);
+    }
+
+    function place() {
+      const r = trigger.getBoundingClientRect();
+      const w = tip.offsetWidth, h = tip.offsetHeight;
+      const left = Math.max(margin, Math.min(r.left, window.innerWidth - w - margin));
+      let top = r.bottom + gap;
+      if (top + h > window.innerHeight - margin) top = r.top - h - gap;
+      tip.style.left = `${Math.round(left)}px`;
+      tip.style.top = `${Math.round(Math.max(margin, top))}px`;
+    }
+
+    function hide() { tip.hidden = true; }
+    function show() {
+      if (!text) { hide(); return; }
+      render();
+      tip.hidden = false;
+      place();
+    }
+
+    trigger.addEventListener("pointerover", show);
+    trigger.addEventListener("pointerout", e => {
+      if (e.relatedTarget && trigger.contains(e.relatedTarget)) return;
+      hide();
+    });
+    trigger.addEventListener("focus", show);
+    trigger.addEventListener("blur", hide);
+    // A scroll moves the trigger out from under the tip; drop it rather than
+    // leave it pointing at nothing.
+    window.addEventListener("scroll", hide, true);
+
+    return {
+      setText(next, o = {}) {
+        text = next || "";
+        placeholder = !!o.placeholder;
+        render();
+        if (tip.hidden) return;
+        if (!text) { hide(); return; }
+        place();
+      },
+    };
   };
 
   // mlPick(message, items, opts?) → Promise<value|null>
@@ -299,7 +391,7 @@
 
   // mlContextMenu(event, items) shows a right-click menu at the pointer;
   // mlMenuAt(x, y, items) shows the same menu at a point (a button's corner).
-  // items: [{ label, hint?, run, danger?, disabled? } | "-" | { title } | null].
+  // items: [{ label, hint?, run | href, icon?, count?, title?, danger?, disabled? } | "-" | { title } | null].
   let ctx = null;
   function closeCtx() { if (ctx) { ctx.remove(); ctx = null; } }
   window.mlCloseContextMenu = closeCtx;
@@ -322,18 +414,25 @@
         }
         continue;
       }
-      if (it.title) { const t = document.createElement("div"); t.className = "ml-ctx-title"; t.textContent = it.title; menu.append(t); continue; }
-      const b = document.createElement("button");
-      b.type = "button";
+      if (it.title && it.label == null) { const t = document.createElement("div"); t.className = "ml-ctx-title"; t.textContent = it.title; menu.append(t); continue; }
+      // An item with an href is a link (middle-click opens a tab); one with run is a button.
+      const link = it.href && !it.disabled;
+      const b = document.createElement(link ? "a" : "button");
+      if (link) b.href = it.href; else b.type = "button";
       b.className = "ml-ctx-item" + (it.danger ? " danger" : "");
       b.setAttribute("role", "menuitem");
       if (it.disabled) b.disabled = true;
+      if (it.title) b.title = it.title;
+      if (it.icon && typeof VIEW_ICONS !== "undefined" && VIEW_ICONS[it.icon]) {
+        const i = document.createElement("span"); i.className = "i"; i.innerHTML = VIEW_ICONS[it.icon]; b.append(i);
+      }
       const l = document.createElement("span");
       l.className = "l";
       l.textContent = it.label;
       b.append(l);
       if (it.hint) { const h = document.createElement("span"); h.className = "h"; h.textContent = it.hint; b.append(h); }
-      b.onclick = () => { closeCtx(); it.run(); };
+      if (it.count != null) { const c = document.createElement("span"); c.className = "c"; c.textContent = it.count; b.append(c); }
+      b.onclick = () => { closeCtx(); if (it.run) it.run(); };
       menu.append(b);
     }
     while (menu.lastChild && menu.lastChild.className === "ml-ctx-sep") menu.lastChild.remove();
@@ -353,18 +452,6 @@
     if ((inner && inner !== row) || t.isContentEditable) return true;
     const sel = getSelection();
     return !!(sel && !sel.isCollapsed && String(sel).trim() && sel.containsNode(t, true));
-  };
-  // A run's other pages, as right-click menu items: every page but *skip*.
-  // *code*: whether the run has a code snapshot to open.
-  window.mlRunPageItems = function (expId, runId, { skip = "", code = true } = {}) {
-    const q = { experiment: expId, run: runId };
-    return [
-      ["results", "Open results", { experiment: expId }],
-      ["logs", "Open logs", q],
-      ["files", "Open artifacts", q],
-      code ? ["code", "Open code", q] : null,
-    ].filter(p => p && p[0] !== skip)
-      .map(([page, label, query]) => ({ label, run: () => { location.href = pageHref(`${page}.html`, query); } }));
   };
   document.addEventListener("mousedown", e => { if (ctx && !ctx.contains(e.target)) closeCtx(); }, true);
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeCtx(); });

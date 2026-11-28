@@ -158,6 +158,8 @@ async function selectJob(job) {
   currentRunId = job.run_id;
 
   logRunIdEl.innerHTML = runNameHtml(job);
+  mlTagEntity(logRunIdEl, job.experiment_id, job.run_id,
+    { title: job.label || job.run_id, skip: "logs", codeFiles: job.code_files });
   setBadge(job.status);
   logHeader.style.display = "";
   logWrap.style.display   = "flex";
@@ -303,7 +305,7 @@ jobListEl.addEventListener("contextmenu", e => {
       if (label !== undefined) setJobLabel(job.run_id, label);
     } },
     "-",
-    ...mlRunPageItems(job.experiment_id, job.run_id, { skip: "logs", code: Boolean(job.artifact_id) }),
+    ...mlRunPageItems(job.experiment_id, job.run_id, { skip: "logs", codeFiles: job.code_files }),
     "-",
     { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
   ]);

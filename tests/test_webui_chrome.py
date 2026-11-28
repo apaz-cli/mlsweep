@@ -131,7 +131,9 @@ def test_an_outdated_worker_offers_the_update(browser, mgr) -> None:  # type: ig
     cards = browser.eval("[...document.querySelectorAll('.worker-card')].map(c => "
                          "[!!c.querySelector('.btn-update'), !!c.querySelector('.btn-disconnect'), "
                          "!!c.querySelector('.worker-warning')])")
-    assert cards == [[True, False, False], [False, False, False], [False, False, False],
+    # Disconnect is offered in every state, so that a worker that never started
+    # can be taken out of the pool too.
+    assert cards == [[True, True, False], [False, True, False], [False, True, False],
                      [True, True, True], [False, True, False]]
     browser.eval("document.querySelector('.btn-update').click()")
     browser.wait_for("window._posted.length === 1")

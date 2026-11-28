@@ -355,6 +355,24 @@ function bindCurveEvents() {
     const hash = _chartRunHashes[pt.curveNumber % _chartRunHashes.length];
     setSelectedRun(hash === selectedRun ? null : hash);
   });
+  // Right-click a curve: the run under the pointer, as plotly last hovered it.
+  let hoveredRun = null;
+  gd.on("plotly_hover", e => {
+    const pt = e.points && e.points[0];
+    hoveredRun = pt && _chartRunHashes.length ? _chartRunHashes[pt.curveNumber % _chartRunHashes.length] : null;
+  });
+  gd.on("plotly_unhover", () => { hoveredRun = null; });
+  gd.addEventListener("contextmenu", e => {
+    const r = hoveredRun && DATA && DATA.runs.find(x => x.hash === hoveredRun);
+    if (!r) return;
+    const items = mlEntityMenuItems(DATA.experiment, r.hash, { title: r.name, skip: "results", codeFiles: JOBS.get(r.hash)?.code_files });
+    items.splice(1, 0,
+      { label: r.hash === selectedRun ? "Clear the highlight" : "Highlight this run",
+        run: () => setSelectedRun(r.hash === selectedRun ? null : r.hash) },
+      { label: "Hide this run", run: () => hideRun(r.hash) },
+      "-");
+    mlContextMenu(e, items);
+  });
   // A click that hit no curve (and was not the end of a zoom drag) clears.
   gd.addEventListener("mousedown", e => { downAt = [e.clientX, e.clientY]; });
   gd.addEventListener("click", e => {
@@ -418,7 +436,7 @@ function renderRunBar() {
     + `<span class="rb-k">${escHtml(k)}</span>=${escHtml(v)}</button>`).join("");
   document.getElementById("run-bar-main").innerHTML =
     `<span class="color-swatch" style="background:${escHtml(color)}"></span>`
-    + `<span class="rb-name" title="${escHtml(r.hash)}">${escHtml(r.name)}</span>`
+    + `<span class="rb-name" title="${escHtml(r.hash)}" ${mlEntityAttrs(DATA.experiment, r.hash, { title: r.name, skip: "results", codeFiles: JOBS.get(r.hash)?.code_files })}>${escHtml(r.name)}</span>`
     + (job ? `<span${job.reason ? ` title="${escHtml(job.reason)}"` : ""}>${badge(job.status)}</span>` : "")
     + `<span class="rb-pills">${pills}</span>`;
   document.getElementById("run-bar-links").innerHTML =
@@ -808,16 +826,24 @@ function buildMetricSelect() {
 
 // ── Init (from visualize.py verbatim, with manager-format data) ───────────────
 
-// The experiment's description under its name; a click edits it.
+// The experiment's description: it lives in a tooltip on the name (the sidebar
+// has no room for a paragraph) and a click on the name edits it.
+const expNameEl = document.getElementById("exp-name");
+const noteTip = mlHoverTip(expNameEl);
+const NO_DESCRIPTION = "No description — click the name to add one.";
+
 function showDescription() {
-  const el = document.getElementById("sweep-note");
-  el.textContent = DATA.note || "No description. Click to add one.";
-  el.classList.toggle("empty", !DATA.note);
-  el.title = "Click to edit the description";
-  el.style.display = "";
+  const note = DATA?.note || "";
+  expNameEl.classList.toggle("has-note", !!note);
+  noteTip.setText(note || NO_DESCRIPTION, { placeholder: !note });
 }
 
-document.getElementById("sweep-note").addEventListener("click", async () => {
+function hideDescription() {
+  expNameEl.classList.remove("has-note");
+  noteTip.setText("");
+}
+
+async function editDescription() {
   if (!DATA?.experiment) return;
   const description = await mlEditDescription(DATA.experiment, DATA.note);
   if (description === undefined) return;
@@ -825,6 +851,11 @@ document.getElementById("sweep-note").addEventListener("click", async () => {
   const exp = ALL_EXPS.find(e => e.experiment_id === DATA.experiment);
   if (exp) exp.note = description;
   showDescription();
+}
+
+expNameEl.addEventListener("click", editDescription);
+expNameEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); editDescription(); }
 });
 
 function init(data) {
@@ -1308,9 +1339,9 @@ async function loadExperiment(expId) {
   dlBtn.href = authURL(`/api/experiments/${encodeURIComponent(expId)}/metrics.zip`);
   dlBtn.style.display = "";
 
-  const expNameEl = document.getElementById("exp-name");
   expNameEl.classList.add("loading");
   expNameEl.textContent = "Fetching data…";
+  hideDescription();
   document.getElementById("status").textContent = "";
 
   if (_ws) { _ws.close(); _ws = null; }
@@ -1376,6 +1407,7 @@ async function loadExperiment(expId) {
 
     expNameEl.classList.remove("loading");
     expNameEl.textContent = expId;
+    mlTagEntity(expNameEl, expId, "", { skip: "results" });
 
     // Connect WS for live updates.
     connectWS(expId);

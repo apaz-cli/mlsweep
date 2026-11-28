@@ -48,14 +48,14 @@ def EXCLUDE(combo: dict) -> bool: ...
 ### `DESCRIPTION`
 
 A string saying what the experiment is for. It is stored on the experiment and
-shown in the dashboard (on hover over the name on the Experiments page, and under
-the name on Results) and in `mlsweep status`. `mlsweep run --description TEXT`
+shown in the dashboard (on hover over the experiment's name, on the Experiments
+and Results pages) and in `mlsweep status`. `mlsweep run --description TEXT`
 overrides it. An experiment submitted with neither gets a warning, and so does a
 sweep file without one in `mlsweep lint`.
 
 Change or remove it later with `mlsweep rename EXP --description TEXT` (or
 `--clear-description`), the "Edit description…" item in an experiment's menu on
-the Experiments page, or a click on the description on Results. `--append` keeps
+the Experiments page, or a click on the experiment's name on Results. `--append` keeps
 the description the experiment already has. Over HTTP it is
 `PUT /api/experiments/EXP/description` with `{"description": TEXT}`, where null
 or `""` clears it. Experiment JSON calls the field `note`.

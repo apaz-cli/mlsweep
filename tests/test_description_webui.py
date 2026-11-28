@@ -49,6 +49,18 @@ def _wait_note(mgr, eid, want, timeout=5.0):
 def _answer_dialog(b, text):
     """Type *text* into the open description dialog and save with Ctrl+Enter."""
     b.wait_for("!!document.querySelector('.ml-dialog textarea')")
+    # The textarea must sit inside the dialog: it used to spill out of the
+    # 340px-wide box and hang over the page behind it.
+    box = b.eval("""(() => {
+      const d = document.querySelector('.ml-dialog');
+      const dr = d.getBoundingClientRect();
+      const tr = d.querySelector('textarea').getBoundingClientRect();
+      return [dr.left, dr.right, dr.top, dr.bottom, tr.left, tr.right, tr.top, tr.bottom, innerWidth];
+    })()""")
+    dleft, dright, dtop, dbottom, tleft, tright, ttop, tbottom, vw = box
+    assert dleft <= tleft and tright <= dright, f"the textarea spills out of its dialog: {box}"
+    assert dtop <= ttop and tbottom <= dbottom, f"the textarea spills out of its dialog: {box}"
+    assert dleft >= 0 and dright <= vw, f"the dialog is off screen: {box}"
     b.eval(f"""(() => {{
       const t = document.querySelector('.ml-dialog textarea');
       t.value = {json.dumps(text)};
@@ -57,6 +69,19 @@ def _answer_dialog(b, text):
       t.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', ctrlKey: true, bubbles: true }}));
     }})()""")
     b.wait_for("!document.querySelector('.ml-dialog')")
+
+
+def _hover_name(b, over=True):
+    """Hover the experiment's name on Results (or leave it) without a real mouse."""
+    kind = "'pointerover'" if over else "'pointerout'"
+    related = "null" if over else "document.body"
+    b.eval(f"""(() => {{ const el = document.getElementById('exp-name');
+        el.dispatchEvent(new PointerEvent({kind}, {{ bubbles: true, relatedTarget: {related} }})); }})()""")
+
+
+def _wait_tip(b, text):
+    b.wait_for("(t => !!t && !t.hidden && t.textContent === %s)(document.querySelector('.ml-hover-tip'))"
+               % json.dumps(text))
 
 
 def _row(eid):
@@ -90,9 +115,34 @@ def test_results_page_shows_and_edits_the_description(mgr, page):
     ok(mgr, "PUT", f"/api/experiments/{eid}/description", {"description": "from the cli"})
     page.goto(page.url("results.html", campaign="test", experiment=eid))
     page.wait_for("DATA && DATA.experiment === " + json.dumps(eid))
-    page.wait_for("document.getElementById('sweep-note').textContent === 'from the cli'")
 
-    page.eval("document.getElementById('sweep-note').click()")
+    # The description is a tooltip on the name, not a line in the sidebar.
+    assert page.eval("!document.getElementById('sweep-note')")
+    _hover_name(page)
+    _wait_tip(page, "from the cli")
+    page.wait_for("document.getElementById('exp-name').classList.contains('has-note')")
+    _hover_name(page, over=False)
+    page.wait_for("document.querySelector('.ml-hover-tip').hidden")
+
+    # Tabbing to the name shows it too, for people who never use a mouse.
+    page.call("Emulation.setFocusEmulationEnabled", enabled=True)
+    page.eval("document.getElementById('exp-name').focus()")
+    _wait_tip(page, "from the cli")
+    page.eval("document.getElementById('exp-name').blur()")
+    page.wait_for("document.querySelector('.ml-hover-tip').hidden")
+
+    # A click on the name edits it, and the tooltip follows the new text.
+    page.eval("document.getElementById('exp-name').click()")
     _answer_dialog(page, "edited on results")
     _wait_note(mgr, eid, "edited on results")
-    page.wait_for("document.getElementById('sweep-note').textContent === 'edited on results'")
+    page.wait_for("DATA.note === 'edited on results'")
+    _hover_name(page)
+    _wait_tip(page, "edited on results")
+
+    # With no description the tooltip says how to add one.
+    ok(mgr, "PUT", f"/api/experiments/{eid}/description", {"description": None})
+    page.eval(f"void refreshExperiments().then(() => loadExperiment({json.dumps(eid)}))")
+    page.wait_for("DATA && DATA.experiment === " + json.dumps(eid) + " && DATA.note === null")
+    _hover_name(page)
+    _wait_tip(page, "No description — click the name to add one.")
+    page.wait_for("document.querySelector('.ml-hover-tip').classList.contains('placeholder')")

@@ -62,38 +62,12 @@ window.addEventListener("scroll", hideExpNoteTip, true);
 window.addEventListener("resize", hideExpNoteTip);
 
 
-// What the View menu's entries lead to, counted the way each page lists them:
-// results and export are finished runs, logs are every run, artifacts are the
-// runs with artifact files.
-function expCounts(expId) {
-  const exp = allExperiments.find(e => e.experiment_id === expId) || {};
-  const c = exp.job_counts || {};
-  return {
-    total: c.total || exp.expected_jobs || 0,
-    finished: (c.done || 0) + (c.pruned || 0) + (c.failed || 0) + (c.xfailed || 0),
-    withArtifacts: c.with_artifacts || 0,
-  };
-}
-
+// What the View menu lists comes from viewmenu.js, shared with every page.
 function toggleExpView(expId) {
   toggleMenu(this, `view:${expId}`, expViewItems(expId));
 }
 
-function expViewItems(expId) {
-  const n = expCounts(expId);
-  const exp = allExperiments.find(e => e.experiment_id === expId) || {};
-  return [
-    { label: "Results", icon: "results", count: n.finished, href: pageHref("results.html", { experiment: expId }) },
-    { label: "Logs", icon: "logs", count: n.total, href: pageHref("logs.html", { experiment: expId }) },
-    { label: "Artifacts", icon: "artifacts", count: n.withArtifacts, href: pageHref("files.html", { experiment: expId }) },
-    { ...codeItem(pageHref("code.html", { experiment: expId }), exp.code_files),
-      title: "The code this experiment ran, with its file tree and where it came from"
-        + (exp.code_files != null ? ` (${exp.code_files} file${exp.code_files === 1 ? "" : "s"})` : "") },
-    notesItem(expId),
-    tracesItem(expId),
-    { label: "Export", icon: "export", count: n.finished, href: pageHref("export.html", { experiment: expId }) },
-  ].filter(Boolean);
-}
+function expViewItems(expId) { return MLViews.expItems(expId); }
 
 function toggleExpMenu(expId) {
   toggleMenu(this, `exp:${expId}`, expManageItems(expId));
@@ -353,8 +327,8 @@ function toggleJobDetail(expId, runId) {
 // The notes badge: a pencil and how many notes mention it, linking to them.
 // It shows once the mentions are loaded; zero is red, with nowhere to go.
 function noteRefHtml(expId, runId) {
-  if (!notesEnabled) return "";
-  const n = noteCount(expId, runId);
+  if (!MLViews.state.notesEnabled) return "";
+  const n = MLViews.noteCount(expId, runId);
   const what = runId ? "run" : "experiment or its runs";
   if (!n) return `<span class="note-ref zero" title="No note mentions this ${what}">${VIEW_ICONS.notes}0</span>`;
   const title = `${n} note${n === 1 ? "" : "s"} mention this ${what}`;
@@ -365,6 +339,7 @@ function noteRefHtml(expId, runId) {
 // The traces badge: how many agent sessions submitted the experiment, linking
 // to them.  Traces link to experiments, not runs.
 function traceRefHtml(expId) {
+  const { captureEnabled, traceCounts } = MLViews.state;
   if (!captureEnabled || !traceCounts) return "";
   const n = traceCounts[expId] || 0;
   if (!n) return `<span class="note-ref trace-ref zero" title="No agent trace submitted this experiment">${VIEW_ICONS.traces}0</span>`;
@@ -691,6 +666,7 @@ async function fetchExperiments() {
     const loaded = await r.json();
     if (seq !== experimentsSeq) return;
     allExperiments = loaded;
+    MLViews.setExperiments(loaded);
     showCampaign();
     setConnStatus("connected");
     document.getElementById("error-msg").style.display = "none";
@@ -713,8 +689,7 @@ function showCampaign() {
 
 MLCampaign.bind(campaignSelect, showCampaign);
 
-watchNoteMentions(() => { if (allExperiments.length) showCampaign(); });
-watchTraceCounts(() => { if (allExperiments.length) showCampaign(); });
+watchViewCounts(() => { if (allExperiments.length) showCampaign(); });
 
 async function refreshAll() {
   await fetchExperiments();

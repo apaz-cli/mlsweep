@@ -814,6 +814,7 @@ function renderLinks(s) {
     link.href = pageHref("experiments.html", { id: eid });
     link.textContent = eid;
     link.title = eid;
+    mlTagEntity(link, eid, "", { skip: "traces" });
     const unlink = document.createElement("button");
     unlink.type = "button";
     unlink.className = "unlink";

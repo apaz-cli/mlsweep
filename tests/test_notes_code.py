@@ -255,11 +255,15 @@ def test_code_page_follows_the_run(page, mgr, exps) -> None:  # type: ignore[no-
     page.wait_for("document.querySelectorAll('table.src tr').length === 6")
     assert "return 1e-3" in page.eval("document.querySelectorAll('table.src td.c')[3].textContent")
     assert "v1 of 2" in page.eval("document.getElementById('hdr-meta').textContent")
-    assert page.eval("document.querySelector('.job-item.selected').dataset.runId") == "r0"
-    # Clicking the other run switches to its code.
-    page.eval("document.querySelector('.job-item[data-run-id=\"r1\"]').click()")
+    assert page.eval("document.getElementById('hdr-kind').textContent") == "Run"
+    assert page.eval("document.getElementById('hdr-title').dataset.mlRun") == "r0"
+    # The files are in the sidebar; there is no list of runs.
+    assert page.eval("!!document.querySelector('#sidebar #file-tree .tnode') && !document.querySelector('.job-item')")
+    # The header goes back to the experiment's latest code.
+    page.eval("document.querySelector('#hdr-badge .hdr-back').click()")
     page.wait_for("(document.querySelectorAll('table.src td.c')[3] || {}).textContent?.includes('min(1, step / 100)')")
     assert "v2 of 2" in page.eval("document.getElementById('hdr-meta').textContent")
+    assert page.eval("document.getElementById('hdr-kind').textContent") == "Experiment"
 
 
 def test_code_page_explains_a_legacy_experiment(page, mgr, exps) -> None:  # type: ignore[no-untyped-def]
@@ -432,13 +436,10 @@ def test_code_page_right_click_menus(page, mgr, exps) -> None:  # type: ignore[n
     assert labels[0] == "Copy note link to line 4" and "Copy as a code block for a note" in labels
     assert page.eval("[...document.querySelectorAll('tr.hl td.n')].map(t => t.textContent).join(',')") == "4"
     page.eval("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
-    # A run in the sidebar that used other code.
-    _right_click(page, '.job-item[data-run-id="r0"]')
+    # The experiment's name in the header: its pages, less Code (this page).
+    _right_click(page, '#hdr-title')
     labels = _ctx_labels(page)
-    assert labels[:2] == ["Show this run's code", "Compare with the code shown now"] and "Open logs" in labels
-    page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent.startsWith('Compare with the code')).click()")
-    page.wait_for("document.getElementById('compare-bar').classList.contains('on')")
-    assert "v1 of this experiment" in page.eval("document.getElementById('compare-text').textContent")
+    assert labels[:3] == ["Results", "Logs", "Artifacts"] and "Code" not in labels, labels
 
 
 def test_notes_complete_experiment_ids(page, mgr, exps) -> None:  # type: ignore[no-untyped-def]

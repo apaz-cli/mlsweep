@@ -355,7 +355,7 @@ function runChip(w, r) {
       title="${escHtml(r.run_id)} · ${escHtml(r.experiment_id)}${live ? "\nDrag onto another GPU to restart it there" : ""}">
     <span class="rc-name">${name}</span>
     <span class="rc-meta">${escHtml(r.experiment_id)}${j?.start_time ? " · " + elapsedSince(j.start_time) : j?.status === "dispatched" ? " · starting" : ""}</span>
-    <button class="rc-menu btn-menu" aria-haspopup="true" title="Move, requeue, logs" ${act("toggleChipMenu", w.worker_id, r.experiment_id, r.run_id)}>⋯</button>
+    <button class="rc-menu btn-menu" aria-haspopup="true" title="Its pages, requeue or cancel (drag the chip to move it)" ${act("toggleChipMenu", w.worker_id, r.experiment_id, r.run_id)}>⋯</button>
   </div>`;
 }
 
@@ -620,36 +620,20 @@ async function requeueRun(expId, runId) {
   await reschedule(expId, runId, null, null);
 }
 
-// A worker's short name: its host, or its full ID when two workers share a host.
-function workerName(w) {
-  return lastWorkers.filter(x => x.host === w.host).length > 1 ? w.worker_id : w.host;
-}
-
 function toggleChipMenu(workerId, expId, runId) {
   const chip = this.closest(".run-chip");
   chip?.classList.add("menu-open");
   toggleMenu(this, `chip:${expId}/${runId}`, chipItems(workerId, expId, runId));
 }
 
+// A run chip: Requeue and Copy ID, the run's View items, then Cancel.
+// Moving it to another GPU is a drag onto that GPU's tile.
 function chipItems(workerId, expId, runId) {
-  const targets = [];
-  for (const w of lastWorkers) {
-    if (w.status !== "connected") continue;
-    for (const g of w.gpus || []) {
-      const on = ((w.gpu_runs || {})[g] || []);
-      if (w.worker_id === workerId && on.some(r => r.run_id === runId && r.experiment_id === expId)) continue;
-      const cap = w.max_jobs_per_gpu || 0;
-      targets.push({
-        label: `Move to ${workerName(w)} GPU ${g}`, count: cap ? `${on.length}/${cap}` : `${on.length}`,
-        act: act("moveRunTo", expId, runId, w.worker_id, g),
-      });
-    }
-  }
+  const view = runViewItems(expId, runId, jobOf(expId, runId)?.code_files);
   return [
-    ...targets,
-    { label: "Requeue anywhere", act: act("requeueRun", expId, runId), divider: targets.length > 0 },
-    { label: "Logs", icon: "logs", href: pageHref("logs.html", { experiment: expId, run: runId }), divider: true },
-    { label: "Results", icon: "results", href: pageHref("results.html", { experiment: expId, run: runId }) },
+    { label: "Requeue anywhere", act: act("requeueRun", expId, runId) },
+    { label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") },
+    ...view.map((it, i) => i ? it : { ...it, divider: true }),
     { label: "Cancel run", act: act("cancelInFlight", expId, runId), danger: true, divider: true },
   ];
 }
@@ -843,8 +827,6 @@ async function cancelQueued(expId, runId) {
   await refresh();
 }
 
-watchNoteMentions(() => {});
-watchTraceCounts(() => {});
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 let refreshSeq = 0;

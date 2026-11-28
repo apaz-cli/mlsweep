@@ -157,7 +157,7 @@ function runMenu(e, j, path) {
     { label: checked ? "Leave out of the comparison" : "Add to the comparison", run: () => setChecked(j.run_id, !checked) },
     { label: "Download all files (.zip)", run: () => downloadURL(runZipURL(eid, j.run_id), `${j.run_id}.zip`) },
     "-",
-    ...mlRunPageItems(eid, j.run_id, { skip: "files", code: Boolean(j.artifact_id) }),
+    ...mlRunPageItems(eid, j.run_id, { skip: "files", codeFiles: j.code_files }),
     { label: "Copy run ID", run: () => copyText(j.run_id, "Copied the run ID") },
   ]);
 }
@@ -366,7 +366,9 @@ async function loadBrowse(runId) {
   toolbar.style.display = "flex";
   document.getElementById("run-dl-zip").href = runZipURL(eid, runId);
   const _browseJob = jobs.find(j => j.run_id === runId);
-  document.getElementById("browse-run-label").innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
+  const runLabel = document.getElementById("browse-run-label");
+  runLabel.innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
+  mlTagEntity(runLabel, eid, runId, { title: _browseJob?.label || runId, skip: "files", codeFiles: _browseJob?.code_files });
   const codeBtn = document.getElementById("run-code-btn");
   codeBtn.href = pageHref("code.html", { experiment: eid, run: runId });
   codeBtn.style.display = _browseJob && _browseJob.artifact_id ? "" : "none";

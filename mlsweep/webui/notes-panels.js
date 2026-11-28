@@ -497,6 +497,7 @@ function expRow(id, note, onclick) {
   if (note) a.append(el("span", "commit-time", note));
   a.title = `${id}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? `\n${m.jobs.done || 0}/${m.jobs.total || 0} runs done, ${m.jobs.failed || 0} failed` : ""}`;
   if (onclick) a.onclick = e => { e.preventDefault(); onclick(); };
+  mlTagEntity(a, id, "", { title: m.name || id });
   return a;
 }
 function refreshOutline(t) {

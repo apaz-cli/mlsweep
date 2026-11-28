@@ -3,8 +3,9 @@
 Every list a person works through has a right-click menu: experiment and run
 rows, workers, GPU tiles and run chips, the Logs and Artifacts sidebars, traces
 and their events, and the notes panels and tables.  Each offers what the row's
-own buttons and clicks do.  A right-click on a link inside a row keeps the
-browser's menu (open in new tab, copy link).
+own buttons and clicks do.  A run or experiment named anywhere else (a page
+header, a highlighted run, a chip) has a menu of its pages.  A right-click on a
+link inside a row keeps the browser's menu (open in new tab, copy link).
 
 Skipped when no Chromium-family browser is installed (set MLSWEEP_TEST_CHROME
 to point at one).
@@ -170,7 +171,10 @@ def test_system_page_rows(mgr, page):
     page.eval(f"renderInFlight([{json.dumps(job)}]); renderWorkers([{json.dumps(worker)}])")
     assert _right_click(page, '.run-chip[data-run="live_r"] .rc-meta')
     labels = _row_menu(page)
-    assert labels[0] == "Move to gpu1 GPU 1" and "Requeue anywhere" in labels and labels[-1] == "Cancel run", labels
+    # The run's View items, as on its in-flight row; moving it is a drag.
+    assert labels[:5] == ["Requeue anywhere", "Copy run ID", "Results", "Artifacts", "Logs"], labels
+    assert labels[-1] == "Cancel run", labels
+    assert not any(x.startswith("Move to") for x in labels), labels
     assert page.eval("!!document.querySelector('.run-chip.menu-open')")
     _escape(page)
     page.wait_for("!document.querySelector('.run-chip.menu-open')")
@@ -224,7 +228,10 @@ def test_logs_run_list(mgr, page):
     page.wait_for("document.querySelectorAll('.job-item').length === 2")
     assert _right_click(page, '.job-item[data-run-id="r2"]')
     labels = _ctx_menu(page)
-    assert labels == ["Show logs", "Download log", "Rename…", "Open results", "Open artifacts", "Copy run ID"], labels
+    # The run's View items as on the Experiments tab, less Logs (this page).
+    assert labels[:3] == ["Show logs", "Download log", "Rename…"], labels
+    assert labels[3:6] == ["Results", "Artifacts", "Code"], labels
+    assert labels[-1] == "Copy run ID", labels
     page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent === 'Show logs').click()")
     page.wait_for("document.querySelector('.job-item.selected')?.dataset.runId === 'r2'")
 
@@ -341,8 +348,74 @@ def test_notes_panels_and_tables(mgr, page):
     page.wait_for("!!document.querySelector('.nb-table td[data-metric=\"loss\"]')", timeout=20)
     assert _right_click(page, '.nb-table td[data-metric="loss"]')
     labels = _notes_menu(page)
-    assert labels[:4] == ["Open results", "Open logs", "Open artifacts", "Open code"], labels
+    assert labels[:4] == ["Results", "Artifacts", "Logs", "Code"], labels
     assert labels[-2:] == ["Copy value", "Copy evidence link"], labels
     # The run's own link keeps the browser's menu.
     page.eval("mlCloseContextMenu()")
     assert not _right_click(page, ".nb-table a.nb-run")
+
+
+def test_run_and_experiment_references(mgr, page):
+    """A run or experiment named outside a list (a page header, a highlighted
+    run, a chip) has the same menu of its pages, without the page it is on."""
+    eid = _experiment(mgr, ["r1"])
+    _insert_metrics(mgr, eid, "r1", [(1, {"loss": 1.0}), (2, {"loss": 0.5})])
+
+    # Results: the experiment's name, and the highlighted run's name.
+    page.goto(static_url(mgr, "results.html", experiment=eid))
+    page.wait_for(f"document.getElementById('exp-name').dataset.mlExp === {json.dumps(eid)}")
+    assert _right_click(page, "#exp-name")
+    labels = _ctx_menu(page)
+    # The experiment's View items, in the Experiments tab's order and with its
+    # counts, less Results (this page).
+    page.wait_for("!!document.querySelector('.ml-ctx-item .c')")
+    items = page.eval("[...document.querySelectorAll('.ml-ctx-item')].map(b => "
+                      "[b.querySelector('.l').textContent, b.querySelector('.c')?.textContent ?? null, !!b.querySelector('.i svg')])")
+    assert [i[0] for i in items[:3]] == ["Logs", "Artifacts", "Code"], items
+    assert items[0][1] == "1" and items[0][2], items
+    assert "Results" not in [i[0] for i in items], items
+    assert labels[-1] == "Copy experiment ID" and "Export" in labels, labels
+    page.eval("mlCloseContextMenu(); setSelectedRun('r1')")
+    page.wait_for("!!document.querySelector('#run-bar .rb-name')")
+    assert _right_click(page, "#run-bar .rb-name")
+    labels = _ctx_menu(page)
+    assert labels[:3] == ["Artifacts", "Logs", "Code"] and "Results" not in labels, labels
+    assert labels[-2:] == ["Copy run ID", "Copy experiment ID"], labels
+    # A page entry is a link, so a middle-click opens it in a tab.
+    assert page.eval("[...document.querySelectorAll('a.ml-ctx-item')].some(a => a.textContent === 'Logs')")
+    page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(b => b.textContent === 'Logs').click()")
+    page.wait_for("location.pathname.endsWith('logs.html')")
+    assert page.eval("new URLSearchParams(location.search).get('run')") == "r1"
+    assert page.eval("new URLSearchParams(location.search).get('experiment')") == eid
+
+    # Logs: the open run's name in the header.
+    page.wait_for("document.getElementById('log-run-id').dataset.mlRun === 'r1'")
+    assert _right_click(page, "#log-run-id")
+    labels = _ctx_menu(page)
+    assert labels[:2] == ["Results", "Artifacts"] and "Logs" not in labels, labels
+
+    # Traces: a linked experiment's chip is a link, so the menu opens it in a
+    # new tab too.
+    sid = uid("tr")
+    ok(mgr, "POST", "/api/capture/sessions", {"session": {
+        "session_id": sid, "agent": "claude_code", "title": sid, "state": "active"},
+        "events": [{"seq": 1, "ts": 1.0, "kind": "user", "text": "hi"}]})
+    linked = uid("ctx")
+    ok(mgr, "POST", "/api/experiments", {"campaign": "test", "experiment_id": linked, "name": linked,
+                                         "capture_session": sid})
+    eid = linked
+    page.goto(static_url(mgr, "traces.html", session=sid))
+    page.wait_for(f"!!document.querySelector('.link-chip[data-ml-exp=\"{eid}\"]')")
+    assert _right_click(page, ".link-chip")
+    labels = _ctx_menu(page)
+    assert labels[0] == "Open link in a new tab" and "Traces" not in labels, labels
+    assert labels[1:4] == ["Results", "Logs", "Artifacts"], labels
+
+    # A page's own menu wins over the shared one: a tagged element inside a
+    # row that has a menu gets the row's.
+    page.eval("""(() => { const s = document.querySelector('.session-item');
+        const t = document.createElement('span'); t.id = 'tagged-in-row'; t.textContent = 'x';
+        mlTagEntity(t, 'e', 'r'); s.append(t); })()""")
+    page.eval("mlCloseContextMenu()")
+    assert _right_click(page, "#tagged-in-row")
+    assert "Copy trace id" in _ctx_menu(page)

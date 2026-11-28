@@ -39,7 +39,6 @@ const TREE_ORDER = new Intl.Collator(undefined, { sensitivity: "base", numeric: 
 
 MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
 MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_code", min: 180, max: 520 });
-MLChrome.resizable(document.getElementById("tree-pane"), { name: "code_tree_width", min: 150, max: 560 });
 
 // ── the URL ──────────────────────────────────────────────────────────────────
 
@@ -144,49 +143,6 @@ function changeOf(path) {
   return S.diff ? (S.diff.changes.find(c => c.path === path) || null) : null;
 }
 
-// ── sidebar ──────────────────────────────────────────────────────────────────
-
-function renderJobs() {
-  const list = $("job-list");
-  const n = versions().length;
-  $("runs-note").textContent = S.snapOnly ? "" : n > 1 ? `· ${n} code versions` : n === 1 ? "· one code version" : "";
-  if (S.snapOnly) {
-    const used = (S.usage && S.usage.experiments) || [];
-    list.innerHTML = `<div class="job-list-msg">Opened by snapshot ID.${used.length
-      ? "<br>Used by " + used.map(e => `<b>${escHtml(e.name || e.experiment_id)}</b>`).join(", ") + "." : ""}
-      <br>Choose an experiment to browse its runs.</div>`;
-    return;
-  }
-  if (!S.jobs.length) { list.innerHTML = `<div class="job-list-msg">No runs</div>`; return; }
-  const sorted = [...S.jobs].sort((a, b) => new Date(b.submit_time) - new Date(a.submit_time));
-  list.innerHTML = sorted.map(j => {
-    let combo = {};
-    try { combo = typeof j.combo === "string" ? JSON.parse(j.combo || "{}") : (j.combo || {}); } catch { combo = {}; }
-    const comboStr = Object.entries(combo).map(([k, v]) => `${k}=${v}`).join(" ");
-    const v = n > 1 ? versionNumber(j.artifact_id) : 0;
-    const cls = j.run_id === S.runId ? " selected" : (!S.runId && j.artifact_id === S.snapshot ? " same" : "");
-    return `<div class="job-item${cls}" data-run-id="${escHtml(j.run_id)}" title="Click to see the code this run used. Right-click for more.">
-      <div class="job-item-top">
-        <span class="job-run-id" title="${escHtml(j.run_id)}">${runNameHtml(j)}</span>
-        ${v ? `<span class="ver-tag" title="${escHtml(short(j.artifact_id))}">v${v}</span>` : ""}
-        <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
-      </div>
-      ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}
-    </div>`;
-  }).join("");
-  list.querySelectorAll(".job-item").forEach(item => item.addEventListener("click", () => {
-    const job = S.jobs.find(j => j.run_id === item.dataset.runId);
-    if (!job) return;
-    // A second click on the selected run goes back to the experiment's latest code.
-    if (S.runId === job.run_id) showCode(latestSnapshot(), null, { push: true });
-    else showCode(job.artifact_id, job, { push: true });
-  }));
-  list.querySelectorAll(".job-item").forEach(item => item.addEventListener("contextmenu", e => {
-    const job = S.jobs.find(j => j.run_id === item.dataset.runId);
-    if (job) runMenu(e, job);
-  }));
-}
-
 // ── header ───────────────────────────────────────────────────────────────────
 
 function metaItem(label, value) {
@@ -200,6 +156,8 @@ function renderHeader() {
   const job = S.runId ? S.jobs.find(j => j.run_id === S.runId) : null;
   const title = $("hdr-title");
   title.replaceChildren();
+  if (job) mlTagEntity(title, job.experiment_id, job.run_id, { title: job.label || job.run_id, skip: "code", codeFiles: job.code_files });
+  else mlTagEntity(title, S.snapOnly ? "" : S.expId, "", { skip: "code" });
   $("hdr-kind").textContent = job ? "Run" : S.snapOnly ? "Snapshot" : "Experiment";
   if (job) title.innerHTML = `<span class="mono">${runNameHtml(job)}</span>`;
   else if (S.snapOnly) title.append(el("span", "mono", short(S.snapshot)));
@@ -209,6 +167,14 @@ function renderHeader() {
     title.title = S.expId;
   }
   $("hdr-badge").innerHTML = job ? `<span class="badge badge-${escHtml(job.status)}">${escHtml(job.status)}</span>` : "";
+  // A run's code came from its View menu or a link; this goes back to the experiment's.
+  if (job) {
+    const back = el("button", "hdr-back", "← experiment's latest code");
+    back.type = "button";
+    back.title = "Show the experiment's latest code instead of this run's";
+    back.onclick = () => showCode(latestSnapshot(), null, { push: true });
+    $("hdr-badge").append(" ", back);
+  }
 
   // Version menu: every version of the experiment's code.
   const vs = $("version-select");
@@ -268,6 +234,7 @@ function renderHeader() {
     for (const e of S.usage.experiments.slice(0, 3)) {
       const a = el("a", null, e.name || e.experiment_id);
       a.href = pageHref("code.html", { experiment: e.experiment_id });
+      mlTagEntity(a, e.experiment_id, "", { title: e.name || e.experiment_id, skip: "code" });
       meta.append(metaItem("used by", a));
     }
   }
@@ -484,20 +451,6 @@ function linesMenu(e, n) {
   ]);
 }
 
-function runMenu(e, job) {
-  const differs = job.artifact_id && job.artifact_id !== S.snapshot && job.artifact_id.startsWith("snap:");
-  mlContextMenu(e, [
-    { title: job.label || job.run_id },
-    { label: "Show this run's code", run: () => showCode(job.artifact_id, job, { push: true }) },
-    differs ? { label: "Compare with the code shown now", hint: `v${versionNumber(job.artifact_id)}`, run: () => compareWith(job.artifact_id) } : null,
-    "-",
-    { label: "Open logs", run: () => { location.href = pageHref("logs.html", { experiment: job.experiment_id, run: job.run_id }); } },
-    { label: "Open artifacts", run: () => { location.href = pageHref("files.html", { experiment: job.experiment_id, run: job.run_id }); } },
-    { label: "Open results", run: () => { location.href = pageHref("results.html", { experiment: job.experiment_id }); } },
-    "-",
-    { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
-  ]);
-}
 
 // ── file tree ────────────────────────────────────────────────────────────────
 
@@ -905,6 +858,7 @@ async function openPath(path, { keepLines = false, push = false, token = null } 
 function showMessage(text, err) {
   $("code-header").style.display = "none";
   $("code-inner").style.display = "none";
+  $("tree-pane").style.display = "none";
   const box = $("no-sel");
   box.style.display = "";
   box.textContent = text;
@@ -924,7 +878,6 @@ function defaultPath() {
 async function showCode(sid, job, { push = false, path = null, lines = "", compare = null } = {}) {
   const seq = ++navSeq;
   S.runId = job ? job.run_id : null;
-  renderJobs();
   if (!sid) {
     showMessage(job ? "This run has no code recorded: it ran from the worker's own directory."
                     : "No code is recorded for this experiment.");
@@ -954,11 +907,11 @@ async function showCode(sid, job, { push = false, path = null, lines = "", compa
   if (path !== null) { S.path = path; [S.start, S.end] = parseLines(lines); }
   const known = !S.path || fileEntry(S.path) || isDir(S.path) || changeOf(S.path);
   if (!known || (path === null && !S.path)) { S.path = known && S.path ? S.path : defaultPath(); S.start = S.end = null; }
-  renderJobs();
   renderHeader();
   $("no-sel").style.display = "none";
   $("code-header").style.display = "";
   $("code-inner").style.display = "";
+  $("tree-pane").style.display = "";
   renderTree();
   await openPath(S.path, { keepLines: true, push, token: seq });
 }
@@ -978,7 +931,6 @@ async function selectExperiment(expId, want = {}) {
   S.snapOnly = false; S.usage = null;
   S.expId = expId;
   S.jobs = []; S.info = null; S.runId = null;
-  $("job-list").innerHTML = `<div class="job-list-msg">Loading…</div>`;
   try { if (!await loadExperimentData(expId, token)) return; }
   catch (e) {
     if (token !== navSeq) return;
@@ -1018,7 +970,7 @@ const expSelect = $("exp-select");
 async function showCampaign(want) {
   MLCampaign.fill(campaignSelect, S.exps);
   const chosen = MLCampaign.fillExperiments(expSelect, MLCampaign.filter(S.exps), want && want.exp, S.expId);
-  if (!chosen) { S.expId = null; showMessage("No experiments in this campaign."); $("job-list").innerHTML = ""; return; }
+  if (!chosen) { S.expId = null; showMessage("No experiments in this campaign."); return; }
   if (chosen !== S.expId || S.snapOnly || want) await selectExperiment(chosen, want || {});
 }
 

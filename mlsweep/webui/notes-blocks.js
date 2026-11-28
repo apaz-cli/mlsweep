@@ -627,6 +627,7 @@ function nbEvidenceMark(a, ev) {
   a.dataset.evValue = String(ev.value);
   a.dataset.evStep = String(ev.step);
   a.href = pageHref("results.html", { experiment: ev.experiment, run: ev.run });
+  mlTagEntity(a, ev.experiment, ev.run);
   if (claimed == null || !Number.isFinite(got)) {
     a.classList.add("ev-unknown");
     mark.textContent = "?";

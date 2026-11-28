@@ -170,7 +170,7 @@ def test_menus_and_citation_counts(notes_mgr):
 
         # View holds the pages with what each leads to, the experiment (and
         # campaign) carried along: two finished runs, two logs, no artifacts.
-        b.wait_for("traceCounts !== null")
+        b.wait_for("MLViews.state.traceCounts !== null")
 
         # The Refs column holds the notes badge over the traces badge: the icon
         # and count of the sessions that submitted the experiment, linking to them.

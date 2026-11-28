@@ -473,8 +473,13 @@ entry counts the files in the code: the experiment's latest version, or the run'
 Right-click works the same way across the dashboard. On the System page it covers a worker,
 one GPU (drain, remove or return it), a run chip and an in-flight run. Logs and Artifacts
 have it on their run lists, Artifacts also on files and compare cards, Traces on traces and
-events, and Export on uploads and their runs. On a link, a field or selected text you get
-the browser's own menu instead.
+events, and Export on uploads and their runs. Anywhere else a run or an experiment is named,
+right-click it for the same pages as its `View ▾` menu on the Experiments page, in the same
+order and with the same counts, and for copying its ID. That covers the experiment name, the highlighted run and
+each curve on Results, the run in the Logs, Artifacts and Code headers, a trace's linked
+experiments, and the experiments and evidence links in notes. On a link, a field or
+selected text you get the browser's own menu instead. A link that names a run or an
+experiment is the exception, and its menu starts with Open link in a new tab.
 
 The Artifacts page previews images and text files. For model and array files (safetensors,
 PyTorch `.pt`/`.pth`/`.ckpt`/`.bin`, TorchScript, pickle, NumPy `.npy`/`.npz`, GGUF and
@@ -545,8 +550,8 @@ dropped. Multi-node runs can be requeued but not pinned.
 
 On the System page each GPU is a tile with its runs on it. The switch on a tile drains the
 GPU or puts it back. Click tiles to select several, then drain, remove or return them
-together. Drag a run onto another GPU, on any worker, to restart it there, or use the run's
-menu.
+together. Drag a run onto another GPU, on any worker, to restart it there. The run's menu
+has its pages, Requeue anywhere and Cancel.
 
 `pack` fills busy GPUs first, keeping whole GPUs and machines free for big jobs. `spread`
 puts each job on the least busy GPU. `mlsweep rename EXP --experiment-name NAME` renames an
@@ -606,16 +611,18 @@ experiments, newest first, each as its latest code. A file several of them share
 once, and its hits name the newest experiment and count the others. Binary files and files
 over 2 MB are skipped.
 
-The dashboard's Code tab shows the same. Pick an experiment and a run, as on Logs, to see
-that run's code as a file tree and files with line numbers, and where it came from.
+The dashboard's Code tab shows the same. Pick an experiment to see its latest code, with
+the file tree in the sidebar, files with line numbers, and where it came from. A run's own
+code opens from its `View ▾` or right-click menu on any page, and the header then has a link
+back to the experiment's latest code.
 Model and array files (`.pt`, `.safetensors`, `.npy` and the like) get the same summary of
 tensors and shapes as on Artifacts, and images are shown. The Wrap box beside a file's path
 folds long lines.
 Details shows everything recorded at submit, the uncommitted diff included. The version
 menu picks any version of the experiment's code. Compare picks another version, a run that
 used other code, or any experiment from a list you can search, then marks the tree and
-shows each changed file's diff. Right-click a file, a folder, a line number or a run for
-the rest: comparing a file with the previous version, links for a note, and downloads. The
+shows each changed file's diff. Right-click a file, a folder, a line number or the header's run or
+experiment for the rest: comparing a file with the previous version, links for a note, and downloads. The
 download button gives the whole snapshot as a zip. Results, Logs and Artifacts, a run's
 details and `View ▾` menu on the Experiments page, and the search palette link to it. Notes can link to a file and lines there, and show code or a diff inline.
 See "Code links" in `mlsweep docs notes`.
