@@ -812,6 +812,17 @@ def test_traces_page_renders_a_session(tmp_path_factory):
         b.eval("document.querySelector('#ledger tbody tr').click()")
         b.wait_for("document.getElementById('inspector').classList.contains('open')")
         assert b.eval("document.getElementById('inspector-text').textContent") == "Run the sweep"
+        # The inspector's copy button is an SVG icon, centred in its square; a
+        # text glyph such as ⧉ sits off centre and falls back to another font.
+        button, icon = b.eval("""(() => {
+          const btn = document.getElementById('inspector-copy');
+          const svg = btn.querySelector('svg');
+          if (!svg) return [null, null];
+          const a = btn.getBoundingClientRect(), r = svg.getBoundingClientRect();
+          return [[a.x + a.width / 2, a.y + a.height / 2], [r.x + r.width / 2, r.y + r.height / 2]];
+        })()""")
+        assert button and icon, "the copy button has no SVG icon"
+        assert abs(button[0] - icon[0]) < 0.5 and abs(button[1] - icon[1]) < 0.5, (button, icon)
         # A tool call is one line with its name; tool results show a status, not output.
         b.eval("document.querySelectorAll('#ledger tbody tr')[2].click()")
         b.wait_for("document.getElementById('inspector-kind').textContent === 'bash'")
