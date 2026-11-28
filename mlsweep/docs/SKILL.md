@@ -18,7 +18,7 @@ description: Use when running machine learning experiments. Hyperparameter sweep
 - Your own experiments, meaning the ones you submitted: `cancel`, `stop`, `pause` and `retry` are yours to use. Abort a sweep you can see is broken rather than letting it use the cluster.
 - Anyone else's experiments: leave them alone unless the user asks. If one you did not start looks broken, ask.
 - `purge`, `delete` and `gc --yes` destroy data, and `export wandb` publishes it. Run them only when the user asks.
-- `workers add`, `workers rm`, `workers set`, `workers update`, `scheduler --placement` and `scheduler --pause` change the cluster for everyone. Ask first.
+- `workers add`, `workers rm`, `workers forget`, `workers set`, `workers update`, `scheduler --placement` and `scheduler --pause` change the cluster for everyone. Ask first.
 - If the manager is unreachable, check the URL and token, then ask. Start a manager only if you were told to. Its worker takes every visible GPU, and a manager started from your session can die with that session.
 - For anything else, use your judgment and ask the user when in doubt.
 

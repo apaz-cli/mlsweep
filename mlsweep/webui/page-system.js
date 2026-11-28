@@ -34,24 +34,55 @@
       if (res.ok) {
         const workers = await res.json();
         _knownWorkers = workers;
-        const inactive = workers.filter(w => w.status !== "connected");
-        if (inactive.length) {
-          knownList.innerHTML = inactive.map(w => `
-            <div class="known-worker-row">
-              <div class="known-worker-info">
-                <span class="known-worker-host">${escHtml(w.host)}</span>
-                <span class="known-worker-dir">${escHtml(w.remote_dir)}</span>
-              </div>
-              <button class="btn-reconnect" data-worker-id="${escHtml(w.worker_id)}">Reconnect</button>
-            </div>`).join("");
-          knownList.classList.remove("hidden");
-          divider.classList.remove("hidden");
-        }
+        renderKnown();
       }
     } catch (_) {}
   }
 
+  // Previously connected workers that are not connected now, each with
+  // Reconnect and Forget.
+  function renderKnown() {
+    const inactive = _knownWorkers.filter(w => w.status !== "connected");
+    knownList.innerHTML = inactive.map(w => `
+      <div class="known-worker-row">
+        <div class="known-worker-info">
+          <span class="known-worker-host">${escHtml(w.host)}</span>
+          <span class="known-worker-dir">${escHtml(w.remote_dir)}</span>
+        </div>
+        <button class="btn-forget" data-worker-id="${escHtml(w.worker_id)}"
+          title="Remove from this list; its runs, if any, are re-queued">Forget</button>
+        <button class="btn-reconnect" data-worker-id="${escHtml(w.worker_id)}">Reconnect</button>
+      </div>`).join("");
+    knownList.classList.toggle("hidden", !inactive.length);
+    divider.classList.toggle("hidden", !inactive.length);
+  }
+
   function closeModal() { modal.classList.add("hidden"); }
+
+  knownList.addEventListener("click", async e => {
+    const forget = e.target.closest(".btn-forget");
+    if (!forget) return;
+    const workerId = forget.dataset.workerId;
+    forget.disabled = true;
+    errEl.classList.add("hidden");
+    try {
+      const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}?forget=1`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) {
+        const data = await res.json().catch(() => ({}));
+        errEl.textContent = "Failed to forget: " + (data.error || res.status);
+        errEl.classList.remove("hidden");
+        forget.disabled = false;
+        return;
+      }
+      _knownWorkers = _knownWorkers.filter(w => w.worker_id !== workerId);
+      renderKnown();
+      refresh();
+    } catch (err) {
+      errEl.textContent = "Network error: " + err.message;
+      errEl.classList.remove("hidden");
+      forget.disabled = false;
+    }
+  });
 
   // Reconnect a previously registered worker with one click.
   knownList.addEventListener("click", async e => {
@@ -148,8 +179,16 @@
 })();
 
 // ── Disconnect worker ─────────────────────────────────────────────────────────
+// Works on a worker in any state, one that never started included, and takes
+// it out of the pool.  It leaves the page and a manager restart does not
+// relaunch it; the Connect dialog offers it again, or forgets it.
 async function disconnectWorker(workerId) {
-  if (!await mlConfirm(`Disconnect worker "${workerId}"?\nIn-flight jobs will be re-queued.`, { confirmLabel: "Disconnect" })) return;
+  const w = lastWorkers.find(x => x.worker_id === workerId);
+  const runs = Object.values(w?.gpu_runs || {}).reduce((n, rs) => n + rs.length, 0);
+  const msg = `Disconnect worker "${workerId}" and remove it from the pool?`
+    + (runs ? `\nIts ${runs} in-flight run${runs === 1 ? "" : "s"} will be re-queued.` : "")
+    + "\nThe Connect dialog can reconnect or forget it later.";
+  if (!await mlConfirm(msg, { confirmLabel: "Disconnect" })) return;
   try {
     const res = await apiFetch(`/api/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" });
     if (!res.ok) {
@@ -405,7 +444,8 @@ function poolSummary(w) {
 }
 
 function renderWorkers(workers) {
-  lastWorkers = workers;
+  // A disconnected worker is out of the pool; the Connect dialog lists it.
+  lastWorkers = workers = workers.filter(w => w.status !== "disconnected");
   const grid = document.getElementById("workers-grid");
   // Don't redraw under a drag, an open menu or an input being edited.
   const active = document.activeElement;
@@ -423,7 +463,6 @@ function renderWorkers(workers) {
   grid.innerHTML = workers.map(w => {
     const status   = w.status || "offline";
     const isLive   = status === "connected";
-    const canDisconnect = status !== "dead" && status !== "updating";
     const canUpdate     = w.outdated && (status === "dead" || isLive);
     const maxJobs  = w.max_jobs_per_gpu || 0;
     const gpus = allGpusOf(w);
@@ -454,7 +493,7 @@ function renderWorkers(workers) {
         <span class="worker-actions-buttons">
           <span class="worker-last-seen">${w.last_seen ? relTime(w.last_seen) : ""}</span>
           ${canUpdate ? `<button class="btn-update" title="Install this manager's mlsweep on ${escHtml(w.host)} and restart the worker" ${act("updateWorker", w.worker_id, isLive)}>Update worker</button>` : ""}
-          ${canDisconnect ? `<button class="btn-disconnect" ${act("disconnectWorker", w.worker_id)}>Disconnect</button>` : ""}
+          <button class="btn-disconnect" title="Remove this worker from the pool" ${act("disconnectWorker", w.worker_id)}>Disconnect</button>
         </span>
       </div>
     </div>`;
@@ -523,7 +562,7 @@ function workerItems(workerId, withLifecycle = false) {
     const status = w.status || "offline";
     const more = [];
     if (w.outdated && (status === "dead" || live)) more.push({ label: "Update worker", act: act("updateWorker", workerId, live) });
-    if (status !== "dead" && status !== "updating") more.push({ label: "Disconnect", act: act("disconnectWorker", workerId), danger: true });
+    more.push({ label: "Disconnect", act: act("disconnectWorker", workerId), danger: true });
     more.push({ label: "Copy worker ID", act: act("copyId", workerId, "Copied the worker ID") });
     return joinMenus(items, more);
   }

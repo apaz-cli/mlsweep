@@ -296,6 +296,7 @@ mlsweep rename EXP --description TEXT   # or --clear-description
 
 # cluster (the System page)
 mlsweep workers [ls|add|rm|set]      mlsweep scheduler [--placement pack|spread]
+mlsweep workers forget W             mlsweep workers update W
 mlsweep scheduler --pause [W|all]    mlsweep scheduler --unpause [W|all]
 mlsweep reschedule EXP RUN [--to W]  mlsweep history EXP [RUN]
 

@@ -515,6 +515,40 @@ def test_add_and_get_worker(manager_server):
     assert fetched["worker_id"] == "w1"
 
 
+
+def test_disconnect_and_forget_a_worker_that_cannot_start(manager_server):
+    """A worker whose launch failed can still be disconnected.  It leaves the
+    pool but stays listed, so the Connect dialog can offer it again.
+    Forgetting it drops it from the list.  Adding it again brings it back."""
+    import time
+    _, url = manager_server
+    _api_post(url, _TOKEN, "/api/workers", {"worker_id": "gone", "host": "user@nosuchhost.invalid"})
+    deadline = time.monotonic() + 60
+    while _api_get(url, _TOKEN, "/api/workers/gone")["status"] != "dead":
+        assert time.monotonic() < deadline, "the launch never failed"
+        time.sleep(0.2)
+
+    def listed():
+        return {w["worker_id"]: w["status"] for w in _api_get(url, _TOKEN, "/api/workers")}
+
+    def code(method, path):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _api_request(url, _TOKEN, method, path, {} if method == "POST" else None)
+        return exc.value.code
+
+    assert _api_delete(url, _TOKEN, "/api/workers/gone")["status"] == "disconnected"
+    assert listed()["gone"] == "disconnected"
+    assert code("POST", "/api/workers/gone/update") == 409
+
+    assert _api_delete(url, _TOKEN, "/api/workers/gone?forget=1")["status"] == "removed"
+    assert "gone" not in listed()
+    for method, path in (("GET", "/api/workers/gone"), ("DELETE", "/api/workers/gone"),
+                         ("POST", "/api/workers/gone/update")):
+        assert code(method, path) == 404, (method, path)
+
+    _api_post(url, _TOKEN, "/api/workers", {"worker_id": "gone", "host": "user@nosuchhost.invalid"})
+    assert "gone" in listed()
+
 # ── Artifacts ───────────────────────────────────────────────────────────────────
 
 

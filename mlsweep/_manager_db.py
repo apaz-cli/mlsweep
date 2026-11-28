@@ -67,7 +67,15 @@ _IN_CAMPAIGN = "experiment_id IN (SELECT experiment_id FROM experiments WHERE ca
 _ACTIVE_IN = _sql_in(ACTIVE_JOB_STATUSES)
 _UNFINISHED_IN = _sql_in(("pending", *ACTIVE_JOB_STATUSES))
 _FINISHED_IN = _sql_in(FINISHED_JOB_STATUSES)
-WorkerStatus = Literal["offline", "connected", "reconnecting", "updating", "dead"]
+# A ``disconnected`` worker was taken out of the pool on purpose (the System
+# page's Disconnect, ``mlsweep workers rm``).  It is still listed, so the
+# Connect dialog can bring it back, but a manager restart does not relaunch it.
+# A ``removed`` worker was forgotten: its row stays (jobs reference it) but it
+# is not listed at all.  Only adding the worker again (``upsert_worker``)
+# brings back either one.
+WorkerStatus = Literal["offline", "connected", "reconnecting", "updating", "dead",
+                       "disconnected", "removed"]
+RETIRED_WORKER_STATUSES: tuple[WorkerStatus, ...] = ("disconnected", "removed")
 
 
 # ===============================================================================
@@ -1442,16 +1450,33 @@ async def update_worker_status(
 
     ``last_error`` records a human-readable failure reason when moving to a
     failed state.  Passing ``None`` (the default) clears any previous error.
+    A disconnected or removed worker keeps its status, so a launch or
+    reconnect that was in flight when it was retired cannot bring it back
+    (``retire_worker`` sets those statuses).
     """
     now = _now_epoch()
     row = await _exec_one(
         db,
         "UPDATE workers SET status = ?, last_seen = ?, last_error = ? "
-        "WHERE worker_id = ? RETURNING *",
+        "WHERE worker_id = ? AND status NOT IN ('disconnected', 'removed') RETURNING *",
         (status, now, last_error, worker_id),
     )
     await db.commit()
     return _row_to_worker(row) if row else None
+
+
+async def retire_worker(
+    db: aiosqlite.Connection,
+    worker_id: str,
+    status: WorkerStatus,
+) -> None:
+    """Mark a worker ``disconnected`` or ``removed`` (see ``WorkerStatus``)."""
+    assert status in RETIRED_WORKER_STATUSES
+    await db.execute(
+        "UPDATE workers SET status = ?, last_seen = ?, last_error = NULL WHERE worker_id = ?",
+        (status, _now_epoch(), worker_id),
+    )
+    await db.commit()
 
 
 async def update_worker_health(
@@ -1495,13 +1520,15 @@ async def list_workers(
     db: aiosqlite.Connection,
     status: WorkerStatus | None = None,
 ) -> list[WorkerRecord]:
-    """List workers, optionally filtered by status."""
+    """List workers, optionally filtered by status.  Removed workers are left
+    out unless *status* asks for them."""
     if status is not None:
         cursor = await db.execute(
             "SELECT * FROM workers WHERE status = ? ORDER BY worker_id", (status,)
         )
     else:
-        cursor = await db.execute("SELECT * FROM workers ORDER BY worker_id")
+        cursor = await db.execute(
+            "SELECT * FROM workers WHERE status != 'removed' ORDER BY worker_id")
     rows = await cursor.fetchall()
     return [_row_to_worker(r) for r in rows]
 
@@ -3363,6 +3390,10 @@ class DbWriter:
         return await self._enqueue(
             lambda: update_worker_status(db, worker_id, status, last_error)
         )
+
+    async def retire_worker(self, worker_id: str, status: WorkerStatus) -> None:
+        db = self._db
+        await self._enqueue(lambda: retire_worker(db, worker_id, status))
 
     async def touch_worker(self, worker_id: str) -> None:
         db = self._db

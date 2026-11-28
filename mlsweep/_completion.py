@@ -35,7 +35,7 @@ _EXPERIMENT_FIRST = frozenset({
 _SUBCOMMANDS = {
     "context": ("list", "show", "add", "use", "rm"),
     "completion": ("bash", "zsh", "fish"),
-    "workers": ("ls", "add", "rm", "set"),
+    "workers": ("ls", "add", "rm", "forget", "set", "update"),
     "campaign": ("ls", "move"),
     "export": ("tensorboard", "wandb"),
     "notes": ("clone", "lint"),

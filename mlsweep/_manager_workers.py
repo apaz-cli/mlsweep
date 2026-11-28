@@ -1913,7 +1913,7 @@ async def reconnect_known_workers(
 
     scheduled = 0
     for wr in known:
-        if wr.host == "localhost":
+        if wr.host == "localhost" or wr.status == "disconnected":
             continue
         if wr.host in covered:
             continue
@@ -2022,6 +2022,12 @@ async def connect_single_worker(
             wc.tunnel_task = asyncio.create_task(_tunnel_monitor_task(wc, manager_port, state.shutdown_event))
 
         async with state.lock:
+            if worker_id in state.retired:
+                # Disconnected while it was launching: drop the new connection.
+                if writer is not None:
+                    _close_writer(writer)
+                _close_tunnel(wc)
+                return None
             state.workers[worker_id] = wc
             if reader is None or writer is None:
                 wc.status = "reconnecting"

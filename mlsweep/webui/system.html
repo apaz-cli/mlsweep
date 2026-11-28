@@ -148,6 +148,9 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .btn-reconnect { flex-shrink: 0; font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
 .btn-reconnect:hover { opacity: 0.85; }
 .btn-reconnect:disabled { opacity: 0.5; cursor: default; }
+.btn-forget { flex-shrink: 0; font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text-muted); cursor: pointer; }
+.btn-forget:hover { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 27%, transparent); }
+.btn-forget:disabled { opacity: 0.5; cursor: default; }
 .modal-divider { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
 .modal-divider::before, .modal-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 .modal-divider.hidden { display: none; }

@@ -504,7 +504,7 @@ mlsweep workers                         # list
 mlsweep workers add user@host [--remote-dir D] [--ssh-key K] [--venv V] [--devices 0,1] [--port P] [--tunnel]
 mlsweep workers set WORKER --jobs N [--add-devices 2,3] [--remove-devices 0] [--drain-devices 1]
 mlsweep workers update WORKER
-mlsweep workers rm WORKER
+mlsweep workers rm WORKER                # forget WORKER also drops it from the list
 mlsweep scheduler [--placement pack|spread]
 mlsweep scheduler --pause [WORKER|all]      # --unpause [WORKER|all] undoes it
 mlsweep reschedule EXP RUN [--to WORKER [--gpus 2,3]]
@@ -514,6 +514,11 @@ A worker's GPUs are each in its pool or out of it, and the scheduler only places
 GPUs in the pool. `--drain-devices` takes GPUs out of the pool and lets the runs already on
 them finish. `--remove-devices` takes them out and requeues their runs at once, without
 spending a retry. `--add-devices` puts GPUs back.
+
+`workers rm` disconnects a worker and takes it out of the pool, in any state, including one
+that never started. Its runs are requeued without spending a retry. A manager restart does
+not relaunch it. It stays in the list of known workers, so `workers add` or the System
+page's Connect dialog can bring it back. `workers forget` also drops it from that list.
 
 `mlsweep scheduler --pause` stops the scheduler from starting new jobs anywhere, and
 `--pause WORKER` stops it on one worker. Use it to place runs by hand without the scheduler

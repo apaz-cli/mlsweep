@@ -2862,11 +2862,13 @@ def workers_cmd(argv: list[str]) -> None:
     sub = parser.add_subparsers(dest="action")
     ls = sub.add_parser("ls", help="List workers (the default)")
     add = sub.add_parser("add", help="Connect a worker over SSH (mlsweep is installed there for you)")
-    rm = sub.add_parser("rm", help="Disconnect and forget a worker")
+    rm = sub.add_parser("rm", help="Disconnect a worker, taking it out of the pool (a manager "
+                                   "restart does not relaunch it; `workers add` brings it back)")
+    fg = sub.add_parser("forget", help="Disconnect a worker and drop it from the list of known workers")
     st = sub.add_parser("set", help="Change a live worker's jobs per GPU or its GPUs")
     up = sub.add_parser("update", help="Reinstall this manager's mlsweep on a worker and restart it "
                                        "(its in-flight runs are requeued)")
-    for p in (ls, add, rm, st, up):
+    for p in (ls, add, rm, fg, st, up):
         _add_manager_args(p)
         p.add_argument("--json", action="store_true", help="Print the result as JSON")
     add.add_argument("host", help="SSH destination, e.g. user@host")
@@ -2883,6 +2885,7 @@ def workers_cmd(argv: list[str]) -> None:
                      help="Seconds to wait for the worker to connect, and report how it went "
                           "(default: 300; 0 = return at once)")
     rm.add_argument("worker_id")
+    fg.add_argument("worker_id")
     up.add_argument("worker_id")
     st.add_argument("worker_id")
     st.add_argument("--jobs", type=int, help="Max concurrent jobs per GPU (0 = unlimited)")
@@ -2890,7 +2893,7 @@ def workers_cmd(argv: list[str]) -> None:
     st.add_argument("--remove-devices", help="GPU indices to stop using; their runs are re-queued")
     st.add_argument("--drain-devices",
                     help="GPU indices to take out of the pool while their runs finish")
-    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "update", "-h", "--help")
+    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "forget", "set", "update", "-h", "--help")
                              else ["ls", *argv])
     manager, token = _manager_token(args)
 
@@ -2911,12 +2914,15 @@ def workers_cmd(argv: list[str]) -> None:
         if worker.get("status") == "dead":
             sys.exit(1)
         return
-    if args.action == "rm":
-        if not _report_request("remove worker", f"removed {args.worker_id}", "DELETE",
-                               _manager_url(manager, f"/api/workers/{args.worker_id}"), token):
+    if args.action in ("rm", "forget"):
+        forget = args.action == "forget"
+        path = f"/api/workers/{args.worker_id}" + ("?forget=1" if forget else "")
+        if not _report_request("forget worker" if forget else "disconnect worker",
+                               f"{'forgot' if forget else 'disconnected'} {args.worker_id}", "DELETE",
+                               _manager_url(manager, path), token):
             sys.exit(1)
         if args.json:
-            emit({"worker_id": args.worker_id, "removed": True})
+            emit({"worker_id": args.worker_id, "status": "removed" if forget else "disconnected"})
         return
     if args.action == "update":
         status, resp = _http_request("POST", _manager_url(manager, f"/api/workers/{args.worker_id}/update"),

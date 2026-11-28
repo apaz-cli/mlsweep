@@ -211,6 +211,10 @@ class ManagerState:
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
         self.launching: set[str] = set()  # worker ids with a launch in progress
+        # Worker ids disconnected or forgotten this session.  A launch still in
+        # flight for one gives up instead of registering it (see
+        # ``connect_single_worker``); adding the worker again clears it.
+        self.retired: set[str] = set()
         # Worker ids refused at their hello for speaking an older protocol.
         # The System page offers to update them (see ``update_worker``).
         self.outdated: set[str] = set()

@@ -140,7 +140,7 @@ def _build_help(include_banner: bool = False) -> str:
             ("unpause EXP", "undo pause"),
         ]),
         ("Cluster", [
-            ("workers [ls|add|rm|set]", "list, connect, remove and tune workers"),
+            ("workers [ls|add|rm|forget|set|update]", "list, connect, disconnect and tune workers"),
             ("scheduler [--placement P]", "show or set GPU placement (pack | spread)"),
             ("scheduler --pause [W|all]", "start no new jobs on a worker or anywhere (--unpause)"),
         ]),

@@ -66,6 +66,7 @@ from mlsweep._manager_db import (
     RunEvent,
     list_run_events,
     WorkerRecord,
+    WorkerStatus,
     count_pending_jobs,
     experiment_summary,
     find_orphans,
@@ -2740,7 +2741,7 @@ async def handle_get_worker(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
     worker = await get_worker(db, worker_id)
-    if worker is None:
+    if worker is None or worker.status == "removed":
         return _not_found("worker")
     return _json_response(_enrich_worker(worker, state))
 
@@ -2802,6 +2803,7 @@ async def handle_add_worker(request: web.Request) -> web.Response:
             worker_id = next(w for i in itertools.count() if (w := worker_id_for(host, 0, i)) not in taken)
         if not state.reserve_worker_id(worker_id):
             return _error_response(f"worker {worker_id} is already connected", status=409)
+        state.retired.discard(worker_id)
 
     # Upsert into DB
     try:
@@ -2840,29 +2842,42 @@ async def handle_add_worker(request: web.Request) -> web.Response:
 
 @routes.delete("/api/workers/{worker_id}")
 async def handle_delete_worker(request: web.Request) -> web.Response:
-    """Remove a worker dynamically.
+    """Disconnect a worker, taking it out of the pool, or with ``?forget=1``
+    forget it.
 
-    Marks the worker as dead in the DB, sends ``MsgShutdown`` if connected,
-    and re-queues any jobs assigned to that worker.
+    Works on a worker in any state, one that never started included.  Its
+    runs are requeued without spending retries, a connected worker is told to
+    exit, and a launch still in flight gives up.  A disconnected worker stays
+    listed with status ``disconnected``, so the Connect dialog offers it
+    again, but a manager restart does not relaunch it.  A forgotten one is
+    marked ``removed`` and no longer listed.  Adding either again brings it
+    back.
     """
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
+    forget = request.query.get("forget", "") not in ("", "0", "false")
 
     worker = await get_worker(db, worker_id)
-    if worker is None:
+    if worker is None or worker.status == "removed":
         return _not_found("worker")
 
-    # Cancels its runs (requeued without spending retries), tells the worker
-    # to exit, and marks it dead.
-    await declare_worker_dead(db, state, worker_id, "", shutdown=True)
-    # A worker added again later starts unpaused.
     async with state.lock:
+        state.retired.add(worker_id)
+    if worker.status != "disconnected":
+        # Cancels its runs (requeued without spending retries), tells the
+        # worker to exit, and marks it dead.
+        await declare_worker_dead(db, state, worker_id, "", shutdown=True)
+    status: WorkerStatus = "removed" if forget else "disconnected"
+    await state.db_writer.retire_worker(worker_id, status)
+    async with state.lock:
+        state.outdated.discard(worker_id)
+        # A worker added again later starts unpaused.
         if worker_id in state.paused_workers:
             state.paused_workers.discard(worker_id)
             await _save_pauses(state)
 
-    return _json_response({"worker_id": worker_id, "status": "dead"})
+    return _json_response({"worker_id": worker_id, "status": status})
 
 
 @routes.post("/api/workers/{worker_id}/update")
@@ -2878,8 +2893,11 @@ async def handle_update_worker(request: web.Request) -> web.Response:
     db: aiosqlite.Connection = request.config_dict[DB_KEY]
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
-    if await get_worker(db, worker_id) is None:
+    record = await get_worker(db, worker_id)
+    if record is None or record.status == "removed":
         return _not_found("worker")
+    if record.status == "disconnected":
+        return _error_response(f"worker {worker_id} is disconnected; connect it again instead", status=409)
     async with state.lock:
         wc = state.workers.get(worker_id)
         if worker_id in state.launching:
