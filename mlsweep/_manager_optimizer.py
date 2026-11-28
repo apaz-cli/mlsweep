@@ -247,7 +247,7 @@ async def give_up_locked(
     await _set_status_locked(state, exp, spec, "paused", why)
     queued = [(exp.experiment_id, r["run_id"]) for r in await optimizer_job_rows(db, exp.experiment_id)
               if r["status"] == "pending"]
-    for job in await state.db_writer.cancel_jobs(queued):
+    for job in await state.db_writer.cancel_jobs(queued, why=f"the sweep was paused: {why}"):
         state.broadcast(exp.experiment_id, {
             "type": "job_done", "run_id": job.run_id, "status": "cancelled", "success": False,
         })

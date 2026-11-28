@@ -59,12 +59,14 @@ import json
 import os
 import re
 import socket
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mlsweep._notes import atomic_write
 from mlsweep._shared import _mlsweep_dir
 
 # ── event schema ──────────────────────────────────────────────────────────────
@@ -166,6 +168,32 @@ def _event(ts: float | None, kind: str, **kw: Any) -> dict[str, Any]:
 # of type text / thinking / toolCall.  model_change lines carry the model.
 
 
+def _assistant_events(
+    ts: float | None, blocks: list[Any], model: Any, tokens_in: Any, tokens_out: Any,
+    *, tool_type: str, args_key: str,
+) -> list[dict[str, Any]]:
+    """An assistant message's thinking, text and tool calls.  The agents differ
+    only in the tool block's type and where its arguments sit."""
+    common: dict[str, Any] = {"model": model}
+    if tokens_in or tokens_out:
+        common["tokens"] = {"input": tokens_in, "output": tokens_out}
+    events: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "thinking":
+            events.append(_event(ts, "thinking", text=block.get("thinking") or "", **common))
+        elif btype == "text" and (block.get("text") or "").strip():
+            events.append(_event(ts, "assistant", text=block["text"], **common))
+        elif btype == tool_type:
+            name = block.get("name") or "tool"
+            events.append(_event(
+                ts, "tool", name=name, tool_id=block.get("id"),
+                text=_summarize_args(name, block.get(args_key)), **common))
+    return events
+
+
 def _normalize_pi_line(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
     kind = line.get("type")
     if kind == "session":
@@ -194,28 +222,10 @@ def _normalize_pi_line(line: dict[str, Any], meta: dict[str, Any]) -> list[dict[
             return [_event(ts, "user", text=text.strip())]
         return []
     if role == "assistant":
-        events: list[dict[str, Any]] = []
         usage = message.get("usage") or {}
-        common: dict[str, Any] = {
-            "model": message.get("model") or meta.get("model"),
-        }
-        if usage.get("input") or usage.get("output"):
-            common["tokens"] = {"input": usage.get("input"), "output": usage.get("output")}
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "thinking":
-                events.append(_event(ts, "thinking", text=block.get("thinking") or "", **common))
-            elif btype == "text":
-                if (block.get("text") or "").strip():
-                    events.append(_event(ts, "assistant", text=block["text"], **common))
-            elif btype == "toolCall":
-                name = block.get("name") or "tool"
-                events.append(_event(
-                    ts, "tool", name=name, tool_id=block.get("id"),
-                    text=_summarize_args(name, block.get("arguments")), **common))
-        return events
+        return _assistant_events(ts, blocks, message.get("model") or meta.get("model"),
+                                 usage.get("input"), usage.get("output"),
+                                 tool_type="toolCall", args_key="arguments")
     if role == "toolResult":
         # Status only: the result's text never leaves the machine.
         return [_event(
@@ -305,25 +315,10 @@ def _claude_line_events(line: dict[str, Any], meta: dict[str, Any]) -> list[dict
                 if text:
                     events.append(_event(ts, "user", text=text))
         return events
-    events = []
     usage = message.get("usage") or {}
-    common: dict[str, Any] = {"model": message.get("model") or meta.get("model")}
-    if usage.get("input_tokens") or usage.get("output_tokens"):
-        common["tokens"] = {"input": usage.get("input_tokens"), "output": usage.get("output_tokens")}
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        btype = block.get("type")
-        if btype == "thinking":
-            events.append(_event(ts, "thinking", text=block.get("thinking") or "", **common))
-        elif btype == "text" and (block.get("text") or "").strip():
-            events.append(_event(ts, "assistant", text=block["text"], **common))
-        elif btype == "tool_use":
-            name = block.get("name") or "tool"
-            events.append(_event(
-                ts, "tool", name=name, tool_id=block.get("id"),
-                text=_summarize_args(name, block.get("input")), **common))
-    return events
+    return _assistant_events(ts, blocks, message.get("model") or meta.get("model"),
+                             usage.get("input_tokens"), usage.get("output_tokens"),
+                             tool_type="tool_use", args_key="input")
 
 
 # ── agents ────────────────────────────────────────────────────────────────────
@@ -521,10 +516,7 @@ class CaptureClient:
         text = json.dumps({"sessions": [vars(s) for s in self.sessions.values()]})
         if text == self._saved:
             return
-        self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(text)
-        os.replace(tmp, self.state_path)
+        atomic_write(self.state_path, text.encode())
         self._saved = text
 
     def pending_path(self, session_id: str) -> Path:
@@ -540,12 +532,16 @@ class CaptureClient:
                 self._pending[session_id] = 0
         return self._pending[session_id]
 
-    def pending_events(self, session_id: str) -> list[dict[str, Any]]:
+    def pending_lines(self, session_id: str) -> list[str]:
+        """The spool as it sits on disk: one event's compact JSON per line."""
         try:
             with self.pending_path(session_id).open() as f:
-                return [json.loads(line) for line in f if line.strip()]
+                return [line.rstrip("\n") for line in f if line.strip()]
         except OSError:
             return []
+
+    def pending_events(self, session_id: str) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in self.pending_lines(session_id)]
 
     # ── following ────────────────────────────────────────────────────
 
@@ -666,8 +662,7 @@ class CaptureClient:
         count = self.pending_count(state.session_id)
         self.pending_dir.mkdir(parents=True, exist_ok=True)
         with self.pending_path(state.session_id).open("a") as f:
-            for event in events:
-                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+            f.write("".join(line + "\n" for line in event_lines(events)))
         self._pending[state.session_id] = count + len(events)
 
     # ── upload scheduling ─────────────────────────────────────────────
@@ -696,11 +691,9 @@ class CaptureClient:
         state.uploaded_seq += count
         state.last_upload_at = now if now is not None else time.time()
         path = self.pending_path(state.session_id)
-        left = self.pending_events(state.session_id)[count:]
+        left = self.pending_lines(state.session_id)[count:]
         if left:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text("".join(json.dumps(e, separators=(",", ":")) + "\n" for e in left))
-            os.replace(tmp, path)
+            atomic_write(path, "".join(line + "\n" for line in left).encode())
         else:
             path.unlink(missing_ok=True)
         self._pending[state.session_id] = len(left)
@@ -903,7 +896,6 @@ def _cmd(argv: list[str]) -> None:
     """`mlsweep capture`: this / on / off / watch / status / ls / import, and
     show / search / export for reading traces (``_capture_read``)."""
     import argparse
-    import sys
 
     from mlsweep.run_sweep import _add_connection_args
 
@@ -955,22 +947,22 @@ def _cmd(argv: list[str]) -> None:
     if action in _capture_read.COMMANDS:
         _capture_read.COMMANDS[action](args)
     elif action == "this":
-        _cmd_this(args, sys)
+        _cmd_this(args)
     elif action == "on":
-        _cmd_on(args, sys)
+        _cmd_on(args)
     elif action == "off":
-        _cmd_off(sys)
+        _cmd_off()
     elif action == "watch":
         _cmd_watch()
     elif action == "status":
-        _cmd_status(args, sys)
+        _cmd_status(args)
     elif action in ("ls", "list"):
-        _cmd_ls(args, sys)
+        _cmd_ls(args)
     elif action == "import":
-        _cmd_import(args, sys)
+        _cmd_import(args)
 
 
-def _cmd_status(args: Any, sys: Any) -> None:
+def _cmd_status(args: Any) -> None:
     from mlsweep._colors import _DIM, _GREEN, _RESET, _YELLOW
     from mlsweep._jsonout import emit
 
@@ -999,7 +991,7 @@ def _cmd_status(args: Any, sys: Any) -> None:
               f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(marker.get('at', 0)))}{_RESET}")
 
 
-def _turn_on(manager: str, token_arg: str | None, agents: list[str], sys: Any) -> str:
+def _turn_on(manager: str, token_arg: str | None, agents: list[str]) -> str:
     """Write the credential that makes capture on; the manager URL it names."""
     from mlsweep._colors import _RED, _RESET
     from mlsweep.run_sweep import _resolve_token
@@ -1024,7 +1016,6 @@ def _turn_on(manager: str, token_arg: str | None, agents: list[str], sys: Any) -
 def ensure_watcher() -> int:
     """The watcher's pid, starting it in the background if it is not running."""
     import subprocess
-    import sys as _sys  # this interpreter, since `mlsweep` may not be on PATH
 
     # Two clients turning capture on together would otherwise both see no
     # watcher and both start one.  The check, spawn and record happen under
@@ -1035,8 +1026,8 @@ def ensure_watcher() -> int:
             return pid
         log = capture_dir() / "watcher.log"
         with log.open("ab") as f:
-            proc = subprocess.Popen(
-                [_sys.executable, "-m", "mlsweep", "capture", "watch"], stdout=f, stderr=f,
+            proc = subprocess.Popen(  # this interpreter: `mlsweep` may not be on PATH
+                [sys.executable, "-m", "mlsweep", "capture", "watch"], stdout=f, stderr=f,
                 stdin=subprocess.DEVNULL, start_new_session=True)
         (capture_dir() / "watcher.json").write_text(json.dumps({"pid": proc.pid}))
         return proc.pid
@@ -1061,10 +1052,10 @@ def _flocked(path: Path, *, block: bool) -> Iterator[bool]:
         os.close(fd)
 
 
-def _cmd_on(args: Any, sys: Any) -> None:
+def _cmd_on(args: Any) -> None:
     from mlsweep._colors import _DIM, _GREEN, _RESET
 
-    url = _turn_on(args.manager, args.token, args.agents.split(","), sys)
+    url = _turn_on(args.manager, args.token, args.agents.split(","))
     print(f"{_GREEN}on{_RESET} — uploading to {url} the sessions that submit sweeps "
           "or run `mlsweep capture this`")
     print(f"  {_DIM}Nothing else is read. mlsweep capture off turns it back off.{_RESET}")
@@ -1074,7 +1065,7 @@ def _cmd_on(args: Any, sys: Any) -> None:
         print(f"  watcher pid {ensure_watcher()}")
 
 
-def _cmd_this(args: Any, sys: Any) -> None:
+def _cmd_this(args: Any) -> None:
     from mlsweep._colors import _DIM, _GREEN, _RED, _RESET
 
     session_id = args.session or resolve_capture_session()
@@ -1088,7 +1079,7 @@ def _cmd_this(args: Any, sys: Any) -> None:
               f"`mlsweep capture on` turns it back on.{_RESET}", file=sys.stderr)
         raise SystemExit(2)
     if not _on_path().exists():
-        url = _turn_on(args.manager, args.token, list(AGENT_NAMES), sys)
+        url = _turn_on(args.manager, args.token, list(AGENT_NAMES))
         print(f"{_GREEN}on{_RESET} — capture is now on for this machine ({url})")
     if find_transcript(agent_specs(), session_id) is None:
         print(f"{_DIM}No transcript for {session_id} yet; it uploads once the agent "
@@ -1100,7 +1091,7 @@ def _cmd_this(args: Any, sys: Any) -> None:
     print(f"Cite it in a note as mlsweep:trace/{session_id}")
 
 
-def _cmd_off(sys: Any) -> None:
+def _cmd_off() -> None:
     import signal
 
     from mlsweep._colors import _RESET, _YELLOW
@@ -1184,31 +1175,39 @@ _UPLOAD_EVENTS = 2000
 _UPLOAD_BYTES = 4 * 1024 * 1024
 
 
-def post_session(manager: str, token: str, meta: dict[str, Any], events: list[dict[str, Any]],
-                 *, batch_events: int = _UPLOAD_EVENTS) -> tuple[int, str | None]:
-    """Send a session's header and *events* in bounded batches, in order.
+def event_lines(events: list[dict[str, Any]]) -> list[str]:
+    """*events* as the spool holds them: compact JSON, one per event."""
+    return [json.dumps(e, separators=(",", ":")) for e in events]
 
-    Returns (events the manager accepted, error or None).  An error stops at
-    the batch it hit, so the caller can keep the rest and retry.
+
+def post_session(manager: str, token: str, meta: dict[str, Any], lines: list[str],
+                 *, batch_events: int = _UPLOAD_EVENTS) -> tuple[int, str | None]:
+    """Send a session's header and its events in bounded batches, in order.
+
+    *lines* are the events' compact JSON (see :func:`event_lines`), as spooled:
+    they are sent as they are, never parsed again.  Returns (events the manager
+    accepted, error or None).  An error stops at the batch it hit, so the
+    caller can keep the rest and retry.
     """
     from mlsweep.run_sweep import _http_request
 
     url = f"{manager.rstrip('/')}/api/capture/sessions"
+    head = '{"session":' + json.dumps(meta) + ',"events":['
     sent = 0
     while True:
-        batch: list[dict[str, Any]] = []
+        batch: list[str] = []
         size = 0
-        for event in events[sent:sent + batch_events]:
-            n = len(json.dumps(event, separators=(",", ":")))
-            if batch and size + n > _UPLOAD_BYTES:
+        for line in lines[sent:sent + batch_events]:
+            if batch and size + len(line) > _UPLOAD_BYTES:
                 break
-            batch.append(event)
-            size += n
-        status, resp = _http_request("POST", url, token, json_data={"session": meta, "events": batch})
+            batch.append(line)
+            size += len(line)
+        status, resp = _http_request("POST", url, token, data=(head + ",".join(batch) + "]}").encode(),
+                                     headers={"Content-Type": "application/json"})
         if status not in (200, 201):
             return sent, f"{status} {resp}"
         sent += len(batch)
-        if sent >= len(events):
+        if sent >= len(lines):
             return sent, None
 
 
@@ -1221,7 +1220,7 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
             "started_at": state.started_at, "last_seen_at": state.last_seen_at,
             "state": "closed" if state.closed else "active",
         }
-        sent, error = post_session(manager, token, meta, client.pending_events(state.session_id))
+        sent, error = post_session(manager, token, meta, client.pending_lines(state.session_id))
         if sent:
             client.mark_uploaded(state, sent)
         if error:
@@ -1241,21 +1240,21 @@ def _upload(client: CaptureClient, state: SessionState, manager: str, token: str
 # ── ls / import ────────────────────────────────────────────────────────
 
 
-def _cmd_ls(args: Any, sys: Any) -> None:
+def _cmd_ls(args: Any) -> None:
     from urllib.parse import urlencode
 
+    from mlsweep._capture_read import NO_CAPTURE_ROUTE
     from mlsweep._jsonout import emit
-    from mlsweep.run_sweep import _http_request, _manager_token
+    from mlsweep.run_sweep import _http_request, _manager_token, check_response
 
     manager, token = _manager_token(args)
     query = {"limit": args.limit, "state": args.state, **({"agent": args.agent} if args.agent else {}),
              **({"experiment": args.experiment} if args.experiment else {}),
              **({"q": args.search} if args.search else {})}
-    status, resp = _http_request("GET", f"{manager}/api/capture/sessions?{urlencode(query)}", token)
-    if status != 200:
-        print(f"Manager answered {status}: {resp}", file=sys.stderr)
-        raise SystemExit(1)
-    sessions = resp if isinstance(resp, list) else resp.get("sessions", [])
+    status, resp = _http_request("GET", f"{manager}/api/capture/sessions?{urlencode(query)}", token,
+                                 quiet=True)
+    check_response(status, resp, manager, missing=NO_CAPTURE_ROUTE)
+    sessions = resp
     if args.as_json:
         emit({"sessions": sessions})
         return
@@ -1307,7 +1306,7 @@ def _mtime(path: Path) -> float:
         return 0.0
 
 
-def _cmd_import(args: Any, sys: Any) -> None:
+def _cmd_import(args: Any) -> None:
     """Convert existing transcripts into traces on the manager, marked imported."""
     from mlsweep._colors import _RED, _RESET
     from mlsweep.run_sweep import _manager_token
@@ -1342,7 +1341,7 @@ def _cmd_import(args: Any, sys: Any) -> None:
                 imported[key] = time.time()  # empty: never look again
                 continue
             meta = {**session_meta(spec, path, session_id, events, found), "state": "imported"}
-            _, error = post_session(manager, token, meta, events)
+            _, error = post_session(manager, token, meta, event_lines(events))
             if error is None:
                 count += 1
                 imported[key] = time.time()

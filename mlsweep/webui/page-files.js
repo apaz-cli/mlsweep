@@ -157,7 +157,7 @@ function runMenu(e, j, path) {
     { label: checked ? "Leave out of the comparison" : "Add to the comparison", run: () => setChecked(j.run_id, !checked) },
     { label: "Download all files (.zip)", run: () => downloadURL(runZipURL(eid, j.run_id), `${j.run_id}.zip`) },
     "-",
-    ...mlRunPageItems(eid, j.run_id, { skip: "files", codeFiles: j.code_files }),
+    ...MLViews.runItems(eid, j.run_id, { skip: "files", codeFiles: j.code_files }),
     { label: "Copy run ID", run: () => copyText(j.run_id, "Copied the run ID") },
   ]);
 }

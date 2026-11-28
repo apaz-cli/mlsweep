@@ -351,6 +351,24 @@ def _report_failure(label: str, status: int, resp: Any) -> None:
     sweep_print(f"  {_RED}FAIL{_RESET}  {label}: {text}")
 
 
+def check_response(status: int, resp: Any, manager: str, *, missing: str) -> None:
+    """Exit with an ``Error:`` line unless a CLI read of the manager succeeded.
+
+    *missing* explains a 404 that carries no ``error`` (the route is not
+    there: an older manager, or the feature switched off).
+    """
+    if status == 0:
+        message = f"cannot reach the manager at {manager}"
+    elif status == 404 and not (isinstance(resp, dict) and resp.get("error")):
+        message = missing
+    elif status >= 400:
+        message = str((resp.get("error") if isinstance(resp, dict) else resp) or f"manager answered {status}")
+    else:
+        return
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _manager_url(manager: str, path: str) -> str:
     """Build a full URL from manager base and path."""
     base = manager.rstrip("/")
@@ -613,7 +631,8 @@ def manager_create_experiment(
     controls: dict[str, Any] | None = None,
     capture_session: str | None = None,
 ) -> dict[str, Any] | None:
-    """Create an experiment in *campaign* on the manager. Returns the response dict or None.
+    """Create an experiment in *campaign* on the manager.  Returns the stored
+    experiment, or None.
 
     *code* is the provenance of the code snapshot the jobs use, recorded with the experiment.
 
@@ -649,7 +668,8 @@ def manager_create_experiment(
         with_jobs = f" with {len(jobs)} job(s)" if jobs else ""
         sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} "
                     f"(campaign {campaign}){with_jobs}")
-        return resp
+        # The bulk route answers {"experiment", "jobs"}; the plain one, the experiment.
+        return resp["experiment"] if jobs else resp
     _report_failure("Create experiment", status, resp)
     return None
 
@@ -2374,10 +2394,7 @@ def _main() -> None:
     )
     if not created:
         sys.exit(1)
-    # The bulk route answers {"experiment", "jobs"}; a Bayesian sweep's, the experiment itself.
-    exp_record: dict[str, Any] = (created["experiment"] if isinstance(created.get("experiment"), dict)
-                                  else created)
-    if not exp_record.get("note"):  # an --append keeps the description the experiment already had
+    if not created.get("note"):  # an --append keeps the description the experiment already had
         sweep_print(f"  {_YELLOW}warning:{_RESET} {experiment_id} has no description. Add one with: "
                     f"mlsweep rename {experiment_id} --description \"...\"")
     # The session that submitted a sweep is followed, so its trace uploads
@@ -2386,7 +2403,7 @@ def _main() -> None:
     follow_if_on(capture_session, why=f"submitted {experiment_id}", manager=manager)
 
     # ── 4. Write local manifest ────────────────────────────────────────────
-    _write_manifest(exp_dir, experiment_id, variations, note=exp_record.get("note"))
+    _write_manifest(exp_dir, experiment_id, variations, note=created.get("note"))
     if args.json:
         emit({"experiment_id": experiment_id, "campaign": campaign, "method": method,
               "runs": len(variations), "budget": spec["budget"] if spec else None,

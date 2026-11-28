@@ -378,7 +378,7 @@ function nbRunMenu(e, row, spec) {
   e.preventDefault();
   e.stopPropagation();
   const items = [
-    ...mlRunPageItems(row.experiment, row.run),
+    ...MLViews.runItems(row.experiment, row.run),
     "-",
     { label: "Copy run ID", run: () => copyText(row.run) },
   ];

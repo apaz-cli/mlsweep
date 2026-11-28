@@ -11,9 +11,6 @@ async function postRunAction(expId, runId, action) {
   if (!r.ok) { const body = await r.json().catch(() => ({})); await mlAlert(`${action} failed: ${body.error || r.status}`); }
 }
 
-// A menu's "Copy … ID" entry (an act() handler, so it takes plain arguments).
-function copyId(id, toast) { copyText(id, toast); }
-
 function closeRowMenu() { if (rowMenu) { rowMenu.remove(); rowMenu = null; } }
 
 function rowMenuItem(it) {
@@ -76,11 +73,7 @@ function toggleMenu(anchor, key, items) {
 
 // codeFiles: how many files the run's code snapshot has (null: no snapshot).
 function toggleRunView(expId, runId, codeFiles = null) {
-  toggleMenu(this, `runview:${expId}/${runId}`, runViewItems(expId, runId, codeFiles));
-}
-
-function runViewItems(expId, runId, codeFiles = null) {
-  return MLViews.runItems(expId, runId, { codeFiles });
+  toggleMenu(this, `runview:${expId}/${runId}`, MLViews.runItems(expId, runId, { codeFiles }));
 }
 
 // A click elsewhere, Esc, or scrolling the list closes the menu.
@@ -95,6 +88,3 @@ document.addEventListener("contextmenu", e => { if (!e.target.closest(".row-menu
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeRowMenu(); });
 window.addEventListener("scroll", closeRowMenu, true);
 window.addEventListener("resize", closeRowMenu);
-
-// Redraw when what the menus and badges count changes (notes, traces).
-function watchViewCounts(onChange) { MLViews.onChange(onChange); }

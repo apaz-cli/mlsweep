@@ -23,7 +23,7 @@ COMMANDS = (
     "manager", "run", "worker", "lint", "gen_makefile", "watch", "fetch", "best", "wait", "status", "doctor",
     "ls", "logs", "metrics", "export", "code", "cancel", "retry", "reschedule", "history", "rename", "move", "purge", "gc",
     "delete", "resume", "optimize", "controls", "stop", "pause", "unpause", "workers", "scheduler", "campaign", "notes",
-    "capture", "sql", "context", "completion", "docs", "version", "help",
+    "capture", "sql", "complain", "context", "completion", "docs", "version", "help",
 )
 
 # Subcommands whose first positional argument is an experiment ID.

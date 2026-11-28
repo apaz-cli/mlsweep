@@ -260,7 +260,7 @@ exportList.addEventListener("contextmenu", ev => {
   mlContextMenu(ev, [
     r ? { title: r.run_id } : null,
     r?.url ? { label: "Open in W&B", run: () => window.open(r.url, "_blank", "noopener") } : null,
-    ...(r && exp ? mlRunPageItems(exp, r.run_id) : []),
+    ...(r && exp ? MLViews.runItems(exp, r.run_id) : []),
     r ? { label: "Copy run ID", run: () => copyText(r.run_id, "Copied the run ID") } : null,
     r?.url ? { label: "Copy W&B link", run: () => copyText(r.url, "Copied the link") } : null,
     r?.error ? { label: "Copy error", run: () => copyText(r.error, "Copied the error") } : null,

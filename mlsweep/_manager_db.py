@@ -51,6 +51,22 @@ ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
 FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled", "pruned")
 
 
+def _sqlite_has_fts5() -> bool:
+    """Whether this SQLite library has the fts5 module (every connection shares it)."""
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+# Capture search uses the full-text index only when SQLite has fts5.
+HAS_FTS5 = _sqlite_has_fts5()
+
+
 def _marks(values: Sequence[Any]) -> str:
     """``?,?,...``: one bound-parameter placeholder per value."""
     return ",".join("?" * len(values))
@@ -767,6 +783,26 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
+    # ── complaints ──────────────────────────────────────────────────
+    # Problems with mlsweep and ideas for it, reported by agents (and people)
+    # with `mlsweep complain`.  Kept on the manager only; nothing is sent
+    # anywhere else.  ``session_id`` is the agent trace the report came from.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS complaints (
+            complaint_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            time          REAL NOT NULL,
+            kind          TEXT NOT NULL,
+            text          TEXT NOT NULL,
+            experiment_id TEXT,
+            session_id    TEXT,
+            command       TEXT,
+            version       TEXT,
+            host          TEXT,
+            user          TEXT,
+            source        TEXT NOT NULL
+        );
+    """)
+
     # ── capture (session traces) ────────────────────────────────────
     # Coding-agent sessions, uploaded by the watcher on the machine the
     # agents run on.  Events are append-only; FTS keeps their text
@@ -807,17 +843,19 @@ async def init_db(db: aiosqlite.Connection) -> None:
     await db.commit()
     await _migrate_capture_links(db)
     await db.execute(_CAPTURE_LINKS_TABLE)
-    # fts5 is guarded: a SQLite built without it keeps everything but search.
-    try:
+    # A SQLite built without fts5 keeps everything but full-text search.
+    if HAS_FTS5:
         await db.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS capture_fts USING fts5(session_id UNINDEXED, text)")
-    except sqlite3.OperationalError as exc:
-        if "no such module" not in str(exc):
-            raise
+    else:
         print("Capture search disabled: this SQLite has no FTS5", file=sys.stderr)
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_capture_sessions_last_seen "
         "ON capture_sessions(last_seen_at)")
+    # A trace's page asks which traces continue it, on every poll.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capture_sessions_continues "
+        "ON capture_sessions(continues)")
 
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
@@ -827,6 +865,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
             ON jobs(status, priority DESC, submit_time ASC);
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
             ON jobs(worker_id);
+        -- an experiment's latest job, for the experiment list's code column
+        CREATE INDEX IF NOT EXISTS idx_jobs_experiment_submit
+            ON jobs(experiment_id, submit_time);
     """)
     await db.commit()
 
@@ -1315,8 +1356,11 @@ class RunEvent:
     attempt: int | None = None
 
 
-async def add_run_events(db: aiosqlite.Connection, events: Sequence[RunEvent], when: float | None = None) -> None:
-    """Record *events*, all at *when* (default now)."""
+async def add_run_events(
+    db: aiosqlite.Connection, events: Sequence[RunEvent], when: float | None = None, *, commit: bool = True,
+) -> None:
+    """Record *events*, all at *when* (default now).  *commit* False: the
+    caller commits them with the change they describe."""
     if not events:
         return
     t = _now_epoch() if when is None else when
@@ -1325,7 +1369,8 @@ async def add_run_events(db: aiosqlite.Connection, events: Sequence[RunEvent], w
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [(t, e.experiment_id, e.run_id, e.attempt, e.action, e.source, e.detail) for e in events],
     )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def list_run_events(
@@ -1345,6 +1390,36 @@ async def list_run_events(
         "time": _utc(r["time"]).isoformat(), "experiment_id": r["experiment_id"], "run_id": r["run_id"],
         "attempt": r["attempt"], "action": r["action"], "source": r["source"], "detail": r["detail"],
     } for r in rows]
+
+
+# ===============================================================================
+# Complaints
+# ===============================================================================
+
+
+COMPLAINT_KINDS = ("problem", "improvement")
+_COMPLAINT_FIELDS = ("experiment_id", "session_id", "command", "version", "host", "user")
+
+
+async def add_complaint(
+    db: aiosqlite.Connection, *, kind: str, text: str, source: str, **context: str | None,
+) -> int:
+    """Store one complaint and return its id.  *context* holds the optional
+    ``_COMPLAINT_FIELDS``."""
+    cursor = await db.execute(
+        f"INSERT INTO complaints (time, kind, text, source, {', '.join(_COMPLAINT_FIELDS)}) "
+        f"VALUES (?, ?, ?, ?{', ?' * len(_COMPLAINT_FIELDS)})",
+        (_now_epoch(), kind, text, source, *(context.get(f) for f in _COMPLAINT_FIELDS)),
+    )
+    await db.commit()
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
+
+
+async def list_complaints(db: aiosqlite.Connection, limit: int = 100) -> list[dict[str, Any]]:
+    """The newest *limit* complaints, newest first."""
+    cursor = await db.execute("SELECT * FROM complaints ORDER BY complaint_id DESC LIMIT ?", (limit,))
+    return [{**dict(r), "time": _utc(r["time"]).isoformat()} for r in await cursor.fetchall()]
 
 
 async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -1507,13 +1582,17 @@ async def touch_worker(
 async def get_worker(
     db: aiosqlite.Connection,
     worker_id: str,
+    *,
+    include_removed: bool = False,
 ) -> WorkerRecord | None:
-    """Return a single worker or None."""
+    """Return a single worker or None.  A removed (forgotten) worker counts as
+    none, like in :func:`list_workers`, unless *include_removed*."""
     cursor = await db.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,))
     row = await cursor.fetchone()
     if row is None:
         return None
-    return _row_to_worker(row)
+    worker = _row_to_worker(row)
+    return None if worker.status == "removed" and not include_removed else worker
 
 
 async def list_workers(
@@ -1853,6 +1932,8 @@ async def insert_job_nodes(
     run_id: str,
     experiment_id: str,
     placements: list[tuple[int, str, list[int]]],
+    *,
+    commit: bool = True,
 ) -> None:
     """Record the placement of every node of a multi-node job.
 
@@ -1872,7 +1953,8 @@ async def insert_job_nodes(
             """,
             (run_id, experiment_id, node_rank, worker_id, json.dumps(gpu_ids)),
         )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def mark_job_node_result(
@@ -2072,6 +2154,8 @@ async def dispatch_job(
     experiment_id: str,
     worker_id: str,
     dispatched_gpu_ids: list[int] | None = None,
+    *,
+    commit: bool = True,
 ) -> JobRecord | None:
     """Atomically move a job from pending → dispatched.
 
@@ -2094,7 +2178,8 @@ async def dispatch_job(
         """,
         (now, worker_id, gpu_json, run_id, experiment_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return _row_to_job(row) if row else None
 
 
@@ -2129,6 +2214,7 @@ async def finish_job(
     elapsed: float,
     status: JobStatus | None = None,
     reason: str | None = None,
+    commit: bool = True,
 ) -> JobRecord | None:
     """Mark a job as done or failed, or as *status* with *reason* (a run the manager stopped)."""
     status = status or ("done" if success else "failed")
@@ -2143,7 +2229,8 @@ async def finish_job(
         """,
         (status, now, exit_code, elapsed, reason, run_id, experiment_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return _row_to_job(row) if row else None
 
 
@@ -2219,15 +2306,24 @@ async def _reopen_experiments(db: aiosqlite.Connection, experiment_ids: set[str]
 async def cancel_jobs(
     db: aiosqlite.Connection,
     keys: Sequence[tuple[str, str]],
+    *,
+    source: str = "manager",
+    why: str | None = None,
 ) -> list[JobRecord]:
     """Cancel jobs that have not finished yet; finished jobs are left alone.
 
     *keys* are (experiment_id, run_id).  Returns the rows that were cancelled.
-    Also drops their multi-node rows.
+    Also drops their multi-node rows.  Each cancelled run's history gets a
+    "cancelled" entry from *source*: *why*, or the status it was cancelled in,
+    in the same transaction.
     """
     if not keys:
         return []
     where, params = _keys_clause(keys)
+    # The writer runs one write at a time, so these are the statuses the
+    # UPDATE below changes (RETURNING gives only the new ones).
+    before = {(str(r[0]), str(r[1])): str(r[2]) for r in await _exec_all(
+        db, f"SELECT experiment_id, run_id, status FROM jobs WHERE {where} AND {_UNFINISHED_IN}", params)}
     rows = await _exec_all(
         db,
         f"""
@@ -2238,8 +2334,13 @@ async def cancel_jobs(
         params,
     )
     await db.execute(f"DELETE FROM job_nodes WHERE {where}", params)
+    cancelled = [_row_to_job(r) for r in rows]
+    await add_run_events(db, [
+        RunEvent(j.experiment_id, j.run_id, "cancelled", source,
+                 why or f"while {before.get((j.experiment_id, j.run_id), 'pending')}")
+        for j in cancelled], commit=False)
     await db.commit()
-    return [_row_to_job(r) for r in rows]
+    return cancelled
 
 
 async def requeue_jobs(
@@ -3407,6 +3508,10 @@ class DbWriter:
         db = self._db
         await self._enqueue(lambda: update_worker_health(db, worker_id, unhealthy_devices))
 
+    async def add_complaint(self, *, kind: str, text: str, source: str, **context: str | None) -> int:
+        db = self._db
+        return await self._enqueue(lambda: add_complaint(db, kind=kind, text=text, source=source, **context))
+
     # ── Settings ──────────────────────────────────────────────────────────────
 
     async def set_setting(self, key: str, value: str) -> None:
@@ -3468,9 +3573,24 @@ class DbWriter:
         experiment_id: str,
         worker_id: str,
         dispatched_gpu_ids: list[int] | None = None,
+        *,
+        nodes: list[tuple[int, str, list[int]]] | None = None,
+        history: Callable[[JobRecord], RunEvent] | None = None,
     ) -> JobRecord | None:
+        """Claim a pending job; with *nodes*, record a multi-node job's placement
+        and with *history*, the run's "dispatched" entry, in the same commit."""
         db = self._db
-        return await self._enqueue(lambda: dispatch_job(db, run_id, experiment_id, worker_id, dispatched_gpu_ids))
+
+        async def write() -> JobRecord | None:
+            claimed = await dispatch_job(db, run_id, experiment_id, worker_id, dispatched_gpu_ids, commit=False)
+            if claimed is not None:
+                if nodes:
+                    await insert_job_nodes(db, run_id, experiment_id, nodes, commit=False)
+                if history is not None:
+                    await add_run_events(db, [history(claimed)], commit=False)
+            await db.commit()
+            return claimed
+        return await self._enqueue(write)
 
     async def mark_job_running(
         self, run_id: str, experiment_id: str
@@ -3488,12 +3608,20 @@ class DbWriter:
         elapsed: float,
         status: JobStatus | None = None,
         reason: str | None = None,
+        history: Callable[[JobRecord | None], RunEvent] | None = None,
     ) -> JobRecord | None:
+        """Finish a job; with *history*, add its "finished" entry in the same commit."""
         db = self._db
-        return await self._enqueue(lambda: finish_job(
-            db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed,
-            status=status, reason=reason,
-        ))
+
+        async def write() -> JobRecord | None:
+            job = await finish_job(
+                db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed,
+                status=status, reason=reason, commit=False)
+            if history is not None:
+                await add_run_events(db, [history(job)], commit=False)
+            await db.commit()
+            return job
+        return await self._enqueue(write)
 
     async def apply_result_rules(
         self, experiment_id: str, run_id: str, success: bool,
@@ -3513,9 +3641,11 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: update_job_label(db, run_id, experiment_id, label))
 
-    async def cancel_jobs(self, keys: Sequence[tuple[str, str]]) -> list[JobRecord]:
+    async def cancel_jobs(
+        self, keys: Sequence[tuple[str, str]], *, source: str = "manager", why: str | None = None,
+    ) -> list[JobRecord]:
         db = self._db
-        return await self._enqueue(lambda: cancel_jobs(db, keys))
+        return await self._enqueue(lambda: cancel_jobs(db, keys, source=source, why=why))
 
     async def end_jobs(
         self, keys: Sequence[tuple[str, str]], status: JobStatus, reason: str,
@@ -3625,7 +3755,7 @@ class DbWriter:
 
     async def store_capture_batch(
         self, meta: dict[str, Any], events: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any], int, str | None]:
+    ) -> tuple[dict[str, Any], int]:
         """Upsert a session's header and append *events*, in one transaction."""
         db = self._db
         return await self._enqueue(lambda: store_capture_batch(db, meta, events), background=True)
@@ -3782,8 +3912,8 @@ async def _claim_srcs(db: aiosqlite.Connection, session_id: str, events: list[di
 
 async def _insert_capture_events(
     db: aiosqlite.Connection, session_id: str, events: list[dict[str, Any]],
-) -> tuple[int, str | None]:
-    """Append *events* to *session_id*.  Returns (stored, error).  The caller commits.
+) -> int:
+    """Append *events* to *session_id*.  Returns how many were stored.  The caller commits.
 
     Idempotent: a seq the session already has is ignored.  Each batch adds
     one FTS row holding only the events it stored.
@@ -3794,7 +3924,7 @@ async def _insert_capture_events(
                 and not isinstance(event["seq"], bool):
             by_seq.setdefault(event["seq"], event)
     if not by_seq:
-        return 0, None
+        return 0
     seqs = sorted(by_seq)
     have = {int(r[0]) for r in await _exec_all(
         db, "SELECT seq FROM capture_events WHERE session_id = ? AND seq BETWEEN ? AND ?",
@@ -3802,59 +3932,47 @@ async def _insert_capture_events(
     new = [by_seq[q] for q in seqs if q not in have]
     new = await _drop_events_held_elsewhere(db, session_id, new)
     if not new:
-        return 0, None
+        return 0
     count = await _exec_one(db, "SELECT event_count FROM capture_sessions WHERE session_id = ?",
                             (session_id,))
     room = _MAX_EVENTS_PER_SESSION - (int(count[0]) if count is not None else 0)
     new = new[:max(0, room)]
     if not new:
-        return 0, None
+        return 0
     await db.executemany(
         "INSERT OR IGNORE INTO capture_events (session_id, seq, data) VALUES (?, ?, ?)",
         [(session_id, e["seq"], _capped_event_json(e)) for e in new])
     await _claim_srcs(db, session_id, new)
     text = _capture_fts_text(new)
-    if text:
-        try:
-            await db.execute("INSERT INTO capture_fts (session_id, text) VALUES (?, ?)",
-                             (session_id, text))
-        except sqlite3.OperationalError as exc:  # no FTS5: everything but search
-            if "no such table" not in str(exc):
-                raise
+    if text and HAS_FTS5:
+        await db.execute("INSERT INTO capture_fts (session_id, text) VALUES (?, ?)", (session_id, text))
     await db.execute("UPDATE capture_sessions SET event_count = event_count + ? WHERE session_id = ?",
                      (len(new), session_id))
-    return len(new), None
+    return len(new)
 
 
 async def store_capture_batch(
     db: aiosqlite.Connection, meta: dict[str, Any], events: list[dict[str, Any]],
-) -> tuple[dict[str, Any], int, str | None]:
+) -> tuple[dict[str, Any], int]:
     """One upload: the session's header and its new events, committed together.
 
-    Returns (stored session row, events stored, error).  On an error nothing
-    is written.
+    Returns (stored session row, events stored).
     """
     session_id = validate_capture_id(meta.get("session_id"))
     try:
         await _upsert_capture_session(db, meta)
-        stored, error = await _insert_capture_events(db, session_id, events)
-        if error:
-            await db.rollback()
-            return {}, 0, error
+        stored = await _insert_capture_events(db, session_id, events)
         await db.commit()
     except BaseException:
         await db.rollback()
         raise
-    return await get_capture_session(db, session_id) or {}, stored, None
+    return await get_capture_session(db, session_id) or {}, stored
 
 
 async def delete_capture_session(db: aiosqlite.Connection, session_id: str) -> bool:
     validate_capture_id(session_id)
-    try:  # events go with the session (ON DELETE CASCADE); FTS is virtual
+    if HAS_FTS5:  # events go with the session (ON DELETE CASCADE); FTS is virtual
         await db.execute("DELETE FROM capture_fts WHERE session_id = ?", (session_id,))
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc):
-            raise
     await db.execute("DELETE FROM capture_links WHERE session_id = ?", (session_id,))
     await db.execute("DELETE FROM capture_src WHERE session_id = ?", (session_id,))
     await db.execute("UPDATE capture_sessions SET continues = '' WHERE continues = ?", (session_id,))
@@ -3895,8 +4013,9 @@ async def find_capture_session(
     if len(ref) < CAPTURE_PREFIX_MIN:
         return None, "no such trace"
     rows = await _exec_all(
-        db, "SELECT * FROM capture_sessions WHERE substr(session_id, 1, ?) = ? LIMIT 2",
-        (len(ref), ref))
+        # A range on the primary key: the ids that start with *ref*.
+        db, "SELECT * FROM capture_sessions WHERE session_id >= ? AND session_id < ? LIMIT 2",
+        (ref, ref + "\U0010ffff"))
     if not rows:
         return None, "no such trace"
     if len(rows) > 1:
@@ -3944,9 +4063,12 @@ async def list_capture_sessions(
     if state and state != "all":
         where.append("state = ?")
         params.append(state)
-    if q:
+    if q and HAS_FTS5:
         where.append("session_id IN (SELECT session_id FROM capture_fts WHERE capture_fts MATCH ?)")
         params.append(_fts_query(q))
+    elif q:  # no FTS5: titles and working directories only
+        where.append("(title LIKE ? ESCAPE '\\' OR cwd LIKE ? ESCAPE '\\')")
+        params += [_like_pattern(q)] * 2
     if experiment_id:
         where.append("session_id IN (SELECT session_id FROM capture_links WHERE experiment_id = ?)")
         params.append(experiment_id)
@@ -3981,16 +4103,11 @@ async def search_capture(
     # A session has one FTS row per uploaded batch: keep its best-ranked one.
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
-    try:
-        rows = await _exec_all(
-            db, "SELECT s.*, snippet(capture_fts, 1, ?, ?, ' … ', 12) AS snippet "
-                "FROM capture_fts JOIN capture_sessions s ON s.session_id = capture_fts.session_id "
-                "WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
-            (SEARCH_MARK_START, SEARCH_MARK_END, _fts_query(q), limit * 10))
-    except sqlite3.OperationalError as exc:  # no FTS5: titles and directories only
-        if "no such table" not in str(exc):
-            raise
-        rows = []
+    rows = await _exec_all(
+        db, "SELECT s.*, snippet(capture_fts, 1, ?, ?, ' … ', 12) AS snippet "
+            "FROM capture_fts JOIN capture_sessions s ON s.session_id = capture_fts.session_id "
+            "WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
+        (SEARCH_MARK_START, SEARCH_MARK_END, _fts_query(q), limit * 10)) if HAS_FTS5 else []
     for row in rows:
         if row["session_id"] not in seen:
             seen.add(row["session_id"])
@@ -4026,12 +4143,15 @@ async def capture_counts(db: aiosqlite.Connection) -> dict[str, Any]:
 
 async def get_capture_events(
     db: aiosqlite.Connection, session_id: str, *, from_seq: int = 0, limit: int = 500,
+    kinds: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
-    """Events from *from_seq* on: the first seq asked for is included."""
+    """Events from *from_seq* on: the first seq asked for is included.  With
+    *kinds*, only events of those kinds."""
     validate_capture_id(session_id)
+    where = f" AND json_extract(data, '$.kind') IN ({_marks(kinds)})" if kinds else ""
     rows = await _exec_all(
-        db, "SELECT data FROM capture_events WHERE session_id = ? AND seq >= ? "
-            "ORDER BY seq LIMIT ?", (session_id, from_seq, min(max(limit, 1), 2000)))
+        db, f"SELECT data FROM capture_events WHERE session_id = ? AND seq >= ?{where} "
+            "ORDER BY seq LIMIT ?", (session_id, from_seq, *kinds, min(max(limit, 1), 2000)))
     return [json.loads(r[0]) for r in rows]
 
 
@@ -4054,12 +4174,3 @@ async def capture_transcript_lines(db: aiosqlite.Connection, session_id: str) ->
     rows = await _exec_all(
         db, "SELECT data FROM capture_events WHERE session_id = ? ORDER BY seq", (session_id,))
     return [str(r[0]) for r in rows]
-
-
-async def capture_sessions_for_experiment(
-    db: aiosqlite.Connection, experiment_id: str,
-) -> list[dict[str, Any]]:
-    rows = await _exec_all(
-        db, "SELECT s.* FROM capture_sessions s JOIN capture_links l USING (session_id) "
-            "WHERE l.experiment_id = ? ORDER BY s.last_seen_at DESC", (experiment_id,))
-    return [dict(r) for r in rows]

@@ -21,12 +21,10 @@ from mlsweep._manager_db import (
     DbWriter,
     _attach_experiment_links,
     capture_counts,
-    capture_sessions_for_experiment,
     capture_transcript_lines,
     find_capture_session,
     get_capture_events,
     get_capture_events_at,
-    get_capture_session,
     list_capture_sessions,
     search_capture,
     validate_capture_id,
@@ -35,7 +33,6 @@ from mlsweep._manager_http import (
     DB_KEY,
     STATE_KEY,
     _bad_request,
-    _error_response,
     _json_body,
     _json_response,
     _limit_param,
@@ -44,7 +41,7 @@ from mlsweep._manager_http import (
 )
 # Trace references (``trace/<id>[?kind=…][#E<seq>]``) are parsed where the
 # terminal can use them too.
-from mlsweep._trace_view import TRACE_LINK_KINDS, parse_trace_ref  # noqa: F401  (re-exported)
+from mlsweep._trace_view import TRACE_LINK_KINDS, parse_trace_ref, stored_kinds
 
 capture_routes = web.RouteTableDef()
 
@@ -81,9 +78,7 @@ async def handle_capture_session(request: web.Request) -> web.Response:
         return _bad_request(f"'events' must be a list of at most {_MAX_EVENTS_PER_SESSION}")
 
     writer: DbWriter = state.db_writer
-    row, stored, error = await writer.store_capture_batch(meta, events)
-    if error:
-        return _error_response(error, status=413)
+    row, stored = await writer.store_capture_batch(meta, events)
     row["events_stored"] = stored
     return _json_response(row, status=201)
 
@@ -143,20 +138,26 @@ async def handle_capture_counts(request: web.Request) -> web.Response:
     return _json_response(await capture_counts(request.config_dict[DB_KEY]))
 
 
+async def find_trace_or_raise(db: Any, ref: str) -> dict[str, Any]:
+    """The trace *ref* names (its id or a unique prefix of one), or raise
+    400 for a malformed or ambiguous ref and 404 when there is none."""
+    try:
+        validate_capture_id(ref)
+    except ValueError as exc:
+        raise _bad_request(str(exc)) from None
+    # A note's link may give only the start of the id; the answer has all of it.
+    session, error = await find_capture_session(db, ref)
+    if session is None:
+        if error and error != "no such trace":
+            raise _bad_request(error)
+        raise _not_found_exc("trace")
+    return session
+
+
 @capture_routes.get("/api/capture/sessions/{session_id}")
 async def handle_capture_get(request: web.Request) -> web.Response:
     db = request.config_dict[DB_KEY]
-    session_id = request.match_info["session_id"]
-    try:
-        validate_capture_id(session_id)
-    except ValueError as exc:
-        return _bad_request(str(exc))
-    # A note's link may give only the start of the id; the answer has all of it.
-    session, error = await find_capture_session(db, session_id)
-    if session is None:
-        if error and error != "no such trace":
-            return _bad_request(error)
-        raise _not_found_exc("trace")
+    session = await find_trace_or_raise(db, request.match_info["session_id"])
     await _attach_experiment_links(db, [session])
     # Traces that continue this one: their transcripts start with its events.
     cursor = await db.execute("SELECT session_id FROM capture_sessions WHERE continues = ? ORDER BY started_at",
@@ -167,18 +168,22 @@ async def handle_capture_get(request: web.Request) -> web.Response:
 
 @capture_routes.get("/api/capture/sessions/{session_id}/events")
 async def handle_capture_events(request: web.Request) -> web.Response:
-    """One page of a trace's events, addressed by the first seq wanted."""
+    """One page of a trace's events, addressed by the first seq wanted.
+
+    ``?kind=K`` keeps only what that kind button shows (and, for tool calls,
+    their results), so a reader skims a long trace without downloading it.
+    """
     db = request.config_dict[DB_KEY]
-    session_id = request.match_info["session_id"]
     try:
-        validate_capture_id(session_id)
         from_seq = max(int(request.query.get("from_seq", "0")), 0)
     except ValueError as exc:
         return _bad_request(str(exc))
+    kind = request.query.get("kind", "")
+    if kind and kind not in TRACE_LINK_KINDS:
+        return _bad_request(f"'kind' must be one of {list(TRACE_LINK_KINDS)}")
     limit = _limit_param(request) or 500
-    if not await get_capture_session(db, session_id):
-        raise _not_found_exc("trace")
-    events = await get_capture_events(db, session_id, from_seq=from_seq, limit=limit)
+    session_id = str((await find_trace_or_raise(db, request.match_info["session_id"]))["session_id"])
+    events = await get_capture_events(db, session_id, from_seq=from_seq, limit=limit, kinds=stored_kinds(kind))
     return _json_response({
         "session_id": session_id, "from_seq": from_seq, "events": events,
         "next_from_seq": events[-1]["seq"] + 1 if events else from_seq,
@@ -189,14 +194,7 @@ async def handle_capture_events(request: web.Request) -> web.Response:
 async def handle_capture_transcript(request: web.Request) -> web.Response:
     """The whole normalized session as JSONL, the form the watcher sent."""
     db = request.config_dict[DB_KEY]
-    session_id = request.match_info["session_id"]
-    try:
-        validate_capture_id(session_id)
-    except ValueError as exc:
-        return _bad_request(str(exc))
-    session = await get_capture_session(db, session_id)
-    if session is None:
-        raise _not_found_exc("trace")
+    session_id = str((await find_trace_or_raise(db, request.match_info["session_id"]))["session_id"])
     # Rows are stored as compact JSON already: no need to parse them again.
     body = "".join(line + "\n" for line in await capture_transcript_lines(db, session_id))
     return web.Response(
@@ -216,14 +214,6 @@ async def handle_capture_delete(request: web.Request) -> web.Response:
     if not deleted:
         raise _not_found_exc("trace")
     return _json_response({"deleted": session_id})
-
-
-@capture_routes.get("/api/experiments/{experiment_id}/capture")
-async def handle_experiment_capture(request: web.Request) -> web.Response:
-    """The traces linked to one experiment, newest activity first."""
-    db = request.config_dict[DB_KEY]
-    sessions = await capture_sessions_for_experiment(db, request.match_info["experiment_id"])
-    return _json_response(sessions)
 
 
 # ── plumbing ──────────────────────────────────────────────────────────────────

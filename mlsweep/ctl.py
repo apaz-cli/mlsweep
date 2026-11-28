@@ -996,13 +996,12 @@ def metrics_cmd(argv: list[str]) -> None:
     def dim_cells(ref: RunRef, fmt: Callable[[Any], str]) -> list[str]:
         return [fmt(combo_by_run.get(ref, {}).get(d)) for d in dims]
 
-    def emit_runs(field_name: str, data: dict[RunRef, Any], extra: dict[RunRef, dict[str, Any]] | None = None) -> None:
-        """The one --json shape, whatever the view."""
+    def emit_runs(fields: dict[RunRef, dict[str, Any]]) -> None:
+        """The one --json shape, whatever the view: each run with its *fields*."""
         emit({"experiment_id": experiments[0] if not several else None,
               **({"experiment_ids": experiments} if several else {}),
-              "runs": [{"run_id": ref[1], "experiment_id": ref[0], "dims": combo_by_run.get(ref, {}),
-                        **({field_name: value} if field_name else {}), **((extra or {}).get(ref) or {})}
-                       for ref, value in data.items()]})
+              "runs": [{"run_id": ref[1], "experiment_id": ref[0], "dims": combo_by_run.get(ref, {}), **f}
+                       for ref, f in fields.items()]})
 
     def run_label(ref: RunRef) -> str:
         return f"{label(ref)} ({_combo_str(combo_by_run.get(ref, {}))})" if args.with_dims else label(ref)
@@ -1028,7 +1027,7 @@ def metrics_cmd(argv: list[str]) -> None:
         for _, vals, _ in rows_out.values():
             cols += [c for c in vals if c not in cols]
         if args.json:
-            emit_runs("", {ref: None for ref in rows_out}, {
+            emit_runs({
                 ref: {"step": st, "values": vals, "steps": where, **({"last": vals} if args.last else {})}
                 for ref, (st, vals, where) in rows_out.items()})
             return
@@ -1086,7 +1085,7 @@ def metrics_cmd(argv: list[str]) -> None:
                         for (gx, gy), v in grid.items():
                             nested.setdefault(str(gx), {})[str(gy)] = v
                         pivots[ref] = {"values": nested}
-            emit_runs("pivot", pivots)
+            emit_runs({ref: {"pivot": p} for ref, p in pivots.items()})
             return
 
         if pattern.groups == 1:
@@ -1118,7 +1117,7 @@ def metrics_cmd(argv: list[str]) -> None:
 
     # ── long JSON / CSV ──────────────────────────────────────────────────────
     if args.json:
-        emit_runs("rows", per_run)
+        emit_runs({ref: {"rows": r} for ref, r in per_run.items()})
         return
     if args.csv:
         w = csv.writer(sys.stdout)

@@ -14,25 +14,26 @@ Both sit under ``/api/capture`` with the other capture routes, so
 
 from __future__ import annotations
 
+import asyncio
 import json
-import sqlite3
 from typing import Any
 
 from aiohttp import web
 
+from mlsweep._manager_capture import find_trace_or_raise
 from mlsweep._manager_db import (
+    HAS_FTS5,
     _attach_experiment_links,
     _exec_all,
     _fts_query,
-    find_capture_session,
-    validate_capture_id,
+    _like_pattern,
+    _marks,
 )
 from mlsweep._manager_http import (
     DB_KEY,
     _bad_request,
     _json_response,
     _limit_param,
-    _not_found_exc,
 )
 from mlsweep._trace_view import (
     TRACE_LINK_KINDS,
@@ -52,23 +53,21 @@ _CANDIDATE_TRACES = 40
 _MAX_HITS = 200
 
 
-def _like_pattern(term: str) -> str | None:
+def _json_like_pattern(term: str) -> str | None:
     """A LIKE pattern for *term* in an event's stored JSON, or None when the
     JSON spells it differently (non-ASCII and escaped characters)."""
     if not term.isascii() or any(c in term for c in '"\\') or any(ord(c) < 32 for c in term):
         return None
-    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    return _like_pattern(term)
 
 
 async def _candidate_traces(db: Any, q: str) -> list[str]:
     """Trace ids whose text matches *q*, best first (newest first without FTS5)."""
-    try:
+    if HAS_FTS5:
         rows = await _exec_all(
             db, "SELECT session_id FROM capture_fts WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
             (_fts_query(q), _CANDIDATE_TRACES * 20))
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc):
-            raise
+    else:
         rows = await _exec_all(db, "SELECT session_id FROM capture_sessions "
                                    "ORDER BY last_seen_at DESC LIMIT ?", (_CANDIDATE_TRACES,))
     out: list[str] = []
@@ -78,6 +77,25 @@ async def _candidate_traces(db: Any, q: str) -> list[str]:
         if len(out) >= _CANDIDATE_TRACES:
             break
     return out
+
+
+def _match_rows(
+    sid: str, rows: list[Any], terms: list[str], kind: str, room: int,
+) -> list[dict[str, Any]]:
+    """Up to *room* hits among one trace's (seq, data) rows."""
+    hits: list[dict[str, Any]] = []
+    for seq, data in rows:
+        event = json.loads(data)
+        if not event_matches(event, terms) or not matches_kind(event, kind):
+            continue
+        hits.append({
+            "session_id": sid, "seq": int(seq), "ref": trace_ref(sid, int(seq)),
+            "kind": event.get("kind"), "label": kind_label(event), "ts": event.get("ts"),
+            "snippet": snippet(str(event.get("text") or event.get("name") or ""), terms),
+        })
+        if len(hits) >= room:
+            break
+    return hits
 
 
 async def search_capture_events(
@@ -90,31 +108,22 @@ async def search_capture_events(
         return []
     limit = min(max(limit, 1), _MAX_HITS)
     traces = [session_id] if session_id else await _candidate_traces(db, q)
-    likes = [p for p in (_like_pattern(t) for t in terms) if p]
+    likes = [p for p in (_json_like_pattern(t) for t in terms) if p]
     where = "".join(" AND data LIKE ? ESCAPE '\\'" for _ in likes)
     hits: list[dict[str, Any]] = []
     for sid in traces:
         rows = await _exec_all(
             db, f"SELECT seq, data FROM capture_events WHERE session_id = ?{where} ORDER BY seq",
             (sid, *likes))
-        for seq, data in rows:
-            event = json.loads(data)
-            if not event_matches(event, terms) or not matches_kind(event, kind):
-                continue
-            hits.append({
-                "session_id": sid, "seq": int(seq), "ref": trace_ref(sid, int(seq)),
-                "kind": event.get("kind"), "label": kind_label(event), "ts": event.get("ts"),
-                "snippet": snippet(str(event.get("text") or event.get("name") or ""), terms),
-            })
-            if len(hits) >= limit:
-                break
+        # Parsing and matching a whole trace's events would stall the loop.
+        hits += await asyncio.to_thread(_match_rows, sid, rows, terms, kind, limit - len(hits))
         if len(hits) >= limit:
             break
     if hits:
+        ids = sorted({h["session_id"] for h in hits})
         meta = {str(r["session_id"]): dict(r) for r in await _exec_all(
             db, "SELECT session_id, agent, title, cwd, last_seen_at FROM capture_sessions "
-                f"WHERE session_id IN ({','.join('?' * len({h['session_id'] for h in hits}))})",
-            tuple(sorted({h["session_id"] for h in hits})))}
+                f"WHERE session_id IN ({_marks(ids)})", tuple(ids))}
         for h in hits:
             m = meta.get(h["session_id"], {})
             h.update(agent=m.get("agent"), title=m.get("title") or "", cwd=m.get("cwd") or "")
@@ -131,11 +140,7 @@ async def handle_search_events(request: web.Request) -> web.Response:
         return _bad_request(f"'kind' must be one of {list(TRACE_LINK_KINDS)}")
     session_id = None
     if request.query.get("session"):
-        session, error = await find_capture_session(db, request.query["session"])
-        if session is None:
-            if error and error != "no such trace":
-                return _bad_request(error)
-            raise _not_found_exc("trace")
+        session = await find_trace_or_raise(db, request.query["session"])
         session_id = str(session["session_id"])
     if not q:
         return _json_response([])
@@ -147,20 +152,11 @@ async def handle_search_events(request: web.Request) -> web.Response:
 async def handle_capture_atif(request: web.Request) -> web.Response:
     """The trace as one ATIF trajectory document, for tools outside mlsweep."""
     db = request.config_dict[DB_KEY]
-    ref = request.match_info["session_id"]
-    try:
-        validate_capture_id(ref)
-    except ValueError as exc:
-        return _bad_request(str(exc))
-    session, error = await find_capture_session(db, ref)
-    if session is None:
-        if error and error != "no such trace":
-            return _bad_request(error)
-        raise _not_found_exc("trace")
+    session = await find_trace_or_raise(db, request.match_info["session_id"])
     await _attach_experiment_links(db, [session])
     rows = await _exec_all(db, "SELECT data FROM capture_events WHERE session_id = ? ORDER BY seq",
                            (session["session_id"],))
-    doc = to_atif(session, [json.loads(r[0]) for r in rows])
+    doc = await asyncio.to_thread(lambda: to_atif(session, [json.loads(r[0]) for r in rows]))
     headers = {}
     if request.query.get("download"):
         headers["Content-Disposition"] = f'attachment; filename="{session["session_id"]}.atif.json"'

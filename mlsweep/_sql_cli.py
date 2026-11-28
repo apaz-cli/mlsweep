@@ -15,10 +15,17 @@ import argparse
 import sys
 from typing import Any
 
+_NO_SQL_ROUTE = "this manager runs an older mlsweep without `mlsweep sql`"
+
 
 def main(argv: list[str]) -> None:
     from mlsweep._jsonout import emit
-    from mlsweep.run_sweep import _add_connection_args, _http_request, _manager_token
+    from mlsweep.run_sweep import (
+        _add_connection_args,
+        _http_request,
+        _manager_token,
+        check_response,
+    )
 
     ap = argparse.ArgumentParser(
         prog="mlsweep sql",
@@ -35,7 +42,7 @@ def main(argv: list[str]) -> None:
     query = sys.stdin.read() if args.query == "-" else args.query
     if not query:
         status, resp = _http_request("GET", f"{manager}/api/sql", token, quiet=True)
-        _check(status, resp, manager)
+        check_response(status, resp, manager, missing=_NO_SQL_ROUTE)
         if args.as_json:
             emit(resp)
             return
@@ -47,7 +54,7 @@ def main(argv: list[str]) -> None:
     status, resp = _http_request("POST", f"{manager}/api/sql", token, quiet=True,
                                  json_data={"sql": query, "limit": args.limit, "timeout": args.timeout},
                                  timeout=int(args.timeout) + 30)
-    _check(status, resp, manager)
+    check_response(status, resp, manager, missing=_NO_SQL_ROUTE)
     if args.as_json:
         emit(resp)
         return
@@ -57,19 +64,6 @@ def main(argv: list[str]) -> None:
     if resp.get("truncated"):
         note += ", cut off (raise --limit, at most 5000, or narrow the query)"
     print(f"({note}, {resp.get('seconds', 0)} s)")
-
-
-def _check(status: int, resp: Any, manager: str) -> None:
-    if status == 0:
-        print(f"Error: cannot reach the manager at {manager}", file=sys.stderr)
-        raise SystemExit(1)
-    if status == 404 and not (isinstance(resp, dict) and resp.get("error")):
-        print("Error: this manager runs an older mlsweep without `mlsweep sql`", file=sys.stderr)
-        raise SystemExit(1)
-    if status >= 400:
-        error = resp.get("error") if isinstance(resp, dict) else resp
-        print(f"Error: {error}", file=sys.stderr)
-        raise SystemExit(1)
 
 
 def _table(columns: list[str], rows: list[list[Any]], width: int) -> str:

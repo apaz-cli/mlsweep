@@ -110,13 +110,6 @@ function fmtClock(ts) {
   });
 }
 
-function fmtDuration(seconds) {
-  const s = Math.max(0, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-}
-
 function agentLabel(s) {
   return AGENT_LABELS[s.agent] || s.agent || "";
 }
@@ -464,7 +457,7 @@ function resultStatus(result) {
 }
 
 function fmtMs(ms) {
-  return ms < 1000 ? `${ms} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : fmtDuration(ms / 1000);
+  return ms < 1000 ? `${ms} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : fmtElapsed(ms / 1000);
 }
 
 function matchesEventFilter(e, needle) {
@@ -839,7 +832,7 @@ function renderLinks(s) {
 function renderHeader(s, { notes = true } = {}) {
   const started = s.started_at ? new Date(s.started_at * 1000).toLocaleString() : "";
   const duration = s.started_at && s.last_seen_at > s.started_at
-    ? ` · ${fmtDuration(s.last_seen_at - s.started_at)}` : "";
+    ? ` · ${fmtElapsed(s.last_seen_at - s.started_at)}` : "";
   traceTitle.textContent = traceName(s) || "Trace";
   traceTitle.title = s.session_id;
   document.title = `mlsweep — ${traceName(s) || "Trace"}`;
@@ -913,24 +906,26 @@ async function unlinkExperiment(id) {
   if (r.ok) await refreshCurrent();
 }
 
+// What a trace's menus offer: the ⋯ button for the open one (with the kind
+// filter shown) and a right-click in the list.
+function traceMenuItems(sid, kind) {
+  const api = `/api/capture/sessions/${encodeURIComponent(sid)}`;
+  return [
+    { label: "Copy note reference", hint: kind ? `mlsweep:trace/…?kind=${kind}` : "mlsweep:trace/…",
+      run: () => copyText(traceRef(kind, null, sid), "Copied trace reference") },
+    { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
+    { label: "Download transcript", run: () => window.open(authURL(`${api}/transcript`), "_blank") },
+    { label: "Download as ATIF", hint: "for other agent tools",
+      run: () => window.open(authURL(`${api}/atif?download=1`), "_blank") },
+    "-",
+    { label: "Delete trace", danger: true, run: () => deleteTrace(sid) },
+  ];
+}
+
 function openMenu() {
   if (!current) return;
-  const sid = current.session_id;
   const rect = menuBtn.getBoundingClientRect();
-  mlContextMenu({
-    clientX: rect.left, clientY: rect.bottom + 2,
-    preventDefault() {}, stopPropagation() {},
-  }, [
-    { label: "Copy note reference", hint: kindFilter ? `mlsweep:trace/…?kind=${kindFilter}` : "mlsweep:trace/…",
-      run: () => copyText(traceRef(kindFilter, null), "Copied trace reference") },
-    { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
-    { label: "Download transcript",
-      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
-    { label: "Download as ATIF", hint: "for other agent tools",
-      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/atif?download=1`), "_blank") },
-    "-",
-    { label: "Delete trace", danger: true, run: deleteCurrent },
-  ]);
+  mlMenuAt(rect.left, rect.bottom + 2, traceMenuItems(current.session_id, kindFilter));
 }
 
 // ── Note links ───────────────────────────────────────────────────────────────
@@ -950,14 +945,7 @@ sessionList.addEventListener("contextmenu", ev => {
   mlContextMenu(ev, [
     { title: s ? traceName(s) : sid },
     isOpen ? null : { label: "Open", run: () => openSession(sid) },
-    { label: "Copy note reference", hint: "mlsweep:trace/…", run: () => copyText(traceRef("", null, sid), "Copied trace reference") },
-    { label: "Copy trace id", run: () => copyText(sid, "Copied trace id") },
-    { label: "Download transcript",
-      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/transcript`), "_blank") },
-    { label: "Download as ATIF", hint: "for other agent tools",
-      run: () => window.open(authURL(`/api/capture/sessions/${encodeURIComponent(sid)}/atif?download=1`), "_blank") },
-    "-",
-    { label: "Delete trace", danger: true, run: () => deleteTrace(sid) },
+    ...traceMenuItems(sid, ""),
   ]);
 });
 
@@ -1103,10 +1091,6 @@ function startPoll() {
       busy = false;
     }
   }, POLL_MS);
-}
-
-async function deleteCurrent() {
-  if (current) await deleteTrace(current.session_id);
 }
 
 // Delete a trace; the open one also clears the view.

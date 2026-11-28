@@ -87,8 +87,8 @@ def test_event_cap_keeps_the_header_moving():
                              "VALUES ('cap1', 'pi', ?, 'active')", (cap - 1,))
             await db.commit()
             events = [{"seq": i, "ts": 1.0, "kind": "user", "text": "x"} for i in (1, 2)]
-            row, stored, error = await store_capture_batch(db, {**meta, "state": "closed"}, events)
-            assert error is None and stored == 1
+            row, stored = await store_capture_batch(db, {**meta, "state": "closed"}, events)
+            assert stored == 1
             assert row["state"] == "closed" and row["event_count"] == cap
         finally:
             await db.close()

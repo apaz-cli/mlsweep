@@ -122,6 +122,16 @@ def matches_kind(event: dict[str, Any], kind: str) -> bool:
     return event.get("kind") == kind
 
 
+def stored_kinds(kind: str) -> tuple[str, ...]:
+    """The stored event kinds a *kind* filter can show (empty: every kind).
+    Results come with tool calls, since they fold into the call's row."""
+    if not kind:
+        return ()
+    if kind in ("mlsweep", "tools"):
+        return ("tool", "tool_result")
+    return (kind,)
+
+
 def kind_label(event: dict[str, Any]) -> str:
     """The tag a row carries: the tool's name for a call, else the kind."""
     kind = str(event.get("kind") or "?")

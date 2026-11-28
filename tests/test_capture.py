@@ -316,7 +316,7 @@ def test_capture_auto_link_experiment(manager_server):
     status, body = _post(url, token, "/api/experiments", experiment)
     assert status == 201, body
 
-    status, body = _get(url, token, "/api/experiments/sweep_test_1/capture")
+    status, body = _get(url, token, "/api/capture/sessions?experiment=sweep_test_1")
     assert status == 200 and len(body) == 1
     assert body[0]["session_id"] == _SESSION["session_id"]
 
@@ -474,7 +474,7 @@ def test_note_trace_links_resolve_prefixes():
 def test_trace_ref_parses_kind_and_event():
     import pytest
 
-    from mlsweep._manager_capture import parse_trace_ref
+    from mlsweep._trace_view import parse_trace_ref
 
     assert parse_trace_ref("trace/abc12345") == ("abc12345", "", None)
     assert parse_trace_ref("trace/abc12345#E42") == ("abc12345", "", 42)
@@ -653,7 +653,7 @@ def test_watcher_uploads_session_end_to_end(manager_server, tmp_path):
 def test_post_session_sends_a_long_spool_in_batches(manager_server):
     server, url = manager_server
     events = [{"seq": i, "ts": float(i), "kind": "user", "text": f"p{i}"} for i in range(1, 6)]
-    sent, error = _capture.post_session(url, server.token, _SESSION, events, batch_events=2)
+    sent, error = _capture.post_session(url, server.token, _SESSION, _capture.event_lines(events), batch_events=2)
     assert (sent, error) == (5, None)
     status, body = _get(url, server.token, f"/api/capture/sessions/{_SESSION['session_id']}")
     assert body["event_count"] == 5

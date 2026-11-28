@@ -59,7 +59,9 @@ def print_lines(data: bytes, *, cite_target: str, path: str, start: int, end: in
     rendered = [f"{n:>{width}}  {lines[n - 1]}" for n in range(start, stop + 1)]
     shown = take_within_budget(rendered, budget if budget > 0 else 10**9)
     last = start + shown - 1
-    ref = f"mlsweep:code/{cite_target}/{path}#L{start}" + (f"-{last}" if last != start else "")
+    from mlsweep._notes_code import code_ref
+
+    ref = code_ref(cite_target, path, start, last)
     more = None
     if last < stop:
         more = f"{again} --lines {last + 1}-{end if end is not None else ''}"
@@ -77,7 +79,7 @@ def print_lines(data: bytes, *, cite_target: str, path: str, start: int, end: in
 
 def search(manager: str, token: str, args: Any, campaign: str | None) -> None:
     from mlsweep._jsonout import emit
-    from mlsweep.run_sweep import _http_request
+    from mlsweep.run_sweep import _http_request, check_response
 
     body: dict[str, Any] = {"q": args.pattern, "regex": args.regex, "ignore_case": args.ignore_case,
                             "context": args.context_lines, "limit": args.limit}
@@ -89,15 +91,7 @@ def search(manager: str, token: str, args: Any, campaign: str | None) -> None:
         body["path"] = args.path
     status, resp = _http_request("POST", f"{manager}/api/code/search", token, json_data=body,
                                  quiet=True, timeout=300)
-    if status == 0:
-        print(f"Error: cannot reach the manager at {manager}", file=sys.stderr)
-        raise SystemExit(1)
-    if status == 404 and not (isinstance(resp, dict) and resp.get("error")):
-        print("Error: this manager runs an older mlsweep without code search", file=sys.stderr)
-        raise SystemExit(1)
-    if status >= 400:
-        print(f"Error: {resp.get('error') if isinstance(resp, dict) else resp}", file=sys.stderr)
-        raise SystemExit(1)
+    check_response(status, resp, manager, missing="this manager runs an older mlsweep without code search")
     if args.json:
         emit(resp)
         return

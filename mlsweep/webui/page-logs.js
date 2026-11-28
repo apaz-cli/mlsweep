@@ -305,7 +305,7 @@ jobListEl.addEventListener("contextmenu", e => {
       if (label !== undefined) setJobLabel(job.run_id, label);
     } },
     "-",
-    ...mlRunPageItems(job.experiment_id, job.run_id, { skip: "logs", codeFiles: job.code_files }),
+    ...MLViews.runItems(job.experiment_id, job.run_id, { skip: "logs", codeFiles: job.code_files }),
     "-",
     { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
   ]);

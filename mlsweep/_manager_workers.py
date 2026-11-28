@@ -1331,16 +1331,16 @@ async def _handle_result(
             status, reason = run.ending if run.ending is not None else (None, None)
             if status is not None:
                 success = False
-            finished_job = await state.db_writer.finish_job(
+            def finished_event(job: JobRecord | None) -> RunEvent:
+                ended_as = status or (job.status if job is not None else ("done" if success else "failed"))
+                return RunEvent(
+                    eid, rid, "finished", "manager",
+                    f"{ended_as}, exit {msg.exit_code}, after {format_duration(elapsed or 0)}"
+                    + (f": {reason}" if reason else ""), run.attempt)
+            await state.db_writer.finish_job(
                 rid, eid, success=success, exit_code=msg.exit_code, elapsed=elapsed,
-                status=status, reason=reason,
+                status=status, reason=reason, history=finished_event,
             )
-            ended_as = status or (finished_job.status if finished_job is not None else
-                                  ("done" if success else "failed"))
-            await state.db_writer.add_run_events([RunEvent(
-                eid, rid, "finished", "manager",
-                f"{ended_as}, exit {msg.exit_code}, after {format_duration(elapsed or 0)}"
-                + (f": {reason}" if reason else ""), run.attempt)])
             if nodes:
                 await state.db_writer.delete_job_nodes(rid, eid)
             # A pruned run ran fine, so for skip rules it is a success.
@@ -1478,13 +1478,18 @@ def _detach_locked(state: ManagerState, keys: Sequence[RunKey]) -> None:
 
 
 async def cancel_runs_locked(
-    db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey],
+    db: aiosqlite.Connection, state: ManagerState, keys: Sequence[RunKey], *,
+    source: str = "manager", why: str | None = None,
 ) -> list[JobRecord]:
-    """Cancel jobs, pending or in flight.  Finished jobs are left alone."""
+    """Cancel jobs, pending or in flight.  Finished jobs are left alone.
+
+    Each cancelled run's history says so, from *source*, with *why* (default:
+    the status it was in).
+    """
     for key in keys:
         state.pins.pop(key, None)
     _detach_locked(state, keys)
-    cancelled = await state.db_writer.cancel_jobs(keys)
+    cancelled = await state.db_writer.cancel_jobs(keys, source=source, why=why)
     for job in cancelled:
         state.broadcast(job.experiment_id, {
             "type": "job_done", "run_id": job.run_id, "status": "cancelled", "success": False,
@@ -1597,11 +1602,12 @@ async def _check_experiments_complete_locked(
     """
     experiment_ids = set(experiment_ids)
     for eid, rid, target in await list_due_moves(db, experiment_ids):
-        if await get_experiment(db, target) is None or await get_job(db, rid, target) is not None:
+        gone = await get_experiment(db, target) is None
+        if gone or await get_job(db, rid, target) is not None:
             await state.db_writer.set_move_to(eid, [rid], None)
             await state.db_writer.add_run_events([RunEvent(
                 eid, rid, "move failed", "manager",
-                f"{target} " + ("no longer exists" if await get_experiment(db, target) is None
+                f"{target} " + ("no longer exists" if gone
                                 else "already has a run with this ID") + "; it stays here")])
             continue
         await move_runs_locked(state, eid, target, [rid])
@@ -1969,7 +1975,7 @@ async def connect_single_worker(
     try:
         # Every worker has a row from its first launch on, so the System page
         # lists one that fails to start (and its retry or update has a target).
-        if await get_worker(db, worker_id) is None:
+        if await get_worker(db, worker_id, include_removed=True) is None:
             await state.db_writer.upsert_worker(
                 worker_id=worker_id, host=host, remote_dir=remote_dir, scratch_dir=scratch_dir,
                 port=port, ssh_key=ssh_key, venv=venv,
@@ -2120,7 +2126,7 @@ async def update_worker(
     """
     handed_off = False  # connect_single_worker releases the claim itself
     try:
-        record = await get_worker(db, worker_id)
+        record = await get_worker(db, worker_id, include_removed=True)
         if record is None:
             return
         args = _relaunch_args(state, record)
@@ -2317,26 +2323,24 @@ async def _dispatch_locked(
 ) -> bool:
     """Claim *job* and send it to one worker per node.  Node 0 is the primary."""
     primary, primary_gpus = placements[0]
+    multinode = len(placements) > 1
+    where = "; ".join(f"{wc.worker_id} GPU{'s' if len(g) != 1 else ''} {','.join(map(str, g)) or '-'}"
+                      for wc, g in placements)
+    # A multi-node job's placement is recorded with the claim, before any node
+    # starts, so no result can arrive first.  Its history entry goes with it.
     claimed = await state.db_writer.dispatch_job(
         job.run_id, job.experiment_id, primary.worker_id, primary_gpus,
+        nodes=[(rank, wc.worker_id, gpus) for rank, (wc, gpus) in enumerate(placements)] if multinode else None,
+        history=lambda c: RunEvent(job.experiment_id, job.run_id, "dispatched", "manager",
+                                   f"to {where}", c.attempt),
     )
     if claimed is None:
         return False  # no longer pending
-    multinode = len(placements) > 1
-    if multinode:
-        # Recorded before any node starts, so no result can arrive first.
-        await state.db_writer.insert_job_nodes(job.run_id, job.experiment_id, [
-            (rank, wc.worker_id, gpus) for rank, (wc, gpus) in enumerate(placements)
-        ])
     run = InFlightRun.from_job(
         claimed, primary=primary.worker_id,
         nodes={wc.worker_id: gpus for wc, gpus in placements},
     )
     state.runs[run.key] = run
-    where = "; ".join(f"{wc.worker_id} GPU{'s' if len(g) != 1 else ''} {','.join(map(str, g)) or '-'}"
-                      for wc, g in placements)
-    await state.db_writer.add_run_events([RunEvent(
-        job.experiment_id, job.run_id, "dispatched", "manager", f"to {where}", claimed.attempt)])
 
     command = json.loads(claimed.command)
     if isinstance(command, str):

@@ -205,6 +205,19 @@ a.ml-ctx-item { text-decoration: none; box-sizing: border-box; }
     });
   };
 
+  // mlPlaceTip(tip, trigger): put a shown, fixed-position tip below *trigger*,
+  // or above it when there is no room, kept inside the window.
+  window.mlPlaceTip = function (tip, trigger) {
+    const gap = 8, margin = 10;
+    const r = trigger.getBoundingClientRect();
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    const left = Math.max(margin, Math.min(r.left, window.innerWidth - w - margin));
+    let top = r.bottom + gap;
+    if (top + h > window.innerHeight - margin) top = r.top - h - gap;
+    tip.style.left = `${Math.round(left)}px`;
+    tip.style.top = `${Math.round(Math.max(margin, top))}px`;
+  };
+
   // mlHoverTip(trigger, opts?) → { setText(text, opts?) }
   // A description that appears next to *trigger* on hover or keyboard focus and
   // wraps long text.  It ignores the mouse, so it never flickers over the
@@ -218,21 +231,10 @@ a.ml-ctx-item { text-decoration: none; box-sizing: border-box; }
 
     let text = opts.text || "";
     let placeholder = !!opts.placeholder;
-    const gap = 8, margin = 10;
 
     function render() {
       tip.textContent = text;
       tip.classList.toggle("placeholder", placeholder);
-    }
-
-    function place() {
-      const r = trigger.getBoundingClientRect();
-      const w = tip.offsetWidth, h = tip.offsetHeight;
-      const left = Math.max(margin, Math.min(r.left, window.innerWidth - w - margin));
-      let top = r.bottom + gap;
-      if (top + h > window.innerHeight - margin) top = r.top - h - gap;
-      tip.style.left = `${Math.round(left)}px`;
-      tip.style.top = `${Math.round(Math.max(margin, top))}px`;
     }
 
     function hide() { tip.hidden = true; }
@@ -240,7 +242,7 @@ a.ml-ctx-item { text-decoration: none; box-sizing: border-box; }
       if (!text) { hide(); return; }
       render();
       tip.hidden = false;
-      place();
+      mlPlaceTip(tip, trigger);
     }
 
     trigger.addEventListener("pointerover", show);

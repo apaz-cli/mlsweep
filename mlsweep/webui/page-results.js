@@ -982,6 +982,12 @@ function parseJsonl(text) {
 function _mergeSeries(entry, steps, values) {
   const n = entry.steps.length;
   const last = n ? entry.steps[n - 1] : -Infinity;
+  // The point already held last, sent again (a replay's first point): drop it
+  // rather than take the slow path and redraw everything.
+  if (n && steps.length && steps[0] === last && values[0] === entry.values[n - 1]) {
+    steps = steps.slice(1);
+    values = values.slice(1);
+  }
   let ordered = true;
   for (let i = 0; i < steps.length; i++) {
     if (steps[i] <= (i ? steps[i - 1] : last)) { ordered = false; break; }

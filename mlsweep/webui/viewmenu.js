@@ -173,14 +173,6 @@ const MLViews = (function () {
   };
 })();
 
-// The same View items for the right-click menus pages build themselves.
-function mlRunPageItems(expId, runId, { skip = "", codeFiles = null } = {}) {
-  return MLViews.runItems(expId, runId, { skip, codeFiles });
-}
-function mlExpPageItems(expId, { skip = "" } = {}) {
-  return MLViews.expItems(expId, { skip });
-}
-
 // The whole right-click menu for a run (*runId* set) or an experiment: a title,
 // its View items, then copying its IDs.  *link*: the element is a link, so the
 // menu also offers what the browser's menu would.
@@ -189,7 +181,7 @@ function mlEntityMenuItems(expId, runId, { title = "", skip = "", codeFiles = nu
     { title: title || runId || expId },
     link ? { label: "Open link in a new tab", run: () => window.open(link, "_blank", "noopener") } : null,
     link ? "-" : null,
-    ...(runId ? mlRunPageItems(expId, runId, { skip, codeFiles }) : mlExpPageItems(expId, { skip })),
+    ...(runId ? MLViews.runItems(expId, runId, { skip, codeFiles }) : MLViews.expItems(expId, { skip })),
     "-",
     runId ? { label: "Copy run ID", run: () => copyText(runId, "Copied the run ID") } : null,
     { label: "Copy experiment ID", run: () => copyText(expId, "Copied the experiment ID") },
@@ -226,8 +218,7 @@ function mlTagEntity(el, expId, runId = "", { title = "", skip = "", codeFiles =
 
 // The same as HTML attributes, for markup built as a string.
 function mlEntityAttrs(expId, runId = "", { skip = "", title = "", codeFiles = null } = {}) {
-  const esc = s => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-  return `data-ml-exp="${esc(expId)}"` + (runId ? ` data-ml-run="${esc(runId)}"` : "")
-    + (skip ? ` data-ml-skip="${esc(skip)}"` : "") + (title ? ` data-ml-title="${esc(title)}"` : "")
-    + (codeFiles != null ? ` data-ml-code="${esc(codeFiles)}"` : "");
+  return `data-ml-exp="${escHtml(expId)}"` + (runId ? ` data-ml-run="${escHtml(runId)}"` : "")
+    + (skip ? ` data-ml-skip="${escHtml(skip)}"` : "") + (title ? ` data-ml-title="${escHtml(title)}"` : "")
+    + (codeFiles != null ? ` data-ml-code="${escHtml(codeFiles)}"` : "");
 }

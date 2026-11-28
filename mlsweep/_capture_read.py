@@ -19,6 +19,7 @@ from typing import Any, NoReturn
 from urllib.parse import quote, urlencode
 
 from mlsweep._trace_view import (
+    CHARS_PER_TOKEN,
     DEFAULT_BUDGET,
     TRACE_LINK_KINDS,
     Ledger,
@@ -28,7 +29,6 @@ from mlsweep._trace_view import (
     mlsweep_calls,
     parse_trace_ref,
     row_line,
-    take_within_budget,
     trace_ref,
 )
 
@@ -74,22 +74,19 @@ def add_parsers(sub: Any, add_connection_args: Any) -> None:
     add_connection_args(export)
 
 
+NO_CAPTURE_ROUTE = "the manager has no such route: it takes no traces (--no-capture) or runs an older mlsweep"
+
+
 def _fail(message: str, code: int = 1) -> NoReturn:
     print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
 def _get(manager: str, token: str, path: str, *, raw: bool = False) -> Any:
-    from mlsweep.run_sweep import _http_request
+    from mlsweep.run_sweep import _http_request, check_response
 
     status, resp = _http_request("GET", f"{manager}{path}", token, quiet=True, raw=raw)
-    if status == 0:
-        _fail(f"cannot reach the manager at {manager}")
-    if status == 404 and not (isinstance(resp, dict) and resp.get("error")):
-        _fail("the manager has no such route: it takes no traces (--no-capture) or runs an older mlsweep")
-    if status >= 400:
-        error = resp.get("error") if isinstance(resp, dict) else resp
-        _fail(str(error or f"manager answered {status}"))
+    check_response(status, resp, manager, missing=NO_CAPTURE_ROUTE)
     return resp
 
 
@@ -125,9 +122,13 @@ def _header(session: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _events(manager: str, token: str, sid: str, from_seq: int, limit: int = _PAGE) -> dict[str, Any]:
+def _events(manager: str, token: str, sid: str, from_seq: int, limit: int = _PAGE,
+            kind: str = "") -> dict[str, Any]:
+    """One page of events; with *kind*, the manager leaves out what that kind
+    never shows (the Ledger still filters, for a manager that ignores it)."""
+    query: dict[str, Any] = {"from_seq": from_seq, "limit": limit, **({"kind": kind} if kind else {})}
     page: dict[str, Any] = _get(manager, token, f"/api/capture/sessions/{quote(sid, safe='')}/events?"
-                                + urlencode({"from_seq": from_seq, "limit": limit}))
+                                + urlencode(query))
     return page
 
 
@@ -148,16 +149,18 @@ def cmd_show(args: Any) -> None:
     lines: list[str] = []
     next_from: int | None = None
     budget = args.budget if args.budget > 0 else 10**9
+    room = budget * CHARS_PER_TOKEN
+    used = 0
     while next_from is None:
-        page = _events(manager, token, sid, cursor)
+        page = _events(manager, token, sid, cursor, kind=kind)
         events = page.get("events") or []
         before = len(ledger.rows)
         ledger.add(events)
         for row in ledger.rows[before:]:
             line = json.dumps(row, default=str) if args.as_json else row_line(row, args.width)
-            full = (args.limit and len(lines) >= args.limit) or \
-                take_within_budget(lines + [line], budget) <= len(lines)
-            if full:
+            used += len(line) + 1
+            # At least one line, so a page always moves.
+            if lines and ((args.limit and len(lines) >= args.limit) or used > room):
                 next_from = int(row["seq"])
                 break
             lines.append(line)

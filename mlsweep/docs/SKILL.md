@@ -120,6 +120,7 @@ mlsweep metrics --experiment <id> --keys '^val_loss$' --x tokens --at 1e8,2e8 # 
 mlsweep fetch --experiment <id> --wait          # block until done, leaderboard, download (exits 1 on failure)
 mlsweep export tensorboard --experiment <id>    # zip of TensorBoard logs
 mlsweep sql "SELECT ..."                        # read-only SQL, for what no command answers (`mlsweep sql` lists tables)
+mlsweep complain "TEXT"                         # mlsweep bug, misleading doc or missing feature (--improvement for ideas)
 
 # control your own sweeps
 mlsweep stop <id> --yes                         # abort: cancel every unfinished run
@@ -159,6 +160,7 @@ mlsweep scheduler --pause [<worker_id>]         # start no new jobs (everywhere 
 - Results live on the manager's host, at `~/.mlsweep/experiments/<experiment_id>/<run>/{metrics.jsonl, training.log, artifacts/}`. From another machine, use `metrics`, `logs` and `fetch`.
 - `fetch --wait`/`best --wait` exit `1` if the experiment settled with failures.
 - `--experiment NAME` refuses a name already in use. Pass `--append` to add the new runs to that experiment.
+- If mlsweep gets in your way (a bug, a confusing error, a doc that misled you, a missing feature), tell its maintainers with `mlsweep complain "what you ran, what happened, what you expected"`. Reports stay on the manager.
 - CLI flags use dashes. Colored output is off unless you pass `--color`. `--json`/`--csv` and raw `logs`/`metrics` stay plain.
 
 ## Campaigns

@@ -63,7 +63,9 @@ from mlsweep._manager_db import (
     ACTIVE_JOB_STATUSES,
     FINISHED_JOB_STATUSES,
     JOB_STATUSES,
+    COMPLAINT_KINDS,
     RunEvent,
+    list_complaints,
     list_run_events,
     WorkerRecord,
     WorkerStatus,
@@ -966,7 +968,8 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
         if status == "aborted":
             pending = await list_jobs_by_experiment(db, experiment_id, status="pending")
             stopped = [*state.runs_of(experiment_id), *(j.key for j in pending)]
-            await cancel_runs_locked(db, state, stopped)
+            stopped = [(j.experiment_id, j.run_id) for j in await cancel_runs_locked(
+                db, state, stopped, source=_source(request), why="the experiment was stopped")]
         # Its last job may have finished while it was paused.
         await _check_experiments_complete_locked(db, state, {experiment_id})
     state.request_schedule()
@@ -976,7 +979,6 @@ async def handle_update_experiment_status(request: web.Request) -> web.Response:
     action = {"paused": "paused", "aborted": "stopped", "running": "unpaused"}.get(status, f"status {status}")
     await _record(request, experiment_id, [None], action,
                   f"cancelled {len(stopped)} unfinished run(s)" if stopped else None)
-    await _record(request, experiment_id, [k[1] for k in stopped], "cancelled", "the experiment was stopped")
     return _json_response(exp)
 
 
@@ -1210,10 +1212,7 @@ async def handle_history(request: web.Request) -> web.Response:
     experiment_id = request.query.get("experiment_id", "")
     if not experiment_id:
         return _error_response("'experiment_id' is required")
-    try:
-        limit = max(1, min(int(request.query.get("limit", "1000")), 20000))
-    except ValueError:
-        return _error_response("'limit' must be a number")
+    limit = max(1, min(_limit_param(request) or 1000, 20000))
     events = await list_run_events(db, experiment_id, request.query.get("run_id") or None, limit)
     return _json_response({"experiment_id": experiment_id, "exists": await get_experiment(db, experiment_id)
                            is not None, "events": events})
@@ -1447,8 +1446,8 @@ async def handle_insert_jobs_bulk(request: web.Request) -> web.Response:
         return _job_insert_refused(exc)
 
     state.request_schedule()
-    for eid in sorted({r.experiment_id for r in records}):
-        await _record(request, eid, [r.run_id for r in records if r.experiment_id == eid], "submitted")
+    await state.db_writer.add_run_events(
+        [RunEvent(r.experiment_id, r.run_id, "submitted", _source(request)) for r in records])
 
     return _json_response(records, status=201)
 
@@ -1642,11 +1641,9 @@ async def handle_cancel_job(request: web.Request) -> web.Response:
     # One path stops any in-flight run on its worker, marks the row cancelled,
     # and broadcasts job_done. Works whether the job is pending or running.
     async with state.lock:
-        await cancel_runs_locked(db, state, [(experiment_id, run_id)])
+        await cancel_runs_locked(db, state, [(experiment_id, run_id)], source=_source(request))
 
     updated = await get_job(db, run_id, experiment_id)
-    if job.status in ("pending", "dispatched", "running"):
-        await _record(request, experiment_id, [run_id], "cancelled", f"while {job.status}")
     return _json_response(updated if updated is not None else job)
 
 
@@ -1786,11 +1783,9 @@ async def handle_delete_job(request: web.Request) -> web.Response:
         return _not_found("job")
 
     async with state.lock:
-        await cancel_runs_locked(db, state, [(experiment_id, run_id)])
+        await cancel_runs_locked(db, state, [(experiment_id, run_id)], source=_source(request))
 
     updated = await get_job(db, run_id, experiment_id)
-    if job.status in ("pending", "dispatched", "running"):
-        await _record(request, experiment_id, [run_id], "cancelled", f"while {job.status}")
     return _json_response(updated if updated is not None else job)
 
 
@@ -2741,7 +2736,7 @@ async def handle_get_worker(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
     worker = await get_worker(db, worker_id)
-    if worker is None or worker.status == "removed":
+    if worker is None:
         return _not_found("worker")
     return _json_response(_enrich_worker(worker, state))
 
@@ -2859,7 +2854,7 @@ async def handle_delete_worker(request: web.Request) -> web.Response:
     forget = request.query.get("forget", "") not in ("", "0", "false")
 
     worker = await get_worker(db, worker_id)
-    if worker is None or worker.status == "removed":
+    if worker is None:
         return _not_found("worker")
 
     async with state.lock:
@@ -2894,7 +2889,7 @@ async def handle_update_worker(request: web.Request) -> web.Response:
     state: ManagerState = request.config_dict[STATE_KEY]
     worker_id = request.match_info["worker_id"]
     record = await get_worker(db, worker_id)
-    if record is None or record.status == "removed":
+    if record is None:
         return _not_found("worker")
     if record.status == "disconnected":
         return _error_response(f"worker {worker_id} is disconnected; connect it again instead", status=409)
@@ -3097,6 +3092,49 @@ async def handle_unpause_scheduler(request: web.Request) -> web.Response:
         settings = _scheduler_settings(state)
     state.request_schedule()
     return _json_response(settings)
+
+
+# ── Complaints ─────────────────────────────────────────────────────────────────
+
+_COMPLAINT_MAX_TEXT = 64 * 1024
+_COMPLAINT_MAX_FIELD = 4096
+
+
+@routes.post("/api/complaints")
+async def handle_add_complaint(request: web.Request) -> web.Response:
+    """Store a problem with mlsweep or an idea for it (``mlsweep complain``).
+
+    Accepts JSON: {"text": str, "kind": "problem" | "improvement" (default
+    problem), and optional strings "experiment_id", "session_id", "command",
+    "version", "host", "user"}.  Returns {"complaint_id": int}.
+    """
+    state: ManagerState = request.config_dict[STATE_KEY]
+    body = await _json_body(request)
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return _error_response("'text' is required")
+    if len(text) > _COMPLAINT_MAX_TEXT:
+        return _error_response(f"'text' is longer than {_COMPLAINT_MAX_TEXT} characters")
+    kind = body.get("kind") or "problem"
+    if kind not in COMPLAINT_KINDS:
+        return _error_response(f"'kind' must be one of {list(COMPLAINT_KINDS)}")
+    context: dict[str, str | None] = {}
+    for key in ("experiment_id", "session_id", "command", "version", "host", "user"):
+        value = body.get(key)
+        if value is not None and not isinstance(value, str):
+            return _error_response(f"'{key}' must be a string")
+        context[key] = value[:_COMPLAINT_MAX_FIELD] if value else None
+    complaint_id = await state.db_writer.add_complaint(
+        kind=kind, text=text.strip(), source=_source(request), **context)
+    return _json_response({"complaint_id": complaint_id})
+
+
+@routes.get("/api/complaints")
+async def handle_list_complaints(request: web.Request) -> web.Response:
+    """The newest complaints, newest first (``?limit=``, default 100, at most 5000)."""
+    db: aiosqlite.Connection = request.config_dict[DB_KEY]
+    limit = max(1, min(_limit_param(request) or 100, 5000))
+    return _json_response({"complaints": await list_complaints(db, limit)})
 
 
 # ── Artifacts ──────────────────────────────────────────────────────────────────

@@ -563,7 +563,7 @@ function workerItems(workerId, withLifecycle = false) {
     const more = [];
     if (w.outdated && (status === "dead" || live)) more.push({ label: "Update worker", act: act("updateWorker", workerId, live) });
     more.push({ label: "Disconnect", act: act("disconnectWorker", workerId), danger: true });
-    more.push({ label: "Copy worker ID", act: act("copyId", workerId, "Copied the worker ID") });
+    more.push({ label: "Copy worker ID", act: act("copyText", workerId, "Copied the worker ID") });
     return joinMenus(items, more);
   }
   return items;
@@ -629,10 +629,10 @@ function toggleChipMenu(workerId, expId, runId) {
 // A run chip: Requeue and Copy ID, the run's View items, then Cancel.
 // Moving it to another GPU is a drag onto that GPU's tile.
 function chipItems(workerId, expId, runId) {
-  const view = runViewItems(expId, runId, jobOf(expId, runId)?.code_files);
+  const view = MLViews.runItems(expId, runId, { codeFiles: jobOf(expId, runId)?.code_files });
   return [
     { label: "Requeue anywhere", act: act("requeueRun", expId, runId) },
-    { label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") },
+    { label: "Copy run ID", act: act("copyText", runId, "Copied the run ID") },
     ...view.map((it, i) => i ? it : { ...it, divider: true }),
     { label: "Cancel run", act: act("cancelInFlight", expId, runId), danger: true, divider: true },
   ];
@@ -743,8 +743,8 @@ function inFlightItems(expId, runId) {
 
 bindRowContextMenu(document.getElementById("inflight-tbody"), "tr[data-run-id]", row => {
   const { expId, runId } = row.dataset;
-  return [`ctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, jobOf(expId, runId)?.code_files),
-    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...inFlightItems(expId, runId)])];
+  return [`ctx:${expId}/${runId}`, joinMenus(MLViews.runItems(expId, runId, { codeFiles: jobOf(expId, runId)?.code_files }),
+    [{ label: "Copy run ID", act: act("copyText", runId, "Copied the run ID") }, ...inFlightItems(expId, runId)])];
 });
 
 async function renameInFlight(expId, runId) {
@@ -812,8 +812,8 @@ function toggleQueuedMenu(expId, runId) {
 bindRowContextMenu(document.getElementById("queue-tbody"), "tr[data-run-id]", row => {
   const { expId, runId } = row.dataset;
   const job = queued.find(j => j.experiment_id === expId && j.run_id === runId);
-  return [`qctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, job?.code_files),
-    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...queuedItems(expId, runId)])];
+  return [`qctx:${expId}/${runId}`, joinMenus(MLViews.runItems(expId, runId, { codeFiles: job?.code_files }),
+    [{ label: "Copy run ID", act: act("copyText", runId, "Copied the run ID") }, ...queuedItems(expId, runId)])];
 });
 
 async function renameQueued(expId, runId) {
@@ -873,7 +873,9 @@ async function refresh() {
 }
 
 refresh();
-setInterval(refresh, 5000);
+// A hidden tab skips the poll (seven requests); it catches up when shown.
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
 // ── Storage cleanup ───────────────────────────────────────────────────────────
 function renderGc(plan, done) {
@@ -920,7 +922,7 @@ document.getElementById("gc-run").onclick = () => runGc(false);
 bindActions({
   disconnectWorker, updateWorker, toggleRunView, toggleInFlightMenu, renameInFlight, cancelInFlight,
   toggleQueuedMenu, renameQueued, cancelQueued,
-  toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun, copyId,
+  toggleGpuSelect, clearGpuSelect, applyGpus, toggleWorkerMenu, toggleChipMenu, moveRunTo, requeueRun, copyText,
   setPaused,
 });
 bindActions({

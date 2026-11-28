@@ -52,6 +52,7 @@ mlsweep best --experiment EXP_ID           # top runs by metric (--group-by DIM,
 mlsweep fetch --experiment EXP_ID --wait   # block until done, then leaderboard + download
                                            # (on the manager's machine: prints its results folder, no copy)
 mlsweep sql "SELECT ..."                   # read-only SQL over the manager's database (no query: list tables)
+mlsweep complain "TEXT"                    # report a problem with mlsweep (--improvement for an idea)
 
 # 4. Control a running sweep
 mlsweep cancel EXP_ID --running            # cancel jobs (--pending / --all --yes)
@@ -648,6 +649,16 @@ can only read. It runs on a read-only connection that refuses writes, `ATTACH` a
 and it stops after 5 seconds (`--timeout`, at most 30) and 200 rows (`--limit`, at most 5000).
 Table layouts can change between versions, so prefer a command where one fits. `POST /api/sql`
 with `{"sql": ...}` is the same thing over HTTP.
+
+## Complaints
+
+`mlsweep complain "TEXT"` records a problem with mlsweep in the manager's database, and
+`--improvement` records an idea instead. Agents are the main audience. When a command
+misbehaves or its docs mislead, they can say so in a sentence or two and carry on. `-` reads
+the text from stdin. `--experiment EXP` and `--command CMD` say what the report is about.
+Each report also keeps the client's version, host and user, and the agent trace it came from
+when there is one. `mlsweep complain --list` shows the latest, and the `complaints` table is
+there for `mlsweep sql`. Reports stay on the manager and are never sent anywhere else.
 
 ## Troubleshooting
 

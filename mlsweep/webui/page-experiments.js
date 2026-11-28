@@ -36,15 +36,7 @@ function showExpNoteTip(trigger) {
   expNoteTrigger = trigger;
   expNoteTip.textContent = note;
   expNoteTip.hidden = false;
-
-  const r = trigger.getBoundingClientRect();
-  const gap = 8, margin = 10;
-  const w = expNoteTip.offsetWidth, h = expNoteTip.offsetHeight;
-  const left = Math.max(margin, Math.min(r.left, window.innerWidth - w - margin));
-  let top = r.bottom + gap;
-  if (top + h > window.innerHeight - margin) top = r.top - h - gap;
-  expNoteTip.style.left = `${Math.round(left)}px`;
-  expNoteTip.style.top = `${Math.round(Math.max(margin, top))}px`;
+  mlPlaceTip(expNoteTip, trigger);
 }
 
 document.addEventListener("pointerover", e => {
@@ -64,10 +56,9 @@ window.addEventListener("resize", hideExpNoteTip);
 
 // What the View menu lists comes from viewmenu.js, shared with every page.
 function toggleExpView(expId) {
-  toggleMenu(this, `view:${expId}`, expViewItems(expId));
+  toggleMenu(this, `view:${expId}`, MLViews.expItems(expId));
 }
 
-function expViewItems(expId) { return MLViews.expItems(expId); }
 
 function toggleExpMenu(expId) {
   toggleMenu(this, `exp:${expId}`, expManageItems(expId));
@@ -108,14 +99,14 @@ function runManageItems(expId, runId) {
 bindRowContextMenu(document.getElementById("exp-tbody"), ".exp-row, .run-row, .job-detail-row", row => {
   if (row.classList.contains("exp-row")) {
     const expId = row.dataset.expId;
-    return [`ctx:${expId}`, joinMenus(expViewItems(expId),
-      [{ label: "Copy experiment ID", act: act("copyId", expId, "Copied the experiment ID") }, ...expManageItems(expId)])];
+    return [`ctx:${expId}`, joinMenus(MLViews.expItems(expId),
+      [{ label: "Copy experiment ID", act: act("copyText", expId, "Copied the experiment ID") }, ...expManageItems(expId)])];
   }
   const { expId, runId } = row.dataset;
   if (!expId || !runId) return null;
   const j = (jobsCache[expId] || []).find(x => x.run_id === runId);
-  return [`ctx:${expId}/${runId}`, joinMenus(runViewItems(expId, runId, j?.code_files),
-    [{ label: "Copy run ID", act: act("copyId", runId, "Copied the run ID") }, ...runManageItems(expId, runId)])];
+  return [`ctx:${expId}/${runId}`, joinMenus(MLViews.runItems(expId, runId, { codeFiles: j?.code_files }),
+    [{ label: "Copy run ID", act: act("copyText", runId, "Copied the run ID") }, ...runManageItems(expId, runId)])];
 });
 
 async function deleteExperiment(expId) {
@@ -689,7 +680,7 @@ function showCampaign() {
 
 MLCampaign.bind(campaignSelect, showCampaign);
 
-watchViewCounts(() => { if (allExperiments.length) showCampaign(); });
+MLViews.onChange(() => { if (allExperiments.length) showCampaign(); });
 
 async function refreshAll() {
   await fetchExperiments();
@@ -705,5 +696,5 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 bindActions({
   toggleJobDetail, renameJob, runAction, moveRun, purgeRun, setExpStatus, bulkRuns,
   toggleExpand, renameExperiment, editExpDescription, moveExperiment, deleteExperiment,
-  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters, copyId,
+  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters, copyText,
 });

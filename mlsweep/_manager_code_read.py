@@ -22,7 +22,7 @@ from typing import Any
 
 from aiohttp import web
 
-from mlsweep._manager_db import list_experiments_with_counts
+from mlsweep._manager_db import _exec_all
 from mlsweep._manager_http import (
     DB_KEY,
     DIR_KEY,
@@ -30,7 +30,7 @@ from mlsweep._manager_http import (
     _json_body,
     _json_response,
 )
-from mlsweep._notes_code import _Snapshots
+from mlsweep._notes_code import _Snapshots, code_ref
 from mlsweep._snapshot import is_snapshot_id, short_id, under_prefix
 
 code_read_routes = web.RouteTableDef()
@@ -193,7 +193,7 @@ async def _collect(
         truncated = truncated or len(found) > room
         for i in found[:room]:
             row: dict[str, Any] = {"target": where["target"], "snapshot": where["snapshot"], "path": fpath, "line": i + 1,
-                   "text": lines[i][:_MAX_LINE], "ref": f"mlsweep:code/{where['target']}/{fpath}#L{i + 1}",
+                   "text": lines[i][:_MAX_LINE], "ref": code_ref(where["target"], fpath, i + 1),
                    "also_in": where["also_in"]}
             if context:
                 row["before"] = [s[:_MAX_LINE] for s in lines[max(i - context, 0):i]]
@@ -229,8 +229,11 @@ async def handle_code_search(request: web.Request) -> web.Response:
     db = request.config_dict[DB_KEY]
     campaign = body.get("campaign")
     if not targets:
-        exps = await list_experiments_with_counts(db, campaign=campaign if isinstance(campaign, str) else None)
-        targets = [e["experiment_id"] for e in exps[:MAX_TARGETS]]   # newest first
+        # Newest first; only the ids are needed, not the per-experiment counts.
+        where, params = ("WHERE campaign = ? ", (campaign,)) if isinstance(campaign, str) else ("", ())
+        rows = await _exec_all(db, f"SELECT experiment_id FROM experiments {where}"
+                                   "ORDER BY submit_time DESC LIMIT ?", (*params, MAX_TARGETS))
+        targets = [str(r[0]) for r in rows]
     path = body.get("path") if isinstance(body.get("path"), str) else None
     result = await search_code(
         db, request.config_dict[DIR_KEY], q, targets=targets, regex=bool(body.get("regex")),

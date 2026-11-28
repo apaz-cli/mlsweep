@@ -162,6 +162,9 @@ def _build_help(include_banner: bool = False) -> str:
         ("Database", [
             ("sql [\"SELECT …\"]", "read-only SQL over the manager's database; no query lists the tables"),
         ]),
+        ("Feedback", [
+            ("complain \"TEXT\"", "report a problem with mlsweep (--improvement for an idea; --list to read them)"),
+        ]),
         ("Client", [
             ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),
             ("completion bash|zsh|fish", "print a shell completion script"),
@@ -841,6 +844,11 @@ def _dispatch(argv: list[str]) -> None:
     if cmd == "sql":
         from mlsweep._sql_cli import main as _sql_main
         _sql_main(rest)
+        return
+
+    if cmd == "complain":
+        from mlsweep._complain_cli import main as _complain_main
+        _complain_main(rest)
         return
 
     if cmd in _CTL_CMDS:
