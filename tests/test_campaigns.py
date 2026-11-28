@@ -323,6 +323,7 @@ _ROUTES = {
     "run_artifact_file": ("GET", "/api/experiments/{e}/jobs/r1/artifacts/f.txt", None, 200),
     "set_status": ("PUT", "/api/experiments/{e}/status", {"status": "paused"}, 200),
     "set_name": ("PUT", "/api/experiments/{e}/name", {"name": "renamed"}, 200),
+    "set_description": ("PUT", "/api/experiments/{e}/description", {"description": "why"}, 200),
     "set_max_concurrent": ("PUT", "/api/experiments/{e}/max_concurrent", {"max_concurrent": 3}, 200),
     "move": ("PUT", "/api/experiments/{e}/campaign", {"campaign": "elsewhere"}, 200),
     "delete_experiment": ("DELETE", "/api/experiments/{e}", None, 200),

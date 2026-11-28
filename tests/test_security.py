@@ -425,7 +425,7 @@ def test_error_middleware_cannot_replace_a_response_already_started():
     ("POST", "/api/experiments"), ("POST", "/api/jobs"), ("POST", "/api/workers"), ("POST", "/api/artifacts"),
     ("PATCH", "/api/scheduler"), ("PUT", "/api/experiments/nope/status"), ("PUT", "/api/jobs/r/priority"),
     ("PUT", "/api/artifacts/a/ref"), ("POST", "/api/experiments/nope/jobs/bulk"),
-    ("PATCH", "/api/workers/w/concurrency"),
+    ("PATCH", "/api/workers/w/concurrency"), ("POST", "/api/scheduler/pause"), ("POST", "/api/scheduler/unpause"),
 ])
 def test_a_body_that_is_not_an_object_is_the_clients_mistake(mgr, method, path):
     status, body, _ = _req(mgr, method, path, [1, 2])

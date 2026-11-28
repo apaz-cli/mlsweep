@@ -126,6 +126,7 @@ const doSearch = debounce(async () => {
       // An open tab keeps its view (Live, Source or Split); a new one opens Live.
       const isOpen = () => S.tabs.some(t => t.type === "file" && t.path === res.path);
       box.onclick = () => openFile(res.path, { mode: !isOpen() && res.kind === "md" ? "live" : null });
+      box.oncontextmenu = e => fileMenu(e, res.path);
       for (const m of res.matches.slice(0, 5)) {
         const line = el("div", "sr-line");
         line.append(el("span", "ln", m.line));
@@ -153,12 +154,17 @@ $("search-input").addEventListener("input", doSearch);
 function searchFor(text) { switchPane("search"); $("search-input").value = text; doSearch(); }
 
 // ── Changes feed ───────────────────────────────────────────────────────────────
-let feedSkip = 0, feedVersion = "";
+let feedSkip = 0, feedVersion = "", feedSeq = 0;
 async function loadFeed(reset = false) {
   const feed = $("feed");
   if (reset) { if (feedVersion === S.version && feed.childElementCount) return; feedSkip = 0; feed.innerHTML = ""; feedVersion = S.version; }
+  const seq = ++feedSeq;
+  const skip = feedSkip;
   try {
-    const r = await api(`/api/notes/history?limit=40&skip=${feedSkip}`);
+    const r = await api(`/api/notes/history?limit=40&skip=${skip}`);
+    // A reset or a newer page started while this one was in flight; appending
+    // it now would duplicate or misorder the feed.
+    if (seq !== feedSeq) return;
     const old = feed.querySelector(".load-more"); if (old) old.remove();
     if (!r.commits.length && !feedSkip) { feed.innerHTML = `<div class="tree-empty">No history yet.</div>`; return; }
     let lastDay = feed.dataset.lastDay || "";
@@ -172,6 +178,7 @@ async function loadFeed(reset = false) {
       head.append(avatar(c.author), el("span", "commit-author", c.author), t);
       head.style.cursor = "pointer"; head.title = c.subject + "\nClick for the full diff";
       head.onclick = () => openDiff(c, null);
+      head.oncontextmenu = e => commitMenu(e, c);
       box.append(head);
       const files = el("div", "commit-files");
       for (const f of (c.files || []).slice(0, 12)) {
@@ -182,6 +189,10 @@ async function loadFeed(reset = false) {
         row.append(db);
         row.title = f.path;
         row.onclick = () => f.status === "D" ? openDiff(c, f.path) : openFile(f.path);
+        row.oncontextmenu = e => fileMenu(e, f.path, [
+          { label: "Show this change", run: () => openDiff(c, f.path) },
+          { label: "View this version", run: () => showVersion(f.path, c.hash, c) },
+          ...commitItems(c)]);
         files.append(row);
       }
       if ((c.files || []).length > 12) files.append(el("div", "cf", `… ${c.files.length - 12} more`));
@@ -189,13 +200,29 @@ async function loadFeed(reset = false) {
       feed.append(box);
     }
     feed.dataset.lastDay = lastDay;
-    feedSkip += r.commits.length;
+    feedSkip = skip + r.commits.length;
     if (r.commits.length === 40) {
       const more = el("button", "mini-btn load-more", "Load older changes");
       more.onclick = () => loadFeed(false);
       feed.append(more);
     }
-  } catch (e) { feed.innerHTML = ""; feed.append(el("div", "tree-empty", "Could not load history: " + e.message)); }
+  } catch (e) {
+    if (seq !== feedSeq) return;
+    feed.innerHTML = "";
+    feed.append(el("div", "tree-empty", "Could not load history: " + e.message));
+  }
+}
+
+// A commit's own entries, for the menus on a change.
+function commitItems(c) {
+  return [
+    { label: "Show the whole commit", run: () => openDiff(c, null) },
+    { label: "Copy commit hash", run: () => copyText(c.hash) },
+  ];
+}
+function commitMenu(e, c) {
+  e.preventDefault();
+  mlMenuAt(e.clientX, e.clientY, [...commitItems(c), { label: "Copy message", run: () => copyText(c.subject || "") }]);
 }
 
 // ── Diff view ──────────────────────────────────────────────────────────────────
@@ -285,6 +312,8 @@ function renderVersionView(view, t) {
 async function restoreVersion(srcPath, rev, c, path = srcPath) {
   if (!(await mlConfirm(`Restore ${path} to the version from ${c && c.time ? new Date(c.time * 1000).toLocaleString() : rev.slice(0, 10)}?\n\nThe current version stays in history.`, { confirmLabel: "Restore", danger: false }))) return;
   try {
+    // An autosave that lands after this PUT would undo the restore.
+    await flushSaves();
     const r = await api(`/api/notes/show?path=${q(srcPath)}&rev=${q(rev)}`);
     if (r.binary) { toast("Restoring binary files is not supported here", "err"); return; }
     let base = null;
@@ -380,6 +409,7 @@ async function refreshRight() {
       for (const l of ls.slice(0, 2)) it.append(el("div", "ctx", l.context || ""));
       it.title = src;
       it.onclick = () => openFile(src, { line: ls[0].line });
+      it.oncontextmenu = e => fileMenu(e, src);
       bb.append(it);
     }
     body.append(bs);
@@ -396,6 +426,14 @@ async function refreshRight() {
       const tt = el("div", "t" + (l.resolved ? "" : " missing"), l.resolved ? titleFor(l.resolved) : l.target);
       it.append(tt); it.title = l.resolved || `Missing: ${l.target}`;
       it.onclick = () => l.resolved ? openFile(l.resolved) : newNote(dirname(path), basename(l.target));
+      it.oncontextmenu = e => {
+        if (l.resolved) return fileMenu(e, l.resolved);
+        e.preventDefault();
+        mlMenuAt(e.clientX, e.clientY, [
+          { label: "Create this note", run: () => newNote(dirname(path), basename(l.target)) },
+          { label: "Copy link target", run: () => copyText(l.target) },
+        ]);
+      };
       lb.append(it);
     }
     body.append(ls);
@@ -413,7 +451,10 @@ async function refreshRight() {
     const users = Object.entries(idx2.links).filter(([, ls]) => ls.some(l => l.resolved === path)).map(([s]) => s);
     const [us, ub] = rsec("usedby", "Linked from", users.length);
     if (!users.length) ub.append(el("div", "rempty", "No note links to this file."));
-    for (const s of users) { const it = el("div", "ritem"); it.append(el("div", "t", titleFor(s))); it.onclick = () => openFile(s); ub.append(it); }
+    for (const s of users) {
+      const it = el("div", "ritem"); it.append(el("div", "t", titleFor(s)));
+      it.onclick = () => openFile(s); it.oncontextmenu = e => fileMenu(e, s); ub.append(it);
+    }
     body.append(us);
   }
 
@@ -433,6 +474,16 @@ async function refreshRight() {
       it.title = `${new Date(c.time * 1000).toLocaleString()}\n${c.subject}`;
       if (c.path && c.path !== path) it.title += `\n(then named ${c.path})`;
       it.onclick = () => openDiff(c, c.path || path, path);
+      it.oncontextmenu = e => {
+        e.preventDefault();
+        const then = c.path || path;
+        mlMenuAt(e.clientX, e.clientY, [
+          { label: "Show this change", run: () => openDiff(c, then, path) },
+          { label: "View this version", run: () => showVersion(then, c.hash, c) },
+          { label: "Restore this version…", run: () => restoreVersion(then, c.hash, c, path) },
+          "-", ...commitItems(c),
+        ]);
+      };
       hb.append(it);
     }
   } catch { hb.append(el("div", "rempty", "History unavailable.")); }
@@ -446,6 +497,7 @@ function expRow(id, note, onclick) {
   if (note) a.append(el("span", "commit-time", note));
   a.title = `${id}${m.campaign ? " · campaign " + m.campaign : ""}${m.jobs ? `\n${m.jobs.done || 0}/${m.jobs.total || 0} runs done, ${m.jobs.failed || 0} failed` : ""}`;
   if (onclick) a.onclick = e => { e.preventDefault(); onclick(); };
+  mlTagEntity(a, id, "", { title: m.name || id });
   return a;
 }
 function refreshOutline(t) {
@@ -488,7 +540,7 @@ function toggleRight() {
 function moreMenu(e) {
   const t = activeTab(); if (!t || !t.path) return;
   const r = e.currentTarget.getBoundingClientRect();
-  showMenu(r.right - 200, r.bottom + 4, [
+  mlMenuAt(r.right - 200, r.bottom + 4, [
     { label: "Rename…", run: () => { const row = treeRow(t.path); if (row) startRename(row); else moveDialog(t.path); } },
     { label: "Move to…", run: () => moveDialog(t.path) },
     { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(t.path); } },
@@ -496,8 +548,8 @@ function moreMenu(e) {
     { label: "Local graph", run: () => openGraph(t.path) },
     { label: "Find mentions of this note", run: () => searchFor(stemOf(t.path)) },
     "-",
-    { label: "Split right", key: "\\", run: () => splitTab(t, "right") },
-    { label: "Split down", key: "|", run: () => splitTab(t, "down") },
+    { label: "Split right", hint: "\\", run: () => splitTab(t, "right") },
+    { label: "Split down", hint: "|", run: () => splitTab(t, "down") },
     "-",
     { label: "Copy path", run: () => copyText(t.path) },
     { label: "Copy wikilink", run: () => copyText(`[[${stemOf(t.path)}]]`) },
@@ -556,6 +608,8 @@ function renderLint() {
         it.append(el("div", "loc", f.line ? `${f.path}:${f.line}` : f.path), el("div", "msg", f.message));
         if (f.detail && f.detail.context) it.append(el("div", "ctx", f.detail.context));
         it.onclick = () => S.fileMap.has(f.path) && openFile(f.path, { mode: isMd(f.path) && f.line ? "split" : null, line: f.line || null });
+        it.oncontextmenu = e => fileMenu(e, f.path, [
+          { label: "Copy finding", run: () => copyText(`${f.line ? `${f.path}:${f.line}` : f.path}: ${f.message}`) }]);
         list.append(it);
       }
       body.append(g);
@@ -574,6 +628,7 @@ function renderLint() {
     const ic = el("span", "ficon"); ic.innerHTML = ICONS.md; ic.querySelector("svg").style.cssText = "width:12px;height:12px";
     it.append(ic, el("span", "", titleFor(r.path)), el("span", "commit-time", ago(r.mtime)));
     it.onclick = () => openFile(r.path);
+    it.oncontextmenu = e => fileMenu(e, r.path);
     body.append(it);
   }
 }
@@ -940,7 +995,7 @@ document.addEventListener("keydown", e => {
   const t = activeTab();
   if (mod && !e.altKey && e.key.toLowerCase() === "s") { e.preventDefault(); saveActiveNow(); return; }
   if (e.key === "Escape") {
-    hideMenu(); $("lightbox").classList.remove("show");
+    mlCloseContextMenu(); $("lightbox").classList.remove("show");
     // Leave a plain text field, so the single-key shortcuts work again.
     if (e.target.matches("input, select") && !e.target.closest("#switcher, .ml-dialog, .tnode")) e.target.blur();
   }

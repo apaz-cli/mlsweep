@@ -25,7 +25,15 @@ body { display: flex;
               border-radius: 6px; background: var(--plot-bg); }
 
 h1 { font-size: 13px; font-weight: 700; color: var(--text-strong); }
-.exp-name { font-size: 10px; color: var(--text-muted); word-break: break-all; margin-top: 2px; }
+/* The experiment's name: hovering it reveals its description, clicking edits it.
+   The dotted underline is the only cue that there is something behind it. */
+.exp-name { font-size: 10px; color: var(--text-muted); word-break: break-all; margin-top: 2px;
+            cursor: pointer; text-decoration: underline dotted var(--border-input);
+            text-underline-offset: 2px; }
+.exp-name.has-note { text-decoration-color: var(--text-dim); }
+.exp-name:hover { color: var(--text); }
+.exp-name:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.exp-name.loading { cursor: default; text-decoration: none; }
 
 @keyframes rainbow-sweep {
   0%   { background-position: 0% 50%; }
@@ -99,9 +107,6 @@ select:focus { outline: none; border-color: var(--accent); }
 #statusbar { display: flex; align-items: center; gap: 8px; }
 #status { font-size: 11px; color: var(--text-muted); }
 
-#sweep-note { font-size: 11px; color: var(--text-muted); font-style: italic;
-              margin-top: 4px; word-break: break-word; }
-
 /* Highlighted run (curves tab) */
 #run-bar { display: flex; align-items: center; gap: 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); min-height: 36px; }
 #run-bar-main { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; overflow: hidden; }
@@ -127,6 +132,7 @@ select:focus { outline: none; border-color: var(--accent); }
 </style>
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
 <script src="campaign.js"></script>
 <script src="steptimer.js"></script>
 </head>
@@ -141,8 +147,7 @@ select:focus { outline: none; border-color: var(--accent); }
 <div id="sidebar">
   <div>
     <h1>Sweep Visualizer</h1>
-    <div class="exp-name loading" id="exp-name">Fetching data…</div>
-    <div id="sweep-note" style="display:none"></div>
+    <div class="exp-name loading" id="exp-name" tabindex="0">Fetching data…</div>
   </div>
 
   <div class="section">

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from mlsweep._colors import (
     _BOLD, _BRIGHT_BLUE, _BRIGHT_GREEN, _CYAN, _DIM, _GREEN, _RED,
@@ -104,7 +106,7 @@ def _build_help(include_banner: bool = False) -> str:
         ("Run", [
             ("manager [args...]", "start the manager daemon (mlsweep_manager)"),
             ("run SWEEP.py [flags]", "submit a sweep (mlsweep_run)"),
-            ("lint SWEEP.py...", "check sweep files for misspelled settings and flag clashes"),
+            ("lint [SWEEP.py...]", "check sweep files (none: every sweep file and experiment)"),
             ("worker [args...]", "start a worker daemon (mlsweep_worker)"),
             ("gen_makefile", "write a standard Makefile into the current directory"),
         ]),
@@ -124,7 +126,8 @@ def _build_help(include_banner: bool = False) -> str:
             ("cancel EXP", "cancel runs (--running/--pending/--all)"),
             ("retry EXP", "re-queue failed runs"),
             ("reschedule EXP RUN [--to W]", "restart a run elsewhere"),
-            ("rename EXP RUN NAME", "give a run a display name (--clear; --experiment-name NAME)"),
+            ("history EXP [RUN]", "what happened to its runs, and who did it"),
+            ("rename EXP RUN NAME", "give a run a display name (--clear; --experiment-name NAME; --description TEXT)"),
             ("move EXP RUN... --to EXP2", "move finished runs to another experiment"),
             ("purge EXP --failed --yes", "delete finished runs with their metrics, logs and files"),
             ("gc [--yes]", "clean up files and records nothing refers to"),
@@ -137,8 +140,9 @@ def _build_help(include_banner: bool = False) -> str:
             ("unpause EXP", "undo pause"),
         ]),
         ("Cluster", [
-            ("workers [ls|add|rm|set]", "list, connect, remove and tune workers"),
+            ("workers [ls|add|rm|forget|set|update]", "list, connect, disconnect and tune workers"),
             ("scheduler [--placement P]", "show or set GPU placement (pack | spread)"),
+            ("scheduler --pause [W|all]", "start no new jobs on a worker or anywhere (--unpause)"),
         ]),
         ("Campaigns", [
             ("campaign [ls]", "list campaigns with experiment and job counts"),
@@ -147,6 +151,19 @@ def _build_help(include_banner: bool = False) -> str:
         ("Notes", [
             ("notes clone DIR", "clone the shared research notes from the manager, then use git"),
             ("notes lint [DIR]", "check links, experiment IDs and conflict markers"),
+        ]),
+        ("Capture", [
+            ("capture [this|on|off]", "upload this agent session (or sweep-submitting ones) to the Traces tab"),
+            ("capture [status|ls|import]", "capture state; traces on the manager; backfill old transcripts"),
+            ("capture show REF", "a trace as a compact ledger (--kind, --event N, --budget)"),
+            ("capture search WORDS", "events across traces, each with its note reference"),
+            ("capture export REF", "a trace as ATIF (or --format jsonl)"),
+        ]),
+        ("Database", [
+            ("sql [\"SELECT …\"]", "read-only SQL over the manager's database; no query lists the tables"),
+        ]),
+        ("Feedback", [
+            ("complain \"TEXT\"", "report a problem with mlsweep (--improvement for an idea; --list to read them)"),
         ]),
         ("Client", [
             ("context [ls|add|use|rm|show]", "named manager/token/campaign settings (--context NAME)"),
@@ -177,7 +194,7 @@ def _build_help(include_banner: bool = False) -> str:
         "when submitting a new sweep).",
         f"Results live on the manager at ~/.mlsweep/experiments/<experiment_id>/<run>/",
         f"{_DIM}Global: --color enables ANSI color (off by default).{_RESET}",
-        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, skill)",
+        f"Docs: {_CYAN}mlsweep --help <topic>{_RESET} (readme, sweep_configuration, mlsweep, examples, notes, traces, skill)",
         f"      or {_CYAN}mlsweep docs{_RESET}. {_CYAN}mlsweep gen_makefile{_RESET} adds {_CYAN}make sweep-*{_RESET} targets.",
     ]
     return "\n".join(lines) + "\n"
@@ -195,6 +212,9 @@ _DOC_ALIASES = {
     "skill": "SKILL.md",
     "examples": "examples.md",
     "notes": "notes.md",
+    "traces": "traces.md",
+    "capture": "traces.md",
+    "sessions": "traces.md",
 }
 
 def _build_makefile_template() -> str:
@@ -282,6 +302,33 @@ def _build_makefile_template() -> str:
 
 
 # ── status / doctor ────────────────────────────────────────────────────────────
+
+
+def gpu_free_lines(gpu_runs: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """One line per busy GPU: its runs, and when the first and the last of them end.
+
+    *gpu_runs* is a worker's ``gpu_runs`` from ``/api/workers``.  A run whose
+    script never told its logger ``total_steps`` has no estimate, and then the
+    time the GPU is free is unknown.
+    """
+    from mlsweep.ctl import _dur
+
+    lines = []
+    for gpu in sorted(gpu_runs, key=lambda g: int(g) if str(g).isdigit() else 0):
+        runs = gpu_runs[gpu]
+        if not runs:
+            continue
+        etas = [r["eta_seconds"] for r in runs if isinstance(r.get("eta_seconds"), (int, float))]
+        n = len(runs)
+        line = f"GPU {gpu}: {n} run{'' if n == 1 else 's'}"
+        if etas:
+            line += f", next ends in about {_dur(min(etas))}"
+            line += (f", free in about {_dur(max(etas))}" if len(etas) == n
+                     else f" ({n - len(etas)} without an estimate)")
+        else:
+            line += ", no estimate (the script sets total_steps on its MLSweepLogger)"
+        lines.append(line)
+    return lines
 
 
 def _status_cmd(argv: list[str]) -> None:
@@ -406,6 +453,8 @@ def _status_cmd(argv: list[str]) -> None:
             if pending:
                 line += f"  probing={pending}"
             print(line)
+            for gpu_line in gpu_free_lines(w.get("gpu_runs") or {}):
+                print(f"{_CONT}  {gpu_line}")
             reasons = w.get("unhealthy_reasons") or {}
             for why in sorted(set(reasons.values())):
                 gs = sorted(int(g) for g, r in reasons.items() if r == why)
@@ -500,32 +549,71 @@ def _gen_makefile_cmd(argv: list[str]) -> None:
 
 
 def _lint_cmd(argv: list[str]) -> None:
-    from mlsweep._lint import lint_file
+    from mlsweep._lint import Finding, find_sweep_files, lint_experiments, lint_file
+    from mlsweep._shared import _git_root
+    from mlsweep.run_sweep import _add_connection_args, _resolve_token, manager_list_experiments
 
     parser = argparse.ArgumentParser(
         prog="mlsweep lint",
         description="Check sweep files for mistakes that would otherwise pass silently: misspelled "
-                    "settings, unknown OPTIMIZE/PRUNE keys, flags passed twice, colliding run names. "
-                    "`mlsweep run` runs the same checks and refuses a file with errors.",
+                    "settings, unknown OPTIMIZE/PRUNE keys, flags passed twice, colliding run names, "
+                    "a missing DESCRIPTION. `mlsweep run` runs the same checks and refuses a file with "
+                    "errors. With no files, checks everything: every sweep file in the project (found "
+                    "by its mlsweep_run shebang) and every experiment on the manager, in all campaigns.",
     )
-    parser.add_argument("sweep_files", nargs="+", metavar="SWEEP.py")
+    parser.add_argument("sweep_files", nargs="*", metavar="SWEEP.py")
     parser.add_argument("--strict", action="store_true", help="Exit 1 on warnings too")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
+    _add_connection_args(parser)
     args = parser.parse_args(argv)
 
-    report = {path: lint_file(path) for path in args.sweep_files}
+    everything = not args.sweep_files
+    files = args.sweep_files or find_sweep_files(_git_root(os.getcwd()) or os.getcwd())
+    report = {path: lint_file(path) for path in files}
+    exp_report: dict[str, list[Finding]] = {}
+    manager_problem = None
+    if everything:
+        token = _resolve_token(args.token)
+        exps = (manager_list_experiments(args.manager.rstrip("/"), token, campaign=None, quiet=True)
+                if token else None)
+        if exps is None:
+            manager_problem = (f"no token for {args.manager}" if not token
+                               else f"could not list experiments on {args.manager}")
+        else:
+            exp_report = lint_experiments(exps)
+    all_findings = [f for fs in (*report.values(), *exp_report.values()) for f in fs]
+    if manager_problem:
+        all_findings.append(Finding("warning", f"experiments not checked: {manager_problem}"))
+
     if args.json:
-        emit({p: [{"severity": f.severity, "message": f.message} for f in fs]
-                          for p, fs in report.items()})
+        # One map of findings: sweep files by path, experiments as experiment:CAMPAIGN/ID,
+        # and "manager" when the experiments could not be checked.
+        keyed = {**report, **{f"experiment:{k}": fs for k, fs in exp_report.items()}}
+        if manager_problem:
+            keyed["manager"] = [Finding("warning", f"experiments not checked: {manager_problem}")]
+        emit({k: [{"severity": f.severity, "message": f.message} for f in fs] for k, fs in keyed.items()})
     else:
+        if everything and not files:
+            print(f"{_YELLOW}no sweep files{_RESET} found under this project")
         for path, findings in report.items():
             if not findings:
                 print(f"{_GREEN}ok{_RESET}     {path}")
             for f in findings:
                 color = _RED if f.severity == "error" else _YELLOW
                 print(f"{color}{f.severity}{_RESET}  {path}: {f.message}")
+        for key, findings in exp_report.items():
+            for f in findings:
+                color = _RED if f.severity == "error" else _YELLOW
+                print(f"{color}{f.severity}{_RESET}  experiment {key}: {f.message}")
+        if everything and not manager_problem:
+            flagged = sum(1 for fs in exp_report.values() if fs)
+            color = _YELLOW if flagged else _GREEN
+            print(f"{color}{'ok' if not flagged else 'checked'}{_RESET}     {len(exp_report)} experiment(s) "
+                  f"on {args.manager}" + (f", {flagged} with warnings" if flagged else ""))
+        if manager_problem:
+            print(f"{_YELLOW}warning{_RESET}  experiments not checked: {manager_problem}")
     bad = {"error", "warning"} if args.strict else {"error"}
-    sys.exit(1 if any(f.severity in bad for fs in report.values() for f in fs) else 0)
+    sys.exit(1 if any(f.severity in bad for f in all_findings) else 0)
 
 
 # ── context ────────────────────────────────────────────────────────────────────
@@ -646,7 +734,7 @@ def _context_cmd(argv: list[str]) -> None:
 _CTL_CMDS = frozenset({
     "ls", "logs", "metrics", "cancel", "retry", "rename", "resume", "optimize", "stop", "pause", "unpause", "best",
     "wait", "campaign", "move", "purge", "gc", "delete", "export", "workers", "scheduler", "reschedule",
-    "code", "controls",
+    "code", "controls", "history",
 })
 
 
@@ -746,6 +834,21 @@ def _dispatch(argv: list[str]) -> None:
     if cmd == "notes":
         from mlsweep.notes_cli import main as _notes_main
         _notes_main(rest)
+        return
+
+    if cmd == "capture":
+        from mlsweep._capture import _cmd as _capture_main
+        _capture_main(rest)
+        return
+
+    if cmd == "sql":
+        from mlsweep._sql_cli import main as _sql_main
+        _sql_main(rest)
+        return
+
+    if cmd == "complain":
+        from mlsweep._complain_cli import main as _complain_main
+        _complain_main(rest)
         return
 
     if cmd in _CTL_CMDS:

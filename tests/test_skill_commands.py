@@ -17,7 +17,7 @@ import pytest
 from mlsweep import cli
 
 SKILL = (Path(__file__).resolve().parent.parent / "mlsweep/docs/SKILL.md").read_text()
-GROUPS = {"notes", "workers", "campaign", "export"}
+GROUPS = {"notes", "workers", "campaign", "export", "capture", "context"}
 NO_HELP = {"docs", "version", "gen_makefile"}
 
 

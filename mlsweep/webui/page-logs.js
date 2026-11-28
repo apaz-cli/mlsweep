@@ -51,6 +51,12 @@ let ws            = null;
 let wsExpId       = null;
 let wsReconnTimer = null;
 let loadAbort     = null;   // AbortController for in-flight history fetches
+let expSeq        = 0;      // bumped when another experiment is selected
+let expsSeq       = 0;      // bumped when another experiment-list fetch starts
+let jobsSeq       = 0;      // bumped when another job-list fetch starts
+let historyLoading = false; // a selected run's history snapshot is in flight
+let pendingLogEvents = [];  // live log chunks that arrive while history loads
+let urlRunPending = params.get("run");  // ?run=, applied once
 
 // "Wrap lines" off scrolls long lines sideways instead.
 const wrapCb = document.getElementById("wrap-lines");
@@ -152,6 +158,8 @@ async function selectJob(job) {
   currentRunId = job.run_id;
 
   logRunIdEl.innerHTML = runNameHtml(job);
+  mlTagEntity(logRunIdEl, job.experiment_id, job.run_id,
+    { title: job.label || job.run_id, skip: "logs", codeFiles: job.code_files });
   setBadge(job.status);
   logHeader.style.display = "";
   logWrap.style.display   = "flex";
@@ -174,22 +182,61 @@ async function selectJob(job) {
   autoScrollCb.checked = true;
   MLStepTimer.tick();
   jumpBtn.style.display = "none";
+  await loadLogHistory(job);
+}
 
-  // Fetch history.
+// Draw the stored log of *job* (the selected run), replacing what is shown.
+// Live log events for this run keep arriving on the experiment WebSocket;
+// they are held until the snapshot is drawn.  The snapshot's X-Log-Seq
+// header says which of them it already contains, so overlapping chunks are
+// dropped rather than shown twice, out of order.  Called on selection and
+// again whenever the socket (re)opens, since chunks broadcast while it was
+// not subscribed are not replayed.
+async function loadLogHistory(job) {
+  if (loadAbort) { loadAbort.abort(); loadAbort = null; }
+  const runId = job.run_id;
+  historyLoading = true;
+  pendingLogEvents = [];
   const ctrl = new AbortController();
   loadAbort  = ctrl;
+  let text = null;
+  let lastSeq = -1;
   try {
     const r = await apiFetch(
-      `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`,
+      `/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(runId)}/logs`,
       { signal: ctrl.signal },
     );
-    if (!ctrl.signal.aborted && r.ok) {
-      const text = await r.text();
-      if (!ctrl.signal.aborted) appendLog(text);
+    if (r.ok) {
+      const header = r.headers.get("X-Log-Seq");
+      if (header != null && header !== "") {
+        const n = Number(header);
+        if (Number.isFinite(n)) lastSeq = n;
+      }
+      text = await r.text();
     }
   } catch (e) {
     if (e.name !== "AbortError") console.warn("Log fetch failed:", e);
   }
+
+  // A newer job or experiment was selected, or a newer reload started.
+  if (ctrl.signal.aborted || runId !== currentRunId) return;
+  loadAbort = null;
+  historyLoading = false;
+  const buffered = pendingLogEvents;
+  pendingLogEvents = [];
+  const scroll = logOutput.scrollTop;
+  // A failed reload keeps what is already shown, and adds what streamed in
+  // meanwhile on top of it.
+  if (text != null || !logRaw) {
+    resetLog();
+    appendLog(text || "");
+  }
+  for (const evt of buffered) {
+    if (evt.run_id !== currentRunId) continue;
+    if (text != null && lastSeq >= 0 && typeof evt.seq === "number" && evt.seq <= lastSeq) continue;
+    if (evt.data) appendLog(evt.data);
+  }
+  if (!autoScrollCb.checked) logOutput.scrollTop = scroll;
 }
 
 function setBadge(status) {
@@ -238,6 +285,32 @@ function renderJobList() {
   });
 }
 
+// Right-click a run: show it, rename it, or go to its other pages.
+jobListEl.addEventListener("contextmenu", e => {
+  const item = e.target.closest(".job-item");
+  const job = item && jobsData.find(j => j.run_id === item.dataset.runId);
+  if (!job || mlNativeMenuWanted(e, item)) return;
+  mlContextMenu(e, [
+    { title: job.label || job.run_id },
+    job.run_id === currentRunId ? null : { label: "Show logs", run: () => selectJob(job) },
+    { label: "Download log", run: () => {
+      const a = Object.assign(document.createElement("a"), {
+        href: authURL(`/api/experiments/${encodeURIComponent(job.experiment_id)}/jobs/${encodeURIComponent(job.run_id)}/logs`),
+        download: `${job.run_id}.log`,
+      });
+      a.click();
+    } },
+    { label: "Rename…", run: async () => {
+      const label = await mlRenameRun(job.experiment_id, job.run_id, job.label);
+      if (label !== undefined) setJobLabel(job.run_id, label);
+    } },
+    "-",
+    ...MLViews.runItems(job.experiment_id, job.run_id, { skip: "logs", codeFiles: job.code_files }),
+    "-",
+    { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
+  ]);
+});
+
 // Show a run's new display name in the list and, if selected, the header.
 function setJobLabel(runId, label) {
   const job = jobsData.find(j => j.run_id === runId);
@@ -274,10 +347,15 @@ function setJobStatus(runId, status) {
 
 // ── Experiment selection ──────────────────────────────────────────────────────
 async function loadJobs(expId) {
+  const seq = ++jobsSeq;
   try {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
     if (!r.ok) return;
-    jobsData = await r.json();
+    const data = await r.json();
+    // Another experiment was selected, or a newer job-list fetch (the 15s
+    // poll, a refresh) already answered.
+    if (seq !== jobsSeq || expId !== currentExpId) return;
+    jobsData = data;
     jobsData.forEach(MLStepTimer.seed);
     renderJobList();
     MLStepTimer.tick();
@@ -285,7 +363,10 @@ async function loadJobs(expId) {
 }
 
 async function selectExperiment(expId) {
+  const token = ++expSeq;
   if (loadAbort) { loadAbort.abort(); loadAbort = null; }
+  historyLoading = false;
+  pendingLogEvents = [];
 
   currentExpId = expId;
   currentRunId = null;
@@ -303,10 +384,12 @@ async function selectExperiment(expId) {
   expDlAllBtn.style.display = "";
 
   await loadJobs(expId);
+  if (token !== expSeq || currentExpId !== expId) return;
   connectWS(expId);
 
-  // Auto-select run from URL on first load only.
-  const urlRun = params.get("run");
+  // Auto-select the run from the URL, on the first experiment shown only.
+  const urlRun = urlRunPending;
+  urlRunPending = null;
   if (urlRun) {
     const job = jobsData.find(j => j.run_id === urlRun);
     if (job) await selectJob(job);
@@ -322,9 +405,19 @@ function connectWS(expId) {
   const sock = new WebSocket(wsURL(`/ws/experiments/${encodeURIComponent(expId)}`));
   ws = sock;
 
-  ws.addEventListener("open", () => setConnStatus("connected"));
+  ws.addEventListener("open", () => {
+    if (ws !== sock) return;
+    setConnStatus("connected");
+    // Log chunks sent before this socket subscribed are not replayed; reload
+    // the selected run's snapshot so they are not missing.
+    const job = jobsData.find(j => j.run_id === currentRunId);
+    if (job) loadLogHistory(job);
+  });
 
   ws.addEventListener("message", e => {
+    // A message queued on the previous socket must not be taken for the new
+    // experiment's stream: run IDs repeat across experiments.
+    if (ws !== sock) return;
     try { handleWsEvent(JSON.parse(e.data)); } catch {}
   });
 
@@ -335,12 +428,13 @@ function connectWS(expId) {
       wsReconnTimer = setTimeout(() => connectWS(expId), 3000);
   });
 
-  ws.addEventListener("error", () => setConnStatus("disconnected"));
+  ws.addEventListener("error", () => { if (ws === sock) setConnStatus("disconnected"); });
 }
 
 function handleWsEvent(evt) {
   if (evt.type === "log" && evt.run_id === currentRunId) {
-    appendLog(evt.data);
+    if (historyLoading) pendingLogEvents.push(evt);
+    else appendLog(evt.data);
   } else if (evt.type === "metric") {
     MLStepTimer.onMetric(evt);
   } else if (evt.type === "job_started") {
@@ -360,11 +454,14 @@ let allExps = [];
 let firstLoad = true;
 
 function clearExperiment() {
+  expSeq += 1;
   if (wsReconnTimer) { clearTimeout(wsReconnTimer); wsReconnTimer = null; }
   wsExpId = null;
   if (ws) { ws.close(); ws = null; }
   currentExpId = null;
   currentRunId = null;
+  historyLoading = false;
+  pendingLogEvents = [];
   jobsData = [];
   MLStepTimer.clear();
   resetLog();
@@ -389,10 +486,13 @@ async function showCampaign(prefer) {
 
 // Returns true when the shown experiment changed (see showCampaign).
 async function loadExperiments() {
+  const seq = ++expsSeq;
   try {
     const r = await apiFetch("/api/experiments");
-    if (!r.ok) { setConnStatus("disconnected"); return false; }
-    allExps = await r.json();
+    if (!r.ok) { if (seq === expsSeq) setConnStatus("disconnected"); return false; }
+    const data = await r.json();
+    if (seq !== expsSeq) return false;   // a newer list was fetched meanwhile
+    allExps = data;
     setConnStatus("connected");
 
     const urlExp = firstLoad ? params.get("experiment") : null;
@@ -400,7 +500,7 @@ async function loadExperiments() {
     MLCampaign.follow(allExps, urlExp);
     return await showCampaign(urlExp);
   } catch {
-    setConnStatus("disconnected");
+    if (seq === expsSeq) setConnStatus("disconnected");
     return false;
   }
 }

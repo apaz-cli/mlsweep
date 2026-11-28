@@ -299,6 +299,8 @@ body.wide-doc .doc { max-width: none; }
 .doc a.code-ref:hover { border-bottom-style: solid; }
 .doc a.code-ref.code-bad { color: var(--bad); border-bottom-color: var(--bad); }
 .doc a.code-ref .ev-mark { font-size: .78em; margin-left: 2px; }
+.doc a.trace-ev.trace-bad { color: var(--bad); }
+.doc a.trace-ev .ev-mark { font-size: .78em; margin-left: 2px; }
 .doc .nb-open { text-decoration: none; }
 .doc .nb-block.nb-code .nb-body, .doc .nb-block.nb-diff .nb-body { padding: 0; }
 .doc .nb-src-lines { display: flex; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.55; max-height: 36em; overflow: auto; padding: 8px 0; }
@@ -475,13 +477,6 @@ kbd { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 1px 6px;
 .sw-item .nm b { color: var(--accent); }
 .sw-item .pth { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sw-foot { border-top: 1px solid var(--border); padding: 7px 16px; font-size: 11px; color: var(--text-muted); display: flex; gap: 16px; }
-#ctx-menu { position: fixed; z-index: 400; background: var(--surface); border: 1px solid var(--border); border-radius: 7px; box-shadow: 0 8px 30px #0005; padding: 4px 0; min-width: 190px; display: none; font-size: 12.5px; }
-#ctx-menu.show { display: block; }
-.cm-item { padding: 6px 14px; cursor: pointer; color: var(--text); display: flex; justify-content: space-between; gap: 20px; }
-.cm-item:hover { background: var(--radio-checked-bg); }
-.cm-item.danger { color: var(--bad); }
-.cm-item .k { color: var(--text-muted); font-size: 11px; }
-.cm-sep { height: 1px; background: var(--border); margin: 4px 0; }
 #toasts { position: fixed; bottom: 18px; right: 18px; z-index: 500; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; pointer-events: none; }
 .toast { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--radio-checked-border); border-radius: 6px; padding: 8px 14px; font-size: 12px; color: var(--text); box-shadow: 0 6px 24px #0004; max-width: 380px; pointer-events: auto; animation: toast-in .15s ease; }
 .toast.err { border-left-color: var(--bad); }
@@ -587,6 +582,7 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
 </style>
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
 <script src="campaign.js"></script>
 <script src="vendor-notes.js"></script>
 <script src="cm-simple.js"></script>
@@ -675,7 +671,6 @@ li.CodeMirror-hint-active { background: var(--radio-checked-bg); color: var(--ra
   <div id="switcher-list"></div>
   <div class="sw-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> move</span><span><kbd>Enter</kbd> open</span><span><kbd>Shift</kbd>+<kbd>Enter</kbd> create note</span><span><kbd>Esc</kbd> close</span></div>
 </div></div>
-<div id="ctx-menu"></div>
 <div id="toasts"></div>
 <div id="drop-overlay">Drop files to upload</div>
 <div id="lightbox"><img id="lightbox-img" alt=""></div>

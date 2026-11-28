@@ -20,6 +20,11 @@ let checkedRuns = new Set();    // run_ids selected in sidebar
 let browseRun   = null;         // run_id shown in Browse tab
 let browseFile  = null;         // file path highlighted in Browse tree
 let compareFile = null;         // file path shown in Compare grid
+// Async work carries the values it started with (and a sequence number for the
+// two views that can be redrawn) and drops its result if they changed.
+let loadGen = 0;                // bumped when the experiment changes
+let browseSeq = 0;
+let compareSeq = 0;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function fmtModified(iso) {
@@ -105,17 +110,85 @@ function renderRunList() {
     bdg.textContent = j.status;
 
     item.append(cb, info, bdg);
+    item.dataset.runId = j.run_id;
     item.addEventListener("click", e => {
       if (e.target === cb) return;
-      browseRun = j.run_id; browseFile = null;
-      document.querySelectorAll(".run-item").forEach(el => el.classList.remove("browse-hl"));
-      item.classList.add("browse-hl");
-      switchTab("browse");
-      loadBrowse(j.run_id);
+      browseRunFiles(j.run_id);
     });
     list.appendChild(item);
   }
 }
+
+function browseRunFiles(runId) {
+  browseRun = runId; browseFile = null;
+  document.querySelectorAll(".run-item").forEach(el => el.classList.toggle("browse-hl", el.dataset.runId === runId));
+  switchTab("browse");
+  loadBrowse(runId);
+}
+
+function downloadURL(url, name) {
+  Object.assign(document.createElement("a"), { href: authURL(url), download: name || "" }).click();
+}
+
+function setChecked(runId, on) {
+  on ? checkedRuns.add(runId) : checkedRuns.delete(runId);
+  renderRunList();
+  if (activeTab === "compare") renderCompareGrid();
+}
+
+function compareAcrossRuns(path) {
+  compareFile = path;
+  rebuildFileSel();
+  document.getElementById("file-path-sel").value = path;
+  switchTab("compare");
+  renderCompareGrid();
+}
+
+// A run's menu, from the sidebar or a compare card.  path: the file the card shows.
+function runMenu(e, j, path) {
+  const eid = expId();
+  const checked = checkedRuns.has(j.run_id);
+  mlContextMenu(e, [
+    { title: j.label || j.run_id },
+    path ? { label: "Download this file", run: () => downloadURL(artifactURL(eid, j.run_id, path), path.split("/").pop()) } : null,
+    path ? { label: "Open this file in a new tab", run: () => window.open(authURL(artifactURL(eid, j.run_id, path)), "_blank", "noopener") } : null,
+    path ? "-" : null,
+    { label: "Browse files", run: () => browseRunFiles(j.run_id) },
+    { label: checked ? "Leave out of the comparison" : "Add to the comparison", run: () => setChecked(j.run_id, !checked) },
+    { label: "Download all files (.zip)", run: () => downloadURL(runZipURL(eid, j.run_id), `${j.run_id}.zip`) },
+    "-",
+    ...MLViews.runItems(eid, j.run_id, { skip: "files", codeFiles: j.code_files }),
+    { label: "Copy run ID", run: () => copyText(j.run_id, "Copied the run ID") },
+  ]);
+}
+
+document.getElementById("run-list").addEventListener("contextmenu", e => {
+  const item = e.target.closest(".run-item");
+  const j = item && jobs.find(x => x.run_id === item.dataset.runId);
+  if (j && !mlNativeMenuWanted(e, item)) runMenu(e, j, null);
+});
+document.getElementById("compare-grid").addEventListener("contextmenu", e => {
+  const card = e.target.closest(".run-card");
+  const j = card && jobs.find(x => x.run_id === card.dataset.runId);
+  if (!j || mlNativeMenuWanted(e, card)) return;
+  const found = (fileCache[j.run_id] || []).some(f => f.path === compareFile);
+  runMenu(e, j, found ? compareFile : null);
+});
+document.getElementById("file-tree").addEventListener("contextmenu", e => {
+  const row = e.target.closest(".file-row");
+  if (!row || !browseRun || mlNativeMenuWanted(e, row)) return;
+  const runId = browseRun, path = row.dataset.path, eid = expId();
+  const f = (fileCache[runId] || []).find(x => x.path === path);
+  mlContextMenu(e, [
+    { title: path },
+    f && browseFile !== path ? { label: "Preview", run: () => row.click() } : null,
+    { label: "Download", run: () => downloadURL(artifactURL(eid, runId, path), path.split("/").pop()) },
+    { label: "Open in a new tab", run: () => window.open(authURL(artifactURL(eid, runId, path)), "_blank", "noopener") },
+    { label: "Compare across runs", run: () => compareAcrossRuns(path) },
+    "-",
+    { label: "Copy path", run: () => copyText(path, "Copied the path") },
+  ]);
+});
 
 document.getElementById("sel-all").onclick = () => {
   jobs.forEach(j => checkedRuns.add(j.run_id)); renderRunList();
@@ -140,17 +213,22 @@ document.getElementById("sel-failed").onclick = () => {
 // ── File list loading ──────────────────────────────────────────────────────────
 function expId() { return document.getElementById("exp-sel").value; }
 
-async function fetchFileList(runId) {
+async function fetchFileList(runId, gen = loadGen, eid = expId()) {
   if (fileCache[runId] !== undefined) return fileCache[runId];
   try {
-    const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId())}/jobs/${encodeURIComponent(runId)}/artifacts`);
-    fileCache[runId] = r.ok ? await r.json() : [];
-  } catch { fileCache[runId] = []; }
-  return fileCache[runId];
+    const r = await apiFetch(`/api/experiments/${encodeURIComponent(eid)}/jobs/${encodeURIComponent(runId)}/artifacts`);
+    const files = r.ok ? await r.json() : [];
+    // The experiment may have changed while this request was in flight.
+    if (gen !== loadGen || eid !== loadedExp) return [];
+    fileCache[runId] = files;
+  } catch {
+    if (gen === loadGen && eid === loadedExp) fileCache[runId] = [];
+  }
+  return fileCache[runId] || [];
 }
 
-async function fetchFileLists(runIds) {
-  await Promise.all(runIds.map(id => fetchFileList(id)));
+async function fetchFileLists(runIds, gen = loadGen, eid = expId()) {
+  await Promise.all(runIds.map(id => fetchFileList(id, gen, eid)));
 }
 
 // ── File path selector ─────────────────────────────────────────────────────────
@@ -167,7 +245,7 @@ function rebuildFileSel() {
     sel.appendChild(opt);
   }
   const target = prev || compareFile;
-  if (target && [...all].has(target)) sel.value = target;
+  if (target && all.has(target)) sel.value = target;
 }
 
 document.getElementById("file-path-sel").addEventListener("change", e => {
@@ -180,8 +258,9 @@ document.getElementById("only-with-file").addEventListener("change", () => rende
 async function renderCompareGrid() {
   const grid = document.getElementById("compare-grid");
   const info = document.getElementById("compare-info");
+  const seq = ++compareSeq, gen = loadGen, eid = expId(), file = compareFile;
 
-  if (!compareFile) {
+  if (!file) {
     grid.innerHTML = `<div class="placeholder">Choose a file path above to compare across runs.</div>`;
     info.textContent = ""; return;
   }
@@ -192,9 +271,11 @@ async function renderCompareGrid() {
     info.textContent = ""; return;
   }
 
-  await fetchFileLists(selected.map(j => j.run_id));
+  await fetchFileLists(selected.map(j => j.run_id), gen, eid);
+  // A newer grid (another file, experiment or set of checked runs) owns the DOM now.
+  if (seq !== compareSeq || gen !== loadGen || eid !== expId() || file !== compareFile) return;
 
-  const hasFile  = j => (fileCache[j.run_id]||[]).some(f => f.path === compareFile);
+  const hasFile  = j => (fileCache[j.run_id]||[]).some(f => f.path === file);
   const onlyWith = document.getElementById("only-with-file").checked;
   const toShow   = onlyWith ? selected.filter(hasFile) : selected;
   const withCnt  = selected.filter(hasFile).length;
@@ -212,9 +293,10 @@ async function renderCompareGrid() {
     const combo = comboStr(j);
     const card  = document.createElement("div");
     card.className = "run-card";
+    card.dataset.runId = j.run_id;
 
-    const dlHref = found ? escHtml(authURL(artifactURL(expId(), j.run_id, compareFile))) : "";
-    const fname  = compareFile.split("/").pop();
+    const dlHref = found ? escHtml(authURL(artifactURL(eid, j.run_id, file))) : "";
+    const fname  = file.split("/").pop();
 
     card.innerHTML = `
       <div class="card-header">
@@ -228,7 +310,7 @@ async function renderCompareGrid() {
       </div>`;
 
     const body = card.querySelector(".card-body");
-    if (found) renderPreviewInto(expId(), j.run_id, compareFile, body, true);
+    if (found) renderPreviewInto(eid, j.run_id, file, body, true);
     else body.innerHTML = `<span class="no-file">—</span>`;
 
     grid.appendChild(card);
@@ -277,20 +359,24 @@ document.addEventListener("keydown", e => {
 
 // ── Browse tab ─────────────────────────────────────────────────────────────────
 async function loadBrowse(runId) {
+  const seq = ++browseSeq, gen = loadGen, eid = expId();
   const tree = document.getElementById("file-tree");
   const pane = document.getElementById("preview-pane");
   const toolbar = document.getElementById("browse-toolbar");
   toolbar.style.display = "flex";
-  document.getElementById("run-dl-zip").href = runZipURL(expId(), runId);
+  document.getElementById("run-dl-zip").href = runZipURL(eid, runId);
   const _browseJob = jobs.find(j => j.run_id === runId);
-  document.getElementById("browse-run-label").innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
+  const runLabel = document.getElementById("browse-run-label");
+  runLabel.innerHTML = _browseJob ? runNameHtml(_browseJob) : escHtml(runId);
+  mlTagEntity(runLabel, eid, runId, { title: _browseJob?.label || runId, skip: "files", codeFiles: _browseJob?.code_files });
   const codeBtn = document.getElementById("run-code-btn");
-  codeBtn.href = pageHref("code.html", { experiment: expId(), run: runId });
+  codeBtn.href = pageHref("code.html", { experiment: eid, run: runId });
   codeBtn.style.display = _browseJob && _browseJob.artifact_id ? "" : "none";
   tree.innerHTML = `<div style="padding:8px 12px;font-size:11px;color:var(--text-muted)">Loading…</div>`;
   pane.innerHTML = `<div class="placeholder">Loading files…</div>`;
 
-  const files = await fetchFileList(runId);
+  const files = await fetchFileList(runId, gen, eid);
+  if (seq !== browseSeq || gen !== loadGen || browseRun !== runId) return;
   rebuildFileSel();
 
   tree.innerHTML = "";
@@ -348,7 +434,9 @@ let loadedExp = null;  // experiment currently shown
 
 async function loadExperiment(eid) {
   if (!eid) return;
+  const gen = ++loadGen;
   loadedExp = eid;
+  browseSeq++; compareSeq++;
   jobs = []; fileCache = {}; checkedRuns.clear();
   browseRun = null; browseFile = null; compareFile = null;
 
@@ -370,10 +458,14 @@ async function loadExperiment(eid) {
 
   try {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(eid)}/jobs`);
+    if (gen !== loadGen) return;
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    jobs = await r.json();
+    const loaded = await r.json();
+    if (gen !== loadGen) return;
+    jobs = loaded;
     setConnStatus("connected");
   } catch (e) {
+    if (gen !== loadGen) return;
     setConnStatus("disconnected");
     document.getElementById("run-list").innerHTML = `<div style="color:var(--bad);font-size:12px;padding:4px">Error loading runs</div>`;
     return;
@@ -397,7 +489,8 @@ async function loadExperiment(eid) {
 
   // Eagerly fetch file lists for terminal runs, then populate selector + grid
   const doneIds = jobs.filter(j => ["done","pruned","failed","xfailed","cancelled"].includes(j.status)).map(j => j.run_id);
-  fetchFileLists(doneIds).then(() => {
+  fetchFileLists(doneIds, gen, eid).then(() => {
+    if (gen !== loadGen) return;
     rebuildFileSel();
     if (activeTab === "compare") {
       if (compareFile) {
@@ -415,6 +508,7 @@ const campaignSel = document.getElementById("campaign-sel");
 let allExps = [];      // every experiment, for the campaign list
 
 function clearExperiment() {
+  loadGen++; browseSeq++; compareSeq++;
   loadedExp = null;
   jobs = []; fileCache = {}; checkedRuns.clear();
   browseRun = null; browseFile = null; compareFile = null;
@@ -438,15 +532,19 @@ function showCampaign() {
   else if (id !== loadedExp) loadExperiment(id);
 }
 
+let expsSeq = 0;
 async function fetchExperiments() {
+  const seq = ++expsSeq;
   try {
     const r = await apiFetch("/api/experiments");
-    if (!r.ok) { setConnStatus("disconnected"); return; }
-    allExps = await r.json();
+    if (!r.ok) { if (seq === expsSeq) setConnStatus("disconnected"); return; }
+    const exps = await r.json();
+    if (seq !== expsSeq) return;
+    allExps = exps;
     setConnStatus("connected");
     MLCampaign.follow(allExps, INIT_EXP);
     showCampaign();
-  } catch { setConnStatus("disconnected"); }
+  } catch { if (seq === expsSeq) setConnStatus("disconnected"); }
 }
 
 MLCampaign.bind(campaignSel, showCampaign);

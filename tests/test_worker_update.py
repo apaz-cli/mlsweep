@@ -153,3 +153,44 @@ def test_a_worker_that_fails_to_launch_is_listed_and_not_flagged(tmp_path):
     assert record is not None and record.status == "dead"
     assert "Connection refused" in (record.last_error or "")
     assert not outdated
+
+
+def test_a_worker_disconnected_while_launching_is_not_registered(tmp_path):
+    """Disconnecting a worker whose launch is still in flight wins: the launch
+    drops its connection when it finishes and the worker stays removed."""
+    class _Writer:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    conn = _Writer()
+
+    async def body():
+        db = await aiosqlite.connect(tmp_path / "manager.db")
+        await init_db(db)
+        writer = DbWriter(db)
+        writer_task = asyncio.create_task(writer.run())
+        try:
+            state = ManagerState()
+            state.db_writer = writer
+            state.reserve_worker_id("w")
+
+            async def launch(**kwargs):
+                # What DELETE /api/workers/w does while the launch runs.
+                state.retired.add("w")
+                await writer.retire_worker("w", "disconnected")
+                return object(), conn, 7890
+
+            wc = await mw.connect_single_worker(db, state, "localhost", "", worker_id="w", launch=launch)
+            await writer.update_worker_status("w", "dead", last_error="late failure")
+            return wc, "w" in state.workers, "w" in state.launching, await mw.get_worker(db, "w"), \
+                await mw.list_workers(db)
+        finally:
+            writer_task.cancel()
+            await db.close()
+
+    wc, registered, launching, record, listed = asyncio.run(body())
+    assert wc is None and not registered and not launching and conn.closed
+    assert record is not None and record.status == "disconnected"
+    assert [w.status for w in listed] == ["disconnected"]

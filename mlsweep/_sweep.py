@@ -56,7 +56,7 @@ def _load_module(path: str | Path) -> types.ModuleType:
 SWEEP_SETTINGS = frozenset({
     "COMMAND", "OPTIONS", "EXCLUDE", "EXTRA_FLAGS", "GPUS_PER_RUN", "NODES_PER_RUN", "RUN_FROM",
     "SET_DIST_ENV", "METRIC", "GOAL", "OPTIMIZE", "SETUP_COMMAND", "UPLOAD_EXCLUDE",
-    "MAX_RUNTIME", "PRUNE", "METRIC_CHECK",
+    "MAX_RUNTIME", "PRUNE", "METRIC_CHECK", "DESCRIPTION",
 })
 
 # The keys each dict setting accepts.
@@ -131,6 +131,10 @@ def sweep_info(mod: types.ModuleType, path: str | Path) -> dict[str, Any]:
     if not isinstance(upload_exclude, (list, tuple)) or not all(isinstance(p, str) and p for p in upload_exclude):
         raise ValueError(f"{path}: UPLOAD_EXCLUDE must be a list of non-empty str patterns")
 
+    description = getattr(mod, "DESCRIPTION", None)
+    if description is not None and not isinstance(description, str):
+        raise ValueError(f"{path}: DESCRIPTION must be a str, got {type(description).__name__}")
+
     controls = build_controls(
         max_runtime=getattr(mod, "MAX_RUNTIME", None),
         prune=getattr(mod, "PRUNE", None),
@@ -155,6 +159,7 @@ def sweep_info(mod: types.ModuleType, path: str | Path) -> dict[str, Any]:
         "setup_command": setup_command,
         "upload_exclude": list(upload_exclude),
         "controls": controls,
+        "description": (description or "").strip() or None,
     }
 
 

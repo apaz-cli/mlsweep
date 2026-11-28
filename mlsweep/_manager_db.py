@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import dataclasses
 import itertools
 import shlex
+import sys
+import time
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Literal, NamedTuple, Sequence, TypeVar, get_args
+from typing import Any, Callable, Coroutine, Iterable, Literal, NamedTuple, Sequence, TypeVar, get_args
 
 import aiosqlite
 
@@ -48,6 +51,22 @@ ACTIVE_JOB_STATUSES: tuple[JobStatus, ...] = ("dispatched", "running")
 FINISHED_JOB_STATUSES: tuple[JobStatus, ...] = ("done", "failed", "xfailed", "cancelled", "pruned")
 
 
+def _sqlite_has_fts5() -> bool:
+    """Whether this SQLite library has the fts5 module (every connection shares it)."""
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+# Capture search uses the full-text index only when SQLite has fts5.
+HAS_FTS5 = _sqlite_has_fts5()
+
+
 def _marks(values: Sequence[Any]) -> str:
     """``?,?,...``: one bound-parameter placeholder per value."""
     return ",".join("?" * len(values))
@@ -64,7 +83,15 @@ _IN_CAMPAIGN = "experiment_id IN (SELECT experiment_id FROM experiments WHERE ca
 _ACTIVE_IN = _sql_in(ACTIVE_JOB_STATUSES)
 _UNFINISHED_IN = _sql_in(("pending", *ACTIVE_JOB_STATUSES))
 _FINISHED_IN = _sql_in(FINISHED_JOB_STATUSES)
-WorkerStatus = Literal["offline", "connected", "reconnecting", "updating", "dead"]
+# A ``disconnected`` worker was taken out of the pool on purpose (the System
+# page's Disconnect, ``mlsweep workers rm``).  It is still listed, so the
+# Connect dialog can bring it back, but a manager restart does not relaunch it.
+# A ``removed`` worker was forgotten: its row stays (jobs reference it) but it
+# is not listed at all.  Only adding the worker again (``upsert_worker``)
+# brings back either one.
+WorkerStatus = Literal["offline", "connected", "reconnecting", "updating", "dead",
+                       "disconnected", "removed"]
+RETIRED_WORKER_STATUSES: tuple[WorkerStatus, ...] = ("disconnected", "removed")
 
 
 # ===============================================================================
@@ -109,6 +136,7 @@ class WorkerRecord:
     devices: str | None = None  # JSON list of ints
     unhealthy_devices: str | None = None  # JSON list of ints excluded by the CUDA probe
     last_error: str | None = None  # human-readable reason for the last failure
+    tunnel: bool = False  # reached through an SSH local forward, not by dialing its port
 
 
 @dataclass(order=False)
@@ -148,6 +176,7 @@ class JobRecord:
     job_key: int = 0  # integer id used by the logs and metrics tables
     attempt: int = 0  # number of times the job has been dispatched
     reason: str | None = None  # why the manager ended or flagged the run (timeout, pruned, missing metric)
+    move_to: str | None = None  # experiment to move the run to once it finishes (``mlsweep move``)
 
     @property
     def key(self) -> tuple[str, str]:
@@ -217,6 +246,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         job_key=row["job_key"],
         attempt=row["attempt"],
         reason=row["reason"],
+        move_to=row["move_to"],
     )
 
 
@@ -256,6 +286,7 @@ def _row_to_worker(row: sqlite3.Row) -> WorkerRecord:
         devices=row["devices"],
         unhealthy_devices=row["unhealthy_devices"],
         last_error=row["last_error"],
+        tunnel=bool(row["tunnel"]),
     )
 
 
@@ -374,6 +405,7 @@ _JOBS_TABLE = """
         label              TEXT,
         attempt            INTEGER NOT NULL DEFAULT 0,
         reason             TEXT,
+        move_to            TEXT,
         UNIQUE (experiment_id, run_id)
     )
 """
@@ -549,6 +581,39 @@ async def _migrate_logs_to_rowid(db: aiosqlite.Connection) -> bool:
     return True
 
 
+# No foreign key on session_id: a sweep names the session it was typed into
+# before the watcher has uploaded that session, and the link must wait for it.
+_CAPTURE_LINKS_TABLE = """
+    CREATE TABLE IF NOT EXISTS capture_links (
+        session_id    TEXT NOT NULL,
+        experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+        source        TEXT NOT NULL DEFAULT 'auto',
+        created_at    REAL NOT NULL,
+        PRIMARY KEY (session_id, experiment_id)
+    )
+"""
+
+
+async def _migrate_capture_links(db: aiosqlite.Connection) -> None:
+    """Drop the session foreign key an earlier ``capture_links`` had, in one transaction."""
+    row = await _exec_one(
+        db, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'capture_links'")
+    if row is None or "capture_sessions" not in row[0]:
+        return
+    await db.execute("BEGIN")
+    try:
+        await db.execute("ALTER TABLE capture_links RENAME TO capture_links_old")
+        await db.execute(_CAPTURE_LINKS_TABLE)
+        await db.execute("INSERT INTO capture_links SELECT session_id, experiment_id, source, "
+                         "created_at FROM capture_links_old "
+                         "WHERE experiment_id IN (SELECT experiment_id FROM experiments)")
+        await db.execute("DROP TABLE capture_links_old")
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+
+
 # Bytes the WAL file is cut back to after a checkpoint.
 _WAL_SIZE_LIMIT = 16 * 1024 * 1024
 
@@ -613,12 +678,15 @@ async def init_db(db: aiosqlite.Connection) -> None:
             venv          TEXT,
             devices       TEXT,
             unhealthy_devices TEXT,
-            last_error    TEXT
+            last_error    TEXT,
+            tunnel        INTEGER NOT NULL DEFAULT 0
         );
     """)
-    # Idempotent migration for databases created before the device-health probe.
+    # Idempotent migration for databases created before the device-health probe
+    # and SSH-tunnelled workers.
     await _add_missing_columns(db, "workers", {
         "unhealthy_devices": "TEXT",
+        "tunnel": "INTEGER NOT NULL DEFAULT 0",
     })
 
     # ── artifacts ───────────────────────────────────────────────────
@@ -633,8 +701,12 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
     # A code snapshot (``snap:`` ID) keeps its manifest here; a legacy
-    # tarball (``sha256:`` ID) has none.
-    await _add_missing_columns(db, "artifacts", {"manifest": "TEXT"})
+    # tarball (``sha256:`` ID) has none.  file_count is the manifest's length,
+    # kept so listings can show it without parsing every manifest.
+    await _add_missing_columns(db, "artifacts", {"manifest": "TEXT", "file_count": "INTEGER"})
+    await db.execute(
+        "UPDATE artifacts SET file_count = json_array_length(manifest, '$.files') "
+        "WHERE file_count IS NULL AND manifest IS NOT NULL")
 
     # ── code_submissions ────────────────────────────────────────────
     # One row per submission of code to an experiment: which snapshot, and the
@@ -653,7 +725,7 @@ async def init_db(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_code_submissions_experiment ON code_submissions(experiment_id)")
 
     await db.execute(_JOBS_TABLE)
-    await _add_missing_columns(db, "jobs", {"reason": "TEXT"})
+    await _add_missing_columns(db, "jobs", {"reason": "TEXT", "move_to": "TEXT"})
     await db.execute(_METRICS_TABLE)
     await db.commit()
     # The rebuild leaves the old table's pages free; VACUUM returns them.
@@ -681,6 +753,26 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
+    # ── run events ──────────────────────────────────────────────────
+    # What happened to each run and who did it: dispatches, results and
+    # requeues from the manager, and cancels, retries, moves and the like from
+    # the dashboard or the CLI.  ``mlsweep history`` reads it.  Rows outlive
+    # the experiment, so a deleted one still says when and how it went.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS run_events (
+            event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            time          REAL NOT NULL,
+            experiment_id TEXT NOT NULL,
+            run_id        TEXT,
+            attempt       INTEGER,
+            action        TEXT NOT NULL,
+            source        TEXT NOT NULL,
+            detail        TEXT
+        );
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_events_exp ON run_events(experiment_id, run_id, time)")
+
     # ── settings ────────────────────────────────────────────────────
     # Manager-wide knobs changed from the web UI, such as the GPU placement
     # policy.  One row per key; a missing row means the default.
@@ -691,6 +783,80 @@ async def init_db(db: aiosqlite.Connection) -> None:
         );
     """)
 
+    # ── complaints ──────────────────────────────────────────────────
+    # Problems with mlsweep and ideas for it, reported by agents (and people)
+    # with `mlsweep complain`.  Kept on the manager only; nothing is sent
+    # anywhere else.  ``session_id`` is the agent trace the report came from.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS complaints (
+            complaint_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            time          REAL NOT NULL,
+            kind          TEXT NOT NULL,
+            text          TEXT NOT NULL,
+            experiment_id TEXT,
+            session_id    TEXT,
+            command       TEXT,
+            version       TEXT,
+            host          TEXT,
+            user          TEXT,
+            source        TEXT NOT NULL
+        );
+    """)
+
+    # ── capture (session traces) ────────────────────────────────────
+    # Coding-agent sessions, uploaded by the watcher on the machine the
+    # agents run on.  Events are append-only; FTS keeps their text
+    # searchable.  See the capture section at the end of this module.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS capture_sessions (
+            session_id   TEXT PRIMARY KEY,
+            agent        TEXT NOT NULL,
+            host         TEXT NOT NULL DEFAULT '',
+            user         TEXT NOT NULL DEFAULT '',
+            cwd          TEXT NOT NULL DEFAULT '',
+            title        TEXT NOT NULL DEFAULT '',
+            model        TEXT NOT NULL DEFAULT '',
+            started_at   REAL NOT NULL DEFAULT 0,
+            last_seen_at REAL NOT NULL DEFAULT 0,
+            event_count  INTEGER NOT NULL DEFAULT 0,
+            state        TEXT NOT NULL DEFAULT 'active'
+        );
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS capture_events (
+            session_id TEXT NOT NULL REFERENCES capture_sessions(session_id) ON DELETE CASCADE,
+            seq        INTEGER NOT NULL,
+            data       TEXT NOT NULL,
+            PRIMARY KEY (session_id, seq)
+        ) WITHOUT ROWID
+    """)
+    # Where each event of a transcript is stored, by the agent's own id for it
+    # (``src``), so a continued session's copy of its history isn't stored twice.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS capture_src (
+            src        TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+        ) WITHOUT ROWID
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_capture_src_session ON capture_src(session_id)")
+    await _add_missing_columns(db, "capture_sessions", {"continues": "TEXT NOT NULL DEFAULT ''"})
+    await db.commit()
+    await _migrate_capture_links(db)
+    await db.execute(_CAPTURE_LINKS_TABLE)
+    # A SQLite built without fts5 keeps everything but full-text search.
+    if HAS_FTS5:
+        await db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS capture_fts USING fts5(session_id UNINDEXED, text)")
+    else:
+        print("Capture search disabled: this SQLite has no FTS5", file=sys.stderr)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capture_sessions_last_seen "
+        "ON capture_sessions(last_seen_at)")
+    # A trace's page asks which traces continue it, on every poll.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_capture_sessions_continues "
+        "ON capture_sessions(continues)")
+
     # ── indexes ─────────────────────────────────────────────────────
     await db.executescript("""
         CREATE INDEX IF NOT EXISTS idx_experiments_campaign
@@ -699,6 +865,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
             ON jobs(status, priority DESC, submit_time ASC);
         CREATE INDEX IF NOT EXISTS idx_jobs_worker
             ON jobs(worker_id);
+        -- an experiment's latest job, for the experiment list's code column
+        CREATE INDEX IF NOT EXISTS idx_jobs_experiment_submit
+            ON jobs(experiment_id, submit_time);
     """)
     await db.commit()
 
@@ -747,6 +916,7 @@ async def create_experiment(
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
     controls: dict[str, Any] | None = None,
+    capture_session: str | None = None,
     commit: bool = True,
 ) -> ExperimentRecord:
     """Insert a new experiment and return the row.
@@ -755,7 +925,8 @@ async def create_experiment(
     campaign; ``update_experiment_campaign`` is the only way to move it.
     *code* is the submitting client's provenance for the code it ships
     (``{"snapshot": ID, ...}``), recorded as one more ``code_submissions`` row.
-    With ``commit=False`` the caller owns the transaction.
+    *capture_session* is the agent trace that submitted it, linked in the same
+    write.  With ``commit=False`` the caller owns the transaction.
     """
     now = _now_epoch()
     singular_dims_json = json.dumps(singular_dims or [])
@@ -791,6 +962,10 @@ async def create_experiment(
     )
     if code is not None:
         await insert_code_submission(db, experiment_id, code, commit=False)
+    if capture_session is not None:
+        await db.execute(
+            "INSERT OR IGNORE INTO capture_links (session_id, experiment_id, source, created_at) "
+            "VALUES (?, ?, 'auto', ?)", (capture_session, experiment_id, time.time()))
     if commit:
         await db.commit()
     assert row is not None
@@ -927,13 +1102,14 @@ async def register_snapshot(
     """
     await db.execute(
         """
-        INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, manifest)
-        VALUES (?, ?, ?, 0, ?)
+        INSERT INTO artifacts (artifact_id, size_bytes, stored_at, ref_count, manifest, file_count)
+        VALUES (?, ?, ?, 0, ?, json_array_length(?, '$.files'))
         ON CONFLICT (artifact_id) DO UPDATE SET
             stored_at = EXCLUDED.stored_at,
-            manifest = COALESCE(artifacts.manifest, EXCLUDED.manifest)
+            manifest = COALESCE(artifacts.manifest, EXCLUDED.manifest),
+            file_count = COALESCE(artifacts.file_count, EXCLUDED.file_count)
         """,
-        (artifact_id, size_bytes, _now_epoch(), manifest),
+        (artifact_id, size_bytes, _now_epoch(), manifest, manifest),
     )
     await db.commit()
 
@@ -942,6 +1118,17 @@ async def get_snapshot_manifest(db: aiosqlite.Connection, artifact_id: str) -> s
     """The snapshot's manifest JSON, or None for a legacy tarball or an unknown ID."""
     row = await _exec_one(db, "SELECT manifest FROM artifacts WHERE artifact_id = ?", (artifact_id,))
     return row[0] if row is not None else None
+
+
+async def snapshot_file_counts(db: aiosqlite.Connection, artifact_ids: Iterable[str | None]) -> dict[str, int]:
+    """``{artifact_id: file count}`` for those of *artifact_ids* that are stored snapshots."""
+    ids = sorted({a for a in artifact_ids if a})
+    if not ids:
+        return {}
+    rows = await _exec_all(
+        db, f"SELECT artifact_id, file_count FROM artifacts WHERE artifact_id IN ({_marks(ids)}) "
+            "AND file_count IS NOT NULL", tuple(ids))
+    return {aid: int(n) for aid, n in rows}
 
 
 async def snapshot_stats(db: aiosqlite.Connection, artifact_id: str) -> tuple[int, int]:
@@ -1093,6 +1280,21 @@ async def update_experiment_name(
     return _row_to_experiment(row) if row else None
 
 
+async def update_experiment_note(
+    db: aiosqlite.Connection,
+    experiment_id: str,
+    note: str | None,
+) -> ExperimentRecord | None:
+    """Set or clear (None) an experiment's description. Returns updated row or None."""
+    row = await _exec_one(
+        db,
+        "UPDATE experiments SET note = ? WHERE experiment_id = ? RETURNING *",
+        (note, experiment_id),
+    )
+    await db.commit()
+    return _row_to_experiment(row) if row else None
+
+
 async def update_experiment_campaign(
     db: aiosqlite.Connection,
     experiment_id: str,
@@ -1121,6 +1323,18 @@ _JOB_COUNT_COLUMNS = ",\n               ".join(
 _ARTIFACT_COUNT_COLUMN = "SUM(CASE WHEN j.artifact_id IS NOT NULL THEN 1 ELSE 0 END) AS artifacts_jobs"
 
 
+# Files in the experiment's latest code, the snapshot the code page opens on:
+# the last one submitted to it, else the one its newest run used.  NULL when
+# it has no snapshot.
+_CODE_FILES_COLUMN = """COALESCE(
+               (SELECT a.file_count FROM code_submissions c JOIN artifacts a ON a.artifact_id = c.artifact_id
+                WHERE c.experiment_id = e.experiment_id
+                ORDER BY c.submit_time DESC, c.submission_id DESC LIMIT 1),
+               (SELECT a.file_count FROM jobs j2 JOIN artifacts a ON a.artifact_id = j2.artifact_id
+                WHERE j2.experiment_id = e.experiment_id
+                ORDER BY j2.submit_time DESC LIMIT 1)) AS code_files"""
+
+
 def _job_counts(row: Any, artifacts: bool = False) -> dict[str, int]:
     """``job_counts`` from a row selected with ``_JOB_COUNT_COLUMNS`` (None = all zero)."""
     keys = ("total", *_JOB_COUNT_STATUSES)
@@ -1128,6 +1342,84 @@ def _job_counts(row: Any, artifacts: bool = False) -> dict[str, int]:
     if artifacts:
         counts["with_artifacts"] = (row["artifacts_jobs"] or 0) if row is not None else 0
     return counts
+
+
+@dataclass(frozen=True)
+class RunEvent:
+    """One entry of ``run_events``: *run_id* None means the experiment as a whole."""
+
+    experiment_id: str
+    run_id: str | None
+    action: str
+    source: str  # "manager", "dashboard", "cli" or "api"
+    detail: str | None = None
+    attempt: int | None = None
+
+
+async def add_run_events(
+    db: aiosqlite.Connection, events: Sequence[RunEvent], when: float | None = None, *, commit: bool = True,
+) -> None:
+    """Record *events*, all at *when* (default now).  *commit* False: the
+    caller commits them with the change they describe."""
+    if not events:
+        return
+    t = _now_epoch() if when is None else when
+    await db.executemany(
+        "INSERT INTO run_events (time, experiment_id, run_id, attempt, action, source, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [(t, e.experiment_id, e.run_id, e.attempt, e.action, e.source, e.detail) for e in events],
+    )
+    if commit:
+        await db.commit()
+
+
+async def list_run_events(
+    db: aiosqlite.Connection, experiment_id: str, run_id: str | None = None, limit: int = 1000,
+) -> list[dict[str, Any]]:
+    """An experiment's events, oldest first (the newest *limit*).  With *run_id*,
+    that run's and the experiment-wide ones."""
+    where, params = "experiment_id = ?", [experiment_id]
+    if run_id is not None:
+        where += " AND (run_id = ? OR run_id IS NULL)"
+        params.append(run_id)
+    cursor = await db.execute(
+        f"SELECT * FROM (SELECT * FROM run_events WHERE {where} ORDER BY time DESC, event_id DESC LIMIT ?) "
+        "ORDER BY time, event_id", (*params, limit))
+    rows = await cursor.fetchall()
+    return [{
+        "time": _utc(r["time"]).isoformat(), "experiment_id": r["experiment_id"], "run_id": r["run_id"],
+        "attempt": r["attempt"], "action": r["action"], "source": r["source"], "detail": r["detail"],
+    } for r in rows]
+
+
+# ===============================================================================
+# Complaints
+# ===============================================================================
+
+
+COMPLAINT_KINDS = ("problem", "improvement")
+_COMPLAINT_FIELDS = ("experiment_id", "session_id", "command", "version", "host", "user")
+
+
+async def add_complaint(
+    db: aiosqlite.Connection, *, kind: str, text: str, source: str, **context: str | None,
+) -> int:
+    """Store one complaint and return its id.  *context* holds the optional
+    ``_COMPLAINT_FIELDS``."""
+    cursor = await db.execute(
+        f"INSERT INTO complaints (time, kind, text, source, {', '.join(_COMPLAINT_FIELDS)}) "
+        f"VALUES (?, ?, ?, ?{', ?' * len(_COMPLAINT_FIELDS)})",
+        (_now_epoch(), kind, text, source, *(context.get(f) for f in _COMPLAINT_FIELDS)),
+    )
+    await db.commit()
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
+
+
+async def list_complaints(db: aiosqlite.Connection, limit: int = 100) -> list[dict[str, Any]]:
+    """The newest *limit* complaints, newest first."""
+    cursor = await db.execute("SELECT * FROM complaints ORDER BY complaint_id DESC LIMIT ?", (limit,))
+    return [{**dict(r), "time": _utc(r["time"]).isoformat()} for r in await cursor.fetchall()]
 
 
 async def list_campaigns(db: aiosqlite.Connection) -> list[dict[str, Any]]:
@@ -1176,6 +1468,7 @@ async def upsert_worker(
     unhealthy_devices: str | None = None,
     status: WorkerStatus = "connected",
     last_error: str | None = None,
+    tunnel: bool = False,
 ) -> WorkerRecord:
     """Insert or update a worker row; set last_seen = now."""
     now = _now_epoch()
@@ -1184,8 +1477,8 @@ async def upsert_worker(
         """
         INSERT INTO workers (worker_id, host, remote_dir, status, last_seen,
                              scratch_dir, port, ssh_key, venv, devices,
-                             unhealthy_devices, last_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             unhealthy_devices, last_error, tunnel)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (worker_id) DO UPDATE SET
             host = EXCLUDED.host,
             remote_dir = EXCLUDED.remote_dir,
@@ -1197,11 +1490,12 @@ async def upsert_worker(
             venv = EXCLUDED.venv,
             devices = EXCLUDED.devices,
             unhealthy_devices = EXCLUDED.unhealthy_devices,
-            last_error = EXCLUDED.last_error
+            last_error = EXCLUDED.last_error,
+            tunnel = EXCLUDED.tunnel
         RETURNING *;
         """,
         (worker_id, host, remote_dir, status, now,
-         scratch_dir, port, ssh_key, venv, devices, unhealthy_devices, last_error),
+         scratch_dir, port, ssh_key, venv, devices, unhealthy_devices, last_error, int(tunnel)),
     )
     await db.commit()
     assert row is not None
@@ -1231,16 +1525,33 @@ async def update_worker_status(
 
     ``last_error`` records a human-readable failure reason when moving to a
     failed state.  Passing ``None`` (the default) clears any previous error.
+    A disconnected or removed worker keeps its status, so a launch or
+    reconnect that was in flight when it was retired cannot bring it back
+    (``retire_worker`` sets those statuses).
     """
     now = _now_epoch()
     row = await _exec_one(
         db,
         "UPDATE workers SET status = ?, last_seen = ?, last_error = ? "
-        "WHERE worker_id = ? RETURNING *",
+        "WHERE worker_id = ? AND status NOT IN ('disconnected', 'removed') RETURNING *",
         (status, now, last_error, worker_id),
     )
     await db.commit()
     return _row_to_worker(row) if row else None
+
+
+async def retire_worker(
+    db: aiosqlite.Connection,
+    worker_id: str,
+    status: WorkerStatus,
+) -> None:
+    """Mark a worker ``disconnected`` or ``removed`` (see ``WorkerStatus``)."""
+    assert status in RETIRED_WORKER_STATUSES
+    await db.execute(
+        "UPDATE workers SET status = ?, last_seen = ?, last_error = NULL WHERE worker_id = ?",
+        (status, _now_epoch(), worker_id),
+    )
+    await db.commit()
 
 
 async def update_worker_health(
@@ -1271,26 +1582,32 @@ async def touch_worker(
 async def get_worker(
     db: aiosqlite.Connection,
     worker_id: str,
+    *,
+    include_removed: bool = False,
 ) -> WorkerRecord | None:
-    """Return a single worker or None."""
+    """Return a single worker or None.  A removed (forgotten) worker counts as
+    none, like in :func:`list_workers`, unless *include_removed*."""
     cursor = await db.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,))
     row = await cursor.fetchone()
     if row is None:
         return None
-    return _row_to_worker(row)
+    worker = _row_to_worker(row)
+    return None if worker.status == "removed" and not include_removed else worker
 
 
 async def list_workers(
     db: aiosqlite.Connection,
     status: WorkerStatus | None = None,
 ) -> list[WorkerRecord]:
-    """List workers, optionally filtered by status."""
+    """List workers, optionally filtered by status.  Removed workers are left
+    out unless *status* asks for them."""
     if status is not None:
         cursor = await db.execute(
             "SELECT * FROM workers WHERE status = ? ORDER BY worker_id", (status,)
         )
     else:
-        cursor = await db.execute("SELECT * FROM workers ORDER BY worker_id")
+        cursor = await db.execute(
+            "SELECT * FROM workers WHERE status != 'removed' ORDER BY worker_id")
     rows = await cursor.fetchall()
     return [_row_to_worker(r) for r in rows]
 
@@ -1615,6 +1932,8 @@ async def insert_job_nodes(
     run_id: str,
     experiment_id: str,
     placements: list[tuple[int, str, list[int]]],
+    *,
+    commit: bool = True,
 ) -> None:
     """Record the placement of every node of a multi-node job.
 
@@ -1634,7 +1953,8 @@ async def insert_job_nodes(
             """,
             (run_id, experiment_id, node_rank, worker_id, json.dumps(gpu_ids)),
         )
-    await db.commit()
+    if commit:
+        await db.commit()
 
 
 async def mark_job_node_result(
@@ -1834,6 +2154,8 @@ async def dispatch_job(
     experiment_id: str,
     worker_id: str,
     dispatched_gpu_ids: list[int] | None = None,
+    *,
+    commit: bool = True,
 ) -> JobRecord | None:
     """Atomically move a job from pending → dispatched.
 
@@ -1856,7 +2178,8 @@ async def dispatch_job(
         """,
         (now, worker_id, gpu_json, run_id, experiment_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return _row_to_job(row) if row else None
 
 
@@ -1891,6 +2214,7 @@ async def finish_job(
     elapsed: float,
     status: JobStatus | None = None,
     reason: str | None = None,
+    commit: bool = True,
 ) -> JobRecord | None:
     """Mark a job as done or failed, or as *status* with *reason* (a run the manager stopped)."""
     status = status or ("done" if success else "failed")
@@ -1905,7 +2229,8 @@ async def finish_job(
         """,
         (status, now, exit_code, elapsed, reason, run_id, experiment_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return _row_to_job(row) if row else None
 
 
@@ -1981,15 +2306,24 @@ async def _reopen_experiments(db: aiosqlite.Connection, experiment_ids: set[str]
 async def cancel_jobs(
     db: aiosqlite.Connection,
     keys: Sequence[tuple[str, str]],
+    *,
+    source: str = "manager",
+    why: str | None = None,
 ) -> list[JobRecord]:
     """Cancel jobs that have not finished yet; finished jobs are left alone.
 
     *keys* are (experiment_id, run_id).  Returns the rows that were cancelled.
-    Also drops their multi-node rows.
+    Also drops their multi-node rows.  Each cancelled run's history gets a
+    "cancelled" entry from *source*: *why*, or the status it was cancelled in,
+    in the same transaction.
     """
     if not keys:
         return []
     where, params = _keys_clause(keys)
+    # The writer runs one write at a time, so these are the statuses the
+    # UPDATE below changes (RETURNING gives only the new ones).
+    before = {(str(r[0]), str(r[1])): str(r[2]) for r in await _exec_all(
+        db, f"SELECT experiment_id, run_id, status FROM jobs WHERE {where} AND {_UNFINISHED_IN}", params)}
     rows = await _exec_all(
         db,
         f"""
@@ -2000,8 +2334,13 @@ async def cancel_jobs(
         params,
     )
     await db.execute(f"DELETE FROM job_nodes WHERE {where}", params)
+    cancelled = [_row_to_job(r) for r in rows]
+    await add_run_events(db, [
+        RunEvent(j.experiment_id, j.run_id, "cancelled", source,
+                 why or f"while {before.get((j.experiment_id, j.run_id), 'pending')}")
+        for j in cancelled], commit=False)
     await db.commit()
-    return [_row_to_job(r) for r in rows]
+    return cancelled
 
 
 async def requeue_jobs(
@@ -2396,7 +2735,9 @@ async def list_experiments_with_counts(
         f"""
         SELECT e.*,
                {_JOB_COUNT_COLUMNS},
-               {_ARTIFACT_COUNT_COLUMN}
+               {_ARTIFACT_COUNT_COLUMN},
+               MAX(j.finish_time) AS last_finish,
+               {_CODE_FILES_COLUMN}
         FROM experiments e
         LEFT JOIN jobs j ON j.experiment_id = e.experiment_id
         {where}
@@ -2412,6 +2753,10 @@ async def list_experiments_with_counts(
         d = dataclasses.asdict(exp)
         d["submit_time"] = exp.submit_time.isoformat()
         d["job_counts"] = _job_counts(r, artifacts=True)
+        d["code_files"] = r["code_files"]
+        # When its newest run finished, so `mlsweep wait` over a campaign can skip the rest.
+        last = _maybe_utc(r["last_finish"])
+        d["last_finish_time"] = last.isoformat() if last else None
         d["manager_note"] = manager_note(exp)
         result.append(d)
     return result
@@ -2464,18 +2809,18 @@ async def move_jobs(
     target: str,
     run_ids: Sequence[str],
 ) -> list[str]:
-    """Move finished runs from experiment *source* to *target*.
+    """Move finished (or pending) runs from experiment *source* to *target*.
 
     Metrics and logs follow (they are keyed by job_key).  The caller checks
-    that both experiments exist, that the runs are finished, and that no run
-    ID is already taken in *target*.  Returns the run IDs moved.
+    that both experiments exist, that the runs are finished or pending, and
+    that no run ID is already taken in *target*.  Returns the run IDs moved.
     """
     if not run_ids:
         return []
     rows = await _exec_all(
         db,
-        f"UPDATE jobs SET experiment_id = ? WHERE experiment_id = ? AND run_id IN ({_marks(run_ids)}) "
-        "RETURNING run_id",
+        f"UPDATE jobs SET experiment_id = ?, move_to = NULL WHERE experiment_id = ? "
+        f"AND run_id IN ({_marks(run_ids)}) AND ({_FINISHED_IN} OR status = 'pending') RETURNING run_id",
         (target, source, *run_ids),
     )
     moved = [r[0] for r in rows]
@@ -2489,6 +2834,38 @@ async def move_jobs(
     return moved
 
 
+async def set_move_to(
+    db: aiosqlite.Connection, source: str, run_ids: Sequence[str], target: str | None,
+) -> list[str]:
+    """Mark in-flight runs of *source* to move to *target* once they finish
+    (None: no longer).  Returns the run IDs marked."""
+    if not run_ids:
+        return []
+    only_live = "AND status IN ('dispatched', 'running') " if target is not None else ""
+    rows = await _exec_all(
+        db,
+        f"UPDATE jobs SET move_to = ? WHERE experiment_id = ? AND run_id IN ({_marks(run_ids)}) "
+        f"{only_live}RETURNING run_id",
+        (target, source, *run_ids),
+    )
+    await db.commit()
+    return [r[0] for r in rows]
+
+
+async def list_due_moves(db: aiosqlite.Connection, experiment_ids: Iterable[str]) -> list[tuple[str, str, str]]:
+    """``(experiment_id, run_id, move_to)`` of finished runs in *experiment_ids* marked to move."""
+    ids = list(experiment_ids)
+    if not ids:
+        return []
+    rows = await _exec_all(
+        db,
+        f"SELECT experiment_id, run_id, move_to FROM jobs WHERE move_to IS NOT NULL "
+        f"AND experiment_id IN ({_marks(ids)}) AND {_FINISHED_IN}",
+        tuple(ids),
+    )
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
 async def purge_jobs(
     db: aiosqlite.Connection,
     experiment_id: str,
@@ -2500,12 +2877,21 @@ async def purge_jobs(
         return []
     marks = _marks(run_ids)
     params = (experiment_id, *run_ids)
-    keys = f"SELECT job_key FROM jobs WHERE experiment_id = ? AND run_id IN ({marks})"
+    keys = (f"SELECT job_key FROM jobs WHERE experiment_id = ? AND run_id IN ({marks}) "
+            f"AND {_FINISHED_IN}")
     await db.execute(f"DELETE FROM metrics WHERE job_key IN ({keys})", params)
     await db.execute(f"DELETE FROM logs WHERE job_key IN ({keys})", params)
-    await db.execute(f"DELETE FROM job_nodes WHERE experiment_id = ? AND run_id IN ({marks})", params)
+    await db.execute(
+        f"DELETE FROM job_nodes WHERE experiment_id = ? AND run_id IN ({marks}) "
+        f"AND run_id IN (SELECT run_id FROM jobs WHERE experiment_id = ? AND run_id IN ({marks}) "
+        f"AND {_FINISHED_IN})",
+        (experiment_id, *run_ids, experiment_id, *run_ids),
+    )
     rows = await _exec_all(
-        db, f"DELETE FROM jobs WHERE experiment_id = ? AND run_id IN ({marks}) RETURNING run_id", params,
+        db,
+        f"DELETE FROM jobs WHERE experiment_id = ? AND run_id IN ({marks}) AND {_FINISHED_IN} "
+        "RETURNING run_id",
+        params,
     )
     await _shrink_expected_jobs(db, experiment_id, len(rows))
     await db.commit()
@@ -2727,10 +3113,26 @@ async def get_logs_for_run(
 ) -> str:
     """Return a run's log text, every attempt in order, each after a header line
     when there was more than one."""
+    text, _ = await get_logs_with_seq_for_run(db, run_id, experiment_id)
+    return text
+
+
+async def get_logs_with_seq_for_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+    experiment_id: str,
+) -> tuple[str, int]:
+    """Return a run's log text and the current attempt's last stored byte offset.
+
+    Both come from one statement, so they are the same snapshot.  A client
+    that also follows the live stream drops live chunks at or below the
+    offset, as the text already holds them.
+    """
     rows = await _exec_all(
         db,
         """
-        SELECT l.attempt, l.data FROM logs l JOIN jobs j ON l.job_key = j.job_key
+        SELECT l.attempt, l.seq, l.data, j.attempt AS current_attempt
+        FROM logs l JOIN jobs j ON l.job_key = j.job_key
         WHERE j.experiment_id = ? AND j.run_id = ?
         ORDER BY l.attempt, l.seq
         """,
@@ -2739,14 +3141,17 @@ async def get_logs_for_run(
     multiple = len({row["attempt"] for row in rows}) > 1
     parts: list[str] = []
     attempt = None
+    seq = 0
     for row in rows:
+        if row["attempt"] == row["current_attempt"]:
+            seq = max(seq, int(row["seq"]))
         if multiple and row["attempt"] != attempt:
             attempt = row["attempt"]
             if parts and not parts[-1].endswith("\n"):
                 parts.append("\n")
             parts.append(f"[mlsweep] ── attempt {attempt} ──\n")
         parts.append(_unpack_log(row["data"]))
-    return "".join(parts)
+    return "".join(parts), seq
 
 
 # A compacted log is one row, so this compression is a level above the live one.
@@ -2917,13 +3322,28 @@ class DbWriter:
         while True:
             _, _, fn, fut = await self._q.get()
             try:
-                fut.set_result(await fn())
+                result = await fn()
+            except asyncio.CancelledError:
+                # The actor itself is being stopped.  Release whoever waits on
+                # this write instead of leaving its future pending forever.
+                if not fut.done():
+                    fut.cancel()
+                raise
             except Exception as exc:
                 try:
                     await self._db.rollback()
                 except Exception:
                     pass
-                fut.set_exception(exc)
+                # The caller may have been cancelled while its write was queued
+                # (an HTTP request can be cancelled, and shutdown cancels the
+                # scheduler and compactor).  Setting a result on that future
+                # raises InvalidStateError; letting it escape here used to kill
+                # the actor and hang every later write.
+                if not fut.done():
+                    fut.set_exception(exc)
+            else:
+                if not fut.done():
+                    fut.set_result(result)
 
     async def _enqueue(
         self, fn: Callable[[], Coroutine[Any, Any, _T]], *, background: bool = False,
@@ -2953,6 +3373,7 @@ class DbWriter:
         optimize: dict[str, Any] | None = None,
         code: dict[str, Any] | None = None,
         controls: dict[str, Any] | None = None,
+        capture_session: str | None = None,
     ) -> ExperimentRecord:
         db = self._db
         return await self._enqueue(lambda: create_experiment(
@@ -2961,7 +3382,7 @@ class DbWriter:
             status=status, expected_jobs=expected_jobs,
             singular_dims=singular_dims, max_concurrent=max_concurrent,
             skip_rules=skip_rules, metric=metric, goal=goal, optimize=optimize,
-            code=code, controls=controls,
+            code=code, controls=controls, capture_session=capture_session,
         ))
 
     async def create_experiment_with_jobs(
@@ -2992,6 +3413,12 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: update_experiment_name(db, experiment_id, name))
 
+    async def update_experiment_note(
+        self, experiment_id: str, note: str | None
+    ) -> ExperimentRecord | None:
+        db = self._db
+        return await self._enqueue(lambda: update_experiment_note(db, experiment_id, note))
+
     async def update_experiment_campaign(
         self, experiment_id: str, campaign: str
     ) -> ExperimentRecord | None:
@@ -3005,6 +3432,10 @@ class DbWriter:
     async def move_jobs(self, source: str, target: str, run_ids: Sequence[str]) -> list[str]:
         db = self._db
         return await self._enqueue(lambda: move_jobs(db, source, target, run_ids))
+
+    async def set_move_to(self, source: str, run_ids: Sequence[str], target: str | None) -> list[str]:
+        db = self._db
+        return await self._enqueue(lambda: set_move_to(db, source, run_ids, target))
 
     async def purge_jobs(self, experiment_id: str, run_ids: Sequence[str]) -> list[str]:
         db = self._db
@@ -3039,14 +3470,19 @@ class DbWriter:
         unhealthy_devices: str | None = None,
         status: WorkerStatus = "connected",
         last_error: str | None = None,
+        tunnel: bool = False,
     ) -> WorkerRecord:
         db = self._db
         return await self._enqueue(lambda: upsert_worker(
             db, worker_id=worker_id, host=host, remote_dir=remote_dir,
             scratch_dir=scratch_dir, port=port, ssh_key=ssh_key,
             venv=venv, devices=devices, unhealthy_devices=unhealthy_devices,
-            status=status, last_error=last_error,
+            status=status, last_error=last_error, tunnel=tunnel,
         ))
+
+    async def add_run_events(self, events: Sequence[RunEvent]) -> None:
+        db = self._db
+        await self._enqueue(lambda: add_run_events(db, events))
 
     async def update_worker_status(
         self, worker_id: str, status: WorkerStatus, last_error: str | None = None
@@ -3055,6 +3491,10 @@ class DbWriter:
         return await self._enqueue(
             lambda: update_worker_status(db, worker_id, status, last_error)
         )
+
+    async def retire_worker(self, worker_id: str, status: WorkerStatus) -> None:
+        db = self._db
+        await self._enqueue(lambda: retire_worker(db, worker_id, status))
 
     async def touch_worker(self, worker_id: str) -> None:
         db = self._db
@@ -3067,6 +3507,10 @@ class DbWriter:
     async def update_worker_health(self, worker_id: str, unhealthy_devices: str) -> None:
         db = self._db
         await self._enqueue(lambda: update_worker_health(db, worker_id, unhealthy_devices))
+
+    async def add_complaint(self, *, kind: str, text: str, source: str, **context: str | None) -> int:
+        db = self._db
+        return await self._enqueue(lambda: add_complaint(db, kind=kind, text=text, source=source, **context))
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
@@ -3129,9 +3573,24 @@ class DbWriter:
         experiment_id: str,
         worker_id: str,
         dispatched_gpu_ids: list[int] | None = None,
+        *,
+        nodes: list[tuple[int, str, list[int]]] | None = None,
+        history: Callable[[JobRecord], RunEvent] | None = None,
     ) -> JobRecord | None:
+        """Claim a pending job; with *nodes*, record a multi-node job's placement
+        and with *history*, the run's "dispatched" entry, in the same commit."""
         db = self._db
-        return await self._enqueue(lambda: dispatch_job(db, run_id, experiment_id, worker_id, dispatched_gpu_ids))
+
+        async def write() -> JobRecord | None:
+            claimed = await dispatch_job(db, run_id, experiment_id, worker_id, dispatched_gpu_ids, commit=False)
+            if claimed is not None:
+                if nodes:
+                    await insert_job_nodes(db, run_id, experiment_id, nodes, commit=False)
+                if history is not None:
+                    await add_run_events(db, [history(claimed)], commit=False)
+            await db.commit()
+            return claimed
+        return await self._enqueue(write)
 
     async def mark_job_running(
         self, run_id: str, experiment_id: str
@@ -3149,12 +3608,20 @@ class DbWriter:
         elapsed: float,
         status: JobStatus | None = None,
         reason: str | None = None,
+        history: Callable[[JobRecord | None], RunEvent] | None = None,
     ) -> JobRecord | None:
+        """Finish a job; with *history*, add its "finished" entry in the same commit."""
         db = self._db
-        return await self._enqueue(lambda: finish_job(
-            db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed,
-            status=status, reason=reason,
-        ))
+
+        async def write() -> JobRecord | None:
+            job = await finish_job(
+                db, run_id, experiment_id, success=success, exit_code=exit_code, elapsed=elapsed,
+                status=status, reason=reason, commit=False)
+            if history is not None:
+                await add_run_events(db, [history(job)], commit=False)
+            await db.commit()
+            return job
+        return await self._enqueue(write)
 
     async def apply_result_rules(
         self, experiment_id: str, run_id: str, success: bool,
@@ -3174,9 +3641,11 @@ class DbWriter:
         db = self._db
         return await self._enqueue(lambda: update_job_label(db, run_id, experiment_id, label))
 
-    async def cancel_jobs(self, keys: Sequence[tuple[str, str]]) -> list[JobRecord]:
+    async def cancel_jobs(
+        self, keys: Sequence[tuple[str, str]], *, source: str = "manager", why: str | None = None,
+    ) -> list[JobRecord]:
         db = self._db
-        return await self._enqueue(lambda: cancel_jobs(db, keys))
+        return await self._enqueue(lambda: cancel_jobs(db, keys, source=source, why=why))
 
     async def end_jobs(
         self, keys: Sequence[tuple[str, str]], status: JobStatus, reason: str,
@@ -3281,3 +3750,427 @@ class DbWriter:
         return await self._enqueue(
             lambda: replace_log_rows(db, job_key, attempt, count, last_seq, data),
             background=True)
+
+    # ── Capture (session traces) ─────────────────────────────────────────
+
+    async def store_capture_batch(
+        self, meta: dict[str, Any], events: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], int]:
+        """Upsert a session's header and append *events*, in one transaction."""
+        db = self._db
+        return await self._enqueue(lambda: store_capture_batch(db, meta, events), background=True)
+
+    async def delete_capture_session(self, session_id: str) -> bool:
+        db = self._db
+        return await self._enqueue(lambda: delete_capture_session(db, session_id))
+
+    async def unlink_capture(self, session_id: str, experiment_id: str) -> bool:
+        db = self._db
+        return await self._enqueue(lambda: unlink_capture(db, session_id, experiment_id))
+
+
+# ===============================================================================
+# Session capture (traces)
+# ===============================================================================
+#
+# A coding-agent session, normalized, uploaded in batches by the capture
+# watcher on the machine the agents run on (see ``_capture.py``).  Events are
+# append-only and addressed by (session_id, seq), so a retried upload is a
+# no-op rather than a duplicate.  FTS keeps the text searchable.
+
+# A trace's id is the agent's own native session id (a UUID for both pi and
+# Claude Code), which is why it needs no agent prefix: the agent column says
+# what wrote it.
+CAPTURE_ID_RE = re.compile(r"[A-Za-z0-9_.:\-]{1,200}")
+CAPTURE_STATES = ("active", "closed", "imported")
+
+# Events a session keeps.  A far larger bound would not be a transcript any
+# more; events past it are dropped (the header still updates), so the
+# watcher does not retry them forever.
+_MAX_EVENTS_PER_SESSION = 100_000
+_MAX_EVENT_JSON_BYTES = 64 * 1024
+
+
+def validate_capture_id(session_id: Any) -> str:
+    """Return *session_id* unchanged if it is path- and URL-safe."""
+    if not isinstance(session_id, str) or not CAPTURE_ID_RE.fullmatch(session_id):
+        raise ValueError("session_id must be 1-200 chars of [A-Za-z0-9_.:-]")
+    return session_id
+
+
+def _capture_fts_text(events: Sequence[dict[str, Any]]) -> str:
+    """The searchable text of a batch of events: their text and tool names."""
+    parts = []
+    for event in events:
+        if isinstance(event.get("text"), str) and event["text"]:
+            parts.append(event["text"])
+        if isinstance(event.get("name"), str) and event["name"]:
+            parts.append(event["name"])
+    return "\n".join(parts)
+
+
+async def _upsert_capture_session(db: aiosqlite.Connection, meta: dict[str, Any]) -> None:
+    """Create or update one session's header.  The caller commits.
+
+    Blank fields keep what is stored.  The live watcher's state wins: an
+    import never replaces it, and a live upload replaces 'imported'.  A closed
+    session goes back to active when the watcher sees it resume.  The start is
+    the earliest one either side reported.
+    """
+    session_id = validate_capture_id(meta.get("session_id"))
+    state = meta.get("state")
+    if state not in CAPTURE_STATES:
+        state = "active"
+    await db.execute(
+        """INSERT INTO capture_sessions (session_id, agent, host, user, cwd, title, model,
+                                            started_at, last_seen_at, state)
+           VALUES (:session_id, :agent, :host, :user, :cwd, :title, :model,
+                   :started_at, :last_seen_at, :state)
+           ON CONFLICT(session_id) DO UPDATE SET
+               agent=CASE WHEN excluded.agent != 'unknown' THEN excluded.agent ELSE capture_sessions.agent END,
+               host=CASE WHEN excluded.host != '' THEN excluded.host ELSE capture_sessions.host END,
+               user=CASE WHEN excluded.user != '' THEN excluded.user ELSE capture_sessions.user END,
+               cwd=CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE capture_sessions.cwd END,
+               title=CASE WHEN excluded.title != '' THEN excluded.title ELSE capture_sessions.title END,
+               model=CASE WHEN excluded.model != '' THEN excluded.model ELSE capture_sessions.model END,
+               started_at=CASE WHEN excluded.started_at = 0 THEN capture_sessions.started_at
+                               WHEN capture_sessions.started_at = 0 THEN excluded.started_at
+                               ELSE MIN(excluded.started_at, capture_sessions.started_at) END,
+               last_seen_at=MAX(excluded.last_seen_at, capture_sessions.last_seen_at),
+               state=CASE WHEN excluded.state = 'imported'
+                          THEN capture_sessions.state ELSE excluded.state END""",
+        {
+            "session_id": session_id,
+            "agent": str(meta.get("agent") or "unknown"),
+            **{k: str(meta.get(k) or "") for k in ("host", "user", "cwd", "title", "model")},
+            "started_at": float(meta.get("started_at") or 0.0),
+            "last_seen_at": float(meta.get("last_seen_at") or 0.0),
+            "state": state,
+        },
+    )
+
+
+def _capped_event_json(event: dict[str, Any]) -> str:
+    """One event as JSON of at most _MAX_EVENT_JSON_BYTES, still valid JSON.
+
+    A long event (a big thinking block, say) keeps the start of its text and
+    says it was cut.  Cutting the JSON itself would leave a row nothing can
+    parse.
+    """
+    def dump(obj: dict[str, Any]) -> str:
+        return json.dumps(obj, separators=(",", ":"))
+    data = dump(event)
+    if len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
+        return data
+    text = event.get("text")
+    if isinstance(text, str):
+        # The longest start of the text that fits, measured on the JSON itself:
+        # escaping makes one character cost from 1 to 12 bytes.
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(dump({**event, "text": text[:mid], "truncated": True})) <= _MAX_EVENT_JSON_BYTES:
+                lo = mid
+            else:
+                hi = mid - 1
+        data = dump({**event, "text": text[:lo], "truncated": True})
+        if lo and len(data.encode()) <= _MAX_EVENT_JSON_BYTES:
+            return data
+    # Nothing to shorten (or still too big): keep the bare shape of the event.
+    bare = {k: event[k] for k in ("seq", "ts", "kind", "name", "tool_id", "ok") if k in event}
+    return json.dumps({**bare, "truncated": True}, separators=(",", ":"))
+
+
+async def _drop_events_held_elsewhere(
+    db: aiosqlite.Connection, session_id: str, events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """*events* without those another trace already stores, by their ``src``.
+
+    When Claude Code continues a session, the new transcript starts with a
+    copy of the old one's history.  Those events stay in the old trace, and
+    this one records that it ``continues`` it.  The caller commits, and
+    claims the srcs of what it stores with ``_claim_srcs``.
+    """
+    srcs = [e["src"] for e in events if isinstance(e.get("src"), str)]
+    owners: dict[str, str] = {}
+    for i in range(0, len(srcs), 500):
+        chunk = srcs[i:i + 500]
+        owners.update({r[0]: r[1] for r in await _exec_all(
+            db, f"SELECT src, session_id FROM capture_src WHERE src IN ({_marks(chunk)})", tuple(chunk))})
+    elsewhere = [o for e in events if (o := owners.get(e.get("src") or "")) and o != session_id]
+    if elsewhere:
+        await db.execute("UPDATE capture_sessions SET continues = ? WHERE session_id = ? AND continues = ''",
+                         (max(set(elsewhere), key=elsewhere.count), session_id))
+    return [e for e in events if owners.get(e.get("src") or "", session_id) == session_id]
+
+
+async def _claim_srcs(db: aiosqlite.Connection, session_id: str, events: list[dict[str, Any]]) -> None:
+    claim = [(e["src"], session_id) for e in events if isinstance(e.get("src"), str)]
+    if claim:
+        await db.executemany("INSERT OR IGNORE INTO capture_src (src, session_id) VALUES (?, ?)", claim)
+
+
+async def _insert_capture_events(
+    db: aiosqlite.Connection, session_id: str, events: list[dict[str, Any]],
+) -> int:
+    """Append *events* to *session_id*.  Returns how many were stored.  The caller commits.
+
+    Idempotent: a seq the session already has is ignored.  Each batch adds
+    one FTS row holding only the events it stored.
+    """
+    by_seq: dict[int, dict[str, Any]] = {}
+    for event in events:
+        if isinstance(event, dict) and isinstance(event.get("seq"), int) \
+                and not isinstance(event["seq"], bool):
+            by_seq.setdefault(event["seq"], event)
+    if not by_seq:
+        return 0
+    seqs = sorted(by_seq)
+    have = {int(r[0]) for r in await _exec_all(
+        db, "SELECT seq FROM capture_events WHERE session_id = ? AND seq BETWEEN ? AND ?",
+        (session_id, seqs[0], seqs[-1]))}
+    new = [by_seq[q] for q in seqs if q not in have]
+    new = await _drop_events_held_elsewhere(db, session_id, new)
+    if not new:
+        return 0
+    count = await _exec_one(db, "SELECT event_count FROM capture_sessions WHERE session_id = ?",
+                            (session_id,))
+    room = _MAX_EVENTS_PER_SESSION - (int(count[0]) if count is not None else 0)
+    new = new[:max(0, room)]
+    if not new:
+        return 0
+    await db.executemany(
+        "INSERT OR IGNORE INTO capture_events (session_id, seq, data) VALUES (?, ?, ?)",
+        [(session_id, e["seq"], _capped_event_json(e)) for e in new])
+    await _claim_srcs(db, session_id, new)
+    text = _capture_fts_text(new)
+    if text and HAS_FTS5:
+        await db.execute("INSERT INTO capture_fts (session_id, text) VALUES (?, ?)", (session_id, text))
+    await db.execute("UPDATE capture_sessions SET event_count = event_count + ? WHERE session_id = ?",
+                     (len(new), session_id))
+    return len(new)
+
+
+async def store_capture_batch(
+    db: aiosqlite.Connection, meta: dict[str, Any], events: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int]:
+    """One upload: the session's header and its new events, committed together.
+
+    Returns (stored session row, events stored).
+    """
+    session_id = validate_capture_id(meta.get("session_id"))
+    try:
+        await _upsert_capture_session(db, meta)
+        stored = await _insert_capture_events(db, session_id, events)
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
+    return await get_capture_session(db, session_id) or {}, stored
+
+
+async def delete_capture_session(db: aiosqlite.Connection, session_id: str) -> bool:
+    validate_capture_id(session_id)
+    if HAS_FTS5:  # events go with the session (ON DELETE CASCADE); FTS is virtual
+        await db.execute("DELETE FROM capture_fts WHERE session_id = ?", (session_id,))
+    await db.execute("DELETE FROM capture_links WHERE session_id = ?", (session_id,))
+    await db.execute("DELETE FROM capture_src WHERE session_id = ?", (session_id,))
+    await db.execute("UPDATE capture_sessions SET continues = '' WHERE continues = ?", (session_id,))
+    cursor = await db.execute("DELETE FROM capture_sessions WHERE session_id = ?", (session_id,))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def unlink_capture(db: aiosqlite.Connection, session_id: str, experiment_id: str) -> bool:
+    validate_capture_id(session_id)
+    cursor = await db.execute(
+        "DELETE FROM capture_links WHERE session_id = ? AND experiment_id = ?",
+        (session_id, experiment_id))
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_capture_session(db: aiosqlite.Connection, session_id: str) -> dict[str, Any] | None:
+    row = await _exec_one(db, "SELECT * FROM capture_sessions WHERE session_id = ?", (session_id,))
+    return dict(row) if row else None
+
+
+# A note may name a trace by the start of its id, like a short git hash.
+CAPTURE_PREFIX_MIN = 6
+
+
+async def find_capture_session(
+    db: aiosqlite.Connection, ref: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The trace *ref* names: its exact id, or else a unique prefix of one.
+
+    Returns (session, error); error is "no such trace" or says the prefix is
+    ambiguous or too short.
+    """
+    exact = await get_capture_session(db, ref)
+    if exact is not None:
+        return exact, None
+    if len(ref) < CAPTURE_PREFIX_MIN:
+        return None, "no such trace"
+    rows = await _exec_all(
+        # A range on the primary key: the ids that start with *ref*.
+        db, "SELECT * FROM capture_sessions WHERE session_id >= ? AND session_id < ? LIMIT 2",
+        (ref, ref + "\U0010ffff"))
+    if not rows:
+        return None, "no such trace"
+    if len(rows) > 1:
+        return None, f"{ref} is the start of more than one trace id; write more of it"
+    return dict(rows[0]), None
+
+
+# How many sessions one page may ask for.  The sidebar pages through them, so
+# this only bounds a single request.
+_MAX_SESSION_LIST = 1000
+
+# Search snippets mark their matches with characters no transcript contains, so
+# the page can highlight them without trusting the text as HTML.
+SEARCH_MARK_START = "\x01"
+SEARCH_MARK_END = "\x02"
+
+
+async def _attach_experiment_links(
+    db: aiosqlite.Connection, sessions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add each session's linked experiment ids, in one query."""
+    ids = list(dict.fromkeys(s["session_id"] for s in sessions))
+    links: dict[str, list[str]] = {i: [] for i in ids}
+    if ids:
+        link_rows = await _exec_all(
+            db, f"SELECT session_id, experiment_id FROM capture_links WHERE session_id IN ({_marks(ids)})",
+            tuple(ids))
+        for lid, eid in link_rows:
+            links[str(lid)].append(str(eid))
+    for s in sessions:
+        s["experiments"] = links[s["session_id"]]
+    return sessions
+
+
+async def list_capture_sessions(
+    db: aiosqlite.Connection, *, agent: str | None = None, state: str | None = None,
+    q: str | None = None, experiment_id: str | None = None, limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Sessions, newest activity first, each with its linked experiment ids."""
+    where: list[str] = ["1=1"]
+    params: list[Any] = []
+    if agent:
+        where.append("agent = ?")
+        params.append(agent)
+    if state and state != "all":
+        where.append("state = ?")
+        params.append(state)
+    if q and HAS_FTS5:
+        where.append("session_id IN (SELECT session_id FROM capture_fts WHERE capture_fts MATCH ?)")
+        params.append(_fts_query(q))
+    elif q:  # no FTS5: titles and working directories only
+        where.append("(title LIKE ? ESCAPE '\\' OR cwd LIKE ? ESCAPE '\\')")
+        params += [_like_pattern(q)] * 2
+    if experiment_id:
+        where.append("session_id IN (SELECT session_id FROM capture_links WHERE experiment_id = ?)")
+        params.append(experiment_id)
+    params.append(min(max(limit, 1), _MAX_SESSION_LIST))
+    rows = await _exec_all(
+        db, f"SELECT * FROM capture_sessions WHERE {' AND '.join(where)} "
+            "ORDER BY last_seen_at DESC LIMIT ?", tuple(params))
+    return await _attach_experiment_links(db, [dict(r) for r in rows])
+
+
+def _fts_query(q: str) -> str:
+    """*q* as an FTS5 MATCH query: terms ANDed, quotes kept as one term."""
+    terms = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in q.split() if t]
+    return " AND ".join(terms) if terms else '""'
+
+
+def _like_pattern(q: str) -> str:
+    """*q* as a LIKE pattern: its own `%` and `_` are literal."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+async def search_capture(
+    db: aiosqlite.Connection, q: str, *, limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Sessions matching *q* in their events, title or working directory.
+
+    A snippet of the best-matching event text comes with each result, its matches
+    wrapped in ``SEARCH_MARK_START``/``SEARCH_MARK_END``.
+    """
+    limit = min(max(limit, 1), 100)
+    # A session has one FTS row per uploaded batch: keep its best-ranked one.
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    rows = await _exec_all(
+        db, "SELECT s.*, snippet(capture_fts, 1, ?, ?, ' … ', 12) AS snippet "
+            "FROM capture_fts JOIN capture_sessions s ON s.session_id = capture_fts.session_id "
+            "WHERE capture_fts MATCH ? ORDER BY rank LIMIT ?",
+        (SEARCH_MARK_START, SEARCH_MARK_END, _fts_query(q), limit * 10)) if HAS_FTS5 else []
+    for row in rows:
+        if row["session_id"] not in seen:
+            seen.add(row["session_id"])
+            found.append(dict(row))
+    # Titles and working directories are not in the FTS index; match them too,
+    # so "which session was in that repo" finds the trace.
+    like = _like_pattern(q)
+    extra = await _exec_all(
+        db, "SELECT * FROM capture_sessions WHERE (title LIKE ? ESCAPE '\\' "
+            "OR cwd LIKE ? ESCAPE '\\') ORDER BY last_seen_at DESC LIMIT ?",
+        (like, like, limit))
+    for row in extra:
+        session = dict(row)
+        if session["session_id"] in seen:
+            continue
+        session["snippet"] = session.get("title") or session.get("cwd") or ""
+        found.append(session)
+    found = found[:limit]
+    return await _attach_experiment_links(db, found)
+
+
+async def capture_counts(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Trace totals for the dashboard: all sessions, and per experiment."""
+    total = await _exec_one(db, "SELECT COUNT(*) FROM capture_sessions")
+    rows = await _exec_all(
+        db, "SELECT experiment_id, COUNT(*) FROM capture_links "
+            "JOIN capture_sessions USING (session_id) GROUP BY experiment_id")
+    return {
+        "sessions": int(total[0]) if total else 0,
+        "experiments": {str(eid): int(n) for eid, n in rows},
+    }
+
+
+async def get_capture_events(
+    db: aiosqlite.Connection, session_id: str, *, from_seq: int = 0, limit: int = 500,
+    kinds: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Events from *from_seq* on: the first seq asked for is included.  With
+    *kinds*, only events of those kinds."""
+    validate_capture_id(session_id)
+    where = f" AND json_extract(data, '$.kind') IN ({_marks(kinds)})" if kinds else ""
+    rows = await _exec_all(
+        db, f"SELECT data FROM capture_events WHERE session_id = ? AND seq >= ?{where} "
+            "ORDER BY seq LIMIT ?", (session_id, from_seq, *kinds, min(max(limit, 1), 2000)))
+    return [json.loads(r[0]) for r in rows]
+
+
+async def get_capture_events_at(
+    db: aiosqlite.Connection, wanted: Sequence[tuple[str, int]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """The events at each (session_id, seq) in *wanted*, in one query."""
+    if not wanted:
+        return {}
+    where = " OR ".join("(session_id = ? AND seq = ?)" for _ in wanted)
+    rows = await _exec_all(
+        db, f"SELECT session_id, seq, data FROM capture_events WHERE {where}",
+        tuple(v for pair in wanted for v in pair))
+    return {(str(r[0]), int(r[1])): json.loads(r[2]) for r in rows}
+
+
+async def capture_transcript_lines(db: aiosqlite.Connection, session_id: str) -> list[str]:
+    """Every stored event of a session, as the compact JSON it is stored in."""
+    validate_capture_id(session_id)
+    rows = await _exec_all(
+        db, "SELECT data FROM capture_events WHERE session_id = ? ORDER BY seq", (session_id,))
+    return [str(r[0]) for r in rows]

@@ -280,3 +280,47 @@ def test_evidence_refs_skips_code_and_sources(tmp_path: Path) -> None:
     })
     index = _notes.build_index(tmp_path, set())
     assert _notes_lint.evidence_refs(index, tmp_path) == ["e/r/loss@1"]
+
+
+def test_lint_says_why_the_evidence_numbers_went_unchecked(tmp_path, capsys):
+    """A manager that refuses the evidence lookup is named with its reason, in text and JSON."""
+    import http.server
+    import json
+    import threading
+
+    from mlsweep import notes_cli
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = {"known": ["exp1"]} if "experiment-ids" in self.path else {"runs": {}}
+            self._send(200, body)
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._send(413, {"error": "request body is too large"})
+
+        def _send(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    (tmp_path / "n.md").write_text("Loss was [0.4](mlsweep:exp1/run1/loss@final).\n")
+    try:
+        notes_cli._lint([str(tmp_path), "--manager", url, "--token", "t"])
+        out = capsys.readouterr().out
+        assert ("evidence numbers not checked: asking the manager for 1 link(s) failed, "
+                "HTTP 413: request body is too large") in out
+        notes_cli._lint([str(tmp_path), "--manager", url, "--token", "t", "--json"])
+        assert "HTTP 413" in json.loads(capsys.readouterr().out)["note"]
+    finally:
+        server.shutdown()
+        server.server_close()

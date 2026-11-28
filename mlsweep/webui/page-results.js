@@ -40,12 +40,17 @@ let JOBS         = new Map();         // run_id → job record, for status and t
 // ── Live state (SSE replaced with WS) ────────────────────────────────────────
 let LIVE_RUNS      = new Set();  // run hashes currently status=running
 let _ws            = null;       // WebSocket for live updates
+let _wsReconnTimer = null;       // pending reconnect, cleared when the socket is replaced
 // run_hash → line-trace index in chart-curves (populated by buildCurvesChart)
 let _traceIndexMap = {};
 // last EMA accumulator: {metric: {run_hash: s_prev}} for incremental smoothing
 let LAST_EMA_S     = {};
 let _pendingMetrics = {};   // runId → metricName → {steps, values} accumulated between RAF flushes
 let _rafPending     = false;
+let _flushGen       = 0;     // bumped when the experiment/socket changes; stale RAFs stand down
+// Bumped when the shown experiment changes.  Async loads and refreshes carry
+// the value they started with and drop their result if it moved on.
+let _loadSeq        = 0;
 
 // ── Tab management (from visualize.py verbatim) ───────────────────────────────
 
@@ -350,6 +355,24 @@ function bindCurveEvents() {
     const hash = _chartRunHashes[pt.curveNumber % _chartRunHashes.length];
     setSelectedRun(hash === selectedRun ? null : hash);
   });
+  // Right-click a curve: the run under the pointer, as plotly last hovered it.
+  let hoveredRun = null;
+  gd.on("plotly_hover", e => {
+    const pt = e.points && e.points[0];
+    hoveredRun = pt && _chartRunHashes.length ? _chartRunHashes[pt.curveNumber % _chartRunHashes.length] : null;
+  });
+  gd.on("plotly_unhover", () => { hoveredRun = null; });
+  gd.addEventListener("contextmenu", e => {
+    const r = hoveredRun && DATA && DATA.runs.find(x => x.hash === hoveredRun);
+    if (!r) return;
+    const items = mlEntityMenuItems(DATA.experiment, r.hash, { title: r.name, skip: "results", codeFiles: JOBS.get(r.hash)?.code_files });
+    items.splice(1, 0,
+      { label: r.hash === selectedRun ? "Clear the highlight" : "Highlight this run",
+        run: () => setSelectedRun(r.hash === selectedRun ? null : r.hash) },
+      { label: "Hide this run", run: () => hideRun(r.hash) },
+      "-");
+    mlContextMenu(e, items);
+  });
   // A click that hit no curve (and was not the end of a zoom drag) clears.
   gd.addEventListener("mousedown", e => { downAt = [e.clientX, e.clientY]; });
   gd.addEventListener("click", e => {
@@ -413,7 +436,7 @@ function renderRunBar() {
     + `<span class="rb-k">${escHtml(k)}</span>=${escHtml(v)}</button>`).join("");
   document.getElementById("run-bar-main").innerHTML =
     `<span class="color-swatch" style="background:${escHtml(color)}"></span>`
-    + `<span class="rb-name" title="${escHtml(r.hash)}">${escHtml(r.name)}</span>`
+    + `<span class="rb-name" title="${escHtml(r.hash)}" ${mlEntityAttrs(DATA.experiment, r.hash, { title: r.name, skip: "results", codeFiles: JOBS.get(r.hash)?.code_files })}>${escHtml(r.name)}</span>`
     + (job ? `<span${job.reason ? ` title="${escHtml(job.reason)}"` : ""}>${badge(job.status)}</span>` : "")
     + `<span class="rb-pills">${pills}</span>`;
   document.getElementById("run-bar-links").innerHTML =
@@ -803,17 +826,43 @@ function buildMetricSelect() {
 
 // ── Init (from visualize.py verbatim, with manager-format data) ───────────────
 
+// The experiment's description: it lives in a tooltip on the name (the sidebar
+// has no room for a paragraph) and a click on the name edits it.
+const expNameEl = document.getElementById("exp-name");
+const noteTip = mlHoverTip(expNameEl);
+const NO_DESCRIPTION = "No description — click the name to add one.";
+
+function showDescription() {
+  const note = DATA?.note || "";
+  expNameEl.classList.toggle("has-note", !!note);
+  noteTip.setText(note || NO_DESCRIPTION, { placeholder: !note });
+}
+
+function hideDescription() {
+  expNameEl.classList.remove("has-note");
+  noteTip.setText("");
+}
+
+async function editDescription() {
+  if (!DATA?.experiment) return;
+  const description = await mlEditDescription(DATA.experiment, DATA.note);
+  if (description === undefined) return;
+  DATA.note = description;
+  const exp = ALL_EXPS.find(e => e.experiment_id === DATA.experiment);
+  if (exp) exp.note = description;
+  showDescription();
+}
+
+expNameEl.addEventListener("click", editDescription);
+expNameEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); editDescription(); }
+});
+
 function init(data) {
   DATA    = data;
   colorBy = Object.keys(DATA.dims)[0] || "_none_";
 
-  const noteEl = document.getElementById("sweep-note");
-  if (DATA.note) {
-    noteEl.textContent = DATA.note;
-    noteEl.style.display = "";
-  } else {
-    noteEl.style.display = "none";
-  }
+  showDescription();
 
   filters = Object.fromEntries(
     Object.entries(DATA.dims).map(([dim, vals]) => [dim, new Set(vals)])
@@ -884,10 +933,14 @@ function _updateExperimentList(experiments, prefer) {
 
 // The selected campaign has no experiments, so show nothing.
 function clearExperiment() {
+  _loadSeq++;  // a load still in flight is for the experiment just cleared
+  _flushGen++;
   LOADED_EXP = null;
+  if (_wsReconnTimer) { clearTimeout(_wsReconnTimer); _wsReconnTimer = null; }
   if (_ws) { _ws.onclose = null; _ws.close(); _ws = null; }
   clearTimeout(_jobRefreshTimer);
   DATA = null; METRIC_CACHE = {}; LIVE_RUNS = new Set();
+  _pendingMetrics = {}; _rafPending = false;
   if (typeof Plotly !== "undefined") {
     Plotly.purge("chart-curves");
     Plotly.purge("chart-sensitivity");
@@ -922,20 +975,56 @@ function parseJsonl(text) {
   return rows;
 }
 
+// Append one metric's points to its series, dropping points already held (a
+// history snapshot overlapping the live stream, or a reconnect replay).  The
+// fast path is the ordinary in-order stream; anything out of order merges by
+// step and asks the caller for a full redraw.
+function _mergeSeries(entry, steps, values) {
+  const n = entry.steps.length;
+  const last = n ? entry.steps[n - 1] : -Infinity;
+  // The point already held last, sent again (a replay's first point): drop it
+  // rather than take the slow path and redraw everything.
+  if (n && steps.length && steps[0] === last && values[0] === entry.values[n - 1]) {
+    steps = steps.slice(1);
+    values = values.slice(1);
+  }
+  let ordered = true;
+  for (let i = 0; i < steps.length; i++) {
+    if (steps[i] <= (i ? steps[i - 1] : last)) { ordered = false; break; }
+  }
+  if (ordered) {
+    entry.steps.push(...steps);
+    entry.values.push(...values);
+    return { steps, values, rebuilt: false };
+  }
+  const byStep = new Map();
+  for (let i = 0; i < n; i++) byStep.set(entry.steps[i], entry.values[i]);
+  for (let i = 0; i < steps.length; i++) byStep.set(steps[i], values[i]);
+  const sorted = [...byStep.keys()].sort((a, b) => a - b);
+  entry.steps = sorted;
+  entry.values = sorted.map(s => byStep.get(s));
+  return { steps: [], values: [], rebuilt: true };
+}
+
 // Parse JSONL rows for one run into METRIC_CACHE entries.
 // Each row: {step: N, metric1: v1, metric2: v2, ...}
 function mergeJsonlIntoCache(rows, runId) {
+  const perMetric = new Map();
   for (const row of rows) {
     const step = row.step;
     if (step == null) continue;
     for (const [k, v] of Object.entries(row)) {
       if (k === "step") continue;
-      if (!METRIC_CACHE[k]) METRIC_CACHE[k] = {};
-      if (!METRIC_CACHE[k][runId]) METRIC_CACHE[k][runId] = { steps: [], values: [] };
-      const val = (typeof v === "number" && isFinite(v)) ? v : null;
-      METRIC_CACHE[k][runId].steps.push(step);
-      METRIC_CACHE[k][runId].values.push(val);
+      let series = perMetric.get(k);
+      if (!series) perMetric.set(k, series = { steps: [], values: [] });
+      series.steps.push(step);
+      series.values.push((typeof v === "number" && isFinite(v)) ? v : null);
     }
+  }
+  for (const [k, series] of perMetric) {
+    if (!METRIC_CACHE[k]) METRIC_CACHE[k] = {};
+    if (!METRIC_CACHE[k][runId]) METRIC_CACHE[k][runId] = { steps: [], values: [] };
+    _mergeSeries(METRIC_CACHE[k][runId], series.steps, series.values);
   }
 }
 
@@ -944,10 +1033,14 @@ function mergeJsonlIntoCache(rows, runId) {
 function _scheduleFlush() {
   if (_rafPending) return;
   _rafPending = true;
-  requestAnimationFrame(_flushPendingMetrics);
+  const gen = _flushGen;
+  requestAnimationFrame(() => _flushPendingMetrics(gen));
 }
 
-function _flushPendingMetrics() {
+function _flushPendingMetrics(gen = _flushGen) {
+  // A frame queued for the previous experiment or socket must not consume the
+  // new one's pending metrics, nor clear its scheduled flush.
+  if (gen !== _flushGen) return;
   _rafPending = false;
   const pending = _pendingMetrics;
   _pendingMetrics = {};
@@ -955,33 +1048,39 @@ function _flushPendingMetrics() {
 
   let gotCurrentMetric   = false;
   let metricNamesChanged = false;
+  let rebuilt            = false;
   const incrementalUpdates = [];
 
   for (const [runId, perMetric] of Object.entries(pending)) {
     for (const [mname, {steps, values}] of Object.entries(perMetric)) {
       if (!METRIC_CACHE[mname]) METRIC_CACHE[mname] = {};
       if (!METRIC_CACHE[mname][runId]) METRIC_CACHE[mname][runId] = { steps: [], values: [] };
-      METRIC_CACHE[mname][runId].steps.push(...steps);
-      METRIC_CACHE[mname][runId].values.push(...values);
+      // A reconnect replays metrics the cache already has, and a history load
+      // can overlap the live stream.  Merge by step instead of appending
+      // duplicates to the chart.
+      const merged = _mergeSeries(METRIC_CACHE[mname][runId], steps, values);
+      if (merged.rebuilt) rebuilt = true;
 
       if (!DATA.metricNames.includes(mname)) {
         DATA.metricNames.push(mname);
         metricNamesChanged = true;
       }
 
-      if (mname === metric) {
+      if (mname === metric && !merged.rebuilt) {
         gotCurrentMetric = true;
         if (!LAST_EMA_S[metric]) LAST_EMA_S[metric] = {};
-        const [newSmoothed, newS] = _applyEmaIncremental(values, LAST_EMA_S[metric][runId] ?? null);
+        const [newSmoothed, newS] = _applyEmaIncremental(merged.values, LAST_EMA_S[metric][runId] ?? null);
         LAST_EMA_S[metric][runId] = newS;
         const lineIdx = _traceIndexMap[runId];
         if (lineIdx !== undefined) {
           const n      = Object.keys(_traceIndexMap).length;
           const dotIdx = n + lineIdx;
-          const lastStep = steps[steps.length - 1];
+          const lastStep = merged.steps[merged.steps.length - 1];
           const lastY    = newSmoothed[newSmoothed.length - 1];
-          incrementalUpdates.push({ lineIdx, dotIdx, newSteps: steps, newSmoothed, lastStep, lastY });
+          incrementalUpdates.push({ lineIdx, dotIdx, newSteps: merged.steps, newSmoothed, lastStep, lastY });
         }
+      } else if (mname === metric) {
+        gotCurrentMetric = true;
       }
     }
   }
@@ -996,6 +1095,9 @@ function _flushPendingMetrics() {
     }
     buildMetricSelect();
   }
+  // Out-of-order or duplicate steps were merged into the middle of a series;
+  // Plotly cannot extend that incrementally, so redraw from the cache.
+  if (rebuilt) { dirtyTabs.add("sensitivity"); buildActiveChart(); return; }
   if (!gotCurrentMetric) return;
 
   if (activeTab === "curves" && !dirtyTabs.has("curves") && smoothAlpha === 0) {
@@ -1021,42 +1123,71 @@ function _flushPendingMetrics() {
 
 // ── WebSocket live updates (replaces connectSSE from visualize.py) ────────────
 
-function connectWS(expId) {
+function connectWS(expId, { reconnecting = false } = {}) {
+  // Runs that were live when the old socket dropped may have logged (and even
+  // finished) while we were disconnected; their history is fetched on reopen.
+  const wasLive = new Set(LIVE_RUNS);
+  if (_wsReconnTimer) { clearTimeout(_wsReconnTimer); _wsReconnTimer = null; }
   if (_ws) { _ws.close(); _ws = null; }
-  LIVE_RUNS       = new Set();
+  const liveJobs = () => new Set([...JOBS.values()]
+    .filter(j => j.status === "running" || j.status === "dispatched")
+    .map(j => j.run_id));
+  LIVE_RUNS       = reconnecting ? liveJobs() : new Set();
   LAST_EMA_S      = {};
+  _flushGen      += 1;
   _pendingMetrics = {};
   _rafPending     = false;
 
   const url = wsURL(`/ws/experiments/${encodeURIComponent(expId)}`);
-  _ws = new WebSocket(url);
+  const sock = _ws = new WebSocket(url);
 
   let pingInterval = null;
-  _ws.onopen = () => {
+  sock.onopen = () => {
+    if (sock !== _ws) return;
     setConnStatus("connected");
     pingInterval = setInterval(() => {
-      if (_ws && _ws.readyState === WebSocket.OPEN)
-        _ws.send(JSON.stringify({ type: "ping" }));
+      if (sock === _ws && sock.readyState === WebSocket.OPEN)
+        sock.send(JSON.stringify({ type: "ping" }));
     }, 30000);
+    if (DATA) {
+      // Fill the gap: metrics broadcast before this socket subscribed (after
+      // the history snapshot, or while a dropped socket was down) are not
+      // replayed.  Refetch job statuses and every live series; merging by
+      // step drops what the cache already holds.
+      const seq = _loadSeq;
+      const ids = new Set([...wasLive, ...liveJobs()]);
+      const metrics = ids.size
+        ? _loadMetrics(expId, [...ids].map(id => ({ run_id: id })), seq)
+        : Promise.resolve();
+      Promise.all([_refreshJobs(expId), metrics]).then(() => {
+        if (sock !== _ws || seq !== _loadSeq || !DATA) return;
+        buildActiveChart();
+      }).catch(() => {});
+    }
   };
 
-  _ws.onclose = () => {
+  sock.onclose = () => {
     clearInterval(pingInterval);
+    if (sock !== _ws) return;  // replaced on purpose, not dropped
     const sel = document.getElementById("experiment-sel");
-    if (sel && sel.value === expId) {
+    if (sel && sel.value === expId && expId === LOADED_EXP) {
       setConnStatus("reconnecting");
       // Auto-reconnect if this experiment is still selected.
-      setTimeout(() => {
-        if (document.getElementById("experiment-sel")?.value === expId) connectWS(expId);
+      _wsReconnTimer = setTimeout(() => {
+        _wsReconnTimer = null;
+        if (document.getElementById("experiment-sel")?.value === expId && expId === LOADED_EXP)
+          connectWS(expId, { reconnecting: true });
       }, 3000);
     } else {
       setConnStatus("disconnected");
     }
   };
 
-  _ws.onerror = () => {};
+  sock.onerror = () => {};
 
-  _ws.onmessage = e => {
+  sock.onmessage = e => {
+    // An event queued by the previous socket must not reach the new experiment.
+    if (sock !== _ws || expId !== LOADED_EXP) return;
     let evt;
     try { evt = JSON.parse(e.data); } catch { return; }
     if (!DATA) return;
@@ -1132,16 +1263,19 @@ function parseCombo(raw) {
 
 // Debounced job list refresh to pick up new runs.
 let _jobRefreshTimer = null;
+let _jobsRefreshSeq = 0;
 function _scheduleJobRefresh(expId) {
   clearTimeout(_jobRefreshTimer);
   _jobRefreshTimer = setTimeout(() => _refreshJobs(expId), 3000);
 }
 
 async function _refreshJobs(expId) {
+  const seq = _loadSeq, refresh = ++_jobsRefreshSeq;
   try {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
     if (!r.ok) return;
     const jobs = await r.json();
+    if (seq !== _loadSeq || refresh !== _jobsRefreshSeq || expId !== LOADED_EXP || !DATA) return;
     rememberJobs(jobs);
     const existing = new Set(DATA.runs.map(r => r.hash));
     let added = false;
@@ -1159,7 +1293,8 @@ async function _refreshJobs(expId) {
     }
     if (added) { buildColorBySelect(); buildFilters(); }
     // Fetch metrics for any new runs.
-    await _loadMetrics(expId, jobs.filter(j => !existing.has(j.run_id)));
+    await _loadMetrics(expId, jobs.filter(j => !existing.has(j.run_id)), seq);
+    if (seq !== _loadSeq || refresh !== _jobsRefreshSeq || expId !== LOADED_EXP || !DATA) return;
     // Sync any newly discovered metric names and auto-select if unset.
     let metricNamesChanged = false;
     for (const mname of Object.keys(METRIC_CACHE)) {
@@ -1181,7 +1316,7 @@ async function _refreshJobs(expId) {
 
 // ── Metric loading (new — replaces file-based approach from visualize.py) ─────
 
-async function _loadMetrics(expId, jobs) {
+async function _loadMetrics(expId, jobs, seq = _loadSeq) {
   await Promise.all(jobs.map(async j => {
     try {
       const r = await apiFetch(
@@ -1189,6 +1324,9 @@ async function _loadMetrics(expId, jobs) {
       );
       if (!r.ok) return;
       const text = await r.text();
+      // Another experiment may have been selected while this page was in flight;
+      // its cache is not this run's cache any more.
+      if (seq !== _loadSeq || expId !== LOADED_EXP) return;
       mergeJsonlIntoCache(parseJsonl(text), j.run_id);
     } catch {}
   }));
@@ -1197,6 +1335,7 @@ async function _loadMetrics(expId, jobs) {
 // ── Load experiment (replaces loadExperiment from visualize.py) ───────────────
 
 async function loadExperiment(expId) {
+  const seq = ++_loadSeq;
   LOADED_EXP = expId;
   // Keep Artifacts nav link in sync with the viewed experiment
   document.getElementById("nav-files").href = pageHref("files.html", { experiment: expId });
@@ -1206,9 +1345,9 @@ async function loadExperiment(expId) {
   dlBtn.href = authURL(`/api/experiments/${encodeURIComponent(expId)}/metrics.zip`);
   dlBtn.style.display = "";
 
-  const expNameEl = document.getElementById("exp-name");
   expNameEl.classList.add("loading");
   expNameEl.textContent = "Fetching data…";
+  hideDescription();
   document.getElementById("status").textContent = "";
 
   if (_ws) { _ws.close(); _ws = null; }
@@ -1218,6 +1357,7 @@ async function loadExperiment(expId) {
   selectedRun = expId === INIT_EXP && !loadExperiment._done ? (INIT_RUN || null) : null;
   loadExperiment._done = true;
   hiddenRuns = new Set(); JOBS = new Map(); MLStepTimer.clear();
+  _flushGen += 1;
   _pendingMetrics = {}; _rafPending = false;
   dirtyTabs.add("curves"); dirtyTabs.add("sensitivity"); dirtyTabs.add("optimization");
   if (typeof Plotly !== "undefined") {
@@ -1230,8 +1370,10 @@ async function loadExperiment(expId) {
 
   try {
     const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
+    if (seq !== _loadSeq) return;
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const jobs = await r.json();
+    if (seq !== _loadSeq) return;
     rememberJobs(jobs);
 
     // Build manifest-like DATA structure.
@@ -1258,11 +1400,12 @@ async function loadExperiment(expId) {
       })),
       metricNames: [],
       subDims: {},
-      note: null,
+      note: ALL_EXPS.find(e => e.experiment_id === expId)?.note || null,
     };
 
     // Load all metrics from JSONL files, then discover metric names.
-    await _loadMetrics(expId, jobs);
+    await _loadMetrics(expId, jobs, seq);
+    if (seq !== _loadSeq) return;
 
     manifest.metricNames = Object.keys(METRIC_CACHE).sort();
 
@@ -1270,6 +1413,7 @@ async function loadExperiment(expId) {
 
     expNameEl.classList.remove("loading");
     expNameEl.textContent = expId;
+    mlTagEntity(expNameEl, expId, "", { skip: "results" });
 
     // Connect WS for live updates.
     connectWS(expId);
@@ -1278,6 +1422,7 @@ async function loadExperiment(expId) {
     buildActiveChart();
 
   } catch (err) {
+    if (seq !== _loadSeq) return;
     expNameEl.classList.remove("loading");
     expNameEl.textContent = "Error";
     document.getElementById("status").textContent = "Failed to load: " + err;
@@ -1287,13 +1432,17 @@ async function loadExperiment(expId) {
 
 // ── Refresh experiment list (from visualize.py, adapted to manager API) ───────
 
+let _expListSeq = 0;
 async function refreshExperiments() {
+  const seq = ++_expListSeq;
   try {
     const r = await apiFetch("/api/experiments");
     const experiments = await r.json();
+    if (seq !== _expListSeq) return;
     _updateExperimentList(experiments);
     showSelected();
   } catch (err) {
+    if (seq !== _expListSeq) return;
     document.getElementById("status").textContent = "Error refreshing: " + err;
   }
 }
@@ -1306,9 +1455,11 @@ MLStepTimer.mount(document.getElementById("run-bar-timer"), () =>
 
 // ── Bootstrap (replaces the bottom fetch block from visualize.py) ─────────────
 
+const _bootSeq = ++_expListSeq;
 apiFetch("/api/experiments")
   .then(r => r.json())
   .then(experiments => {
+    if (_bootSeq !== _expListSeq) return;
     MLCampaign.follow(experiments, INIT_EXP);
     _updateExperimentList(experiments, INIT_EXP);
 
@@ -1328,6 +1479,7 @@ apiFetch("/api/experiments")
     }
   })
   .catch(err => {
+    if (_bootSeq !== _expListSeq) return;
     const el = document.getElementById("exp-name");
     el.classList.remove("loading");
     el.textContent = "Error";

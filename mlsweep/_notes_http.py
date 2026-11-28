@@ -772,12 +772,22 @@ async def notes_evidence(request: web.Request) -> web.Response:
 
 
 async def _resolve_refs(request: web.Request, refs: list[str]) -> dict[str, dict[str, Any]]:
-    """Resolve ``mlsweep:`` links: ``code/...`` against the code snapshots, the rest against metrics."""
+    """Resolve ``mlsweep:`` links: ``code/...`` against the code snapshots,
+    ``trace/...`` against the session captures, the rest against metrics."""
     code = [r for r in refs if _notes_code.is_code_ref(r)]
-    other = [r for r in refs if not _notes_code.is_code_ref(r)]
+    trace = [r for r in refs if r.startswith("trace/") and not _notes_code.is_code_ref(r)]
+    other = [r for r in refs if r not in code and r not in trace]
     db = request.config_dict[DB_KEY]
     out = await _notes_blocks.resolve_evidence_many(db, other)
     out.update(await _notes_code.resolve_code_refs(db, request.config_dict[DIR_KEY], code))
+    if trace:
+        from mlsweep._manager_capture import capture_enabled, resolve_trace_refs
+
+        if capture_enabled(request.config_dict):
+            out.update(await resolve_trace_refs(db, trace))
+        else:
+            out.update({ref: {"ok": False, "ref": ref, "error": "capture is off on this manager"}
+                        for ref in trace})
     return out
 
 

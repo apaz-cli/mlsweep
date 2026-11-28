@@ -368,10 +368,15 @@ class _Client:
         self.ws = ws
         self.queue: asyncio.Queue[bytes | str | None] = asyncio.Queue()
         self.backlog = 0
+        self.dropped = False  # fell too far behind; the pump closes it
 
     def send(self, data: bytes | str) -> None:
+        if self.dropped:
+            return
         self.backlog += len(data)
         if self.backlog > _CLIENT_BACKLOG:
+            # Too far behind: close it rather than queue output it will never read.
+            self.dropped = True
             self.queue.put_nowait(None)
             return
         self.queue.put_nowait(data)
@@ -405,6 +410,9 @@ class SessionService:
         self.systemd_run = shutil.which("systemd-run")
         self.nice = shutil.which("nice")
         self._probed: asyncio.Task[None] | None = None
+        # One create at a time: the terminal limit and the notes clone are
+        # shared state, and plan()/the clone are slow enough to interleave.
+        self._create_lock = asyncio.Lock()
 
     def config(self) -> Config:
         """``terminals.json`` as it is now; a ValueError says what is wrong with it."""
@@ -555,6 +563,10 @@ class SessionService:
         """Start a terminal, running command *name* from the config if given,
         in *folder* of the notes clone (a path relative to it; "" is its top)."""
         await self.ready()
+        async with self._create_lock:
+            return await self._create_locked(name, folder)
+
+    async def _create_locked(self, name: str | None, folder: str = "") -> Session:
         if self.error:
             raise SessionError(self.error)
         try:

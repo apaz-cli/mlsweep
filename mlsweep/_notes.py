@@ -547,7 +547,9 @@ def search(root: Path, files: list[Entry], query: str, *, limit: int = 100,
     A file matches when every term appears in its path or its text.  Lines
     with any term are returned as context.  ``"quoted phrases"`` stay whole.
     """
-    terms = [t.lower() for t in re.findall(r'"([^"]+)"|(\S+)', query) for t in t if t]
+    from mlsweep._trace_view import search_terms
+
+    terms = search_terms(query)
     if not terms:
         return []
     results: list[dict[str, Any]] = []

@@ -6,43 +6,79 @@ let experiments = [];     // experiments in the selected campaign
 let allExperiments = [];  // every experiment, for the campaign list
 let expSearch = "";       // words to match in name, ID and note
 let expFilter = "all";    // all | running | completed | failed
+let experimentsSeq = 0;   // guards the periodic / visibility refreshes from landing out of order
+const jobLoadSeq = new Map();  // experiment id -> newest run-list request for it
 
-// What the View menu's entries lead to, counted the way each page lists them:
-// results and export are finished runs, logs are every run, artifacts are the
-// runs with artifact files.
-function expCounts(expId) {
-  const exp = allExperiments.find(e => e.experiment_id === expId) || {};
-  const c = exp.job_counts || {};
-  return {
-    total: c.total || exp.expected_jobs || 0,
-    finished: (c.done || 0) + (c.pruned || 0) + (c.failed || 0) + (c.xfailed || 0),
-    withArtifacts: c.with_artifacts || 0,
-  };
+// ── Experiment descriptions ─────────────────────────────────────────────────
+// A note is the experiment's description. It used to sit beside the name,
+// taking width and height in every row. It now appears in a large tooltip on
+// hover instead. The tooltip lives on <body>: the table's scroll container
+// would otherwise clip it.
+const expNoteTip = document.createElement("div");
+expNoteTip.className = "exp-note-tip";
+expNoteTip.setAttribute("role", "tooltip");
+expNoteTip.hidden = true;
+document.body.appendChild(expNoteTip);
+let expNoteTrigger = null;
+
+function expNoteTriggerOf(target) {
+  return target?.closest?.(".exp-name[data-note]") || null;
 }
 
+function hideExpNoteTip() {
+  expNoteTrigger = null;
+  expNoteTip.hidden = true;
+}
+
+function showExpNoteTip(trigger) {
+  const note = trigger.dataset.note;
+  if (!note || trigger === expNoteTrigger) return;
+  expNoteTrigger = trigger;
+  expNoteTip.textContent = note;
+  expNoteTip.hidden = false;
+  mlPlaceTip(expNoteTip, trigger);
+}
+
+document.addEventListener("pointerover", e => {
+  const trigger = expNoteTriggerOf(e.target);
+  if (trigger) showExpNoteTip(trigger);
+});
+document.addEventListener("pointerout", e => {
+  const trigger = expNoteTriggerOf(e.target);
+  if (!trigger || trigger !== expNoteTrigger) return;
+  const next = e.relatedTarget;
+  if (next && trigger.contains(next)) return;
+  hideExpNoteTip();
+});
+window.addEventListener("scroll", hideExpNoteTip, true);
+window.addEventListener("resize", hideExpNoteTip);
+
+
+// What the View menu lists comes from viewmenu.js, shared with every page.
 function toggleExpView(expId) {
-  const n = expCounts(expId);
-  toggleMenu(this, `view:${expId}`, [
-    { label: "Results", icon: "results", count: n.finished, href: pageHref("results.html", { experiment: expId }) },
-    { label: "Logs", icon: "logs", count: n.total, href: pageHref("logs.html", { experiment: expId }) },
-    { label: "Artifacts", icon: "artifacts", count: n.withArtifacts, href: pageHref("files.html", { experiment: expId }) },
-    { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId }),
-      title: "The code this experiment ran, with its file tree and where it came from" },
-    notesItem(expId),
-    { label: "Export", icon: "export", count: n.finished, href: pageHref("export.html", { experiment: expId }) },
-  ].filter(Boolean));
+  toggleMenu(this, `view:${expId}`, MLViews.expItems(expId));
 }
+
 
 function toggleExpMenu(expId) {
-  toggleMenu(this, `exp:${expId}`, [
+  toggleMenu(this, `exp:${expId}`, expManageItems(expId));
+}
+
+function expManageItems(expId) {
+  return [
     { label: "Rename…", act: act("renameExperiment", expId) },
+    { label: "Edit description…", act: act("editExpDescription", expId) },
     { label: "Move to campaign…", act: act("moveExperiment", expId) },
     { label: "Delete…", act: act("deleteExperiment", expId), danger: true, divider: true },
-  ]);
+  ];
+}
+
+function toggleRunMenu(expId, runId) {
+  toggleMenu(this, `run:${expId}/${runId}`, runManageItems(expId, runId));
 }
 
 
-function toggleRunMenu(expId, runId) {
+function runManageItems(expId, runId) {
   const j = (jobsCache[expId] || []).find(x => x.run_id === runId) || {};
   const items = [{ label: "Rename…", act: act("renameJob", expId, runId) }];
   if (ACTIVE_RUN.includes(j.status)) {
@@ -55,13 +91,30 @@ function toggleRunMenu(expId, runId) {
     items.push({ label: "Move to experiment…", act: act("moveRun", expId, runId), divider: true });
     items.push({ label: "Delete…", act: act("purgeRun", expId, runId), danger: true });
   }
-  toggleMenu(this, `run:${expId}/${runId}`, items);
+  return items;
 }
+
+// Right-click an experiment or one of its runs: its View and Manage menus in one.
+// The expanded details row under a run counts as that run.
+bindRowContextMenu(document.getElementById("exp-tbody"), ".exp-row, .run-row, .job-detail-row", row => {
+  if (row.classList.contains("exp-row")) {
+    const expId = row.dataset.expId;
+    return [`ctx:${expId}`, joinMenus(MLViews.expItems(expId),
+      [{ label: "Copy experiment ID", act: act("copyText", expId, "Copied the experiment ID") }, ...expManageItems(expId)])];
+  }
+  const { expId, runId } = row.dataset;
+  if (!expId || !runId) return null;
+  const j = (jobsCache[expId] || []).find(x => x.run_id === runId);
+  return [`ctx:${expId}/${runId}`, joinMenus(MLViews.runItems(expId, runId, { codeFiles: j?.code_files }),
+    [{ label: "Copy run ID", act: act("copyText", runId, "Copied the run ID") }, ...runManageItems(expId, runId)])];
+});
 
 async function deleteExperiment(expId) {
   if (!await mlConfirm(`Delete experiment "${expId}" and all its jobs?`, { confirmLabel: "Delete" })) return;
   const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}`, { method: "DELETE" });
   if (r.ok) {
+    // A list request started before the delete may still answer with the row.
+    experimentsSeq += 1;
     document.getElementById(`exp-row-${expId}`)?.remove();
     runRowsOf(expId).forEach(r => r.remove());
     experiments = experiments.filter(e => e.experiment_id !== expId);
@@ -168,6 +221,15 @@ async function moveExperiment(expId) {
   }
 }
 
+async function editExpDescription(expId) {
+  const exp = experiments.find(e => e.experiment_id === expId);
+  const description = await mlEditDescription(expId, exp?.note);
+  if (description === undefined) return;
+  if (exp) exp.note = description;
+  hideExpNoteTip();
+  renderCurrent();
+}
+
 async function renameExperiment(expId) {
   const exp = experiments.find(e => e.experiment_id === expId);
   const current = exp?.name || expId;
@@ -253,16 +315,35 @@ function toggleJobDetail(expId, runId) {
   }
 }
 
-// A pencil and count beside a name that notes mention, linking to those notes.
+// The notes badge: a pencil and how many notes mention it, linking to them.
+// It shows once the mentions are loaded; zero is red, with nowhere to go.
 function noteRefHtml(expId, runId) {
-  const n = notesEnabled ? noteCount(expId, runId) : 0;
-  if (!n) return "";
-  const what = runId || expId;
-  const title = runId
-    ? `${n} note${n === 1 ? "" : "s"} mention this run`
-    : `${n} note${n === 1 ? "" : "s"} mention this experiment or its runs`;
-  return `<a class="note-ref" href="${escHtml(pageHref("notes.html", { mentions: what }))}" title="${title}" data-act="">`
+  if (!MLViews.state.notesEnabled) return "";
+  const n = MLViews.noteCount(expId, runId);
+  const what = runId ? "run" : "experiment or its runs";
+  if (!n) return `<span class="note-ref zero" title="No note mentions this ${what}">${VIEW_ICONS.notes}0</span>`;
+  const title = `${n} note${n === 1 ? "" : "s"} mention this ${what}`;
+  return `<a class="note-ref" href="${escHtml(pageHref("notes.html", { mentions: runId || expId }))}" title="${title}" data-act="">`
     + `${VIEW_ICONS.notes}${n}</a>`;
+}
+
+// The traces badge: how many agent sessions submitted the experiment, linking
+// to them.  Traces link to experiments, not runs.
+function traceRefHtml(expId) {
+  const { captureEnabled, traceCounts } = MLViews.state;
+  if (!captureEnabled || !traceCounts) return "";
+  const n = traceCounts[expId] || 0;
+  if (!n) return `<span class="note-ref trace-ref zero" title="No agent trace submitted this experiment">${VIEW_ICONS.traces}0</span>`;
+  const title = `${n} trace${n === 1 ? "" : "s"} submitted this experiment`;
+  return `<a class="note-ref trace-ref" href="${escHtml(pageHref("traces.html", { experiment: expId }))}" title="${title}" data-act="">`
+    + `${VIEW_ICONS.traces}${n}</a>`;
+}
+
+// The Refs cell: notes that mention it and, for an experiment, the traces
+// that submitted it.  Runs have no traces of their own.
+function refsHtml(expId, runId) {
+  const refs = noteRefHtml(expId, runId) + (runId ? "" : traceRefHtml(expId));
+  return refs ? `<div class="refs">${refs}</div>` : "";
 }
 
 // ── Render runs ───────────────────────────────────────────────────────────────
@@ -275,24 +356,24 @@ function runsHtml(expId) {
     const comboStr = escHtml(Object.entries(comboObj).map(([k,v]) => `${k}=${v}`).join(" "));
     const key = `${expId}/${j.run_id}`;
     const isOpen = expandedJobs.has(key);
-    return `<tr class="run-row" style="cursor:pointer" ${act("toggleJobDetail", expId, j.run_id)}>
+    return `<tr class="run-row" style="cursor:pointer" data-exp-id="${escHtml(expId)}" data-run-id="${escHtml(j.run_id)}" ${act("toggleJobDetail", expId, j.run_id)}>
       <td class="mono"><span class="job-toggle" id="${escHtml(`job-toggle-${expId}-${j.run_id}`)}">${isOpen ? "▼" : "▶"}</span>${runNameHtml(j)}</td>
       <td${j.reason ? ` title="${escHtml(j.reason)}"` : ""}>${badge(j.status)}</td>
       <td colspan="2">${j.worker_id ? escHtml(j.worker_id.split(":")[0]) : "—"}</td>
       <td>${fmtElapsed(j.elapsed)}</td>
       <td colspan="3" class="combo-cell mono" title="${comboStr}"><div class="combo-clip">${comboStr}</div></td>
-      <td class="notes-cell" data-act="">${noteRefHtml(expId, j.run_id)}</td>
+      <td class="refs-cell" data-act="">${refsHtml(expId, j.run_id)}</td>
       <td class="actions-cell" data-act=""><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes" ${act("toggleRunView", expId, j.run_id)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Artifacts, Logs, Code, Notes, Traces" ${act("toggleRunView", expId, j.run_id, j.code_files ?? null)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, cancel, move or delete" ${act("toggleRunMenu", expId, j.run_id)}>Manage</button>
       </div></td>
     </tr>
-    <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" style="display:${isOpen ? "" : "none"}">
+    <tr id="${escHtml(`job-detail-${expId}-${j.run_id}`)}" class="job-detail-row" data-exp-id="${escHtml(expId)}" data-run-id="${escHtml(j.run_id)}" style="display:${isOpen ? "" : "none"}">
       <td colspan="10">${isOpen ? renderJobDetail(j) : ""}</td>
     </tr>`;
   }).join("");
   const head = `<tr class="runs-head"><td>Run ID</td><td>Status</td><td colspan="2">Worker</td>
-      <td>Elapsed</td><td colspan="3">Combo</td><td>Notes</td><td></td></tr>`;
+      <td>Elapsed</td><td colspan="3">Combo</td><td>Refs</td><td></td></tr>`;
   return runTools(expId, jobs) + (rows ? head + rows : `<tr class="runs-empty"><td colspan="10">No jobs</td></tr>`);
 }
 
@@ -349,10 +430,15 @@ async function toggleExpand(expId) {
   expRow && expRow.classList.add("expanded");
 
   if (!jobsCache[expId]) {
+    const seq = (jobLoadSeq.get(expId) || 0) + 1;
+    jobLoadSeq.set(expId, seq);
     try {
       const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
+      const loaded = await r.json();
+      if (seq !== jobLoadSeq.get(expId)) return;  // a newer expand/fetch owns the cache
+      jobsCache[expId] = loaded;
     } catch {
+      if (seq !== jobLoadSeq.get(expId)) return;
       jobsCache[expId] = [];
     }
   }
@@ -362,10 +448,14 @@ async function toggleExpand(expId) {
 
 // ── Refresh jobs for expanded experiments ─────────────────────────────────────
 async function refreshExpandedJobs() {
-  for (const expId of expandedExps) {
+  for (const expId of [...expandedExps]) {
+    const seq = (jobLoadSeq.get(expId) || 0) + 1;
+    jobLoadSeq.set(expId, seq);
     try {
       const r = await apiFetch(`/api/experiments/${encodeURIComponent(expId)}/jobs`);
-      jobsCache[expId] = await r.json();
+      const jobs = await r.json();
+      if (seq !== jobLoadSeq.get(expId)) continue;  // an expand or newer poll already answered
+      jobsCache[expId] = jobs;
       renderRuns(expId);
     } catch {}
   }
@@ -505,8 +595,8 @@ function renderExperiments(exps) {
     const html = `<td>
         <div class="exp-name-cell">
           <span class="exp-toggle" ${act("toggleExpand", expId)}>${isExpanded ? "▼" : "▶"}</span>
-          <span class="exp-name" ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
-          ${exp.note ? `<span class="exp-note">${escHtml(exp.note)}</span>` : ""}
+          <span class="exp-name${exp.note ? " has-note" : ""}" ${exp.note ? `data-note="${escHtml(exp.note)}"` : ""} ${act("toggleExpand", expId)} style="cursor:pointer">${escHtml(exp.name || expId)}</span>
+          ${exp.note ? "" : `<button type="button" class="exp-no-desc" title="This experiment has no description. Click to add one." ${act("editExpDescription", expId)}>no description</button>`}
           ${exp.manager_note ? `<span class="exp-manager-note${exp.status === "paused" ? " paused" : ""}" title="${escHtml(exp.manager_note)}">${escHtml(exp.manager_note)}</span>` : ""}
           ${MLCampaign.get() === MLCampaign.ALL ? `<span class="campaign-tag">${escHtml(MLCampaign.campaignOf(exp))}</span>` : ""}
         </div>
@@ -518,9 +608,9 @@ function renderExperiments(exps) {
       <td class="count-cell">${running ? `<span style="color:var(--ok)">${running}</span>` : (done ? "0" : "—")}</td>
       <td class="count-cell">${total ? `${(c.done||0)+(c.pruned||0)+(c.failed||0)+(c.xfailed||0)}/${total}` : "—"}</td>
       <td>${relTime(exp.submit_time)}</td>
-      <td class="notes-cell">${noteRefHtml(expId)}</td>
+      <td class="refs-cell">${refsHtml(expId)}</td>
       <td class="actions-cell"><div class="actions">
-        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Export" ${act("toggleExpView", expId)}>View ▾</button>
+        <button class="btn-link btn-menu" aria-haspopup="true" title="Results, Logs, Artifacts, Code, Notes, Traces, Export" ${act("toggleExpView", expId)}>View ▾</button>
         <button class="btn-link btn-manage" aria-haspopup="true" title="Rename, move or delete" ${act("toggleExpMenu", expId)}>Manage</button>
       </div></td>`;
 
@@ -542,12 +632,20 @@ function renderExperiments(exps) {
 
     if (isExpanded) renderRuns(expId);
   });
+
+  // A refresh replaces the hovered name element. Keep the open tooltip on the
+  // new one, or close it if the pointer is no longer over an experiment name.
+  const hovered = document.querySelector(".exp-name[data-note]:hover");
+  if (hovered) showExpNoteTip(hovered);
+  else if (expNoteTrigger && !expNoteTrigger.isConnected) hideExpNoteTip();
 }
 
 // ── Fetch and refresh ─────────────────────────────────────────────────────────
 async function fetchExperiments() {
+  const seq = ++experimentsSeq;
   try {
     const r = await apiFetch("/api/experiments");
+    if (seq !== experimentsSeq) return;
     if (!r.ok) {
       setConnStatus("disconnected");
       document.getElementById("error-msg").textContent = `API error: ${r.status}`;
@@ -556,11 +654,15 @@ async function fetchExperiments() {
       document.getElementById("exp-table").style.display = "none";
       return;
     }
-    allExperiments = await r.json();
+    const loaded = await r.json();
+    if (seq !== experimentsSeq) return;
+    allExperiments = loaded;
+    MLViews.setExperiments(loaded);
     showCampaign();
     setConnStatus("connected");
     document.getElementById("error-msg").style.display = "none";
   } catch (e) {
+    if (seq !== experimentsSeq) return;
     setConnStatus("disconnected");
     document.getElementById("error-msg").textContent = `Failed to fetch: ${e}`;
     document.getElementById("error-msg").style.display = "";
@@ -578,7 +680,7 @@ function showCampaign() {
 
 MLCampaign.bind(campaignSelect, showCampaign);
 
-watchNoteMentions(() => { if (allExperiments.length) showCampaign(); });
+MLViews.onChange(() => { if (allExperiments.length) showCampaign(); });
 
 async function refreshAll() {
   await fetchExperiments();
@@ -593,6 +695,6 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 
 bindActions({
   toggleJobDetail, renameJob, runAction, moveRun, purgeRun, setExpStatus, bulkRuns,
-  toggleExpand, renameExperiment, moveExperiment, deleteExperiment,
-  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters,
+  toggleExpand, renameExperiment, editExpDescription, moveExperiment, deleteExperiment,
+  toggleExpView, toggleExpMenu, toggleRunView, toggleRunMenu, clearExpFilters, copyText,
 });

@@ -108,6 +108,11 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .placement-toggle button { font-size: 12px; padding: 3px 10px; border: none; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
 .placement-toggle button + button { border-left: 1px solid var(--border-input); }
 .placement-toggle button:hover { background: var(--btn-hover); }
+.btn-pause { font-size: 12px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border-input); background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.btn-pause:hover { background: var(--btn-hover); }
+.btn-pause.active { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border-input)); background: color-mix(in srgb, var(--warn) 10%, var(--btn-bg)); font-weight: 600; }
+.pause-banner { margin-bottom: 12px; }
+.pause-banner.hidden { display: none; }
 .placement-toggle button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); text-shadow: .35px 0 0 currentColor, -.35px 0 0 currentColor; }
 
 /* Modal */
@@ -143,6 +148,9 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .btn-reconnect { flex-shrink: 0; font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--radio-checked-border); background: var(--radio-checked-bg); color: var(--radio-checked-color); cursor: pointer; font-weight: 600; }
 .btn-reconnect:hover { opacity: 0.85; }
 .btn-reconnect:disabled { opacity: 0.5; cursor: default; }
+.btn-forget { flex-shrink: 0; font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text-muted); cursor: pointer; }
+.btn-forget:hover { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 27%, transparent); }
+.btn-forget:disabled { opacity: 0.5; cursor: default; }
 .modal-divider { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
 .modal-divider::before, .modal-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 .modal-divider.hidden { display: none; }
@@ -163,11 +171,17 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
 .mono { font-family: monospace; font-size: 11px; }
 .jobs-table td.id-cell { overflow-wrap: anywhere; }
 .no-data { color: var(--text-muted); font-size: 12px; padding: 20px 10px; text-align: center; }
+.section-count { color: var(--text-muted); font-weight: 400; font-size: 0.85em; }
+.queue-more { color: var(--text-muted); font-size: 11px; padding: 8px 10px; }
+.queue-more.hidden { display: none; }
+.jobs-table tr.held td { opacity: 0.6; }
+.jobs-table tr.held td.actions-cell { opacity: 1; }
 
 /* Connection indicator */
 </style>
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
@@ -186,9 +200,11 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
             <button data-placement="spread" title="Put each job on the least busy GPU, so every GPU gets one job before any gets a second.">Spread</button>
           </div>
         </div>
+        <button class="btn-pause" id="btn-pause">Pause scheduling</button>
         <button class="btn-connect" id="btn-connect-worker">+ Connect Worker</button>
       </div>
     </div>
+    <div class="worker-warning pause-banner hidden" id="pause-banner">Scheduling is paused. No new jobs start on any worker until you unpause; running jobs carry on.</div>
     <div id="workers-grid" class="workers-grid">
       <div class="no-data">Loading…</div>
     </div>
@@ -199,6 +215,14 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
       <thead><tr><th>Run ID</th><th>Experiment</th><th>Status</th><th>Worker</th><th>GPU IDs</th><th>Elapsed</th><th>Actions</th></tr></thead>
       <tbody id="inflight-tbody"><tr><td colspan="7" class="no-data">Loading…</td></tr></tbody>
     </table>
+  </div>
+  <div>
+    <h3>Queued Jobs <span class="section-count" id="queue-count"></span></h3>
+    <table class="jobs-table">
+      <thead><tr><th>#</th><th>Run ID</th><th>Experiment</th><th>Status</th><th>GPUs</th><th>Priority</th><th>Queued</th><th>Actions</th></tr></thead>
+      <tbody id="queue-tbody"><tr><td colspan="8" class="no-data">Loading…</td></tr></tbody>
+    </table>
+    <div class="queue-more hidden" id="queue-more"></div>
   </div>
   <div>
     <div class="section-header">
@@ -248,6 +272,10 @@ body.dragging-run .gpu-tile.st-pool { border-style: dashed; border-color: var(--
         <label for="fw-devices">GPU device IDs <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
         <input id="fw-devices" type="text" placeholder="0,1,2,3" autocomplete="off">
         <span class="form-hint">Comma-separated GPU indices. Leave blank to auto-detect.</span>
+      </div>
+      <div class="form-row">
+        <label class="gc-check"><input type="checkbox" id="fw-tunnel"> Connect over SSH</label>
+        <span class="form-hint">For a machine whose firewall lets only SSH in, such as a cloud instance. The manager reaches the worker through an SSH tunnel instead of its port.</span>
       </div>
       <div class="modal-actions" style="margin-top:0">
         <button class="btn-cancel" id="connect-cancel">Cancel</button>

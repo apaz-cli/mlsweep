@@ -223,7 +223,8 @@ def test_reconnect_known_workers_schedules_remote_only():
 
     Localhost is skipped (connect_workers already handles it), and so are
     workers whose host is covered by a worker launched this session, plus any
-    later DB worker sharing an already-scheduled host.
+    later DB worker sharing an already-scheduled host.  A worker disconnected
+    on purpose stays down.
     """
     import mlsweep._manager_workers as mw
 
@@ -243,7 +244,7 @@ def test_reconnect_known_workers_schedules_remote_only():
             "status TEXT NOT NULL DEFAULT 'offline', last_seen REAL, scratch_dir TEXT, "
             "port INTEGER NOT NULL DEFAULT 7890, ssh_key TEXT, venv TEXT, devices TEXT, "
             "unhealthy_devices TEXT, "
-            "last_error TEXT)"
+            "last_error TEXT, tunnel INTEGER NOT NULL DEFAULT 0)"
         )
         await db.commit()
 
@@ -251,6 +252,7 @@ def test_reconnect_known_workers_schedules_remote_only():
             ("aaron@95.133.252.99:dynamic", "aaron@95.133.252.99", "dead", "stale-1"),
             ("aaron@95.133.252.99:other", "aaron@95.133.252.99", "dead", "stale-2"),
             ("covered@example.com:dynamic", "covered.example.com", "dead", "stale-3"),
+            ("user@disconnected.example.com:dynamic", "user@disconnected.example.com", "disconnected", None),
             ("localhost:ephemeral:0", "localhost", "offline", None),
         ]
         for wid, host, status, err in rows:

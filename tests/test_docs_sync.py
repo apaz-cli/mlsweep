@@ -15,6 +15,7 @@ PAIRS = [
     ("docs/sweep_configuration.md", "mlsweep/docs/sweep_configuration.md"),
     ("docs/examples.md", "mlsweep/docs/examples.md"),
     ("docs/notes.md", "mlsweep/docs/notes.md"),
+    ("docs/traces.md", "mlsweep/docs/traces.md"),
 ]
 
 

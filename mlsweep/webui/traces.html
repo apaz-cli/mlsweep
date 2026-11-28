@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="/static/favicon.ico">
+<title>mlsweep — Traces</title>
+<link rel="stylesheet" href="common.css">
+<style>
+
+body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+/* Layout: sidebar | main (header + ledger) | inspector */
+#layout { flex: 1; display: flex; min-height: 0; }
+
+/* Sidebar */
+#sidebar { flex: 0 0 clamp(240px, 26vw, 320px); min-width: 0; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+#sidebar-top { padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 10px; }
+.sb-title { font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
+.list-info { font-size: 10px; color: var(--text-muted); margin-top: 6px; }
+.list-info button { border: 0; background: none; color: var(--accent-text); cursor: pointer; padding: 0 2px; font-size: 10px; }
+.list-info button:hover { text-decoration: underline; }
+.list-more { margin: 8px 12px; padding: 5px 8px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); font-size: 11px; cursor: pointer; }
+.list-more:hover { background: var(--btn-hover); }
+#search { width: 100%; padding: 5px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
+#search:focus { outline: none; border-color: var(--accent); }
+.agent-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 3px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; }
+.chip:hover { background: var(--btn-hover); }
+.chip.active { background: var(--radio-checked-bg); border-color: var(--radio-checked-border); color: var(--radio-checked-color); }
+.chip .state-dot { display: inline-block; vertical-align: 1px; margin-right: 4px; }
+#session-list { flex: 1; overflow-y: auto; }
+.session-item { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
+.session-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.session-item:hover { background: var(--btn-hover); }
+.session-item.selected { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
+.session-item-top { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.session-title { font-size: 12px; line-height: 1.25; color: var(--text-strong); flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-item-top .state-dot { margin-top: 5px; }
+.session-agent { font-size: 10px; padding: 0 5px; border-radius: 3px; flex-shrink: 0; background: var(--surface-3); color: var(--text-dim); }
+.session-item-bottom { display: flex; gap: 6px; align-items: center; margin-top: 2px; font-size: 10px; color: var(--text-muted); min-width: 0; }
+.session-cwd { font-family: var(--font-mono); font-size: 10px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-links { color: var(--accent-text); flex-shrink: 0; }
+.state-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--ok); }
+.state-dot.closed { background: var(--text-muted); }
+.state-dot.imported { background: var(--info); }
+.snippet { margin-top: 3px; font-size: 10px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snippet mark { background: color-mix(in srgb, var(--warn) 32%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
+.list-msg { padding: 20px 12px; color: var(--text-muted); font-size: 12px; text-align: center; }
+
+/* Main */
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+#trace-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 8px 14px 7px; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+.hdr-row { display: flex; align-items: center; gap: 6px 8px; min-width: 0; }
+.hdr-row.meta { flex-wrap: wrap; min-height: 18px; }
+.trace-title { font-size: 14px; font-weight: 600; color: var(--text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 8em; flex: 0 1 auto; }
+.trace-meta { font-size: 11px; color: var(--text-dim); }
+.trace-meta .sep { color: var(--text-muted); padding: 0 5px; }
+.trace-meta .mono { font-family: var(--font-mono); font-size: 10.5px; }
+.agent-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: var(--surface-3); color: var(--text-dim); flex-shrink: 0; }
+.link-chip { font-size: 10px; padding: 2px 7px; border: 1px solid var(--accent-border); border-radius: 10px; color: var(--accent-text); background: var(--accent-soft); text-decoration: none; white-space: nowrap; }
+.link-chip:hover { border-color: var(--accent); }
+.hdr-spacer { flex: 1; }
+.trace-links { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chip-wrap { display: inline-flex; align-items: stretch; border: 1px solid var(--accent-border); border-radius: 10px; background: var(--accent-soft); overflow: hidden; }
+.chip-wrap .link-chip { border: 0; background: none; border-radius: 0; padding: 2px 2px 2px 8px; }
+.chip-wrap .unlink { border: 0; background: none; color: var(--accent-text); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 6px 0 2px; opacity: .55; }
+.chip-wrap .unlink:hover { opacity: 1; color: var(--bad); }
+.trace-state { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+.trace-state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+.trace-state.active { color: var(--ok); }
+.trace-state.active::before { background: var(--ok); }
+.trace-state.imported { color: var(--info); }
+.trace-state.imported::before { background: var(--info); }
+.hdr-notes { font-size: 10px; color: var(--accent-text); text-decoration: none; }
+.hdr-notes:hover { text-decoration: underline; }
+.hdr-tools { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+#ledger-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 5px 14px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.seg { display: inline-flex; border: 1px solid var(--border-input); border-radius: 5px; overflow: hidden; }
+.seg button { border: 0; border-left: 1px solid var(--border-input); background: var(--btn-bg); color: var(--btn-text); font-size: 11px; padding: 3px 9px; cursor: pointer; white-space: nowrap; }
+.seg button:first-child { border-left: 0; }
+.seg button:hover:not(:disabled) { background: var(--btn-hover); }
+.seg button.active { background: var(--radio-checked-bg); color: var(--radio-checked-color); }
+.seg button:disabled { opacity: .4; cursor: default; }
+.seg .n { margin-left: 5px; font: 10px var(--font-mono); color: var(--text-muted); }
+.seg button.active .n { color: inherit; opacity: .75; }
+.bar-right { margin-left: auto; display: inline-flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px 12px; }
+.jump-group { display: inline-flex; align-items: center; gap: 1px; }
+.jump-label { font-size: 10px; color: var(--text-dim); margin-right: 3px; }
+.more-links { font-size: 10px; padding: 2px 8px; border: 1px solid var(--border-input); border-radius: 10px; background: var(--btn-bg); color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.more-links:hover { color: var(--accent-text); border-color: var(--accent-border); }
+.trace-links.expanded { max-height: 30vh; overflow-y: auto; flex-basis: 100%; padding: 2px 0; }
+.turn-pos { min-width: 4.6em; text-align: center; font: 10px/1 var(--font-mono); color: var(--text-dim); }
+.icon-btn:disabled { opacity: .3; cursor: default; }
+#in-filter { width: 140px; padding: 4px 8px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 11px; background: var(--btn-bg); color: var(--text); }
+#in-filter:focus { outline: none; border-color: var(--accent); }
+
+/* Ledger: a headerless table, time | kind | content.  Rows stay neutral; the
+   kind tag carries the color, and each prompt opens a turn. */
+#ledger-wrap { flex: 1; overflow: auto; min-height: 0; background: var(--bg); }
+#ledger { width: 100%; table-layout: fixed; border-spacing: 0; border-collapse: collapse; font-size: 13px; line-height: 1.5; }
+#ledger td { padding: 3px 10px; vertical-align: top; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+#ledger .time-col { width: 70px; padding-left: 14px; padding-top: 6px; font: 10px/1.4 var(--font-mono); color: var(--text-muted); white-space: nowrap; }
+#ledger .tag-col { width: 96px; padding-left: 4px; padding-top: 5px; white-space: nowrap; }
+#ledger .content-col { padding-right: 16px; }
+#ledger tbody tr { cursor: default; }
+#ledger tbody tr:hover td { background: color-mix(in srgb, var(--btn-hover) 70%, transparent); }
+#ledger tbody tr.selected td { background: var(--accent-soft); }
+#ledger tbody tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* A prompt starts a turn: a gap above, a tinted band, the turn number. */
+#ledger tr.ev-user td { background: color-mix(in srgb, var(--accent) 7%, var(--surface)); border-top: 1px solid var(--border-strong); border-bottom-color: var(--border); padding-top: 8px; padding-bottom: 8px; }
+#ledger tr.ev-user .time-col { padding-top: 11px; }
+#ledger tr.ev-user .tag-col { padding-top: 9px; }
+#ledger tr.ev-user + tr td { padding-top: 6px; }
+#ledger tbody tr.ev-user:not(:first-child) td { border-top-width: 10px; border-top-color: var(--bg); box-shadow: inset 0 1px 0 var(--border-strong); }
+#ledger tbody tr.ev-user.selected:not(:first-child) td:first-child { box-shadow: inset 0 1px 0 var(--border-strong), inset 2px 0 0 var(--accent); }
+.turn-label { margin-left: 5px; font: 10px/1 var(--font-mono); color: var(--accent-text); opacity: .8; }
+
+.kind-tag { display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 3px; font: 600 10px/1 var(--font-mono); letter-spacing: .01em; user-select: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.kind-tag.kind-user { color: var(--accent-text); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-border); }
+.kind-tag.kind-assistant { color: var(--info); background: color-mix(in srgb, var(--info) 12%, transparent); }
+.kind-tag.kind-thinking { color: var(--text-muted); background: none; font-weight: 400; font-style: italic; padding-left: 0; }
+.kind-tag.kind-tool { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.kind-tag.kind-tool_result { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.kind-tag.kind-mlsweep { color: var(--accent-text); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-border); }
+tr.is-mlsweep .event-text { color: var(--text-strong); -webkit-line-clamp: 1; }
+tr.is-mlsweep .cmd { color: var(--text-strong); }
+.kind-tag.kind-meta { color: var(--text-muted); background: none; font-weight: 400; padding-left: 0; }
+
+.content-line { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.event-text { display: block; flex: 1; white-space: pre-wrap; word-break: break-word; min-width: 0; color: var(--text); }
+tr.ev-user .event-text { font-weight: 500; color: var(--text-strong); font-size: 13.5px; }
+tr.ev-thinking .event-text { font-style: italic; color: var(--text-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+tr.ev-meta .event-text { color: var(--text-muted); font-size: 11px; }
+tr.ev-tool .event-text, tr.ev-tool_result .event-text { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-label); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+tr.ev-tool .event-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+tr.ev-assistant .event-text { display: -webkit-box; -webkit-line-clamp: 8; -webkit-box-orient: vertical; overflow: hidden; }
+tr.ev-tool td { padding-top: 4px; padding-bottom: 4px; }
+.event-status { flex-shrink: 0; font: 10px var(--font-mono); color: var(--text-muted); white-space: nowrap; }
+.event-status .mark { margin-right: 4px; }
+.event-status.ok .mark { color: var(--ok); }
+.event-status.err { color: var(--bad); }
+.event-ok { color: var(--ok); }
+.event-err { color: var(--bad); }
+.event-arrow { color: var(--text-muted); padding: 0 4px; }
+#ledger-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
+#ledger-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Inspector */
+#inspector { flex: 0 0 clamp(300px, 34%, 480px); border-left: 1px solid var(--border); background: var(--surface); display: none; flex-direction: column; min-width: 0; overflow: hidden; }
+#inspector.open { display: flex; }
+#inspector-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+#inspector-body { flex: 1; overflow-y: auto; padding: 14px; }
+.event-full { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.6; color: var(--text); }
+.event-full.thinking { font-style: italic; color: var(--text-label); }
+.event-full.tool { font-family: var(--font-mono); font-size: 12px; line-height: 1.55; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+.event-full.result { font-family: var(--font-mono); font-size: 12px; }
+.event-full.result.ok { color: var(--ok); }
+.event-full.result.err { color: var(--bad); }
+.overview { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 16px 0 0; padding-top: 12px; border-top: 1px solid var(--border); font-size: 11px; }
+.overview > div { display: contents; }
+.overview dt { color: var(--text-dim); }
+.overview dd { margin: 0; color: var(--text-label); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.overview-link { border: 0; background: none; padding: 0; color: var(--accent-text); font: inherit; cursor: pointer; text-decoration: underline; }
+#inspector-link { margin-left: auto; }
+.note-link-btn { font-size: 10px; padding: 3px 8px; border: 1px solid var(--border-input); border-radius: 4px; background: var(--btn-bg); color: var(--btn-text); cursor: pointer; white-space: nowrap; }
+.note-link-btn:hover { color: var(--accent-text); border-color: var(--accent-border); }
+#inspector-close { margin-left: 0; }
+
+/* No selection */
+#no-sel { flex: 1; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; }
+
+@media (max-width: 1100px) { #inspector { position: absolute; right: 0; top: 40px; bottom: 0; z-index: 5; box-shadow: var(--shadow-md); } }
+</style>
+<script src="chrome.js"></script>
+<script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
+<script src="campaign.js"></script>
+</head>
+<body>
+<nav data-page="traces"></nav>
+<script src="nav.js"></script>
+
+<div id="layout">
+  <div id="sidebar">
+    <div id="sidebar-top">
+      <div>
+        <span class="sb-title">Search</span>
+        <input id="search" type="search" placeholder="Search traces…" autocomplete="off">
+      </div>
+      <div>
+        <span class="sb-title">Agent</span>
+        <div class="agent-chips" id="agent-chips">
+          <button class="chip active" data-agent="" aria-pressed="true">all</button>
+          <button class="chip" data-agent="pi" aria-pressed="false">pi</button>
+          <button class="chip" data-agent="claude_code" aria-pressed="false">claude</button>
+        </div>
+      </div>
+      <div>
+        <span class="sb-title">State</span>
+        <div class="agent-chips" id="state-chips">
+          <button class="chip active" data-state="all" aria-pressed="true">all</button>
+          <button class="chip" data-state="active" aria-pressed="false"><span class="state-dot"></span>live</button>
+          <button class="chip" data-state="closed" aria-pressed="false"><span class="state-dot closed"></span>closed</button>
+          <button class="chip" data-state="imported" aria-pressed="false"><span class="state-dot imported"></span>imported</button>
+        </div>
+        <div class="list-info" id="list-info" aria-live="polite"></div>
+      </div>
+    </div>
+    <div id="session-list" role="listbox" aria-label="Traces">
+      <div class="list-msg">Loading…</div>
+    </div>
+    <button id="more-btn" class="list-more" hidden>Show more traces</button>
+  </div>
+
+  <div id="main">
+    <div id="trace-header">
+      <div class="hdr-row">
+        <span class="trace-title" id="trace-title">No trace selected</span>
+        <span class="agent-tag" id="trace-agent" style="display:none"></span>
+        <span class="trace-state" id="trace-state" style="display:none"></span>
+        <span class="hdr-spacer"></span>
+        <span class="hdr-tools">
+          <a class="icon-btn" id="dl-btn" style="display:none" title="Download transcript (JSONL)">&#8599;</a>
+          <button class="icon-btn" id="menu-btn" style="display:none" title="More actions">&#8942;</button>
+          <button class="icon-btn" id="refresh-btn" title="Refresh">&#8635;</button>
+        </span>
+      </div>
+      <div class="hdr-row meta">
+        <span class="trace-meta" id="trace-meta"></span>
+        <span id="trace-links" class="trace-links" style="display:none"></span>
+        <a class="hdr-notes" id="trace-notes" style="display:none"></a>
+      </div>
+    </div>
+    <div id="ledger-bar" style="display:none">
+      <span class="seg" id="kind-chips" role="group" aria-label="Show events of kind">
+        <button type="button" data-kind="">all</button>
+        <button type="button" data-kind="user">user</button>
+        <button type="button" data-kind="assistant">assistant</button>
+        <button type="button" data-kind="thinking">thinking</button>
+        <button type="button" data-kind="tools">tools</button>
+        <button type="button" data-kind="mlsweep" title="Tool calls that run the mlsweep CLI">mlsweep</button>
+      </span>
+      <span class="bar-right">
+      <span class="jump-group" id="turn-nav" style="display:none">
+        <span class="jump-label">prompt</span>
+        <button class="icon-btn" id="turn-prev" title="Previous prompt (&#91;)">&#8249;</button>
+        <span class="turn-pos" id="turn-pos"></span>
+        <button class="icon-btn" id="turn-next" title="Next prompt (&#93;)">&#8250;</button>
+      </span>
+      <span class="jump-group" id="cmd-nav" style="display:none">
+        <span class="jump-label">mlsweep</span>
+        <button class="icon-btn" id="cmd-prev" title="Previous mlsweep command (M)">&#8249;</button>
+        <span class="turn-pos" id="cmd-pos"></span>
+        <button class="icon-btn" id="cmd-next" title="Next mlsweep command (m)">&#8250;</button>
+      </span>
+      <input id="in-filter" type="search" placeholder="Filter events…" style="display:none">
+      </span>
+    </div>
+    <div id="ledger-wrap" tabindex="0" role="region" aria-label="Trace events">
+      <div id="no-sel">
+        <div>Pick a trace from the left, or capture one from inside an agent session:</div>
+        <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim)">mlsweep capture this</div>
+      </div>
+      <table id="ledger" style="display:none"><tbody></tbody></table>
+    </div>
+  </div>
+
+  <aside id="inspector">
+    <div id="inspector-header">
+      <span class="kind-tag" id="inspector-kind">event</span>
+      <span class="trace-meta" id="inspector-where"></span>
+      <button class="note-link-btn" id="inspector-link" title="Copy a markdown link to this event, for a note">Copy note link</button>
+      <button class="icon-btn" id="inspector-copy" title="Copy this event's text"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5"/><path d="M10.5 3.5v-.6a1.4 1.4 0 0 0-1.4-1.4H3.4A1.4 1.4 0 0 0 2 2.9v5.7A1.4 1.4 0 0 0 3.4 10h.6"/></svg></button>
+      <button class="icon-btn" id="inspector-close">&times;</button>
+    </div>
+    <div id="inspector-body">
+      <div class="event-full" id="inspector-text"></div>
+      <dl class="overview" id="inspector-overview"></dl>
+    </div>
+  </aside>
+</div>
+
+<script src="page-traces.js"></script>
+</body>
+</html>

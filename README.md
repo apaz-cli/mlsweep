@@ -149,6 +149,7 @@ The token is also saved to `~/.mlsweep/manager.token` so local workers find it a
 mlsweep run sweeps/my_sweep.py --manager http://localhost:7891 --stream   # submit + live status
 mlsweep run sweeps/my_sweep.py --validate                                # print all combos, no submission
 mlsweep lint sweeps/my_sweep.py                                          # check for misspelled settings and flag clashes
+mlsweep lint                                                             # every sweep file here and every experiment
 mlsweep run sweeps/my_sweep.py --dry-run                                 # print commands, no submission
 ```
 
@@ -160,8 +161,9 @@ Every client command resolves the token the same way, in order: `--token`, then 
 mlsweep status                                       # manager / token / GPUs / result paths
 mlsweep watch EXP_ID                                 # live terminal status
 mlsweep ls                                           # experiments grouped by status (`mlsweep ls EXP_ID` lists runs, --all lifts the cap of 20 settled)
+mlsweep ls --finished-since 2h                       # runs that finished lately, across the campaign
 mlsweep logs RUN_ID --experiment EXP_ID              # tail a run's training.log
-mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics (--last, --with-dims, --pivot, --json, --csv)
+mlsweep metrics --experiment EXP_ID --keys REGEX     # runs' logged metrics (--last, --agg, --step, --x/--at, --pivot, --json, --csv)
 mlsweep best --experiment EXP_ID                     # top runs by metric (--group-by DIM, --table D1,D2)
 mlsweep fetch --experiment EXP_ID --wait             # block until done, then leaderboard + download
 ```
@@ -232,6 +234,7 @@ jobs = 2
 | `devices`    | no       | Specific GPU IDs to use (worker CLI: `-g`). Default: all visible. |
 | `jobs`       | no       | Max concurrent jobs per GPU on this worker (worker CLI: `-j`). Default 1; set to 0 for unlimited. |
 | `port`       | no       | Worker TCP port (default: 7890; `0` = ephemeral). |
+| `tunnel`     | no       | `true` to reach the worker through SSH instead of dialing its port, for a machine whose firewall lets only SSH in. Default `false`. |
 | `scratch_dir` | no      | Where the worker keeps each run's working files while it runs (default: the manager's `--scratch-dir`, `/tmp/mlsweep`). A second worker given a directory that a live worker already uses takes a `.worker-<port>` subdirectory of it. |
 
 #### 2. Start the manager with the workers file
@@ -289,17 +292,25 @@ mlsweep campaign [ls]                mlsweep campaign move EXP NAME
 mlsweep move EXP RUN... --to EXP2    mlsweep purge EXP --failed --yes
 mlsweep delete EXP --yes             mlsweep gc [--yes] [--vacuum] [--downloads]
 mlsweep export tensorboard|wandb     mlsweep rename EXP --experiment-name NAME
+mlsweep rename EXP --description TEXT   # or --clear-description
 
 # cluster (the System page)
 mlsweep workers [ls|add|rm|set]      mlsweep scheduler [--placement pack|spread]
-mlsweep reschedule EXP RUN [--to W]
+mlsweep workers forget W             mlsweep workers update W
+mlsweep scheduler --pause [W|all]    mlsweep scheduler --unpause [W|all]
+mlsweep reschedule EXP RUN [--to W]  mlsweep history EXP [RUN]
 
 # notes (a shared research notes folder in a git repo the manager hosts; mlsweep docs notes)
 mlsweep notes clone DIR              mlsweep notes status
 mlsweep notes lint                   mlsweep notes links|mentions|search|history|mv
 
+# capture (coding-agent traces, on the dashboard's Traces tab; mlsweep docs traces)
+mlsweep capture this                 mlsweep capture status
+mlsweep capture on|off               mlsweep capture ls
+mlsweep capture import --days 30
+
 # docs
-mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, notes, skill
+mlsweep docs [topic]                 mlsweep --help <topic>   # readme, sweep_configuration, mlsweep, examples, notes, traces, skill
 ```
 
 ### Shell completion
@@ -367,6 +378,24 @@ with `[^1]`.
 
 See [notes.md](docs/notes.md) (`mlsweep docs notes`).
 
+## Traces
+
+Session capture records the coding-agent conversation next to the runs it
+produced. An agent runs `mlsweep capture this` inside its session, and that
+session uploads to the manager. The dashboard's Traces tab shows it as a
+ledger of your prompts, the agent's replies, its thinking, and tool calls one
+line each. Tool output and file contents are not captured. Sessions that never
+ask are never read. With `mlsweep capture on`, a session that submits a sweep is
+uploaded too.
+
+An experiment records the trace it was submitted from. The session id comes
+out of the environment the agent runs its commands with, so the link is exact
+per agent context, with no shell hooks and no guessing. A note can cite a
+trace as `[that idea](mlsweep:trace/9f6c0e22)`, and `mlsweep capture import`
+brings in the transcripts you already have.
+
+See [traces.md](docs/traces.md) (`mlsweep docs traces`).
+
 ## Dashboard and command line
 
 Everything the dashboard does, an agent can do from the command line, and the
@@ -375,15 +404,16 @@ other way round (watching live is the exception; `mlsweep watch` and
 
 | Dashboard | Command |
 |---|---|
-| Experiments: rename, move campaign, delete | `mlsweep rename EXP --experiment-name N`, `mlsweep campaign move`, `mlsweep delete` |
+| Experiments: rename, edit description, move campaign, delete | `mlsweep rename EXP --experiment-name N --description TEXT`, `mlsweep campaign move`, `mlsweep delete` |
 | Experiments: pause, unpause, stop, retry failed, cancel active, delete failed | `mlsweep pause`, `unpause`, `stop`, `retry --failed`, `cancel --running`, `purge --failed` |
 | Runs: rename, cancel, retry, move, delete | `mlsweep rename`, `cancel`, `retry`, `move`, `purge` |
 | Results, Logs, Artifacts | `mlsweep metrics`, `mlsweep best`, `mlsweep logs`, `mlsweep fetch` |
 | Code: a run's files, where they came from, diffs between versions | `mlsweep code EXP [PATH]`, `mlsweep code diff A B`, `mlsweep code checkout EXP DIR` |
 | Export (TensorBoard, W&B) | `mlsweep export tensorboard`, `mlsweep export wandb` |
-| System: workers, devices, jobs per GPU, placement | `mlsweep workers ...`, `mlsweep scheduler --placement` |
+| System: workers, devices, jobs per GPU, placement, pausing | `mlsweep workers ...`, `mlsweep scheduler --placement`, `mlsweep scheduler --pause` |
 | System: storage cleanup | `mlsweep gc` |
 | Notes | `mlsweep notes ...` (see [notes.md](docs/notes.md)) |
+| Traces | `mlsweep capture this\|on\|off\|status\|ls\|import` (see [traces.md](docs/traces.md)) |
 
 ## Running an agent
 

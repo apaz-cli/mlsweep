@@ -211,6 +211,60 @@ def test_logger_times_steps(tmp_path):
     assert [m["step_seconds"] for m in metrics] == [None, None, 2.0, 4.0]
 
 
+def test_logger_sends_total_steps_once_it_is_known(tmp_path):
+    """total_steps rides along with each metric, from the constructor or set later."""
+    import socket as socket_mod
+
+    from mlsweep.logger import MLSweepLogger
+
+    path = str(tmp_path / "w.sock")
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
+    logger = MLSweepLogger(socket_path=path)
+    logger.log({"loss": 1.0}, step=1)
+    logger.total_steps = 1500
+    logger.log({"loss": 0.9}, step=2)
+    logger.close()
+    with MLSweepLogger(socket_path=path, total_steps=300) as other:
+        other.log({"loss": 1.0}, step=1)
+
+    sent = []
+    for _ in range(2):
+        conn, _ = server.accept()
+        data = b""
+        while chunk := conn.recv(65536):
+            data += chunk
+        conn.close()
+        sent += [json.loads(line) for line in data.decode().splitlines()]
+    server.close()
+    assert [m.get("total_steps") for m in sent if m["type"] == "metric"] == [None, 1500, 300]
+
+
+def test_logger_heartbeats_at_most_every_ten_seconds(tmp_path):
+    import socket as socket_mod
+
+    from mlsweep.logger import MLSweepLogger
+
+    path = str(tmp_path / "w.sock")
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    server.bind(path)
+    server.listen(1)
+    clock = iter([0.0, 4.0, 9.9, 10.5, 30.0])
+    logger = MLSweepLogger(socket_path=path, clock=lambda: next(clock))
+    for _ in range(5):
+        logger.heartbeat()
+    logger.close()
+    conn, _ = server.accept()
+    data = b""
+    while chunk := conn.recv(65536):
+        data += chunk
+    conn.close()
+    server.close()
+    sent = [json.loads(line) for line in data.decode().splitlines()]
+    assert [m["type"] for m in sent] == ["heartbeat"] * 3  # at 0, 10.5 and 30
+
+
 def test_logger_spreads_lists_and_dicts_into_keys(tmp_path):
     """A list logs one key per element, so per-layer values reach the manager."""
     import socket as socket_mod

@@ -17,7 +17,7 @@ and, for pairs that don't fit a tree, [`EXCLUDE`](#exclude-predicate-static-filt
 
 ## Sweep File Format
 
-Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, `RUN_FROM`, `UPLOAD_EXCLUDE`, `SETUP_COMMAND`, and the [run controls](#run-controls) `MAX_RUNTIME`, `PRUNE` and `METRIC_CHECK`:
+Every sweep file must define `COMMAND` and `OPTIONS`, and may optionally define `EXCLUDE`, `EXTRA_FLAGS`, `GPUS_PER_RUN`, `NODES_PER_RUN`, `SET_DIST_ENV`, `RUN_FROM`, `UPLOAD_EXCLUDE`, `SETUP_COMMAND`, `DESCRIPTION`, and the [run controls](#run-controls) `MAX_RUNTIME`, `PRUNE` and `METRIC_CHECK`:
 
 ```python
 COMMAND = ["python", "train.py"]
@@ -31,6 +31,7 @@ RUN_FROM = "/abs/path/to/dir"  # working directory for each run (default: git ro
 UPLOAD_EXCLUDE = ["/runs", "*.ckpt"]  # leave these out of the uploaded project
 EXTRA_FLAGS = ["--seed", "42"]
 SETUP_COMMAND = "pip install -e ."  # shell command run in the workspace before each run
+DESCRIPTION = "Does warmup length matter at 3e-4?"  # what the experiment is for
 
 # Optional ranking defaults (stored on the experiment; see below)
 METRIC = "val_loss"   # metric name used to rank runs
@@ -43,6 +44,21 @@ METRIC_CHECK = True   # (default) pause if the first runs never log METRIC
 
 def EXCLUDE(combo: dict) -> bool: ...
 ```
+
+### `DESCRIPTION`
+
+A string saying what the experiment is for. It is stored on the experiment and
+shown in the dashboard (on hover over the experiment's name, on the Experiments
+and Results pages) and in `mlsweep status`. `mlsweep run --description TEXT`
+overrides it. An experiment submitted with neither gets a warning, and so does a
+sweep file without one in `mlsweep lint`.
+
+Change or remove it later with `mlsweep rename EXP --description TEXT` (or
+`--clear-description`), the "Edit description…" item in an experiment's menu on
+the Experiments page, or a click on the experiment's name on Results. `--append` keeps
+the description the experiment already has. Over HTTP it is
+`PUT /api/experiments/EXP/description` with `{"description": TEXT}`, where null
+or `""` clears it. Experiment JSON calls the field `note`.
 
 ### `METRIC` and `GOAL`
 
@@ -826,6 +842,7 @@ mlsweep wait EXP --until done            # no pending/dispatched/running jobs
 mlsweep wait EXP --until any-failure     # return as soon as any run failed
 mlsweep wait EXP --until any-done        # return as soon as any run finished, however it ended
 mlsweep wait EXP --until stalled         # return when a running run stops progressing
+mlsweep wait EXP --until started         # return once every run has logged a step (a smoke test)
 mlsweep wait EXP --until done --timeout 3600 --interval 15
 mlsweep wait EXP --until stalled --stalled-after 900
 ```
@@ -835,9 +852,14 @@ mlsweep wait EXP --until stalled --stalled-after 900
 | `0` | Every run finished successfully. |
 | `1` | At least one run finished as `failed`, or the manager paused the sweep for a [run control](#metric_check). |
 | `2` | `--timeout` elapsed with work outstanding (`0` = wait forever). Waiting again is safe. |
-| `3` | `--until stalled` and a running run made no log/metric progress for `--stalled-after` seconds (default `900`). |
+| `3` | `--until stalled` and a running run made no log/metric progress for `--stalled-after` seconds (default `900`). A script with long quiet stretches calls `logger.heartbeat()` in them. |
 | `4` | No answer: the manager is unreachable, the ID is unknown, or the experiment has no runs. |
 | `5` | No failures, but some runs were cancelled or the sweep was stopped, so the results are partial. |
+
+`--until started` exits `0` once every run has logged a metric step or finished, and `1`
+as soon as one fails. It waits for pending runs too, so it says a smoke test's runs all got
+going. A script that never uses the logger never counts as started; use `--until
+any-failure` with a timeout for those.
 
 `--until stalled` also exits when the sweep settles, so it covers `--until done`. Neither notices runs
 stuck in `pending`. Pruned runs count as finished; the summary line says how many there were. A running Bayesian sweep is not settled, even with no active runs, because the manager is about to add more.
@@ -861,15 +883,62 @@ done
 `stopped`, `paused`, `stalled`, `run_finished`, `timeout` or `unknown`), `exit_code`,
 the `runs` it is about with their status and reason, `counts` by status, and `cursor`.
 
+#### Several experiments at once
+
+`wait` takes more than one experiment ID, or none. With none it watches every
+experiment in the campaign that has active runs, and picks up experiments
+submitted while it waits, so one loop covers everything an agent has queued:
+
+```bash
+mlsweep wait EXP_A EXP_B --until any-done --since "$cursor" --json
+mlsweep wait --until any-done --since "$cursor" --json   # the whole campaign
+```
+
+The answer is the most urgent one any of them gives. An unknown ID (`4`) comes
+first, then a sweep the manager paused (`1`), a failure under `--until any-failure`
+(`1`), a stalled run (`3`), and runs that finished (`0`). Finished runs from every
+experiment are reported together, so one cursor covers them all. Otherwise
+`wait` returns once all of them have settled, with the worst of their results:
+failure, then cancelled, then settled. Without IDs, `--until any-failure` counts
+only runs that failed after `--since`, so an old failure in a still-running
+experiment doesn't end it at once. With nothing active in the campaign it exits
+`0` straight away.
+
+The `--json` result has `experiment_ids`, `campaign` when no IDs were given,
+`runs` with each run's `experiment_id`, `counts` over all of them, `experiments`
+with each one's counts, and `cursor`.
+
 `--interval` controls the poll period (default `10` seconds). `mlsweep fetch
 --wait` and `mlsweep best --wait` also exit non-zero when the experiment settles
 with failures.
+
+### Comparing a sweep file with an experiment
+
+`mlsweep run SWEEP.py --compare EXP` submits nothing. It matches the file's
+runs with EXP's by their full command line, so a renamed run still matches, and prints how
+many are already in EXP, how many `--append` would add, and how many runs EXP has that the
+file doesn't make. A new run whose name EXP already uses for another command is listed too,
+since `--append` would refuse it. Use it to check that a rewritten sweep file still
+describes an experiment, or that several files appended to one experiment add up to it.
+`--json` gives the lists (`same`, `new`, `clash`, `only_in_experiment`).
+
+```bash
+mlsweep run sweeps/scaling.py --compare scaling_20261126_0217_24d4
+```
 
 ### Checking a sweep file
 
 `mlsweep lint SWEEP.py ...` reports mistakes that would otherwise pass silently.
 `mlsweep run` runs the same checks first, refuses a file with errors (even with
 `--validate` or `--dry-run`), and prints the warnings.
+
+With no files, `mlsweep lint` checks everything. That means every sweep file in
+the project (any `.py` file whose first line is an `mlsweep_run` shebang, skipping
+hidden directories and virtualenvs) and every experiment on the manager in all
+campaigns. For an experiment, the one check so far is a missing description. A
+manager it can't reach is a warning, and the files are still checked. With
+`--json`, experiments appear as `experiment:CAMPAIGN/ID` next to the file paths,
+and `manager` holds the warning when the manager was not checked.
 
 Errors:
 
@@ -884,6 +953,8 @@ Warnings:
 - `flags` given for values that are not in the dim's `values`
 - `METRIC` without `GOAL`, or `GOAL` without `METRIC`
 - a grid of more than 2000 runs
+- no `DESCRIPTION` (`mlsweep run` leaves this one out, and warns after submitting
+  if the experiment ended up with no description)
 
 `--strict` also exits `1` on warnings, and `--json` prints the findings for scripts.
 
@@ -977,7 +1048,7 @@ Monitor / Control / Campaigns / Docs). Individual binaries remain as aliases.
 | `manager` | Start the manager daemon (alias of `mlsweep_manager`). |
 | `run` | Submit a sweep (alias of `mlsweep_run`). |
 | `worker` | Start a worker daemon (alias of `mlsweep_worker`). |
-| `lint SWEEP.py...` | Check sweep files (see [Checking a sweep file](#checking-a-sweep-file)). `--strict`, `--json`. |
+| `lint [SWEEP.py...]` | Check sweep files, or with none every sweep file and experiment (see [Checking a sweep file](#checking-a-sweep-file)). `--strict`, `--json`. |
 | `gen_makefile` | Write a standard `Makefile` (adds `make sweep-*` targets). |
 | `watch <exp_id>` | Live terminal status for an experiment (`--events` / `--json` stream one JSON event per line). |
 | `fetch` | Download + summarize + rank an experiment's results (leaderboard). |
@@ -1105,7 +1176,8 @@ only means no IDs are offered.
 | `--fetch` | Fetch and display results after submission (when `--stream` is not used). |
 | `--dry-run` | Print the commands that would be executed without running them. |
 | `--validate` | Validate sweep config, print all combinations, and exit (no jobs submitted). |
-| `--note <text>` | Human-readable note stored with the experiment. |
+| `--compare EXP` | Like `--validate`, but compare the runs with EXP's (see [Comparing a sweep file with an experiment](#comparing-a-sweep-file-with-an-experiment)). |
+| `--description <text>` | What the experiment is for. Overrides the sweep file's [`DESCRIPTION`](#description). `--note` is the older name and still works. |
 | `--max-retries N` | Max automatic retries of a run lost with its worker (default: 2). A run that exits with an error is not retried automatically. `mlsweep retry` is not counted and resets the count. |
 | `--setup-command <cmd>` | Shell command executed before training in the worker workspace. |
 | `--wandb-project P` | W&B project name (enables W&B logging). |

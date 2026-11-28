@@ -120,6 +120,11 @@ def parse_lines(text: str) -> tuple[int | None, int | None]:
     return start, end
 
 
+def code_ref(target: str, path: str, start: int, end: int | None = None) -> str:
+    """``mlsweep:code/TARGET/PATH#Lstart[-end]``: the link :func:`parse_code_ref` reads."""
+    return f"mlsweep:{CODE_PREFIX}{target}/{path}#L{start}" + (f"-{end}" if end not in (None, start) else "")
+
+
 def parse_code_ref(raw: str) -> CodeRef:
     """``[mlsweep:]code/TARGET[/PATH][#Lstart[-end]]`` as a :class:`CodeRef`."""
     text = raw.strip()

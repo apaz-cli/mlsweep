@@ -8,6 +8,13 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # Tests take what they need as arguments; nothing patches the code under test.
+      - id: forbid-monkeypatch
+        name: "forbid monkeypatching"
+        entry: '(?i)\bmonkey[\s_-]?patch|unittest[./]mock|\bmock[./]patch\b|from\s+mock\s+import'
+        language: pygrep
+        types: [python]
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.15.0
     hooks:

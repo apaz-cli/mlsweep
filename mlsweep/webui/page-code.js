@@ -29,14 +29,16 @@ const S = {
   filter: "", changedOnly: true,
   details: false,
 };
-const manifests = new Map();
+const manifests = new Map();          // snapshot -> Promise<manifest> (one fetch per snapshot)
 const fileCache = new Map();          // snapshot + path -> text (content never changes)
+// Bumped by every navigation (experiment, version, file, popstate).  Async work
+// carries the token it began with and drops its result if the view moved on.
+let navSeq = 0;
 const openDirs = new Set();
 const TREE_ORDER = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });   // as the notes tree sorts
 
 MLChrome.collapsibleSidebar(document.getElementById("sidebar"));
 MLChrome.resizable(document.getElementById("sidebar"), { name: "sidebar_width_code", min: 180, max: 520 });
-MLChrome.resizable(document.getElementById("tree-pane"), { name: "code_tree_width", min: 150, max: 560 });
 
 // ── the URL ──────────────────────────────────────────────────────────────────
 
@@ -106,9 +108,15 @@ async function getJSON(path) {
   return body;
 }
 
-async function manifestOf(sid) {
-  if (!manifests.has(sid)) manifests.set(sid, (await getJSON(`/api/snapshots/${encodeURIComponent(sid)}`)).manifest);
-  return manifests.get(sid);
+function manifestOf(sid) {
+  let pending = manifests.get(sid);
+  if (!pending) {
+    pending = getJSON(`/api/snapshots/${encodeURIComponent(sid)}`).then(body => body.manifest);
+    // A failed fetch is retryable; a concurrent caller shares this one request.
+    pending.catch(() => manifests.delete(sid));
+    manifests.set(sid, pending);
+  }
+  return pending;
 }
 
 const versions = () => (S.info && S.info.versions) || [];
@@ -135,49 +143,6 @@ function changeOf(path) {
   return S.diff ? (S.diff.changes.find(c => c.path === path) || null) : null;
 }
 
-// ── sidebar ──────────────────────────────────────────────────────────────────
-
-function renderJobs() {
-  const list = $("job-list");
-  const n = versions().length;
-  $("runs-note").textContent = S.snapOnly ? "" : n > 1 ? `· ${n} code versions` : n === 1 ? "· one code version" : "";
-  if (S.snapOnly) {
-    const used = (S.usage && S.usage.experiments) || [];
-    list.innerHTML = `<div class="job-list-msg">Opened by snapshot ID.${used.length
-      ? "<br>Used by " + used.map(e => `<b>${escHtml(e.name || e.experiment_id)}</b>`).join(", ") + "." : ""}
-      <br>Choose an experiment to browse its runs.</div>`;
-    return;
-  }
-  if (!S.jobs.length) { list.innerHTML = `<div class="job-list-msg">No runs</div>`; return; }
-  const sorted = [...S.jobs].sort((a, b) => new Date(b.submit_time) - new Date(a.submit_time));
-  list.innerHTML = sorted.map(j => {
-    let combo = {};
-    try { combo = typeof j.combo === "string" ? JSON.parse(j.combo || "{}") : (j.combo || {}); } catch { combo = {}; }
-    const comboStr = Object.entries(combo).map(([k, v]) => `${k}=${v}`).join(" ");
-    const v = n > 1 ? versionNumber(j.artifact_id) : 0;
-    const cls = j.run_id === S.runId ? " selected" : (!S.runId && j.artifact_id === S.snapshot ? " same" : "");
-    return `<div class="job-item${cls}" data-run-id="${escHtml(j.run_id)}" title="Click to see the code this run used. Right-click for more.">
-      <div class="job-item-top">
-        <span class="job-run-id" title="${escHtml(j.run_id)}">${runNameHtml(j)}</span>
-        ${v ? `<span class="ver-tag" title="${escHtml(short(j.artifact_id))}">v${v}</span>` : ""}
-        <span class="badge badge-${escHtml(j.status)}">${escHtml(j.status)}</span>
-      </div>
-      ${comboStr ? `<div class="job-combo" title="${escHtml(comboStr)}">${escHtml(comboStr)}</div>` : ""}
-    </div>`;
-  }).join("");
-  list.querySelectorAll(".job-item").forEach(item => item.addEventListener("click", () => {
-    const job = S.jobs.find(j => j.run_id === item.dataset.runId);
-    if (!job) return;
-    // A second click on the selected run goes back to the experiment's latest code.
-    if (S.runId === job.run_id) showCode(latestSnapshot(), null, { push: true });
-    else showCode(job.artifact_id, job, { push: true });
-  }));
-  list.querySelectorAll(".job-item").forEach(item => item.addEventListener("contextmenu", e => {
-    const job = S.jobs.find(j => j.run_id === item.dataset.runId);
-    if (job) runMenu(e, job);
-  }));
-}
-
 // ── header ───────────────────────────────────────────────────────────────────
 
 function metaItem(label, value) {
@@ -191,6 +156,8 @@ function renderHeader() {
   const job = S.runId ? S.jobs.find(j => j.run_id === S.runId) : null;
   const title = $("hdr-title");
   title.replaceChildren();
+  if (job) mlTagEntity(title, job.experiment_id, job.run_id, { title: job.label || job.run_id, skip: "code", codeFiles: job.code_files });
+  else mlTagEntity(title, S.snapOnly ? "" : S.expId, "", { skip: "code" });
   $("hdr-kind").textContent = job ? "Run" : S.snapOnly ? "Snapshot" : "Experiment";
   if (job) title.innerHTML = `<span class="mono">${runNameHtml(job)}</span>`;
   else if (S.snapOnly) title.append(el("span", "mono", short(S.snapshot)));
@@ -200,6 +167,14 @@ function renderHeader() {
     title.title = S.expId;
   }
   $("hdr-badge").innerHTML = job ? `<span class="badge badge-${escHtml(job.status)}">${escHtml(job.status)}</span>` : "";
+  // A run's code came from its View menu or a link; this goes back to the experiment's.
+  if (job) {
+    const back = el("button", "hdr-back", "← experiment's latest code");
+    back.type = "button";
+    back.title = "Show the experiment's latest code instead of this run's";
+    back.onclick = () => showCode(latestSnapshot(), null, { push: true });
+    $("hdr-badge").append(" ", back);
+  }
 
   // Version menu: every version of the experiment's code.
   const vs = $("version-select");
@@ -259,6 +234,7 @@ function renderHeader() {
     for (const e of S.usage.experiments.slice(0, 3)) {
       const a = el("a", null, e.name || e.experiment_id);
       a.href = pageHref("code.html", { experiment: e.experiment_id });
+      mlTagEntity(a, e.experiment_id, "", { title: e.name || e.experiment_id, skip: "code" });
       meta.append(metaItem("used by", a));
     }
   }
@@ -290,7 +266,8 @@ async function renderDetails(scrollToDiff) {
   const box = $("details");
   box.classList.toggle("on", S.details);
   if (!S.details) return;
-  const sub = submissionOf(S.snapshot);
+  const token = navSeq, snapshot = S.snapshot;
+  const sub = submissionOf(snapshot);
   box.replaceChildren();
   const grid = el("div", "prov-grid");
   const row = (k, v) => { grid.append(el("div", "k", k)); const d = el("div", "v"); d.append(v); grid.append(d); };
@@ -327,10 +304,14 @@ async function renderDetails(scrollToDiff) {
     box.append(sec);
   }
   if ((vcs && vcs.diff_bytes) || m.sweep_source_bytes) {
-    if (!fullSub || fullSub.submission_id !== sub.submission_id) {
-      try { fullSub = await getJSON(`/api/code/submissions/${sub.submission_id}`); } catch { fullSub = null; }
+    let fullSubForThis = fullSub;
+    if (!fullSubForThis || fullSubForThis.submission_id !== sub.submission_id) {
+      try { fullSubForThis = await getJSON(`/api/code/submissions/${sub.submission_id}`); }
+      catch { fullSubForThis = null; }
     }
-    const full = (fullSub && fullSub.meta) || {};
+    if (token !== navSeq || S.snapshot !== snapshot || !S.details) return;
+    fullSub = fullSubForThis;
+    const full = (fullSubForThis && fullSubForThis.meta) || {};
     if (full.vcs && full.vcs.diff) {
       const sec = el("div", "prov-section");
       sec.append(el("h4", null, "Uncommitted changes" + (full.vcs.diff_truncated ? " (cut at 1 MB)" : "")));
@@ -348,14 +329,18 @@ async function renderDetails(scrollToDiff) {
 
 // ── comparing ────────────────────────────────────────────────────────────────
 
-async function loadCompare() {
+async function loadCompare(token = navSeq) {
+  const compare = S.compare, snapshot = S.snapshot;
   S.diff = null;
-  if (!S.compare) return;
+  if (!compare) return;
   try {
-    S.diff = await getJSON(`/api/code/diff?from=${encodeURIComponent(S.compare)}&to=${encodeURIComponent(S.snapshot)}&context=4`);
+    const diff = await getJSON(`/api/code/diff?from=${encodeURIComponent(compare)}&to=${encodeURIComponent(snapshot)}&context=4`);
+    if (token !== navSeq || S.compare !== compare || S.snapshot !== snapshot) return;
+    S.diff = diff;
   } catch (e) {
-    await mlAlert(`Can't compare with ${S.compare}: ${e.message}`);
-    S.compare = "";
+    if (token !== navSeq || S.compare !== compare || S.snapshot !== snapshot) return;
+    await mlAlert(`Can't compare with ${compare}: ${e.message}`);
+    if (token === navSeq) S.compare = "";
   }
 }
 
@@ -466,20 +451,6 @@ function linesMenu(e, n) {
   ]);
 }
 
-function runMenu(e, job) {
-  const differs = job.artifact_id && job.artifact_id !== S.snapshot && job.artifact_id.startsWith("snap:");
-  mlContextMenu(e, [
-    { title: job.label || job.run_id },
-    { label: "Show this run's code", run: () => showCode(job.artifact_id, job, { push: true }) },
-    differs ? { label: "Compare with the code shown now", hint: `v${versionNumber(job.artifact_id)}`, run: () => compareWith(job.artifact_id) } : null,
-    "-",
-    { label: "Open logs", run: () => { location.href = pageHref("logs.html", { experiment: job.experiment_id, run: job.run_id }); } },
-    { label: "Open artifacts", run: () => { location.href = pageHref("files.html", { experiment: job.experiment_id, run: job.run_id }); } },
-    { label: "Open results", run: () => { location.href = pageHref("results.html", { experiment: job.experiment_id }); } },
-    "-",
-    { label: "Copy run ID", run: () => copyText(job.run_id, "Copied the run ID") },
-  ]);
-}
 
 // ── file tree ────────────────────────────────────────────────────────────────
 
@@ -766,10 +737,10 @@ function renderDir(path) {
   $("view").replaceChildren(table);
 }
 
-async function fileText(path, entry) {
-  const key = S.snapshot + "\n" + path;
+async function fileText(path, entry, snapshot = S.snapshot) {
+  const key = snapshot + "\n" + path;
   if (fileCache.has(key)) return fileCache.get(key);
-  const url = `/api/snapshots/${encodeURIComponent(S.snapshot)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
+  const url = `/api/snapshots/${encodeURIComponent(snapshot)}/files/${path.split("/").map(encodeURIComponent).join("/")}`;
   const r = await apiFetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const bytes = new Uint8Array(await r.arrayBuffer());
@@ -778,7 +749,11 @@ async function fileText(path, entry) {
   return text;
 }
 
-async function openPath(path, { keepLines = false, push = false } = {}) {
+async function openPath(path, { keepLines = false, push = false, token = null } = {}) {
+  // A click in the tree starts a new navigation; showCode passes its own token
+  // so its follow-up calls are not mistaken for a newer view.
+  const seq = token ?? ++navSeq;
+  const snapshot = S.snapshot;
   S.path = path || "";
   if (!keepLines) S.start = S.end = null;
   if (S.path) revealInTree(S.path);
@@ -834,9 +809,13 @@ async function openPath(path, { keepLines = false, push = false } = {}) {
   }
   view.replaceChildren(el("div", "msg", "Loading…"));
   let text;
-  try { text = await fileText(S.path, entry); }
-  catch (e) { view.replaceChildren(el("div", "msg err", `Could not load ${S.path}: ${e.message}`)); return; }
-  if (S.path !== path) return;   // another file was opened meanwhile
+  try { text = await fileText(S.path, entry, snapshot); }
+  catch (e) {
+    if (seq !== navSeq || S.path !== path || S.snapshot !== snapshot) return;
+    view.replaceChildren(el("div", "msg err", `Could not load ${S.path}: ${e.message}`));
+    return;
+  }
+  if (seq !== navSeq || S.path !== path || S.snapshot !== snapshot) return;   // another file was opened meanwhile
   if (text == null) {
     meta.textContent = fmtSize(entry[2]);
     view.replaceChildren(el("div", "msg", `Binary file, ${fmtSize(entry[2])}. The download button next to the path has it.`));
@@ -879,6 +858,7 @@ async function openPath(path, { keepLines = false, push = false } = {}) {
 function showMessage(text, err) {
   $("code-header").style.display = "none";
   $("code-inner").style.display = "none";
+  $("tree-pane").style.display = "none";
   const box = $("no-sel");
   box.style.display = "";
   box.textContent = text;
@@ -896,8 +876,8 @@ function defaultPath() {
 }
 
 async function showCode(sid, job, { push = false, path = null, lines = "", compare = null } = {}) {
+  const seq = ++navSeq;
   S.runId = job ? job.run_id : null;
-  renderJobs();
   if (!sid) {
     showMessage(job ? "This run has no code recorded: it ran from the worker's own directory."
                     : "No code is recorded for this experiment.");
@@ -909,42 +889,54 @@ async function showCode(sid, job, { push = false, path = null, lines = "", compa
     syncUrl(push);
     return;
   }
+  let manifest;
   try {
-    S.manifest = await manifestOf(sid);
+    manifest = await manifestOf(sid);
   } catch (e) {
+    if (seq !== navSeq) return;
     showMessage(`Could not load this code: ${e.message}`, true);
     return;
   }
+  if (seq !== navSeq) return;
+  S.manifest = manifest;
   S.snapshot = sid;
   if (compare !== null) S.compare = compare;
   if (S.compare === sid) S.compare = "";
-  await loadCompare();
+  await loadCompare(seq);
+  if (seq !== navSeq) return;
   if (path !== null) { S.path = path; [S.start, S.end] = parseLines(lines); }
   const known = !S.path || fileEntry(S.path) || isDir(S.path) || changeOf(S.path);
   if (!known || (path === null && !S.path)) { S.path = known && S.path ? S.path : defaultPath(); S.start = S.end = null; }
-  renderJobs();
   renderHeader();
   $("no-sel").style.display = "none";
   $("code-header").style.display = "";
   $("code-inner").style.display = "";
+  $("tree-pane").style.display = "";
   renderTree();
-  await openPath(S.path, { keepLines: true, push });
+  await openPath(S.path, { keepLines: true, push, token: seq });
 }
 
-async function loadExperimentData(expId) {
-  [S.jobs, S.info] = await Promise.all([
+async function loadExperimentData(expId, token = navSeq) {
+  const [jobs, info] = await Promise.all([
     getJSON(`/api/experiments/${encodeURIComponent(expId)}/jobs`),
     getJSON(`/api/experiments/${encodeURIComponent(expId)}/code`),
   ]);
+  if (token !== navSeq || S.expId !== expId) return false;
+  S.jobs = jobs; S.info = info;
+  return true;
 }
 
 async function selectExperiment(expId, want = {}) {
+  const token = ++navSeq;
   S.snapOnly = false; S.usage = null;
   S.expId = expId;
   S.jobs = []; S.info = null; S.runId = null;
-  $("job-list").innerHTML = `<div class="job-list-msg">Loading…</div>`;
-  try { await loadExperimentData(expId); }
-  catch (e) { showMessage(`Could not load ${expId}: ${e.message}`, true); return; }
+  try { if (!await loadExperimentData(expId, token)) return; }
+  catch (e) {
+    if (token !== navSeq) return;
+    showMessage(`Could not load ${expId}: ${e.message}`, true);
+    return;
+  }
   const job = want.run && S.jobs.find(j => j.run_id === want.run);
   let sid = job ? job.artifact_id : latestSnapshot();
   if (!job && want.snap) {
@@ -956,13 +948,16 @@ async function selectExperiment(expId, want = {}) {
 }
 
 async function showSnapshotOnly(target, want = {}) {
+  const token = ++navSeq;
   let res;
   try { res = await getJSON(`/api/code/resolve?ref=${encodeURIComponent("code/" + target)}`); }
   catch (e) { res = { ok: false, error: e.message }; }
+  if (token !== navSeq) return;
   if (!res.ok) { showMessage(res.error || "not found", true); return; }
   S.snapOnly = true;
   S.expId = null; S.jobs = []; S.info = null;
   try { S.usage = await getJSON(`/api/snapshots/${encodeURIComponent(res.snapshot)}/usage`); } catch { S.usage = null; }
+  if (token !== navSeq) return;
   expSelect.value = "";
   await showCode(res.snapshot, null, { path: want.path ?? null, lines: want.lines || "", compare: want.compare ?? "" });
 }
@@ -975,16 +970,21 @@ const expSelect = $("exp-select");
 async function showCampaign(want) {
   MLCampaign.fill(campaignSelect, S.exps);
   const chosen = MLCampaign.fillExperiments(expSelect, MLCampaign.filter(S.exps), want && want.exp, S.expId);
-  if (!chosen) { S.expId = null; showMessage("No experiments in this campaign."); $("job-list").innerHTML = ""; return; }
+  if (!chosen) { S.expId = null; showMessage("No experiments in this campaign."); return; }
   if (chosen !== S.expId || S.snapOnly || want) await selectExperiment(chosen, want || {});
 }
 
+let expsSeq = 0;
 async function loadExperiments() {
+  const seq = ++expsSeq;
   try {
-    S.exps = await getJSON("/api/experiments");
+    const exps = await getJSON("/api/experiments");
+    if (seq !== expsSeq) return false;
+    S.exps = exps;
     setConnStatus("connected");
     return true;
   } catch {
+    if (seq !== expsSeq) return false;
     setConnStatus("disconnected");
     return false;
   }
@@ -1008,7 +1008,8 @@ expSelect.addEventListener("change", () => { S.path = ""; S.compare = ""; select
 $("refresh-btn").addEventListener("click", async () => {
   await loadExperiments();
   if (S.expId && !S.snapOnly) {
-    try { await loadExperimentData(S.expId); } catch { return; }
+    const expId = S.expId, token = ++navSeq;
+    try { if (!await loadExperimentData(expId, token)) return; } catch { return; }
     const job = S.runId && S.jobs.find(j => j.run_id === S.runId);
     const latest = latestSnapshot();
     await showCode(job ? job.artifact_id : (versionNumber(S.snapshot) ? S.snapshot : latest), job || null);

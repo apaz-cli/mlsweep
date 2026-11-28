@@ -33,17 +33,6 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 select { min-width: 0; padding: 5px 7px; border: 1px solid var(--border-input); border-radius: 4px; font-size: 12px; background: var(--btn-bg); color: var(--text); }
 #sidebar select { flex: 1; }
 select:focus, input:focus { outline: none; border-color: var(--accent); }
-#job-list { flex: 1; overflow-y: auto; }
-.job-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border); border-left: 2px solid transparent; }
-.job-item:hover { background: var(--btn-hover); }
-.job-item.selected { background: var(--radio-checked-bg); border-left-color: var(--radio-checked-border); }
-.job-item.same { border-left-color: color-mix(in srgb, var(--radio-checked-border) 40%, transparent); }
-.job-item-top { display: flex; align-items: center; gap: 6px; }
-.job-run-id { font-family: monospace; font-size: 11px; color: var(--text-strong); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job-combo { font-size: 10px; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job-list-msg { padding: 20px 12px; color: var(--text-muted); font-size: 12px; text-align: center; line-height: 1.6; }
-.ver-tag { font-family: monospace; font-size: 9.5px; padding: 0 5px; border-radius: 3px; border: 1px solid var(--border-input); color: var(--text-label); flex-shrink: 0; }
-
 /* ── Header ────────────────────────────────────────────────────────────────── */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 #code-header { background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -89,9 +78,11 @@ select:focus, input:focus { outline: none; border-color: var(--accent); }
 .prov-section h4 { margin: 0 0 6px; font-size: 10px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; }
 .prov-cmd { background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: monospace; font-size: 11.5px; overflow-x: auto; white-space: pre; color: var(--text); }
 
-/* ── Tree and file ─────────────────────────────────────────────────────────── */
+/* ── Tree (in the sidebar) and file ─────────────────────────────────────────────────────────── */
 #code-inner { flex: 1; display: flex; min-height: 0; }
-#tree-pane { flex: 0 0 clamp(170px, 22vw, 260px); min-width: 0; border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--surface); }
+#tree-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.hdr-back { font-size: 11px; color: var(--text-muted); background: none; border: 0; padding: 0 2px; cursor: pointer; flex-shrink: 0; }
+.hdr-back:hover { color: var(--accent-text); text-decoration: underline; }
 #tree-head { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 6px 0 12px; flex-shrink: 0; }
 #tree-title { font-size: 12px; font-weight: 700; color: var(--text-strong); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #tree-title .count { font-weight: 500; color: var(--text-muted); font-size: 10px; margin-left: 4px; font-family: ui-monospace, monospace; }
@@ -175,6 +166,7 @@ table.dirlist td.size { text-align: right; color: var(--text-muted); font-size: 
 </style>
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
@@ -196,11 +188,15 @@ table.dirlist td.size { text-align: right; color: var(--text-muted); font-size: 
           <button class="icon-btn" id="refresh-btn" title="Refresh experiments, runs and code">&#8635;</button>
         </div>
       </div>
-      <div class="sb-section">
-        <span class="sb-title">Runs <span class="sb-note" id="runs-note"></span></span>
-      </div>
     </div>
-    <div id="job-list"><div class="job-list-msg">Loading…</div></div>
+    <div id="tree-pane" style="display:none">
+      <div id="tree-head">
+        <span id="tree-title">Files</span>
+        <button type="button" class="ghost-btn" id="tree-collapse" title="Collapse all folders"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 2.5 8 6l3.5-3.5M4.5 13.5 8 10l3.5 3.5"/></svg></button>
+      </div>
+      <input id="tree-filter" placeholder="Filter files" autocomplete="off" spellcheck="false">
+      <div id="file-tree"></div>
+    </div>
   </div>
 
   <div id="main">
@@ -240,14 +236,6 @@ table.dirlist td.size { text-align: right; color: var(--text-muted); font-size: 
       <div id="details"></div>
     </div>
     <div id="code-inner" style="display:none">
-      <div id="tree-pane">
-        <div id="tree-head">
-          <span id="tree-title">Files</span>
-          <button type="button" class="ghost-btn" id="tree-collapse" title="Collapse all folders"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 2.5 8 6l3.5-3.5M4.5 13.5 8 10l3.5 3.5"/></svg></button>
-        </div>
-        <input id="tree-filter" placeholder="Filter files" autocomplete="off" spellcheck="false">
-        <div id="file-tree"></div>
-      </div>
       <div id="viewer">
         <div id="path-bar">
           <span id="crumbs"></span>

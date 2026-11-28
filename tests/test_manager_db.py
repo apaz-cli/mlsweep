@@ -49,6 +49,7 @@ from mlsweep._manager_db import (
     get_metrics_for_run,
     insert_log,
     get_logs_for_run,
+    get_logs_with_seq_for_run,
     last_log_seq,
     uncompacted_log_attempts,
     compact_log_attempt,
@@ -1039,6 +1040,97 @@ def test_experiment_counts_include_runs_with_artifacts():
             rows = await list_experiments_with_counts(db)
             assert rows[0]["job_counts"]["with_artifacts"] == 1
             assert rows[0]["job_counts"]["total"] == 2
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_db_writer_survives_a_cancelled_caller():
+    """A caller cancelled while its write is queued must not kill the actor.
+
+    `run()` used to call `fut.set_result`/`set_exception` without checking that
+    the caller's future was already cancelled; the resulting InvalidStateError
+    escaped the loop and every later write hung forever.
+    """
+    class FakeDb:
+        async def rollback(self) -> None:
+            pass
+
+    async def run():
+        writer = DbWriter(FakeDb())  # type: ignore[arg-type]
+        task = asyncio.create_task(writer.run())
+        started = asyncio.Event()
+
+        async def slow():
+            started.set()
+            await asyncio.sleep(0.2)
+            return "done"
+
+        caller = asyncio.create_task(writer._enqueue(slow))
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await asyncio.sleep(0.3)
+        assert not task.done(), "a cancelled caller killed the writer actor"
+        assert await asyncio.wait_for(
+            writer._enqueue(lambda: asyncio.sleep(0, result=42)), 1) == 42
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+
+def test_log_text_and_offset_are_one_snapshot():
+    async def run():
+        db = await _init_db()
+        try:
+            job = await _dispatched(db)
+            end = await _write_chunks(db, job, _CHUNKS)
+            text, seq = await get_logs_with_seq_for_run(db, "run1", "exp1")
+            assert text == "".join(_CHUNKS)
+            assert seq == end
+            assert await get_logs_for_run(db, "run1", "exp1") == text
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_code_file_counts():
+    """A snapshot's file count is kept with it, backfilled for older rows, and the
+    experiments listing gives the count of the code its code page opens on."""
+    from mlsweep._manager_db import insert_code_submission, register_snapshot, snapshot_file_counts
+
+    def manifest(n):
+        return '{"files": [%s]}' % ",".join(f'{{"path": "f{i}.py"}}' for i in range(n))
+
+    async def run():
+        db = await _init_db()
+        try:
+            await create_experiment(db, experiment_id="exp1", name="t", campaign="test")
+            await create_experiment(db, experiment_id="nocode", name="t", campaign="test")
+            await register_snapshot(db, artifact_id="snap:old", manifest=manifest(2), size_bytes=1)
+            await register_snapshot(db, artifact_id="snap:new", manifest=manifest(5), size_bytes=1)
+            await insert_job(db, run_id="r1", experiment_id="exp1", command=["echo"], artifact_id="snap:old")
+            await insert_code_submission(db, "exp1", {"snapshot": "snap:old"})
+            rows = {r["experiment_id"]: r for r in await list_experiments_with_counts(db)}
+            assert rows["exp1"]["code_files"] == 2 and rows["nocode"]["code_files"] is None
+
+            # Appended with newer code: the latest submission's snapshot counts.
+            await insert_code_submission(db, "exp1", {"snapshot": "snap:new"})
+            rows = {r["experiment_id"]: r for r in await list_experiments_with_counts(db)}
+            assert rows["exp1"]["code_files"] == 5
+            assert await snapshot_file_counts(db, ["snap:old", "snap:new", None, "sha256:x"]) == {
+                "snap:old": 2, "snap:new": 5}
+
+            # A database from before the column: opening it fills the count in.
+            await db.execute("UPDATE artifacts SET file_count = NULL")
+            await db.commit()
+            await init_db(db)
+            assert await snapshot_file_counts(db, ["snap:old"]) == {"snap:old": 2}
         finally:
             await db.close()
 

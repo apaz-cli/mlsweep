@@ -63,6 +63,7 @@ from mlsweep._shared import (
     MsgRun,
     MsgShutdown,
     MsgStarted,
+    MsgHeartbeat,
     MsgSyncReq,
     MsgWorkerHello,
     LOG_CHUNK_BYTES,
@@ -1172,7 +1173,7 @@ def _ipc_conn_thread(sock: socket.socket) -> None:
                         if rs is not None:
                             rs.ipc_conns += 1
                         _ipc_cond.notify_all()
-                _handle_ipc_msg(msg)
+                _handle_ipc_msg(msg, rs)
     except OSError:
         pass
     finally:
@@ -1221,16 +1222,22 @@ def _ipc_run_state_locked(msg: dict[str, Any]) -> RunState | None:
     return next((rs for rs in _in_flight.values() if rs.run_id == run_id), None)
 
 
-def _handle_ipc_msg(msg: dict[str, Any]) -> None:
-    """Route an IPC message (metric or sync) from a training script."""
+def _handle_ipc_msg(msg: dict[str, Any], state: RunState | None) -> None:
+    """Route an IPC message (metric or sync) from a training script.
+
+    *state* is the run its connection was bound to by its first message.  A
+    logger left over from an attempt that has been drained and replaced must
+    not write into the next attempt's metrics, so it is dropped once *state*
+    is no longer the in-flight run under its key.
+    """
     run_id = msg.get("run_id", "")
     msg_type = msg.get("type")
 
-    with _lock:
-        state = _ipc_run_state_locked(msg)
-
     if state is None:
         return
+    with _lock:
+        if _in_flight.get((state.experiment, state.run_id)) is not state:
+            return
 
     metrics_path = os.path.join(state.scratch_path, "metrics.jsonl")
 
@@ -1245,13 +1252,19 @@ def _handle_ipc_msg(msg: dict[str, Any]) -> None:
         except OSError:
             pass
         secs = msg.get("step_seconds")
+        total = msg.get("total_steps")
         _send_run_msg(encode(MsgMetric(
             run_id=run_id, experiment=state.experiment, attempt=state.attempt, step=step, data=data,
-            step_seconds=float(secs) if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None)))
+            step_seconds=float(secs) if isinstance(secs, (int, float)) and not isinstance(secs, bool) else None,
+            total_steps=int(total) if isinstance(total, int) and not isinstance(total, bool) else None)))
 
     elif msg_type == "sync":
         _send_run_msg(encode(MsgSyncReq(run_id=run_id, experiment=state.experiment,
                                         attempt=state.attempt)))
+
+    elif msg_type == "heartbeat":
+        _send_run_msg(encode(MsgHeartbeat(run_id=run_id, experiment=state.experiment,
+                                          attempt=state.attempt)))
 
 
 # ── GPU stats polling ─────────────────────────────────────────────────────────

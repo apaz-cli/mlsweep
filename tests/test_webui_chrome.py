@@ -11,7 +11,8 @@ from campaign_helpers import shared_manager, static_url
 
 
 WEBUI = Path(__file__).parent.parent / "mlsweep" / "webui"
-PAGES = ["experiments", "results", "logs", "files", "code", "notes", "export", "system"]
+PAGES = ["experiments", "results", "logs", "files", "code", "notes", "traces", "export", "system"]
+NAV_LABELS = ["Experiments", "Results", "Logs", "Artifacts", "Code", "Notes", "Traces", "Export", "System"]
 CHROME = find_chromium()
 
 
@@ -45,12 +46,12 @@ def browser():  # type: ignore[no-untyped-def]
 def test_nav_is_the_same_on_every_page(browser, mgr, page_name: str) -> None:  # type: ignore[no-untyped-def]
     browser.goto(static_url(mgr, f"{page_name}.html"))
     labels = browser.eval("[...document.querySelectorAll('nav a.nav-link')].map(a => a.textContent)")
-    assert labels == ["Experiments", "Results", "Logs", "Artifacts", "Code", "Notes", "Export", "System"]
+    assert labels == NAV_LABELS
     active = browser.eval("[...document.querySelectorAll('a.nav-link.active')].map(a => a.textContent)")
     assert active == [dict(zip(PAGES, labels))[page_name]]
     # Campaign links are added to these, but the token never is.
     hrefs = browser.eval("[...document.querySelectorAll('a.nav-link[id]')].map(a => a.getAttribute('href'))")
-    assert len(hrefs) == 7 and not any("token" in h for h in hrefs)
+    assert len(hrefs) == len(PAGES) - 1 and not any("token" in h for h in hrefs)
     assert browser.eval("!!document.getElementById('theme-toggle')")
     assert browser.eval("!!document.getElementById('nav-sync')") == (page_name == "notes")
     assert browser.eval("!!document.getElementById('conn-dot')") == (page_name != "notes")
@@ -130,7 +131,9 @@ def test_an_outdated_worker_offers_the_update(browser, mgr) -> None:  # type: ig
     cards = browser.eval("[...document.querySelectorAll('.worker-card')].map(c => "
                          "[!!c.querySelector('.btn-update'), !!c.querySelector('.btn-disconnect'), "
                          "!!c.querySelector('.worker-warning')])")
-    assert cards == [[True, False, False], [False, False, False], [False, False, False],
+    # Disconnect is offered in every state, so that a worker that never started
+    # can be taken out of the pool too.
+    assert cards == [[True, True, False], [False, True, False], [False, True, False],
                      [True, True, True], [False, True, False]]
     browser.eval("document.querySelector('.btn-update').click()")
     browser.wait_for("window._posted.length === 1")

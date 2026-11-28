@@ -516,7 +516,7 @@ def test_open_terminal_here_from_the_file_tree(mgr, page) -> None:
     page.wait_for("!!document.querySelector(\"#tree .tnode[data-path='sources']\")")
     page.eval("""(() => { const r = document.querySelector("#tree .tnode[data-path='sources']").getBoundingClientRect();
       document.querySelector("#tree .tnode[data-path='sources']").dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: r.left + 5, clientY: r.top + 5 })); })()""")
-    page.eval("[...document.querySelectorAll('#ctx-menu .cm-item')].find(i => i.textContent === 'Open terminal here').click()")
+    page.eval("[...document.querySelectorAll('.ml-ctx-item')].find(i => i.querySelector('.l').textContent === 'Open terminal here').click()")
     page.wait_for("activeTab() && activeTab().type === 'term'")
     assert page.eval("activeTab().title") == "Terminal: sources"
     page.wait_for(f"{SCREEN}.includes('sandbox:')", timeout=20)

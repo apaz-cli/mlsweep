@@ -21,32 +21,33 @@ from pathlib import Path
 
 COMMANDS = (
     "manager", "run", "worker", "lint", "gen_makefile", "watch", "fetch", "best", "wait", "status", "doctor",
-    "ls", "logs", "metrics", "export", "code", "cancel", "retry", "reschedule", "rename", "move", "purge", "gc",
+    "ls", "logs", "metrics", "export", "code", "cancel", "retry", "reschedule", "history", "rename", "move", "purge", "gc",
     "delete", "resume", "optimize", "controls", "stop", "pause", "unpause", "workers", "scheduler", "campaign", "notes",
-    "context", "completion", "docs", "version", "help",
+    "capture", "sql", "complain", "context", "completion", "docs", "version", "help",
 )
 
 # Subcommands whose first positional argument is an experiment ID.
 _EXPERIMENT_FIRST = frozenset({
-    "watch", "wait", "ls", "cancel", "retry", "reschedule", "rename", "move", "purge", "delete", "resume",
+    "watch", "wait", "ls", "cancel", "retry", "reschedule", "history", "rename", "move", "purge", "delete", "resume",
     "optimize", "controls", "stop", "pause", "unpause", "code", "logs",
 })
 
 _SUBCOMMANDS = {
     "context": ("list", "show", "add", "use", "rm"),
     "completion": ("bash", "zsh", "fish"),
-    "workers": ("ls", "add", "rm", "set"),
+    "workers": ("ls", "add", "rm", "forget", "set", "update"),
     "campaign": ("ls", "move"),
     "export": ("tensorboard", "wandb"),
     "notes": ("clone", "lint"),
+    "capture": ("this", "on", "off", "status", "ls", "show", "search", "export", "import"),
 }
 
-_DOC_TOPICS = ("readme", "sweep_configuration", "mlsweep", "examples", "notes", "skill")
+_DOC_TOPICS = ("readme", "sweep_configuration", "mlsweep", "examples", "notes", "traces", "skill")
 
 _FLAG_RE = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)")
 
 # Flags whose value is not something to complete from the manager.
-_TAKES_VALUE = frozenset({"--manager", "--token", "--note", "--priority", "--timeout", "--interval"})
+_TAKES_VALUE = frozenset({"--manager", "--token", "--note", "--description", "--experiment-name", "--priority", "--timeout", "--interval"})
 
 
 def _flags(cmd: str) -> list[str]:

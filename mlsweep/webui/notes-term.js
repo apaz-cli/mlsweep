@@ -6,9 +6,13 @@
 
 S.term = { enabled: false, error: null, config_error: null, commands: [], sessions: [] };
 
+let sessionsSeq = 0;
 async function loadSessions() {
-  try { Object.assign(S.term, await api("/api/sessions")); }
-  catch { S.term.enabled = false; }
+  const seq = ++sessionsSeq;
+  try {
+    const info = await api("/api/sessions");
+    if (seq === sessionsSeq) Object.assign(S.term, info);
+  } catch { if (seq === sessionsSeq) S.term.enabled = false; }
   return S.term;
 }
 
@@ -61,7 +65,7 @@ async function termMenu(e) {
     items.push("-");
     for (const s of loose) items.push({ label: `Attach: ${s.title} (${ago(s.created)})`, run: () => openTerminalTab(s.id, s.title) });
   }
-  showMenu(at[0], at[1], items);
+  mlMenuAt(at[0], at[1], items);
 }
 
 // ── The tab's view ─────────────────────────────────────────────────────────────

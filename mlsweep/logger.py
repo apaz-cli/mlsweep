@@ -85,6 +85,9 @@ class MLSweepLogger:
         step_seconds: Wall seconds per step over the last step advance, or
             ``None`` until the step has advanced once.  Sent with each metric
             so the dashboard can show a step timer.
+        total_steps: The step the run ends at, if known.  Sent with each
+            metric, so ``mlsweep ls`` and ``mlsweep status`` can say when the
+            run will finish.  Set it here or with the constructor argument.
     """
 
     def __init__(
@@ -95,6 +98,7 @@ class MLSweepLogger:
         rank_zero_only: bool = True,
         socket_path: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        total_steps: int | None = None,
     ) -> None:
         """Create a logger.
 
@@ -110,6 +114,8 @@ class MLSweepLogger:
             socket_path: The worker's socket.  Defaults to
                          ``MLSWEEP_WORKER_SOCKET``.
             clock: Seconds, for ``step_seconds``.  Defaults to ``time.monotonic``.
+            total_steps: The last step the run will log, for an estimate of
+                         when it finishes.  ``None`` (default) means unknown.
         """
         self._run_id: str = run_name if run_name is not None else os.environ.get("MLSWEEP_RUN_NAME", "")
         self._experiment: str = os.environ.get("EXP_EXPERIMENT", "")
@@ -126,6 +132,8 @@ class MLSweepLogger:
         self._logged_any = False
         self._step_keys: set[str] = set()   # keys already logged at self.step
         self.step_seconds: float | None = None
+        self.total_steps: int | None = total_steps
+        self._last_heartbeat: float | None = None
         self._step_clock: float | None = None  # monotonic time self.step was first logged
 
     # ── Internal ───────────────────────────────────────────────────────────────
@@ -200,6 +208,7 @@ class MLSweepLogger:
             "step": self.step,
             "data": metrics,
             "step_seconds": self.step_seconds,
+            **({"total_steps": int(self.total_steps)} if self.total_steps is not None else {}),
         })
 
     def _time_step(self, prev_step: int | None) -> None:
@@ -210,6 +219,21 @@ class MLSweepLogger:
         if prev_step is not None and self._step_clock is not None:
             self.step_seconds = (now - self._step_clock) / (self.step - prev_step)
         self._step_clock = now
+
+    def heartbeat(self) -> None:
+        """Say the script is still working, during a stretch that logs nothing.
+
+        A run that logs no metric and prints nothing for ``--stalled-after``
+        seconds counts as stalled for ``mlsweep wait --until stalled``.  Call
+        this inside a long quiet phase (an evaluation pass, a checkpoint, a
+        branch that doesn't log) so it doesn't.  Cheap to call often: at most
+        one message goes out every 10 seconds.
+        """
+        now = self._clock()
+        if self._last_heartbeat is not None and now - self._last_heartbeat < 10.0:
+            return
+        self._last_heartbeat = now
+        self._send({"type": "heartbeat", "run_id": self._run_id, "experiment": self._experiment})
 
     def sync(self) -> None:
         """Fire-and-forget: signal the worker to rsync artifacts to the controller."""

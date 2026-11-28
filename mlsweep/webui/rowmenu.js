@@ -1,12 +1,8 @@
 // Row menus, shared by the Experiments and System pages.
 // Each row has one menu of places to go ("View") and one of things to change
 // ("Manage"), so a row costs two controls however many pages and verbs exist.
-// Needs chrome.js (act, escHtml, pageHref, apiFetch, VIEW_ICONS) loaded first.
-// notes are optional: with no notes folder there is no Notes entry at all.
-let notesEnabled = false;
-let noteMentions = {};      // experiment id -> [note paths] (its own or its runs')
-let noteRunMentions = {};   // experiment id -> {run id: [note paths]}
-
+// Needs chrome.js (act, escHtml, pageHref, apiFetch, VIEW_ICONS) and viewmenu.js
+// (what the View menus list) loaded first.
 let rowMenu = null;
 
 // POST a run verb (cancel, retry) and report a failure; the caller refreshes.
@@ -28,6 +24,7 @@ function rowMenuItem(it) {
   return `<button class="${cls}"${title} ${it.act}>${body}</button>`;
 }
 
+// anchor is the button the menu drops from, or a {x, y} point (a right-click).
 function openRowMenu(anchor, key, items) {
   closeRowMenu();
   const menu = document.createElement("div");
@@ -37,11 +34,35 @@ function openRowMenu(anchor, key, items) {
   menu.innerHTML = items.map(it =>
     (it.divider ? "<hr>" : "") + rowMenuItem(it)).join("");
   document.body.appendChild(menu);
-  const r = anchor.getBoundingClientRect();
   const w = menu.offsetWidth, h = menu.offsetHeight;
-  menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
-  menu.style.top = `${r.bottom + 4 + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 4) : r.bottom + 4}px`;
+  if (anchor.getBoundingClientRect) {
+    const r = anchor.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
+    menu.style.top = `${r.bottom + 4 + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 4) : r.bottom + 4}px`;
+  } else {
+    menu.style.left = `${Math.max(8, Math.min(anchor.x, window.innerWidth - w - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(anchor.y, window.innerHeight - h - 8))}px`;
+  }
   rowMenu = menu;
+}
+
+// A row's View and Manage menus as one list, Manage below a divider.
+function joinMenus(view, manage) {
+  if (!view.length || !manage.length) return [...view, ...manage];
+  return [...view, { ...manage[0], divider: true }, ...manage.slice(1)];
+}
+
+// Right-clicking a row opens menu(row) at the pointer.  menu returns
+// [key, items], or null to leave the browser's menu alone.
+function bindRowContextMenu(container, selector, menu) {
+  container.addEventListener("contextmenu", e => {
+    const row = e.target.closest(selector);
+    if (!row || !container.contains(row) || mlNativeMenuWanted(e, row)) return;
+    const got = menu(row);
+    if (!got) return;
+    e.preventDefault();
+    openRowMenu({ x: e.clientX, y: e.clientY }, got[0], got[1]);
+  });
 }
 
 // A second click on the same button closes the menu it opened.
@@ -50,33 +71,9 @@ function toggleMenu(anchor, key, items) {
   openRowMenu(anchor, key, items);
 }
 
-function noteCount(expId, runId) {
-  if (runId) return ((noteRunMentions[expId] || {})[runId] || []).length;
-  return (noteMentions[expId] || []).length;
-}
-
-function notesItem(expId, runId) {
-  const what = runId || expId;
-  const n = noteCount(expId, runId);
-  if (!notesEnabled) return null;
-  const item = { label: "Notes", icon: "notes", count: n };
-  if (!n) return { ...item, disabled: true, title: `No note mentions ${what} yet` };
-  return {
-    ...item,
-    href: pageHref("notes.html", { mentions: what }),
-    title: `${n} note${n === 1 ? "" : "s"} mention ${what}`,
-  };
-}
-
-// Where a run's View menu leads.
-function toggleRunView(expId, runId) {
-  toggleMenu(this, `runview:${expId}/${runId}`, [
-    { label: "Results", icon: "results", href: pageHref("results.html", { experiment: expId }) },
-    { label: "Artifacts", icon: "artifacts", href: pageHref("files.html", { experiment: expId, run: runId }) },
-    { label: "Logs", icon: "logs", href: pageHref("logs.html", { experiment: expId, run: runId }) },
-    { label: "Code", icon: "code", href: pageHref("code.html", { experiment: expId, run: runId }) },
-    notesItem(expId, runId),
-  ].filter(Boolean));
+// codeFiles: how many files the run's code snapshot has (null: no snapshot).
+function toggleRunView(expId, runId, codeFiles = null) {
+  toggleMenu(this, `runview:${expId}/${runId}`, MLViews.runItems(expId, runId, { codeFiles }));
 }
 
 // A click elsewhere, Esc, or scrolling the list closes the menu.
@@ -86,30 +83,8 @@ document.addEventListener("click", e => {
   if (e.target.closest(".row-menu") || e.target.closest(".btn-manage") || e.target.closest(".btn-menu")) return;
   closeRowMenu();
 });
+// A right-click anywhere else closes it too (a row's own handler then opens its menu).
+document.addEventListener("contextmenu", e => { if (!e.target.closest(".row-menu")) closeRowMenu(); }, true);
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeRowMenu(); });
 window.addEventListener("scroll", closeRowMenu, true);
 window.addEventListener("resize", closeRowMenu);
-
-// What cites each experiment and each of its runs (empty with no --notes).
-// onChange runs whenever the answer differs from the last one.
-function watchNoteMentions(onChange) {
-  async function poll() {
-    try {
-      const r = await apiFetch("/api/notes/mentions");
-      if (!r.ok) return;
-      const d = await r.json();
-      const next = d.mentions || {};
-      const nextRuns = d.runs || {};
-      const nextEnabled = d.enabled !== false;
-      const changed = nextEnabled !== notesEnabled
-        || JSON.stringify(next) !== JSON.stringify(noteMentions)
-        || JSON.stringify(nextRuns) !== JSON.stringify(noteRunMentions);
-      noteMentions = next;
-      noteRunMentions = nextRuns;
-      notesEnabled = nextEnabled;
-      if (changed) onChange();
-    } catch { /* notes are optional */ }
-  }
-  poll();
-  setInterval(() => { if (!document.hidden) poll(); }, 30000);
-}

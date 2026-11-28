@@ -17,6 +17,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import socket
 import ssl
 import struct
@@ -27,7 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -80,6 +81,20 @@ def _resolve_token(token_arg: str | None) -> str:
         if token_file.exists():
             token = token_file.read_text().strip()
     return token
+
+
+def capture_session_id() -> str | None:
+    """The agent trace this command belongs to, for experiment attribution.
+
+    Resolved from the environment the coding agent ran this command with
+    (see ``_capture.resolve_capture_session``).  Import errors or a missing
+    watcher only ever mean "no trace": a sweep is never held up by it.
+    """
+    try:
+        from mlsweep._capture import resolve_capture_session
+        return resolve_capture_session()
+    except Exception:
+        return None
 
 
 def _require_token(token_arg: str | None) -> str:
@@ -273,7 +288,8 @@ def _http_request(
     With *raw*, a successful response's body is returned as bytes, undecoded.
     On error, prints a message (unless *quiet*) and returns (status, None).
     """
-    req_headers = {"Authorization": f"Bearer {token}"}
+    # The client header names the CLI in a run's history (``mlsweep history``).
+    req_headers = {"Authorization": f"Bearer {token}", "X-Mlsweep-Client": "cli"}
     if json_data is not None:
         data = json.dumps(json_data).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
@@ -335,6 +351,24 @@ def _report_failure(label: str, status: int, resp: Any) -> None:
     sweep_print(f"  {_RED}FAIL{_RESET}  {label}: {text}")
 
 
+def check_response(status: int, resp: Any, manager: str, *, missing: str) -> None:
+    """Exit with an ``Error:`` line unless a CLI read of the manager succeeded.
+
+    *missing* explains a 404 that carries no ``error`` (the route is not
+    there: an older manager, or the feature switched off).
+    """
+    if status == 0:
+        message = f"cannot reach the manager at {manager}"
+    elif status == 404 and not (isinstance(resp, dict) and resp.get("error")):
+        message = missing
+    elif status >= 400:
+        message = str((resp.get("error") if isinstance(resp, dict) else resp) or f"manager answered {status}")
+    else:
+        return
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def _manager_url(manager: str, path: str) -> str:
     """Build a full URL from manager base and path."""
     base = manager.rstrip("/")
@@ -370,6 +404,11 @@ class _WebSocket:
         self._timeout = timeout
         self._sock: socket.socket | None = None
         self._buf = bytearray()
+        # The heartbeat thread pings while the reader answers pongs and the
+        # caller may close.  Two concurrent sendall() calls can interleave
+        # bytes and split a frame, so frames go out one at a time.  RLock lets
+        # close() keep the send/clear pair atomic.
+        self._send_lock = threading.RLock()
 
     def connect(self) -> None:
         """Establish WebSocket connection (TCP + TLS + upgrade handshake)."""
@@ -471,29 +510,31 @@ class _WebSocket:
 
     def send_frame(self, opcode: int, payload: bytes) -> None:
         """Send a masked WebSocket frame (client must mask)."""
-        if not self._sock:
-            return
-        mask_key = secrets.token_bytes(4)
-        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        with self._send_lock:
+            sock = self._sock
+            if not sock:
+                return
+            mask_key = secrets.token_bytes(4)
+            masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
-        frame = bytearray()
-        frame.append(0x80 | opcode)  # FIN + opcode
-        length = len(payload)
-        if length < 126:
-            frame.append(0x80 | length)
-        elif length < 65536:
-            frame.append(0x80 | 126)
-            frame.extend(struct.pack("!H", length))
-        else:
-            frame.append(0x80 | 127)
-            frame.extend(struct.pack("!Q", length))
-        frame.extend(mask_key)
-        frame.extend(masked)
+            frame = bytearray()
+            frame.append(0x80 | opcode)  # FIN + opcode
+            length = len(payload)
+            if length < 126:
+                frame.append(0x80 | length)
+            elif length < 65536:
+                frame.append(0x80 | 126)
+                frame.extend(struct.pack("!H", length))
+            else:
+                frame.append(0x80 | 127)
+                frame.extend(struct.pack("!Q", length))
+            frame.extend(mask_key)
+            frame.extend(masked)
 
-        try:
-            self._sock.sendall(bytes(frame))
-        except OSError:
-            self._sock = None
+            try:
+                sock.sendall(bytes(frame))
+            except OSError:
+                self._sock = None
 
     def send_ping(self) -> None:
         self.send_frame(_WS_OP_PING, b"")
@@ -503,8 +544,10 @@ class _WebSocket:
         self.send_frame(_WS_OP_CLOSE, payload)
 
     def close(self) -> None:
-        sock = self._sock
-        if sock:
+        with self._send_lock:
+            sock = self._sock
+            if not sock:
+                return
             self.send_close(1000)  # clears self._sock if the peer is already gone
             self._sock = None
             try:
@@ -586,8 +629,10 @@ def manager_create_experiment(
     optimize: dict[str, Any] | None = None,
     code: dict[str, Any] | None = None,
     controls: dict[str, Any] | None = None,
+    capture_session: str | None = None,
 ) -> dict[str, Any] | None:
-    """Create an experiment in *campaign* on the manager. Returns the response dict or None.
+    """Create an experiment in *campaign* on the manager.  Returns the stored
+    experiment, or None.
 
     *code* is the provenance of the code snapshot the jobs use, recorded with the experiment.
 
@@ -616,13 +661,15 @@ def manager_create_experiment(
             **({"optimize": optimize} if optimize else {}),
             **({"code": code} if code else {}),
             **({"controls": controls} if controls else {}),
+            **({"capture_session": capture_session} if capture_session else {}),
         },
     )
     if status in (200, 201) and isinstance(resp, dict):
         with_jobs = f" with {len(jobs)} job(s)" if jobs else ""
         sweep_print(f"  {_GREEN}OK{_RESET}    Experiment created: {experiment_id} "
                     f"(campaign {campaign}){with_jobs}")
-        return resp
+        # The bulk route answers {"experiment", "jobs"}; the plain one, the experiment.
+        return resp["experiment"] if jobs else resp
     _report_failure("Create experiment", status, resp)
     return None
 
@@ -1668,7 +1715,8 @@ def _load_and_lint(sweep_file: str, as_json: bool = False) -> dict[str, Any]:
     except Exception as e:
         sweep_print(f"{_RED}Error: cannot load {sweep_file}: {e!r}{_RESET}")
         sys.exit(1)
-    findings: list[Finding] = lint_module(mod, sweep_file)
+    # A missing description is reported after submitting, when --description is known.
+    findings: list[Finding] = lint_module(mod, sweep_file, check_description=False)
     for f in findings:
         color = _RED if f.severity == "error" else _YELLOW
         sweep_print(f"{color}{f.severity}:{_RESET} {f.message}")
@@ -1682,6 +1730,91 @@ def _load_and_lint(sweep_file: str, as_json: bool = False) -> dict[str, Any]:
     info = sweep_info(mod, sweep_file)
     info["findings"] = [{"severity": f.severity, "message": f.message} for f in findings]
     return info
+
+
+def _job_command(job: dict[str, Any]) -> list[str]:
+    raw = job.get("command")
+    try:
+        cmd = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return [str(raw)]
+    if isinstance(cmd, str):
+        return shlex.split(cmd)
+    return [str(c) for c in cmd] if isinstance(cmd, list) else []
+
+
+def compare_with_experiment(
+    variations: list[dict[str, Any]], command: list[str], extra: list[str], jobs: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """How a sweep file's runs line up with an experiment's, matched by full command line.
+
+    ``same``: a run the experiment already has (``run_id``, its status, and the
+    file's ``name`` for it, which may differ).  ``new``: what ``--append`` would
+    add.  ``clash``: a new run whose name the experiment already uses for a
+    different command, which ``--append`` would refuse.  ``only_in_experiment``:
+    its runs this file doesn't make.
+    """
+    by_cmd: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for j in jobs:
+        by_cmd.setdefault(tuple(_job_command(j)), []).append(j)
+    ids = {str(j.get("run_id")) for j in jobs}
+    matched: set[str] = set()
+    out: dict[str, list[dict[str, Any]]] = {"same": [], "new": [], "clash": [], "only_in_experiment": []}
+    for v in variations:
+        cmd = tuple(command + list(v["overrides"]) + extra)
+        hits = [j for j in by_cmd.get(cmd, []) if str(j.get("run_id")) not in matched]
+        if hits:
+            j = hits[0]
+            matched.add(str(j.get("run_id")))
+            out["same"].append({"name": v["name"], "run_id": j.get("run_id"), "status": j.get("status")})
+        elif v["name"] in ids:
+            out["clash"].append({"name": v["name"], "command": list(cmd)})
+        else:
+            out["new"].append({"name": v["name"], "combo": v["combo"], "command": list(cmd)})
+    out["only_in_experiment"] = [
+        {"run_id": j.get("run_id"), "status": j.get("status"), "command": _job_command(j)}
+        for j in jobs if str(j.get("run_id")) not in matched]
+    return out
+
+
+def _validate_against(args: argparse.Namespace, campaign: str | None, variations: list[dict[str, Any]],
+                      command: list[str], extra: list[str], findings: Any) -> NoReturn:
+    """``run --compare EXP``: print how the file's runs compare with EXP's, and exit."""
+    manager, token = _manager_token(args)
+    exp = args.compare
+    jobs = manager_list_experiment_jobs(manager, token, exp, campaign=campaign)
+    if jobs is None:
+        sys.exit(1)
+    cmp = compare_with_experiment(variations, command, extra, jobs)
+    renamed = sum(1 for s in cmp["same"] if s["name"] != s["run_id"])
+    sweep_print(f"{_BOLD}{args.sweep_file}{_RESET} makes {len(variations)} run(s); "
+                f"{_CYAN}{exp}{_RESET} has {len(jobs)}. Matched by full command line:")
+    sweep_print(f"  {len(cmp['same'])} already in {exp}"
+                + (f" ({renamed} under another name)" if renamed else ""))
+    sweep_print(f"  {len(cmp['new'])} new: `--experiment {exp} --append` would add them")
+    if cmp["clash"]:
+        sweep_print(f"  {_RED}{len(cmp['clash'])} new, but {exp} already uses their names for other "
+                    f"commands; --append would refuse them{_RESET}")
+    sweep_print(f"  {len(cmp['only_in_experiment'])} in {exp} that this file does not make")
+    show = 20
+    for label, rows, key in (("New", cmp["new"], "name"), ("Name taken", cmp["clash"], "name"),
+                             (f"Only in {exp}", cmp["only_in_experiment"], "run_id")):
+        if not rows:
+            continue
+        sweep_print(f"\n{_BOLD}{label}:{_RESET}")
+        for r in rows[:show]:
+            status = f" ({r['status']})" if r.get("status") else ""
+            sweep_print(f"  {r[key]}{status}")
+        if len(rows) > show:
+            sweep_print(f"  ... and {len(rows) - show} more (--json lists them all)")
+    if renamed:
+        sweep_print(f"\n{_BOLD}Same command, other name:{_RESET}")
+        for s in [s for s in cmp["same"] if s["name"] != s["run_id"]][:show]:
+            sweep_print(f"  {s['name']} = {s['run_id']} ({s['status']})")
+    if args.json:
+        emit({"experiment_id": exp, "runs_in_file": len(variations), "runs_in_experiment": len(jobs),
+              **cmp, "findings": findings})
+    sys.exit(0)
 
 
 def _check_duplicate_run_names(variations: list[dict[str, Any]]) -> None:
@@ -1947,8 +2080,10 @@ def _main() -> None:
                         help="Experiment name (default: <sweep>_<timestamp>)")
     parser.add_argument("--append", action="store_true",
                         help="Add this sweep's runs to the experiment named by --experiment, if it exists")
-    parser.add_argument("--note", default=None,
-                        help="Human-readable note stored with the experiment")
+    parser.add_argument("--description", "--note", dest="description", default=None,
+                        help="What the experiment is for, shown in the dashboard and `mlsweep status` "
+                             "(overrides the sweep file's DESCRIPTION; change it later with "
+                             "`mlsweep rename EXP --description TEXT`)")
     parser.add_argument("--priority", type=int, default=0,
                         help="Job priority (higher = earlier, default: 0)")
     parser.add_argument("--stream", action="store_true",
@@ -1960,6 +2095,10 @@ def _main() -> None:
                         help="Print commands without execution")
     parser.add_argument("--validate", action="store_true",
                         help="Validate sweep config, print all combinations, and exit")
+    parser.add_argument("--compare", metavar="EXPERIMENT", default=None,
+                        help="Like --validate, but compare the runs with EXPERIMENT's, by command line: "
+                             "which are already there, which --append would add, and which it has that "
+                             "this file doesn't make")
     parser.add_argument("--max-retries", type=int, default=2,
                         help="Max automatic retries of a run lost with its worker (default: 2)")
     parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
@@ -1989,6 +2128,8 @@ def _main() -> None:
                              "and --dry-run the runs it would make. Not with --stream or --fetch.")
 
     args, extra = parser.parse_known_args(argv)
+    if args.compare:
+        args.validate = True
     if args.json and (args.stream or args.fetch):
         parser.error("--json prints one result; it can't be used with --stream or --fetch")
     if extra and extra[0] == "--":
@@ -2054,6 +2195,10 @@ def _main() -> None:
 
     # ── Validate mode ──────────────────────────────────────────────────────
     if args.validate:
+        if method == "bayes" and args.compare:
+            sweep_print(f"{_RED}Error: a Bayesian sweep chooses its runs as it goes, so there is nothing "
+                        f"to compare with {args.compare}.{_RESET}")
+            sys.exit(1)
         if method == "bayes":
             sweep_print(f"Sweep: {sweep_name} (bayes, budget={optimize_cfg['budget']})")
             sweep_print(f"Metric: {optimize_cfg['metric']} ({optimize_cfg['goal']})")
@@ -2078,6 +2223,8 @@ def _main() -> None:
 
         all_variations = generate_variations(sweep_name, options, exclude_fn, extra_flags)
         _check_duplicate_run_names(all_variations)
+        if args.compare:
+            _validate_against(args, campaign, all_variations, list(command), list(extra), info["findings"])
         expected = count_expected(options)
         excluded = expected - len(all_variations)
         dim_names = [k[1:] for k in options]
@@ -2228,10 +2375,11 @@ def _main() -> None:
     if spec is not None:
         spec["job"]["artifact_id"] = artifact_id
     assert campaign is not None  # resolved above; only --validate runs without one, and it returned
-    if not manager_create_experiment(
+    description = (args.description or "").strip() or info.get("description")
+    created = manager_create_experiment(
         manager, token, experiment_id,
         name=sweep_name,
-        note=args.note,
+        note=description,
         singular_dims=singular_dims(options),
         max_concurrent=args.max_concurrent,
         skip_rules=_skip_rules(options) if method == "grid" else None,
@@ -2242,11 +2390,20 @@ def _main() -> None:
         optimize=spec,
         code=provenance,
         controls=info.get("controls"),
-    ):
+        capture_session=(capture_session := capture_session_id()),
+    )
+    if not created:
         sys.exit(1)
+    if not created.get("note"):  # an --append keeps the description the experiment already had
+        sweep_print(f"  {_YELLOW}warning:{_RESET} {experiment_id} has no description. Add one with: "
+                    f"mlsweep rename {experiment_id} --description \"...\"")
+    # The session that submitted a sweep is followed, so its trace uploads
+    # (only while capture is on for this machine).
+    from mlsweep._capture import follow_if_on
+    follow_if_on(capture_session, why=f"submitted {experiment_id}", manager=manager)
 
     # ── 4. Write local manifest ────────────────────────────────────────────
-    _write_manifest(exp_dir, experiment_id, variations, note=args.note)
+    _write_manifest(exp_dir, experiment_id, variations, note=created.get("note"))
     if args.json:
         emit({"experiment_id": experiment_id, "campaign": campaign, "method": method,
               "runs": len(variations), "budget": spec["budget"] if spec else None,

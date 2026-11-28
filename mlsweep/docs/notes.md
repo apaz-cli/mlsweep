@@ -284,7 +284,9 @@ save your copy.
 For a note: the experiments it cites with their status, its outline, backlinks with
 the linking line, outgoing links (missing ones create the note on click), and history.
 For other files: size, modified time, download, the notes linking to it, and history.
-With no file open: folder totals and the most cited experiments.
+With no file open: folder totals and the most cited experiments. Right-click a backlink
+or a link for Open in new tab, Open to the side, Reveal in file tree and Copy path. A
+history entry offers View this version and Restore this version.
 
 ### History and Changes
 
@@ -300,7 +302,8 @@ An author name is whatever that clone's git config says; nothing verifies it.
 `/` searches file paths and the text of markdown and text files. PDFs are left out. Every word
 must match, case-insensitively; `"quote"` a phrase. Click a result to open the file,
 or a line to open it at that line. A note opens in Live view, scrolled to that line, with
-the search words highlighted for a few seconds.
+the search words highlighted for a few seconds. Right-click a result, a changed file or a
+lint finding for the same menu as a backlink.
 
 ### Graph
 
@@ -318,7 +321,7 @@ files, and notes not written yet, and sets how many labels show.
 The Experiments page counts the documents citing an experiment in its `View ▾` menu,
 next to Notes, and those citing a run in the run's `View ▾` menu. Every entry there
 shows what it leads to (results and export: finished runs, logs: every run, artifacts:
-runs with files). Nothing cites the experiment yet, Notes is there with 0 but greyed
+runs with files, code: the files in it). Nothing cites the experiment yet, Notes is there with 0 but greyed
 out.
 
 ### Keys
@@ -472,6 +475,9 @@ to Results (Shift+click for Logs). If you list `columns` and the run names are j
 one of those values, the run column is dropped and that parameter cell links to the
 run instead, so the same name is not shown twice. Each metric cell's tooltip has
 final/min/max/mean, and `⧉` copies the table as markdown in the order shown.
+Right-click a row for the run's Results, Logs, Artifacts and Code, or to copy its ID.
+On a metric cell it also copies the value, or an evidence link that cites it at the
+table's `agg`.
 
 ### Evidence links
 
@@ -517,6 +523,23 @@ selection, as a link or a `mlsweep-code` block. The code page is the
 dashboard's Code tab.
 
 Code that ran from a tarball, from before snapshots, can't be linked.
+
+### Trace links
+
+```md
+The sweep came out of [that idea about warmup](mlsweep:trace/9f6c0e22).
+```
+
+The link opens the session trace named by its id, which is the agent's own session
+id. Like a git hash, the id can be cut to its first 6 or more characters as long as
+no other trace starts the same way. The tab checks the link and marks it ⚠ with the
+reason when the trace isn't there or the short id matches more than one.
+`#E412` after the id opens event 412, and `?kind=mlsweep` (or user, assistant,
+thinking, tools) shows only that kind, as in
+`[the second sweep](mlsweep:trace/9f6c0e22#E412)`. The Traces tab's **Copy note
+link** writes the event form for you. Lint reports a trace link that does not
+resolve, or names an event the trace lacks, like every other `mlsweep:` link.
+See [traces.md](traces.md).
 
 ### Code and diff blocks
 
@@ -677,7 +700,9 @@ Files under `sources/` are originals and are not linted.
 The experiment/run ID and evidence-number checks need the manager (`--manager`,
 `MLSWEEP_MANAGER`, default `http://localhost:7891`, and its token as usual).
 Without it, lint still parses the chart/table specs, checks links and reports
-merge leftovers; it leaves the numbers unchecked.
+merge leftovers; it leaves the numbers unchecked. When a check is skipped, the
+report's first line says which and why, with the manager's answer, and `--json`
+gives that line as `note`. An empty report with a note is not a clean bill.
 
 ## Rules for agents
 

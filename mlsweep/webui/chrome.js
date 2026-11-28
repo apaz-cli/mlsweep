@@ -64,7 +64,8 @@ function el(tag, cls, text) {
 }
 
 async function apiFetch(path, opts = {}) {
-  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}` } });
+  // X-Mlsweep-Client names the dashboard in a run's history (`mlsweep history`).
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${TOKEN}`, "X-Mlsweep-Client": "dashboard" } });
   if (r.status === 401) showLoginProblem("The manager rejected this page's token. Open the link it printed at startup, or run `mlsweep status` to find it.");
   else if (r.status === 429) showLoginProblem("Too many failed logins from this address. Try again in a minute.");
   return r;
@@ -105,6 +106,11 @@ function wsURL(path) {
   return `${proto}://${location.host}${path}?token=${encodeURIComponent(TOKEN)}`;
 }
 
+// What a trace is called: its title, else its working directory's last part, else its id.
+function traceName(s) {
+  return s.title || (s.cwd ? s.cwd.split("/").filter(Boolean).pop() : s.session_id);
+}
+
 // A link to another dashboard page, with query *extra*.
 function pageHref(page, extra = {}) {
   const query = new URLSearchParams(extra).toString();
@@ -143,6 +149,7 @@ const VIEW_ICONS = {
   logs: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 4h10M3 8h10M3 12h6"/></svg>',
   artifacts: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.5 14 4.5v7L8 14.5 2 11.5v-7z"/><path d="M2 4.5 8 7.5l6-3M8 7.5v7"/></svg>',
   notes: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="m2.5 13.5.8-3.2 7.4-7.4 2.4 2.4-7.4 7.4z"/><path d="m9.5 3.7 2.4 2.4"/></svg>',
+  traces: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12.5v-9"/><path d="M6 13.5V6.5"/><path d="M10 12.5V3"/><path d="M14 13.5V8.5"/></svg>',
   code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5 14 8l-3.5 3.5"/></svg>',
   export: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7.5"/><path d="m4.8 6.5 3.2 3.2 3.2-3.2"/><path d="M3 13.5h10"/></svg>',
   system: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.6 4.75h.01M4.6 11.25h.01M7 4.75h.01M7 11.25h.01" stroke-width="2"/></svg>',
@@ -175,9 +182,11 @@ function fileKindOf(path) {
 const PANEL_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M5.5 2.5v11"/></svg>';
 
 const MLChrome = (() => {
+  // [page, label, palette glyph]: the nav bar and the command palette both list these.
   const PAGES = [
-    ["experiments", "Experiments"], ["results", "Results"], ["logs", "Logs"], ["files", "Artifacts"],
-    ["code", "Code"], ["notes", "Notes"], ["export", "Export"], ["system", "System"],
+    ["experiments", "Experiments", "▤"], ["results", "Results", "▥"], ["logs", "Logs", "≡"],
+    ["files", "Artifacts", "▣"], ["code", "Code", "‹›"], ["notes", "Notes", "✎"],
+    ["traces", "Traces", "∿"], ["export", "Export", "⇩"], ["system", "System", "⚙"],
   ];
   const root = document.documentElement;
 
@@ -296,7 +305,7 @@ const MLChrome = (() => {
     h.addEventListener("dblclick", () => { MLPrefs.remove(name); set(null); refit(); });
   }
 
-  return { PAGES: PAGES.map(([page]) => page), nav, collapsibleSidebar, resizable };
+  return { PAGES: PAGES.map(([page]) => page), pages: PAGES, nav, collapsibleSidebar, resizable };
 })();
 
 // The Ctrl/Cmd+K palette (palette.js, searching through search-core.js) on every page.

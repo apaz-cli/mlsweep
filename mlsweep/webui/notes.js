@@ -244,8 +244,11 @@ $("btn-sync").onclick = commitNow;
 $("nav-sync").onclick = commitNow;
 
 let polling = false;
+let pollAgain = false;
 async function poll(force = false) {
-  if (polling) return;
+  // A force refresh requested while a poll is running must not be dropped;
+  // queue it so the status/tree catch up with the commit that asked for it.
+  if (polling) { pollAgain = pollAgain || force; return; }
   polling = true;
   try {
     const st = await api("/api/notes/status");
@@ -267,24 +270,41 @@ async function poll(force = false) {
   } catch (e) {
     if (e.status === 401) { $("foot-text").textContent = "Unauthorized: open the dashboard with ?token=…"; }
     else { $("nav-sync-dot").className = "sync-dot err"; $("nav-sync-text").textContent = "Manager unreachable"; }
-  } finally { polling = false; }
+  } finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; poll(true); }
+  }
 }
 
+let experimentsSeq = 0;
 async function loadExperiments() {
+  const seq = ++experimentsSeq;
   try {
     const exps = await api("/api/experiments");
+    if (seq !== experimentsSeq) return;   // a newer list owns the page
     S.experiments = new Map(exps.map(e => [e.experiment_id, { status: e.status, campaign: e.campaign, name: e.name, jobs: e.job_counts }]));
   } catch { /* keep the old list */ }
 }
 
+let indexSeq = 0;
 async function ensureIndex() {
-  if (S.index && S.indexVersion === S.version) return S.index;
+  const version = S.version;
+  if (S.index && S.indexVersion === version) return S.index;
+  const seq = ++indexSeq;
   try {
-    S.index = await api("/api/notes/index");
-    S.indexVersion = S.version;
-    for (const [id, m] of Object.entries(S.index.experiments || {})) if (!S.experiments.has(id)) S.experiments.set(id, m);
-  } catch { S.index = S.index || { links: {}, mentions: {} }; }
-  return S.index;
+    const idx = await api("/api/notes/index");
+    // The folder moved on while this index was being built.  Do not cache it
+    // under the newer version; the next refresh will fetch the right one.
+    if (seq === indexSeq && S.version === version) {
+      S.index = idx;
+      S.indexVersion = version;
+      for (const [id, m] of Object.entries(idx.experiments || {})) if (!S.experiments.has(id)) S.experiments.set(id, m);
+    }
+    return idx;
+  } catch {
+    if (seq === indexSeq) S.index = S.index || { links: {}, mentions: {} };
+    return S.index;
+  }
 }
 
 // ── File tree ──────────────────────────────────────────────────────────────────
@@ -296,8 +316,16 @@ function selectTreeRow(path) {
   document.querySelectorAll("#tree .tnode.selected").forEach(n => n.classList.remove("selected"));
   treeRow(path)?.classList.add("selected");
 }
-async function loadTree() {
+let treeSeq = 0, treeLatest = null;
+function loadTree() {
+  const seq = ++treeSeq;
+  return treeLatest = loadTreeAs(seq);
+}
+async function loadTreeAs(seq) {
   const t = await api("/api/notes/tree");
+  // A save/move/upload started another tree fetch; its answer is newer, and
+  // the caller waits for it so it still sees a fresh tree.
+  if (seq !== treeSeq) return treeLatest;
   S.files = t.files; S.dirs = t.dirs; S.protectedDirs = new Set(t.protected_dirs); S.version = t.version || S.version;
   S.fileMap = new Map(S.files.map(f => [f.path, f]));
   Resolver.rebuild();
@@ -406,26 +434,6 @@ function revealInTree(path) {
 }
 $("btn-collapse").onclick = () => { S.openDirs.clear(); store.set("openDirs", []); renderTree(); };
 
-// Context menu
-function showMenu(x, y, items) {
-  const m = $("ctx-menu");
-  m.innerHTML = "";
-  for (const it of items) {
-    if (it === "-") { m.append(el("div", "cm-sep")); continue; }
-    const row = el("div", "cm-item" + (it.danger ? " danger" : ""));
-    row.append(el("span", "", it.label));
-    if (it.key) row.append(el("span", "k", it.key));
-    row.onclick = () => { hideMenu(); it.run(); };
-    m.append(row);
-  }
-  m.classList.add("show");
-  const r = m.getBoundingClientRect();
-  m.style.left = Math.min(x, innerWidth - r.width - 8) + "px";
-  m.style.top = Math.min(y, innerHeight - r.height - 8) + "px";
-}
-function hideMenu() { $("ctx-menu").classList.remove("show"); }
-document.addEventListener("mousedown", e => { if (!e.target.closest("#ctx-menu")) hideMenu(); });
-window.addEventListener("blur", hideMenu);
 
 $("tree").addEventListener("contextmenu", e => {
   e.preventDefault();
@@ -435,15 +443,15 @@ $("tree").addEventListener("contextmenu", e => {
   const folder = isDir ? path : dirname(path);
   const items = [];
   if (row && !isDir) {
-    items.push({ label: "Open", key: "Double-click", run: () => openFile(path, { newTab: true }) },
-      { label: "Open to the side", key: "Alt+Click", run: () => openToSide(path) });
+    items.push({ label: "Open", hint: "Double-click", run: () => openFile(path, { newTab: true }) },
+      { label: "Open to the side", hint: "Alt+Click", run: () => openToSide(path) });
     if (kindOf(path) === "md" || kindOf(path) === "text") items.push({ label: "Edit", run: () => openFile(path, { mode: "source" }) });
     items.push("-");
   }
   items.push({ label: "New note", run: () => newNote(folder) }, { label: "New folder", run: () => newFolder(folder) }, { label: "Upload files here…", run: () => pickUpload(folder) });
   if (S.term.enabled && !S.term.error) items.push({ label: "Open terminal here", run: () => newTerminal(null, folder) });
   if (row) {
-    items.push("-", { label: "Rename…", key: "F2", run: () => startRename(row) }, { label: "Move to…", run: () => moveDialog(path) });
+    items.push("-", { label: "Rename…", hint: "F2", run: () => startRename(row) }, { label: "Move to…", run: () => moveDialog(path) });
     if (!isDir) {
       items.push({ label: "History", run: () => { openFile(path); setTimeout(() => openRightSection("history"), 200); } });
       items.push({ label: "Download", run: () => downloadFile(path) });
@@ -452,8 +460,25 @@ $("tree").addEventListener("contextmenu", e => {
     if (!isDir && isMd(path)) items.push({ label: "Copy wikilink", run: () => copyText(`[[${stemOf(path)}]]`) });
     items.push("-", { label: isDir ? "Delete folder…" : "Delete…", danger: true, run: () => deletePath(path, isDir) });
   }
-  showMenu(e.clientX, e.clientY, items);
+  mlMenuAt(e.clientX, e.clientY, items);
 });
+
+// A right-click on a file named outside the tree (a search hit, a link, a
+// change): ways to open it, then what the caller adds for that place.
+function fileMenu(e, path, extra = []) {
+  e.preventDefault();
+  e.stopPropagation();
+  const items = [];
+  if (S.fileMap.has(path)) {
+    items.push({ label: "Open in new tab", run: () => openFile(path, { newTab: true }) },
+      { label: "Open to the side", run: () => openToSide(path) },
+      { label: "Reveal in file tree", run: () => { switchPane("files"); revealInTree(path); } }, "-");
+  }
+  items.push({ label: "Copy path", run: () => copyText(path) });
+  if (isMd(path)) items.push({ label: "Copy wikilink", run: () => copyText(`[[${stemOf(path)}]]`) });
+  if (extra.length) items.push("-", ...extra);
+  mlMenuAt(e.clientX, e.clientY, items);
+}
 
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast("Copied"); }
@@ -541,6 +566,8 @@ async function deletePath(path, isDir) {
   const ok = await mlConfirm(isDir ? `Delete the folder ${path} and everything in it?\n\nIt stays in the git history.` : `Delete ${path}?\n\nIt stays in the git history, so it can be restored.`, { confirmLabel: "Delete" });
   if (!ok) return;
   try {
+    // Let an autosave in flight finish before removing the file (or folder).
+    await flushSaves();
     await api(`/api/notes/file?path=${q(path)}${isDir ? "&recursive=1" : ""}`, { method: "DELETE" });
     for (const t of [...S.tabs]) if (t.path === path || (isDir && t.path && t.path.startsWith(path + "/"))) closeTab(t.id, true);
     await loadTree();

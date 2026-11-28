@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
+import math
 import os
 import re
 import sys
 import time
+from urllib.parse import quote
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -57,6 +60,7 @@ from mlsweep.run_sweep import (
     manager_list_campaigns,
     manager_list_experiment_jobs,
     manager_list_experiments,
+    manager_list_workers,
     manager_move_experiment,
     manager_retry_job,
     manager_set_experiment_status,
@@ -344,7 +348,7 @@ def _exp_bullet(e: dict[str, Any]) -> list[str]:
     if status == "running" and not any(c.get(k) for k in ("running", "dispatched", "pending")):
         text += _paint(" No runs are active.", _C_WARN)
     if e.get("note"):
-        text += f" {_paint('Note:', _C_NAME)} {e['note']}"
+        text += f" {_paint('Description:', _C_NAME)} {e['note']}"
     return [text]
 
 
@@ -381,6 +385,19 @@ def _logs_hint(run_id: str, experiment: str, campaign: str | None) -> str:
             + _paint(f"mlsweep logs {experiment} {run_id}{scope} --tail 50", _C_CMD))
 
 
+def _gpu_suffix(job: dict[str, Any]) -> str:
+    """`` GPU 3`` or `` GPUs 0,1`` for the GPUs a run was placed on, or ''."""
+    raw = job.get("dispatched_gpu_ids")
+    try:
+        gpus = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return ""
+    if not isinstance(gpus, list) or not gpus:
+        return ""
+    ids = ",".join(str(g) for g in gpus)
+    return f" GPU {ids}" if len(gpus) == 1 else f" GPUs {ids}"
+
+
 def _run_bullet(
     j: dict[str, Any],
     varying: set[str],
@@ -403,10 +420,14 @@ def _run_bullet(
             facts.append(f"Running for {_paint(since, _C_TIME)}")
         if j.get("last_step") is not None:
             progress = f"step {_paint(j['last_step'], _C_TIME)}"
+            if j.get("total_steps") is not None:
+                progress += f" of {_paint(j['total_steps'], _C_TIME)}"
             avg = j.get("avg_step_seconds")
             if avg is not None:
                 progress += f" at {_paint(_per_step(avg), _C_TIME)} on average"
             facts.append(progress)
+            if j.get("eta_seconds") is not None:
+                facts.append(f"about {_paint(_dur(j['eta_seconds']), _C_TIME)} left")
         if run_id in stalled:
             facts.append(_paint("stalled", _BOLD, _C_WARN))
     elif status in ("failed", "cancelled", "xfailed") and j.get("exit_code") is not None:
@@ -416,7 +437,7 @@ def _run_bullet(
         facts.append(took)
     if status != "done" and (j.get("attempt") or 0) > 1:
         facts.append(_paint(f"attempt {j['attempt']}", _C_WARN))
-    on = _paint(f" on {j['worker_id']}", _C_AUX) if (
+    on = _paint(f" on {j['worker_id']}{_gpu_suffix(j)}", _C_AUX) if (
         status in ("running", "dispatched", "failed") and j.get("worker_id")) else ""
     text = head + ":" if dims or facts or on else head
     if dims:
@@ -472,7 +493,7 @@ def _ls_runs(
         sweep_print(_paint("Dims:", _BOLD) + " " + ", ".join(
             f"{_paint(k, _C_NAME)} ({_dim_values(vs)})" for k, vs in values.items()))
     if summary.get("note"):
-        sweep_print(f"{_paint('Note:', _C_NAME)} {summary['note']}")
+        sweep_print(f"{_paint('Description:', _C_NAME)} {summary['note']}")
     stalled = set(summary.get("stalled_runs") or [])
     _print_sections(
         _sections(jobs, lambda j: j.get("status") or "unknown", _RUN_SECTIONS),
@@ -491,8 +512,21 @@ def ls_cmd(argv: list[str]) -> None:
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     parser.add_argument("--with-dims", action="store_true",
                         help="With --json: add a parsed 'dims' object for each run")
+    parser.add_argument("--finished-since", metavar="T", default=None,
+                        help="Only runs that finished since T: a duration ago (2h, 30m, 1d) or an ISO time "
+                             "or epoch seconds. Without EXPERIMENT, across every experiment in the campaign")
     args = parser.parse_args(argv)
+    since = None
+    if args.finished_since is not None:
+        try:
+            since = parse_since_or_ago(args.finished_since)
+        except ValueError as exc:
+            parser.error(str(exc))
     manager, token, campaign = _connect(args, args.experiment)
+
+    if since is not None:
+        _ls_finished(manager, token, campaign, args, since)
+        return
 
     if args.experiment:
         listed = manager_list_experiment_jobs(manager, token, args.experiment, status_filter=args.status,
@@ -519,6 +553,77 @@ def ls_cmd(argv: list[str]) -> None:
         emit(exps)
         return
     _ls_experiments(exps, campaign, args.all)
+
+
+def parse_since_or_ago(raw: str, now: float | None = None) -> float:
+    """Epoch seconds for ``--finished-since``: a duration back from *now* ("2h"), an ISO time, or epoch seconds."""
+    from mlsweep._sweep import parse_duration
+
+    now = time.time() if now is None else now
+    try:
+        return now - parse_duration(raw, "--finished-since")
+    except ValueError:
+        pass
+    try:
+        return _parse_since(raw)
+    except ValueError:
+        raise ValueError(f"--finished-since takes a duration such as 2h or 30m, an ISO time, or epoch "
+                         f"seconds, not {raw!r}") from None
+
+
+_FINISHED_ORDER = ("failed", "cancelled", "pruned", "xfailed", "done")
+
+
+def finished_since(jobs: list[dict[str, Any]], since: float) -> list[dict[str, Any]]:
+    """The finished runs in *jobs* that finished after *since*, oldest first."""
+    hits = [j for j in jobs if j.get("status") not in _WAIT_ACTIVE_STATUSES
+            and (t := _finish_epoch(j)) is not None and t > since]
+    return sorted(hits, key=lambda j: _finish_epoch(j) or 0)
+
+
+def _ls_finished(manager: str, token: str, campaign: str | None, args: argparse.Namespace, since: float) -> None:
+    """``ls --finished-since``: what finished lately, in one experiment or across the campaign."""
+    if args.experiment:
+        experiments = [args.experiment]
+    else:
+        listing = manager_list_experiments(manager, token, campaign=campaign)
+        if listing is None:
+            sys.exit(1)
+        experiments = [str(e["experiment_id"]) for e in listing
+                       if "last_finish_time" not in e
+                       or ((t := _parse_time(e.get("last_finish_time"))) is not None and t.timestamp() > since)]
+    found: list[dict[str, Any]] = []
+    for exp in experiments:
+        jobs = manager_list_experiment_jobs(manager, token, exp, status_filter=args.status, campaign=campaign)
+        if jobs is None:
+            if args.experiment:
+                sys.exit(1)
+            continue
+        found += [dict(j, experiment_id=j.get("experiment_id") or exp) for j in finished_since(jobs, since)]
+    found.sort(key=lambda j: _finish_epoch(j) or 0)
+    if args.json:
+        emit([dict(j, dims=_parse_combo(j["combo"]) or {}) if args.with_dims else j for j in found])
+        return
+    when = datetime.fromtimestamp(since).astimezone().strftime("%Y-%m-%d %H:%M")
+    where = args.experiment or _campaign_label(campaign)
+    sweep_print(_paint(f"# Runs finished since {when} in {where}: {len(found)}", _BOLD))
+    several = not args.experiment
+    for status in [*_FINISHED_ORDER, *sorted({str(j.get("status")) for j in found} - set(_FINISHED_ORDER))]:
+        group = [j for j in found if j.get("status") == status]
+        if not group:
+            continue
+        sweep_print("")
+        sweep_print(_paint(f"## {status.capitalize()} ({len(group)})", _BOLD, _SECTION_COLORS.get(status, "")))
+        for j in reversed(group):  # newest first
+            lines = _run_bullet(j, set(), set(), j["experiment_id"], campaign)
+            if several:
+                lines[0] = lines[0].replace(f"- {_paint(j['run_id'], _C_ID)}",
+                                            f"- {_paint(j['experiment_id'] + '/' + j['run_id'], _C_ID)}", 1)
+            ago = _ago(j.get("finish_time"))
+            if ago:
+                lines[0] = lines[0].removesuffix(".") + f". Finished {ago}."
+            for line in lines:
+                sweep_print(line)
 
 
 # ── logs ───────────────────────────────────────────────────────────────────────
@@ -674,12 +779,128 @@ def _csv_cell(v: Any) -> str:
     return "" if v is None else str(v)
 
 
+_AGGS = ("final", "min", "max", "mean")
+
+
+def parse_aggs(specs: list[str] | None) -> list[tuple[str, re.Pattern[str] | None]]:
+    """``--agg FN`` or ``--agg FN:REGEX`` (repeatable) as ``[(fn, pattern or None)]``.
+
+    ValueError for an unknown function or a bad regex.
+    """
+    out: list[tuple[str, re.Pattern[str] | None]] = []
+    for spec in specs or []:
+        fn, _, rx = spec.partition(":")
+        if fn not in _AGGS:
+            raise ValueError(f"--agg {spec!r}: the function is one of {', '.join(_AGGS)}")
+        try:
+            out.append((fn, re.compile(rx) if rx else None))
+        except re.error as e:
+            raise ValueError(f"--agg {spec!r}: {e}") from None
+    return out
+
+
+def _agg_for(key: str, aggs: list[tuple[str, re.Pattern[str] | None]]) -> str:
+    """The function for *key*: the first ``FN:REGEX`` that matches it, else a bare ``FN``, else final."""
+    for fn, rx in aggs:
+        if rx is not None and rx.search(key):
+            return fn
+    return next((fn for fn, rx in aggs if rx is None), "final")
+
+
+def _number(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return float(v)
+    return float(v) if isinstance(v, (int, float)) and math.isfinite(v) else None
+
+
+def summarize_run(
+    rows: list[dict[str, Any]],
+    pattern: re.Pattern[str] | None,
+    *,
+    aggs: list[tuple[str, re.Pattern[str] | None]] | None = None,
+    steps: list[int] | None = None,
+    x: str | None = None,
+    at: list[float] | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    """One run as one row: ``(run_step, {column: value}, {column: step it came from})``.
+
+    *rows* are everything the run logged; *pattern* picks the keys.  With
+    *steps*, each key's value at (the latest logged at or before) each step.
+    With *x* and *at*, the same at the first step where *x* reached each value,
+    plus a ``step@x=v`` column for that step.  Otherwise each key aggregated
+    over every step by *aggs* (see ``_agg_for``): ``final`` is its latest
+    value, ``min``/``max`` its extremes (with their step), ``mean`` its mean.
+    ``run_step`` is the run's latest step with anything logged.
+    """
+    ordered = sorted((r for r in rows if isinstance(r.get("step"), (int, float))), key=lambda r: r["step"])
+    run_step = ordered[-1]["step"] if ordered else None
+    keys = sorted({k for r in ordered for k in r if k != "step" and (pattern is None or pattern.search(k))})
+    values: dict[str, Any] = {}
+    where: dict[str, Any] = {}
+
+    def at_or_before(key: str, step: Any) -> tuple[Any, Any]:
+        found: tuple[Any, Any] = (None, None)
+        for r in ordered:
+            if r["step"] > step:
+                break
+            if key in r:
+                found = (r[key], r["step"])
+        return found
+
+    if at is not None and x is not None:
+        for target in at:
+            label = f"{x}={target:g}"
+            hit = next((r["step"] for r in ordered if (v := _number(r.get(x))) is not None and v >= target), None)
+            values[f"step@{label}"] = hit
+            for key in keys:
+                col = f"{key}@{label}"
+                values[col], where[col] = at_or_before(key, hit) if hit is not None else (None, None)
+        return run_step, values, where
+    if steps is not None:
+        for step in steps:
+            for key in keys:
+                col = f"{key}@{step}"
+                values[col], where[col] = at_or_before(key, step)
+        return run_step, values, where
+    for key in keys:
+        fn = _agg_for(key, aggs or [])
+        col = key if fn == "final" else f"{fn}({key})"
+        seen = [(r["step"], r[key]) for r in ordered if key in r]
+        if fn == "final":
+            where[col], values[col] = seen[-1]
+            continue
+        nums = [(st, n) for st, v in seen if (n := _number(v)) is not None]
+        if not nums:
+            values[col] = None
+        elif fn == "mean":
+            values[col] = sum(n for _, n in nums) / len(nums)
+        else:
+            pick = (min if fn == "min" else max)(nums, key=lambda t: t[1])
+            where[col], values[col] = pick
+    return run_step, values, where
+
+
+def _parse_steps(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    try:
+        steps = [int(s) for s in raw.split(",") if s.strip()]
+    except ValueError:
+        raise ValueError(f"--step takes step numbers separated by commas, not {raw!r}") from None
+    if not steps:
+        raise ValueError("--step needs at least one step")
+    return steps
+
+
 def metrics_cmd(argv: list[str]) -> None:
     parser = _common_parser(
         "mlsweep metrics",
         "Print what runs logged, filtered and reshaped on demand (nothing is stored).",
     )
-    parser.add_argument("--experiment", required=True, help="Experiment ID")
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--experiment", help="Experiment ID, or several separated by commas")
+    which.add_argument("--active", action="store_true",
+                       help="Every experiment in the campaign with runs pending or running")
     parser.add_argument("runs", nargs="*", help="Run IDs (default: every run in the experiment)")
     parser.add_argument("--keys", default=None, help="Regex selecting metric keys")
     shape = parser.add_mutually_exclusive_group()
@@ -687,24 +908,64 @@ def metrics_cmd(argv: list[str]) -> None:
                        help="Reshape keys via --keys' capture groups: one group makes one "
                             "column per run; two groups make a row×column grid per run")
     shape.add_argument("--last", action="store_true",
-                       help="One row per run: each selected key's own latest value")
-    parser.add_argument("--step", type=int, default=None,
-                        help="With --pivot: use steps at or before this (default: latest)")
+                       help="One row per run: each selected key's own latest value, the step it was "
+                            "logged at when older than the run's, and the run's latest step "
+                            "(the same as --agg final)")
+    parser.add_argument("--agg", action="append", metavar="FN[:REGEX]",
+                        help="One row per run, each key aggregated over its steps: final (latest), min, "
+                             "max (with the step) or mean. FN:REGEX applies FN to the keys REGEX matches; "
+                             "repeat it, e.g. --agg final --agg max:diverged")
+    parser.add_argument("--step", default=None, metavar="N[,N...]",
+                        help="One row per run with each key's value at these steps (the latest logged at "
+                             "or before each). With --pivot, one step caps the steps used")
+    parser.add_argument("--x", default=None, metavar="KEY",
+                        help="With --at: compare at the first step where KEY (tokens, FLOPs, seconds...) "
+                             "reaches each value, rather than at a step")
+    parser.add_argument("--at", default=None, metavar="V[,V...]", help="Values of --x to compare at")
     parser.add_argument("--tail", type=int, default=None,
                         help="Steps per run in the table view (default 10; 0 = all)")
     parser.add_argument("--with-dims", action="store_true",
                         help="Add each sweep dimension as a column, from the submitted combo")
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true",
-                     help='Emit JSON, always {"experiment_id", "runs": [{"run_id", "dims", ...}]}: each run has '
-                          '"rows" (every step), "last" ({key: latest value}) with --last, or "pivot" with --pivot')
-    fmt.add_argument("--csv", action="store_true", help="Emit CSV (long, or wide with --last)")
+                     help='Emit JSON, always {"experiment_id", "runs": [{"run_id", "experiment_id", "dims", '
+                          '...}]}: each run has "rows" (every step); "step" (its latest), "values" and '
+                          '"steps" (where each came from) in the one-row-per-run views, with "last" too '
+                          'for --last; or "pivot" with --pivot')
+    fmt.add_argument("--csv", action="store_true", help="Emit CSV (long, or wide in the one-row-per-run views)")
     args = parser.parse_args(argv)
-    if args.tail is not None and (args.json or args.csv or args.last or args.pivot):
+    try:
+        steps = _parse_steps(args.step)
+        aggs = parse_aggs(args.agg)
+        at = [float(v) for v in args.at.split(",") if v.strip()] if args.at else None
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (args.x is None) != (at is None):
+        parser.error("--x and --at go together: --x tokens --at 1e8,2e8")
+    if args.pivot and (aggs or at):
+        parser.error("--pivot can't be combined with --agg or --at")
+    if args.pivot and steps is not None and len(steps) != 1:
+        parser.error("with --pivot, --step takes one step")
+    if sum(bool(v) for v in (args.last or aggs, steps is not None and not args.pivot, at)) > 1:
+        parser.error("pick one of --last/--agg, --step and --at")
+    summary = bool(args.last or aggs or at or (steps is not None and not args.pivot))
+    if args.tail is not None and (args.json or args.csv or summary or args.pivot):
         parser.error("--tail only applies to the table view. For one row per run "
                      "(each key's latest value), use --last")
     tail = 10 if args.tail is None else args.tail
-    manager, token, campaign = _connect(args, args.experiment)
+
+    manager, token, campaign = _connect(args)
+    if args.active:
+        listing = manager_list_experiments(manager, token, campaign=campaign) or []
+        experiments = [str(e["experiment_id"]) for e in listing if _active_count(e)]
+        if not experiments:
+            sweep_print(f"{_YELLOW}No experiment in {_campaign_label(campaign)} has active runs.{_RESET}")
+            sys.exit(1)
+    else:
+        experiments = list(dict.fromkeys(e.strip() for e in args.experiment.split(",") if e.strip()))
+        for exp in experiments:
+            require_campaign(manager, token, exp, campaign)
+    several = len(experiments) > 1
 
     try:
         pattern = re.compile(args.keys) if args.keys else None
@@ -712,55 +973,93 @@ def metrics_cmd(argv: list[str]) -> None:
         sweep_print(f"{_RED}Bad --keys regex{_RESET}: {e}")
         sys.exit(2)
 
-    jobs: list[dict[str, Any]] = []
-    if not args.runs or args.with_dims or args.json:
-        jobs = _jobs_or_exit(manager, token, args.experiment, campaign)
-    dims, combo_by_run = _dim_columns(jobs)
+    RunRef = tuple[str, str]
+    combo_by_run: dict[RunRef, dict[str, Any]] = {}
+    dims: list[str] = []
+    targets: list[RunRef] = []
+    for exp in experiments:
+        jobs: list[dict[str, Any]] = []
+        if not args.runs or args.with_dims or args.json or several:
+            jobs = _jobs_or_exit(manager, token, exp, campaign)
+        exp_dims, combos = _dim_columns(jobs)
+        dims += [d for d in exp_dims if d not in dims]
+        combo_by_run.update({(exp, rid): c for rid, c in combos.items()})
+        ids = [j["run_id"] for j in jobs]
+        targets += [(exp, rid) for rid in (args.runs if args.runs else ids) if not several or rid in ids]
     if not args.with_dims:
         dims = []  # so every dim column below comes out empty
-    run_ids = list(args.runs) or [j["run_id"] for j in jobs]
+
+    def label(ref: RunRef) -> str:
+        return f"{ref[0]}/{ref[1]}" if several else ref[1]
 
     # combo_by_run covers every run when --with-dims is on (it fetched all jobs).
-    def dim_cells(rid: str, fmt: Callable[[Any], str]) -> list[str]:
-        return [fmt(combo_by_run[rid].get(d)) for d in dims]
+    def dim_cells(ref: RunRef, fmt: Callable[[Any], str]) -> list[str]:
+        return [fmt(combo_by_run.get(ref, {}).get(d)) for d in dims]
 
-    def emit_runs(field_name: str, data: dict[str, Any]) -> None:
-        """The one --json shape, whatever the view."""
-        emit({"experiment_id": args.experiment,
-              "runs": [{"run_id": rid, "dims": combo_by_run.get(rid, {}), field_name: value}
-                       for rid, value in data.items()]})
+    def emit_runs(fields: dict[RunRef, dict[str, Any]]) -> None:
+        """The one --json shape, whatever the view: each run with its *fields*."""
+        emit({"experiment_id": experiments[0] if not several else None,
+              **({"experiment_ids": experiments} if several else {}),
+              "runs": [{"run_id": ref[1], "experiment_id": ref[0], "dims": combo_by_run.get(ref, {}), **f}
+                       for ref, f in fields.items()]})
 
-    def run_label(rid: str) -> str:
-        return f"{rid} ({_combo_str(combo_by_run[rid])})" if args.with_dims else rid
+    def run_label(ref: RunRef) -> str:
+        return f"{label(ref)} ({_combo_str(combo_by_run.get(ref, {}))})" if args.with_dims else label(ref)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        fetched = pool.map(lambda rid: manager_get_job_metrics(manager, token, args.experiment, rid,
-                                                               campaign=campaign),
-                           run_ids)
-        per_run = {rid: select_metrics(rows or [], pattern) for rid, rows in zip(run_ids, fetched)}
-    per_run = {rid: rows for rid, rows in per_run.items() if rows}
+        fetched = pool.map(lambda ref: manager_get_job_metrics(manager, token, ref[0], ref[1], campaign=campaign),
+                           targets)
+        raw = {ref: rows or [] for ref, rows in zip(targets, fetched)}
+    per_run = {ref: sel for ref, rows in raw.items() if (sel := select_metrics(rows, pattern))}
     if not per_run:
-        sweep_print(f"{_RED}No metrics{_RESET} in {args.experiment}"
+        sweep_print(f"{_RED}No metrics{_RESET} in {', '.join(experiments)}"
                     + (f" matching {args.keys!r}" if args.keys else ""))
         sys.exit(1)
 
-    # ── --last: wide, one row per run ────────────────────────────────────────
-    if args.last:
-        wide = {rid: pivot_metrics(rows, None, None)[1] for rid, rows in per_run.items()}
-        keys = sorted({k for vals in wide.values() for k in vals})
+    # ── one row per run: --last, --agg, --step, --x/--at ───────────────────
+    if summary:
+        rows_out: dict[RunRef, tuple[Any, dict[str, Any], dict[str, Any]]] = {}
+        for ref in per_run:
+            # The run's latest step counts every key, the --x key too.
+            rows_out[ref] = summarize_run(raw[ref], pattern, aggs=aggs, steps=None if args.pivot else steps,
+                                          x=args.x, at=at)
+        cols: list[str] = []
+        for _, vals, _ in rows_out.values():
+            cols += [c for c in vals if c not in cols]
         if args.json:
-            emit_runs("last", wide)
+            emit_runs({
+                ref: {"step": st, "values": vals, "steps": where, **({"last": vals} if args.last else {})}
+                for ref, (st, vals, where) in rows_out.items()})
             return
+        # A value's step is shown when it isn't simply the run's latest (final) or the step asked for.
+        def note(col: str, run_step: Any, where: dict[str, Any]) -> Any:
+            s = where.get(col)
+            if s is None:
+                return None
+            if "@" in col and not col.startswith("step@"):
+                asked = col.rsplit("@", 1)[1]
+                return None if asked == str(s) or "=" in asked else s
+            return None if s == run_step and not col.startswith(("min(", "max(")) else s
         if args.csv:
+            noted = [c for c in cols if any(note(c, st, w) is not None for st, _, w in rows_out.values())]
             w = csv.writer(sys.stdout)
-            w.writerow(["run"] + dims + keys)
-            for rid, vals in wide.items():
-                w.writerow([rid] + dim_cells(rid, _csv_cell) + [_csv_cell(vals.get(k)) for k in keys])
+            w.writerow(["run"] + (["experiment"] if several else []) + dims + ["step"]
+                       + [h for c in cols for h in ([c, f"{c} step"] if c in noted else [c])])
+            for ref, (st, vals, where) in rows_out.items():
+                w.writerow([ref[1]] + ([ref[0]] if several else []) + dim_cells(ref, _csv_cell) + [_csv_cell(st)]
+                           + [cell for c in cols for cell in ([_csv_cell(vals.get(c)), _csv_cell(where.get(c))]
+                                                              if c in noted else [_csv_cell(vals.get(c))])])
             return
-        _print_table(["run"] + dims + keys,
-                     [[rid] + dim_cells(rid, _fmt) + [_fmt(vals.get(k)) for k in keys]
-                      for rid, vals in wide.items()])
+
+        def shown(col: str, st: Any, vals: dict[str, Any], where: dict[str, Any]) -> str:
+            n = note(col, st, where)
+            return _fmt(vals.get(col)) + (f" @{_fmt(n)}" if n is not None else "")
+        _print_table(["run"] + dims + ["step"] + cols,
+                     [[label(ref)] + dim_cells(ref, _fmt) + [_fmt(st)] + [shown(c, st, vals, where) for c in cols]
+                      for ref, (st, vals, where) in rows_out.items()])
         return
+
+    pivot_step = steps[0] if steps else None
 
     # ── --pivot: reshape key captures ────────────────────────────────────────
     if args.pivot:
@@ -773,70 +1072,70 @@ def metrics_cmd(argv: list[str]) -> None:
             sys.exit(2)
 
         if args.json:
-            pivots: dict[str, Any] = {}
-            for rid, rows in per_run.items():
+            pivots: dict[RunRef, Any] = {}
+            for ref, rows in per_run.items():
                 if pattern.groups == 1:
-                    pstep, vals = pivot_metrics(rows, pattern, args.step)
-                    if vals:
-                        pivots[rid] = {"step": pstep, "values": vals}
+                    pstep, pvals = pivot_metrics(rows, pattern, pivot_step)
+                    if pvals:
+                        pivots[ref] = {"step": pstep, "values": pvals}
                 else:
-                    grid, _ = _pivot_run(rows, pattern, args.step)
+                    grid, _ = _pivot_run(rows, pattern, pivot_step)
                     if grid:
                         nested: dict[str, dict[str, Any]] = {}
-                        for (x, y), v in grid.items():
-                            nested.setdefault(str(x), {})[str(y)] = v
-                        pivots[rid] = {"values": nested}
-            emit_runs("pivot", pivots)
+                        for (gx, gy), v in grid.items():
+                            nested.setdefault(str(gx), {})[str(gy)] = v
+                        pivots[ref] = {"values": nested}
+            emit_runs({ref: {"pivot": p} for ref, p in pivots.items()})
             return
 
         if pattern.groups == 1:
-            cols = []
-            for rid, rows in per_run.items():
-                pstep, vals = pivot_metrics(rows, pattern, args.step)
-                if vals:
-                    cols.append((f"{run_label(rid)} @{pstep}", vals))
-            if not cols:
-                sweep_print(f"{_YELLOW}No pivot values{_RESET} in {args.experiment}")
+            pcols = []
+            for ref, rows in per_run.items():
+                pstep, pvals = pivot_metrics(rows, pattern, pivot_step)
+                if pvals:
+                    pcols.append((f"{run_label(ref)} @{pstep}", pvals))
+            if not pcols:
+                sweep_print(f"{_YELLOW}No pivot values{_RESET} in {', '.join(experiments)}")
                 return
-            xs = sorted({x for _, vals in cols for x in vals}, key=_sort_key)
-            _print_table(["x"] + [c for c, _ in cols],
-                         [[x] + [_fmt(vals.get(x)) for _, vals in cols] for x in xs])
+            xs = sorted({gx for _, pvals in pcols for gx in pvals}, key=_sort_key)
+            _print_table(["x"] + [c for c, _ in pcols],
+                         [[gx] + [_fmt(pvals.get(gx)) for _, pvals in pcols] for gx in xs])
             return
 
         # two capture groups: one row×column grid per run
-        for rid, rows in per_run.items():
-            grid, _ = _pivot_run(rows, pattern, args.step)
+        for ref, rows in per_run.items():
+            grid, _ = _pivot_run(rows, pattern, pivot_step)
             if not grid:
                 continue
             xs = sorted({g[0] for g in grid}, key=_sort_key)
             ys = sorted({g[1] for g in grid}, key=_sort_key)
-            print(f"{_BOLD}{_CYAN}== {run_label(rid)}{_RESET}")
+            print(f"{_BOLD}{_CYAN}== {run_label(ref)}{_RESET}")
             _print_table(["x\\y"] + ys,
-                         [[x] + [_fmt(grid.get((x, y))) for y in ys] for x in xs])
+                         [[gx] + [_fmt(grid.get((gx, gy))) for gy in ys] for gx in xs])
             print()
         return
 
     # ── long JSON / CSV ──────────────────────────────────────────────────────
     if args.json:
-        emit_runs("rows", per_run)
+        emit_runs({ref: {"rows": r} for ref, r in per_run.items()})
         return
     if args.csv:
         w = csv.writer(sys.stdout)
-        w.writerow(["run"] + dims + ["step", "key", "value"])
-        for rid, rows in per_run.items():
-            cells = dim_cells(rid, _csv_cell)
+        w.writerow(["run"] + (["experiment"] if several else []) + dims + ["step", "key", "value"])
+        for ref, rows in per_run.items():
+            cells = ([ref[0]] if several else []) + dim_cells(ref, _csv_cell)
             for row in rows:
-                for k, v in row.items():
-                    if k != "step":
-                        w.writerow([rid] + cells + [row["step"], k, _csv_cell(v)])
+                for key, v in row.items():
+                    if key != "step":
+                        w.writerow([ref[1]] + cells + [row["step"], key, _csv_cell(v)])
         return
 
     # ── table view ───────────────────────────────────────────────────────────
-    for rid, rows in per_run.items():
-        keys = sorted({k for r in rows for k in r if k != "step"})
-        shown = rows[-tail:] if tail else rows
-        print(f"{_BOLD}{_CYAN}== {run_label(rid)}{_RESET}  ({len(rows)} steps)")
-        _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(k)) for k in keys] for r in shown])
+    for ref, rows in per_run.items():
+        keys = sorted({key for r in rows for key in r if key != "step"})
+        shown_rows = rows[-tail:] if tail else rows
+        print(f"{_BOLD}{_CYAN}== {run_label(ref)}{_RESET}  ({len(rows)} steps)")
+        _print_table(["step"] + keys, [[_fmt(r["step"])] + [_fmt(r.get(key)) for key in keys] for r in shown_rows])
         print()
 
 
@@ -952,11 +1251,51 @@ def reschedule_cmd(argv: list[str]) -> None:
 # ── rename ─────────────────────────────────────────────────────────────────────
 
 
+def history_cmd(argv: list[str]) -> None:
+    parser = _common_parser(
+        "mlsweep history",
+        "What happened to an experiment's runs, and who did it: submissions, dispatches (worker and "
+        "GPUs), results, requeues and why, and the cancels, retries, moves, reschedules and deletes "
+        "made from the dashboard or the CLI. Works for a deleted experiment too.",
+    )
+    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("run", nargs="?", help="Only this run (and what happened to the whole experiment)")
+    parser.add_argument("--limit", type=int, default=1000, help="Most recent entries to show (default: 1000)")
+    parser.add_argument("--json", action="store_true", help="Print the entries as JSON")
+    args = parser.parse_args(argv)
+    manager, token = _manager_token(args)
+    query = f"experiment_id={quote(args.experiment)}&limit={args.limit}"
+    if args.run:
+        query += f"&run_id={quote(args.run)}"
+    status, resp = _http_request("GET", _manager_url(manager, f"/api/history?{query}"), token)
+    if status != 200 or not isinstance(resp, dict):
+        _fail("history", status, resp)
+    if args.json:
+        emit(resp)
+        return
+    events = resp.get("events") or []
+    gone = "" if resp.get("exists") else " (deleted, or never existed)"
+    sweep_print(_paint(f"# History of {args.experiment}" + (f", run {args.run}" if args.run else "") + gone,
+                       _BOLD))
+    if not events:
+        sweep_print("Nothing recorded. History starts with the manager version that keeps it.")
+        return
+    for e in events:
+        t = _parse_time(e.get("time"))
+        when = t.astimezone().strftime("%Y-%m-%d %H:%M:%S") if t else "?"
+        who = e.get("run_id") or "(experiment)"
+        attempt = f" attempt {e['attempt']}" if e.get("attempt") else ""
+        detail = f": {e['detail']}" if e.get("detail") else ""
+        sweep_print(f"{_paint(when, _C_TIME)}  {_paint(e.get('source', '?'), _C_AUX):<9}  "
+                    f"{_paint(who, _C_ID)}  {e.get('action')}{attempt}{detail}")
+
+
 def rename_cmd(argv: list[str]) -> None:
     parser = _common_parser(
         "mlsweep rename",
         "Give a run a display name, shown next to its run ID in ls, best, and the "
-        "dashboard. The run ID itself never changes.",
+        "dashboard. The run ID itself never changes. --experiment-name and --description "
+        "change the experiment's name and description instead.",
     )
     parser.add_argument("experiment", help="Experiment ID")
     parser.add_argument("run", nargs="?", help="Run ID")
@@ -964,26 +1303,48 @@ def rename_cmd(argv: list[str]) -> None:
     parser.add_argument("--clear", action="store_true", help="Remove the display name")
     parser.add_argument("--experiment-name", metavar="NAME",
                         help="Rename the experiment itself (its ID never changes)")
+    parser.add_argument("--description", metavar="TEXT",
+                        help="Set the experiment's description (can go with --experiment-name)")
+    parser.add_argument("--clear-description", action="store_true",
+                        help="Remove the experiment's description")
     parser.add_argument("--json", action="store_true", help="Print the new name as JSON")
     args = parser.parse_args(argv)
-    if args.experiment_name is not None:
+    description = None if args.description is None else args.description.strip()
+    if description is not None and args.clear_description:
+        parser.error("give --description TEXT or --clear-description, not both")
+    if description == "":
+        parser.error("--description must not be empty (--clear-description removes it)")
+    if args.experiment_name is not None or description is not None or args.clear_description:
         if args.run or args.clear:
-            parser.error("--experiment-name takes no RUN, NAME or --clear")
-        new = args.experiment_name.strip()
-        if not new:
+            parser.error("--experiment-name, --description and --clear-description take no RUN, NAME or --clear")
+        new = None if args.experiment_name is None else args.experiment_name.strip()
+        if new == "":
             parser.error("--experiment-name must not be empty")
         manager, token, campaign = _connect(args, args.experiment)
-        status, resp = _http_request(
-            "PUT", _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/name", campaign)),
-            token, json_data={"name": new})
-        _report(status == 200, f"renamed experiment {args.experiment} to {new!r}")
-        if status != 200:
-            _fail("rename", status, resp)
+        out: dict[str, Any] = {"experiment_id": args.experiment}
+        if new is not None:
+            status, resp = _http_request(
+                "PUT", _manager_url(manager, _with_campaign(f"/api/experiments/{args.experiment}/name", campaign)),
+                token, json_data={"name": new})
+            _report(status == 200, f"renamed experiment {args.experiment} to {new!r}")
+            if status != 200:
+                _fail("rename", status, resp)
+            out["name"] = new
+        if description is not None or args.clear_description:
+            status, resp = _http_request(
+                "PUT", _manager_url(manager, _with_campaign(
+                    f"/api/experiments/{args.experiment}/description", campaign)),
+                token, json_data={"description": description})
+            _report(status == 200, f"cleared the description of {args.experiment}" if description is None
+                    else f"set the description of {args.experiment}")
+            if status != 200:
+                _fail("rename", status, resp)
+            out["description"] = description
         if args.json:
-            emit({"experiment_id": args.experiment, "name": new})
+            emit(out)
         return
     if not args.run:
-        parser.error("give RUN and NAME (or --clear), or --experiment-name NAME")
+        parser.error("give RUN and NAME (or --clear), or --experiment-name NAME / --description TEXT")
     name = (args.name or "").strip()
     if args.clear == bool(name):
         parser.error("give a non-empty NAME or --clear, not both")
@@ -1208,7 +1569,7 @@ def _wait_stalled(
 
 
 def wait_cmd(argv: list[str]) -> None:
-    """Wait for an experiment to finish, fail, or stall.
+    """Wait for experiments to finish, fail, or stall.
 
     Exit codes are part of the interface so scripts and agents can branch on
     them without parsing text:
@@ -1225,9 +1586,11 @@ def wait_cmd(argv: list[str]) -> None:
         prog="mlsweep wait",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Wait until an experiment settles, fails, or stalls.\n\n"
+            "Wait until experiments settle, fail, or stall. Name one or more experiments, or none to\n"
+            "watch every experiment in the campaign that has active runs, including ones submitted\n"
+            "while it waits.\n\n"
             "Exit codes:\n"
-            "  0  every run finished successfully\n"
+            "  0  every run finished successfully (with --until started: every run has logged a step)\n"
             "  1  at least one run failed, or the manager paused the sweep (METRIC_CHECK)\n"
             "  2  timed out (--timeout), runs still active; waiting again is safe\n"
             "  3  a running run stalled (--until stalled)\n"
@@ -1236,11 +1599,13 @@ def wait_cmd(argv: list[str]) -> None:
         ),
     )
     _add_manager_args(parser)
-    parser.add_argument("experiment", help="Experiment ID")
+    parser.add_argument("experiments", nargs="*", metavar="EXPERIMENT",
+                        help="Experiment IDs (none: the campaign's experiments with active runs)")
     parser.add_argument(
-        "--until", choices=("done", "any-failure", "any-done", "stalled"), default="done",
+        "--until", choices=("done", "any-failure", "any-done", "stalled", "started"), default="done",
         help="Condition to wait for (default: done = no active runs). any-done returns as soon as "
-             "any run finishes, however it ended; pass --since to pick up where the last call left off",
+             "any run finishes, however it ended; pass --since to pick up where the last call left off. "
+             "started returns once every run has logged a step (or finished), and at once if one fails",
     )
     parser.add_argument(
         "--since", default=None, metavar="T",
@@ -1263,33 +1628,184 @@ def wait_cmd(argv: list[str]) -> None:
              "for --until stalled (default: 900)",
     )
     args = parser.parse_args(argv)
-    manager, token, campaign = _connect(args, args.experiment)
-
-    start = time.monotonic()
     try:
         since = _parse_since(args.since) if args.since is not None else time.time()
     except ValueError:
         parser.error(f"--since must be epoch seconds or an ISO time, not {args.since!r}")
+    experiments = list(dict.fromkeys(args.experiments))
+    if len(experiments) == 1:
+        _wait_one(args, experiments[0], since)
+    manager, token, campaign = _connect(args)
+    for experiment in experiments:
+        require_campaign(manager, token, experiment, campaign)
+    _wait_many(args, manager, token, campaign, experiments, since)
+
+
+def _wait_one(args: argparse.Namespace, experiment: str, since: float) -> NoReturn:
+    manager, token, campaign = _connect(args, experiment)
+    start = time.monotonic()
     while True:
-        jobs = manager_list_experiment_jobs(manager, token, args.experiment, campaign=campaign)
-        verdict = wait_outcome(args.experiment, jobs, args.until, args.stalled_after,
-                               lambda: _get_experiment(manager, token, args.experiment, campaign), since=since)
+        jobs = manager_list_experiment_jobs(manager, token, experiment, campaign=campaign)
+        verdict = wait_outcome(experiment, jobs, args.until, args.stalled_after,
+                               lambda: _get_experiment(manager, token, experiment, campaign), since=since)
         if verdict is None and args.timeout and time.monotonic() - start >= args.timeout:
             active = [j for j in jobs or [] if j.get("status") in _WAIT_ACTIVE_STATUSES]
             if active:
-                message = (f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} still has "
+                message = (f"{_YELLOW}TIMEOUT{_RESET}  {experiment} still has "
                            f"{len(active)} active run(s) after {args.timeout:g}s.")
             else:
-                message = (f"{_YELLOW}TIMEOUT{_RESET}  {args.experiment} has no active runs right now, "
+                message = (f"{_YELLOW}TIMEOUT{_RESET}  {experiment} has no active runs right now, "
                            f"but the manager still expects more. `mlsweep optimize "
-                           f"{args.experiment}` shows where a Bayesian sweep stands.")
+                           f"{experiment}` shows where a Bayesian sweep stands.")
             verdict = WaitVerdict(WAIT_EXIT_TIMEOUT, message, "timeout", active)
         if verdict is not None:
             sweep_print(verdict.message)
             if args.json:
-                emit(verdict.to_json(args.experiment, jobs, since))
+                emit(verdict.to_json(experiment, jobs, since))
             sys.exit(verdict.code)
         time.sleep(args.interval)
+
+
+def _campaign_label(campaign: str | None) -> str:
+    return f"campaign {campaign}" if campaign else "any campaign"
+
+
+def _active_count(exp: dict[str, Any]) -> int:
+    c = exp.get("job_counts") or {}
+    return sum(int(c.get(st) or 0) for st in _WAIT_ACTIVE_STATUSES)
+
+
+def _between_trials(exp: dict[str, Any]) -> bool:
+    """A Bayesian sweep (or one expecting more runs) still running with none active."""
+    return exp.get("status") == "running" and bool(exp.get("optimize") or exp.get("expected_jobs"))
+
+
+def _live_since(jobs: list[dict[str, Any]], since: float) -> bool:
+    """Whether an experiment has active runs, or a run that finished after *since*."""
+    return any(j.get("status") in _WAIT_ACTIVE_STATUSES
+               or ((t := _finish_epoch(j)) is not None and t > since) for j in jobs)
+
+
+def campaign_wait_candidates(
+    experiments: list[dict[str, Any]], since: float, watched: set[str], first_poll: bool,
+) -> list[str]:
+    """The campaign's experiments a ``wait`` with no IDs looks at, newest first.
+
+    Those with active runs, a Bayesian sweep between trials, a run that finished
+    after *since*, and any already *watched* (so its last run's finish is seen).
+    A manager that doesn't report ``last_finish_time`` has every experiment
+    checked on the first poll instead.
+    """
+    out = []
+    for exp in experiments:
+        eid = str(exp.get("experiment_id") or "")
+        if not eid:
+            continue
+        between_trials = _between_trials(exp)
+        if "last_finish_time" in exp:
+            last = _parse_time(exp.get("last_finish_time"))
+            finished_since = last is not None and last.timestamp() > since
+        else:
+            finished_since = first_poll
+        if eid in watched or _active_count(exp) or between_trials or finished_since:
+            out.append(eid)
+    return out
+
+
+def _wait_many(args: argparse.Namespace, manager: str, token: str, campaign: str | None,
+               named: list[str], since: float) -> NoReturn:
+    whole_campaign = not named
+    start = time.monotonic()
+    watched: set[str] = set()
+    first = True
+    verdict: WaitVerdict | None
+    while True:
+        if whole_campaign:
+            listing = manager_list_experiments(manager, token, campaign=campaign, quiet=True)
+            if listing is None:
+                verdict = WaitVerdict(WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  Cannot list the experiments "
+                                                         f"in {_campaign_label(campaign)}", "unknown")
+                _wait_exit(args, verdict, {}, since, campaign)
+            experiments = campaign_wait_candidates(listing, since, watched, first)
+            between_trials = {str(e.get("experiment_id")) for e in listing if _between_trials(e)}
+        else:
+            experiments, between_trials = named, set()
+        first = False
+        per: dict[str, tuple[list[dict[str, Any]] | None, WaitVerdict | None]] = {}
+        for eid in experiments:
+            jobs = manager_list_experiment_jobs(manager, token, eid, campaign=campaign)
+            if whole_campaign and not _live_since(jobs or [], since) and eid not in between_trials:
+                continue  # settled before this wait began (or deleted): not something to wait on
+            verdict = wait_outcome(
+                eid, jobs, args.until, args.stalled_after,
+                functools.partial(_get_experiment, manager, token, eid, campaign),
+                since=since, fail_since=since if whole_campaign else None)
+            per[eid] = (jobs, verdict)
+        watched.update(per)
+        verdict = combine_wait_verdicts({e: v for e, (_, v) in per.items()}, args.until)
+        if verdict is None and not per:
+            verdict = WaitVerdict(WAIT_EXIT_SETTLED, f"{_GREEN}DONE{_RESET}  No experiment in "
+                                                     f"{_campaign_label(campaign)} has active runs.", "settled")
+        if verdict is None and args.timeout and time.monotonic() - start >= args.timeout:
+            active = [{**j, "experiment_id": e} for e, (jobs, _) in per.items()
+                      for j in jobs or [] if j.get("status") in _WAIT_ACTIVE_STATUSES]
+            verdict = WaitVerdict(WAIT_EXIT_TIMEOUT, f"{_YELLOW}TIMEOUT{_RESET}  {len(active)} active run(s) in "
+                                                     f"{len(per)} experiment(s) after {args.timeout:g}s.",
+                                  "timeout", active)
+        if verdict is not None:
+            _wait_exit(args, verdict, {e: jobs for e, (jobs, _) in per.items()}, since,
+                       campaign if whole_campaign else None)
+        time.sleep(args.interval)
+
+
+def _wait_exit(args: argparse.Namespace, verdict: "WaitVerdict",
+               jobs_by_exp: dict[str, list[dict[str, Any]] | None], since: float,
+               campaign: str | None) -> NoReturn:
+    sweep_print(verdict.message)
+    if args.json:
+        emit(verdict.to_json_many(jobs_by_exp, since, campaign))
+    sys.exit(verdict.code)
+
+
+# A verdict on one experiment that ends the whole wait, most urgent first.
+# "failure" is one only under --until any-failure; otherwise it means the
+# experiment settled with failures, and the wait goes on for the others.
+_WAIT_TRIGGERS = ("unknown", "paused", "failure", "stalled", "run_finished")
+_WAIT_TRIGGER_TAGS = {"failure": f"{_RED}FAILURE{_RESET}", "stalled": f"{_YELLOW}STALLED{_RESET}",
+                      "run_finished": f"{_GREEN}FINISHED{_RESET}"}
+
+
+def combine_wait_verdicts(verdicts: dict[str, "WaitVerdict | None"], until: str) -> "WaitVerdict | None":
+    """One verdict for a ``wait`` over several experiments, or None to keep waiting.
+
+    The most urgent triggered outcome wins, with every experiment's runs for it.
+    Once every experiment has settled, the result is the worst of theirs:
+    failure, then cancelled, then settled.  Each run carries its ``experiment_id``.
+    """
+    triggers = [o for o in _WAIT_TRIGGERS if o != "failure" or until in ("any-failure", "started")]
+    for outcome in triggers:
+        hits = {e: v for e, v in verdicts.items() if v is not None and v.outcome == outcome}
+        if not hits:
+            continue
+        runs = [{**j, "experiment_id": e} for e, v in hits.items() for j in v.runs]
+        if outcome in _WAIT_TRIGGER_TAGS:
+            names = ", ".join(f"{j['experiment_id']}/{j.get('run_id', '?')}"
+                              + (f" ({j.get('status')})" if outcome == "run_finished" else "") for j in runs)
+            message = f"{_WAIT_TRIGGER_TAGS[outcome]}  {len(runs)} run(s): {names}"
+        else:
+            message = "\n".join(v.message for v in hits.values())
+        return WaitVerdict(next(iter(hits.values())).code, message, outcome, runs)
+    if not verdicts or any(v is None for v in verdicts.values()):
+        return None
+    settled = [v for v in verdicts.values() if v is not None]
+    runs = [{**j, "experiment_id": e} for e, v in verdicts.items() if v is not None for j in v.runs]
+    message = "\n".join(v.message for v in settled)
+    if any(v.code == WAIT_EXIT_FAILURE for v in settled):
+        return WaitVerdict(WAIT_EXIT_FAILURE, message, "failure", runs)
+    if any(v.code == WAIT_EXIT_CANCELLED for v in settled):
+        return WaitVerdict(WAIT_EXIT_CANCELLED, message, "cancelled", runs)
+    started = any(v.outcome == "started" for v in settled)
+    return WaitVerdict(WAIT_EXIT_SETTLED, message, "started" if started else "settled", runs)
 
 
 def _parse_since(raw: str) -> float:
@@ -1337,6 +1853,28 @@ class WaitVerdict:
         out["cursor"] = max([since, *finished])
         return out
 
+    def to_json_many(self, jobs_by_exp: dict[str, list[dict[str, Any]] | None], since: float,
+                     campaign: str | None) -> dict[str, Any]:
+        """The --json result of a wait over several experiments (*campaign*: over all of its)."""
+        per: dict[str, dict[str, int]] = {}
+        total: dict[str, int] = {}
+        for eid, jobs in jobs_by_exp.items():
+            counts = per.setdefault(eid, {})
+            for j in jobs or []:
+                st = str(j.get("status"))
+                counts[st] = counts.get(st, 0) + 1
+                total[st] = total.get(st, 0) + 1
+        finished = [t for jobs in jobs_by_exp.values() for j in jobs or [] if (t := _finish_epoch(j)) is not None]
+        plain = _ANSI_RE.sub("", self.message)
+        return {
+            **({"error": plain.replace("FAIL  ", "")} if self.outcome == "unknown" else {}),
+            "experiment_ids": list(jobs_by_exp), **({"campaign": campaign} if campaign else {}),
+            "outcome": self.outcome, "exit_code": self.code, "message": plain,
+            "runs": [{k: j.get(k) for k in ("experiment_id", "run_id", "status", "reason", "exit_code", "finish_time")}
+                     for j in self.runs],
+            "counts": total, "experiments": per, "cursor": max([since, *finished]),
+        }
+
 
 def wait_outcome(
     experiment: str,
@@ -1345,12 +1883,14 @@ def wait_outcome(
     stalled_after: float,
     get_experiment: Callable[[], dict[str, Any]],
     since: float = 0.0,
+    fail_since: float | None = None,
 ) -> WaitVerdict | None:
     """What ``mlsweep wait`` does after one poll, or None to keep waiting.
 
     *jobs* is the experiment's runs (None if the manager did not answer), and
     *get_experiment* fetches the experiment itself, only when it is needed.
     For ``any-done``, runs that finished after *since* (epoch seconds) count.
+    With *fail_since*, ``any-failure`` counts only runs that failed after it.
     """
     if jobs is None:
         return WaitVerdict(WAIT_EXIT_UNKNOWN, f"{_RED}FAIL{_RESET}  Cannot list jobs for {experiment}", "unknown")
@@ -1361,10 +1901,12 @@ def wait_outcome(
     failed = _wait_failed(jobs)
     active = [j for j in jobs if j.get("status") in _WAIT_ACTIVE_STATUSES]
 
-    if until == "any-failure" and failed:
-        names = ", ".join(j.get("run_id", "?") for j in failed)
-        return WaitVerdict(WAIT_EXIT_FAILURE, f"{_RED}FAILURE{_RESET}  {len(failed)} run(s) failed: {names}",
-                           "failure", failed)
+    new_failures = failed if fail_since is None else [
+        j for j in failed if (t := _finish_epoch(j)) is not None and t > fail_since]
+    if until in ("any-failure", "started") and new_failures:
+        names = ", ".join(j.get("run_id", "?") for j in new_failures)
+        return WaitVerdict(WAIT_EXIT_FAILURE, f"{_RED}FAILURE{_RESET}  {len(new_failures)} run(s) failed: {names}",
+                           "failure", new_failures)
 
     if until == "any-done":
         newly = sorted((j for j in jobs if j.get("status") not in _WAIT_ACTIVE_STATUSES
@@ -1373,6 +1915,11 @@ def wait_outcome(
             names = ", ".join(f"{j.get('run_id', '?')} ({j.get('status')})" for j in newly)
             return WaitVerdict(WAIT_EXIT_SETTLED, f"{_GREEN}FINISHED{_RESET}  {len(newly)} run(s): {names}",
                                "run_finished", newly)
+
+    if until == "started" and active and all(
+            j.get("status") == "running" and j.get("last_step") is not None for j in active):
+        return WaitVerdict(WAIT_EXIT_SETTLED, f"{_GREEN}STARTED{_RESET}  {experiment}: every run has logged a "
+                                              f"step or finished ({len(active)} running).", "started", active)
 
     if active and all(j.get("status") == "pending" for j in active):
         exp = get_experiment()
@@ -1681,13 +2228,18 @@ def _post_runs(
 def move_cmd(argv: list[str]) -> None:
     parser = _common_parser(
         "mlsweep move",
-        "Move finished runs to another experiment, with their metrics, logs and files. "
-        "Runs still pending or running must be cancelled first.",
+        "Move runs to another experiment, with their metrics, logs and files. Finished and pending "
+        "runs move now; a running one moves when it finishes, without being restarted.",
     )
     parser.add_argument("experiment", help="Experiment the runs are in")
     parser.add_argument("runs", nargs="*", help="Run IDs to move")
     parser.add_argument("--to", required=True, metavar="EXPERIMENT", help="Experiment to move them to")
-    flags = ("done", "failed", "cancelled", "xfailed")
+    parser.add_argument("--create", action="store_true",
+                        help="Create the target if it doesn't exist (this campaign, the source's metric, "
+                             "goal and run controls)")
+    parser.add_argument("--now-only", action="store_true",
+                        help="Refuse runs still running instead of moving them when they finish")
+    flags = ("done", "failed", "cancelled", "xfailed", "pending", "running")
     _add_run_flags(parser, flags, "also every {} run")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -1695,9 +2247,15 @@ def move_cmd(argv: list[str]) -> None:
     if not run_ids:
         sweep_print("No runs selected.")
         return
-    resp = _post_runs("move", args, manager, token, campaign, {"run_ids": run_ids, "to": args.to})
+    resp = _post_runs("move", args, manager, token, campaign, {
+        "run_ids": run_ids, "to": args.to, "after_finish": not args.now_only, "create": args.create})
     if not args.json:
+        if resp.get("created"):
+            _report(True, f"created {args.to}")
         _report(True, f"moved {len(resp['moved'])} run(s) from {args.experiment} to {args.to}")
+        if resp.get("will_move"):
+            _report(True, f"{len(resp['will_move'])} running run(s) move when they finish: "
+                          + ", ".join(resp["will_move"]))
         for rid in resp.get("files_not_moved", []):
             _report(False, f"{rid}: its files could not be moved (see the manager log)")
 
@@ -1806,6 +2364,9 @@ def gc_cmd(argv: list[str]) -> None:
 _CODE_HELP = """\
 mlsweep code EXP                     what code EXP's runs used, and where it came from
 mlsweep code EXP PATH                print one file as EXP ran it
+mlsweep code EXP PATH --lines 40-60  numbered lines, with their note reference (-n: the file, paged)
+mlsweep code mlsweep:code/EXP/PATH#L40-60   the same, from a note's link
+mlsweep code search PATTERN [EXP...] lines that match, in EXP or across the campaign (-E, -i, -C N)
 mlsweep code EXP --files [PREFIX]    list the snapshot's files
 mlsweep code diff A B [--path P]     what changed between two experiments' code (--stat for a summary)
 mlsweep code checkout EXP DIR        write EXP's code out to DIR
@@ -2002,19 +2563,37 @@ def _print_uncommitted(manager: str, token: str, exp: str, campaign: str | None,
 
 
 def code_cmd(argv: list[str]) -> None:
-    verb = argv[0] if argv and argv[0] in ("diff", "checkout") else "show"
+    verb = argv[0] if argv and argv[0] in ("diff", "checkout", "search") else "show"
     parser = argparse.ArgumentParser(prog=f"mlsweep code{'' if verb == 'show' else ' ' + verb}",
-                                     description="The code experiments ran: show, print, diff, check out.",
+                                     description="The code experiments ran: show, print, search, diff, "
+                                                 "check out.",
                                      epilog=_CODE_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_manager_args(parser)
     parser.add_argument("--json", action="store_true", help="Print what the manager returned, as JSON")
     if verb == "show":
-        parser.add_argument("ref", metavar="EXP", help="Experiment ID or snapshot ID")
+        parser.add_argument("ref", metavar="EXP",
+                            help="Experiment ID, snapshot ID, or a note's mlsweep:code/EXP/PATH#L40-60 link")
         parser.add_argument("path", nargs="?", help="A file to print, as the experiment ran it")
         parser.add_argument("--files", nargs="?", const="", metavar="PREFIX", help="List the snapshot's files")
         parser.add_argument("--snapshot", help="Which of the experiment's code versions (ID or prefix)")
         parser.add_argument("--uncommitted", action="store_true",
                             help="Print the uncommitted changes recorded when the code was submitted")
+        parser.add_argument("--lines", metavar="A-B",
+                            help="Print these lines, numbered (40, 40-60, or 40- for the rest)")
+        parser.add_argument("-n", "--numbered", action="store_true",
+                            help="Print the file numbered, within --budget, with the command for the next page")
+        parser.add_argument("--budget", type=int, default=2000, metavar="TOKENS",
+                            help="With -n or --lines, stop after about this many tokens (default 2000, 0: no limit)")
+    elif verb == "search":
+        parser.add_argument("pattern", metavar="PATTERN", help="Text to find (a regular expression with -E)")
+        parser.add_argument("targets", nargs="*", metavar="EXP",
+                            help="Experiments or snapshots to search (default: every experiment of the campaign)")
+        parser.add_argument("--path", help="Only files under this path")
+        parser.add_argument("-E", "--regex", action="store_true", help="PATTERN is a regular expression")
+        parser.add_argument("-i", "--ignore-case", action="store_true")
+        parser.add_argument("-C", "--context-lines", dest="context_lines", type=int, default=0, metavar="N",
+                            help="Lines around each match (at most 10)")
+        parser.add_argument("--limit", type=int, default=50, help="At most this many lines (max 500)")
     elif verb == "diff":
         parser.add_argument("a", metavar="A")
         parser.add_argument("b", metavar="B")
@@ -2027,8 +2606,25 @@ def code_cmd(argv: list[str]) -> None:
     args = parser.parse_args(argv[1:] if verb != "show" else argv)
     manager, token = _manager_token(args)
     campaign = _resolve_campaign(args)
+    if verb == "show":
+        from mlsweep._notes_code import CodeRefError, is_code_ref, parse_code_ref
+        if is_code_ref(args.ref):     # a note's link: mlsweep:code/EXP/PATH#L40-60
+            try:
+                cref = parse_code_ref(args.ref)
+            except CodeRefError as exc:
+                _die(str(exc))
+            args.ref, args.path = cref.target, args.path or cref.path or None
+            if cref.start is not None and not args.lines:
+                args.lines = f"{cref.start}-{cref.end}" if cref.end else str(cref.start)
 
-    if verb == "diff":
+    if verb == "search":
+        from mlsweep._code_read import search
+        from mlsweep._snapshot import is_snapshot_id
+        for t in args.targets:
+            if not is_snapshot_id(t):
+                require_campaign(manager, token, t, campaign)
+        search(manager, token, args, campaign)
+    elif verb == "diff":
         a = _resolve_code_ref(manager, token, args.a, campaign, None)
         b = _resolve_code_ref(manager, token, args.b, campaign, None)
         _code_diff(manager, token, a, b, args.path, args.stat)
@@ -2042,6 +2638,19 @@ def code_cmd(argv: list[str]) -> None:
         if args.path is not None:
             from urllib.parse import quote
             data = _code_get(manager, token, f"/api/snapshots/{sid}/files/{quote(args.path)}", raw=True)
+            if args.lines or args.numbered:
+                from mlsweep._code_read import parse_line_range, print_lines
+                from mlsweep._snapshot import is_snapshot_id, short_id
+                try:
+                    start, end = parse_line_range(args.lines) if args.lines else (1, None)
+                except ValueError as exc:
+                    _die(str(exc))
+                # Cite the experiment, or the snapshot when one was picked or given.
+                cite = short_id(sid) if (args.snapshot or is_snapshot_id(args.ref)) else args.ref
+                print_lines(data, cite_target=cite, path=args.path, start=start, end=end,
+                            budget=args.budget, again=f"mlsweep code {cite} {quote(args.path, safe='/')}",
+                            as_json=args.json)
+                return
             sys.stdout.buffer.write(data)
             sys.stdout.flush()
             return
@@ -2218,6 +2827,32 @@ def _report_request(verb: str, success: str, method: str, url: str, token: str, 
     return status == 200
 
 
+def _wait_for_worker(manager: str, token: str, worker_id: str, timeout: float,
+                     interval: float = 2.0) -> dict[str, Any]:
+    """The worker's row once it has connected or died, or as it stands after *timeout*."""
+    deadline = time.monotonic() + timeout
+    row: dict[str, Any] = {"worker_id": worker_id}
+    while True:
+        workers = manager_list_workers(manager, token) or []
+        row = next((w for w in workers if w.get("worker_id") == worker_id), row)
+        if row.get("status") in ("connected", "dead") or time.monotonic() >= deadline:
+            return row
+        time.sleep(interval)
+
+
+def _report_added_worker(worker: dict[str, Any], waited: float) -> None:
+    wid, st = worker.get("worker_id", "?"), worker.get("status")
+    if st == "connected":
+        _report(True, f"connected {wid}, GPUs {worker.get('gpus') or []}")
+    elif st == "dead":
+        _report(False, f"{wid} did not connect: {worker.get('last_error') or 'no reason given'}")
+    elif waited:
+        _report(True, f"added {wid}; still {st or 'connecting'} after {waited:g}s "
+                      "(`mlsweep workers` shows when it connects)")
+    else:
+        _report(True, f"added {wid}; connecting (`mlsweep workers` shows when it connects)")
+
+
 def workers_cmd(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="mlsweep workers",
@@ -2226,11 +2861,13 @@ def workers_cmd(argv: list[str]) -> None:
     sub = parser.add_subparsers(dest="action")
     ls = sub.add_parser("ls", help="List workers (the default)")
     add = sub.add_parser("add", help="Connect a worker over SSH (mlsweep is installed there for you)")
-    rm = sub.add_parser("rm", help="Disconnect and forget a worker")
+    rm = sub.add_parser("rm", help="Disconnect a worker, taking it out of the pool (a manager "
+                                   "restart does not relaunch it; `workers add` brings it back)")
+    fg = sub.add_parser("forget", help="Disconnect a worker and drop it from the list of known workers")
     st = sub.add_parser("set", help="Change a live worker's jobs per GPU or its GPUs")
     up = sub.add_parser("update", help="Reinstall this manager's mlsweep on a worker and restart it "
                                        "(its in-flight runs are requeued)")
-    for p in (ls, add, rm, st, up):
+    for p in (ls, add, rm, fg, st, up):
         _add_manager_args(p)
         p.add_argument("--json", action="store_true", help="Print the result as JSON")
     add.add_argument("host", help="SSH destination, e.g. user@host")
@@ -2238,7 +2875,16 @@ def workers_cmd(argv: list[str]) -> None:
     add.add_argument("--ssh-key", help="SSH private key")
     add.add_argument("--venv", help="Existing venv for the worker binary (advanced)")
     add.add_argument("--devices", help="GPU indices to use, e.g. 0,1 (default: all)")
+    add.add_argument("--port", type=int, default=0,
+                     help="Fixed port for the worker to listen on (default: one it picks)")
+    add.add_argument("--tunnel", action="store_true",
+                     help="Reach the worker through SSH instead of dialing its port, for a machine "
+                          "whose firewall lets only SSH in")
+    add.add_argument("--wait", type=float, default=300, metavar="S",
+                     help="Seconds to wait for the worker to connect, and report how it went "
+                          "(default: 300; 0 = return at once)")
     rm.add_argument("worker_id")
+    fg.add_argument("worker_id")
     up.add_argument("worker_id")
     st.add_argument("worker_id")
     st.add_argument("--jobs", type=int, help="Max concurrent jobs per GPU (0 = unlimited)")
@@ -2246,29 +2892,36 @@ def workers_cmd(argv: list[str]) -> None:
     st.add_argument("--remove-devices", help="GPU indices to stop using; their runs are re-queued")
     st.add_argument("--drain-devices",
                     help="GPU indices to take out of the pool while their runs finish")
-    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "set", "update", "-h", "--help")
+    args = parser.parse_args(argv if argv and argv[0] in ("ls", "add", "rm", "forget", "set", "update", "-h", "--help")
                              else ["ls", *argv])
     manager, token = _manager_token(args)
 
     if args.action == "add":
         body = {"host": args.host, "remote_dir": args.remote_dir, "ssh_key": args.ssh_key,
-                "venv": args.venv, "devices": _parse_ints(args.devices)}
+                "venv": args.venv, "devices": _parse_ints(args.devices), "port": args.port or None,
+                "tunnel": args.tunnel or None}
         status, resp = _http_request("POST", _manager_url(manager, "/api/workers"), token,
                                      json_data={k: v for k, v in body.items() if v not in (None, "")},
                                      timeout=600)
-        ok = status in (200, 201) and isinstance(resp, dict)
-        _report(ok, f"connected {resp.get('worker_id', args.host) if ok else args.host}")
-        if not ok:
+        if not (status in (200, 201) and isinstance(resp, dict)):
+            _report(False, f"add {args.host}")
             _fail("add worker", status, resp)
+        worker = _wait_for_worker(manager, token, str(resp.get("worker_id")), args.wait) if args.wait else resp
+        _report_added_worker(worker, args.wait)
         if args.json:
-            emit(resp)
+            emit(worker)
+        if worker.get("status") == "dead":
+            sys.exit(1)
         return
-    if args.action == "rm":
-        if not _report_request("remove worker", f"removed {args.worker_id}", "DELETE",
-                               _manager_url(manager, f"/api/workers/{args.worker_id}"), token):
+    if args.action in ("rm", "forget"):
+        forget = args.action == "forget"
+        path = f"/api/workers/{args.worker_id}" + ("?forget=1" if forget else "")
+        if not _report_request("forget worker" if forget else "disconnect worker",
+                               f"{'forgot' if forget else 'disconnected'} {args.worker_id}", "DELETE",
+                               _manager_url(manager, path), token):
             sys.exit(1)
         if args.json:
-            emit({"worker_id": args.worker_id, "removed": True})
+            emit({"worker_id": args.worker_id, "status": "removed" if forget else "disconnected"})
         return
     if args.action == "update":
         status, resp = _http_request("POST", _manager_url(manager, f"/api/workers/{args.worker_id}/update"),
@@ -2319,15 +2972,24 @@ def workers_cmd(argv: list[str]) -> None:
         devs = w.get("devices") or w.get("gpus") or ""
         sweep_print(f"  {color}{st_:<11}{_RESET} {w.get('worker_id')}  {_DIM}{w.get('host', '')}"
                     f"{'  gpus ' + str(devs) if devs else ''}"
+                    f"{'  ' + _YELLOW + 'paused' + _RESET + _DIM if w.get('paused') else ''}"
                     f"{'  ' + str(w.get('last_error')) if w.get('last_error') else ''}{_RESET}")
 
 
 def scheduler_cmd(argv: list[str]) -> None:
     parser = _common_parser(
         "mlsweep scheduler",
-        "Show or set GPU placement: pack fills busy GPUs first (keeps whole GPUs and machines "
-        "free for big jobs); spread puts each job on the least busy GPU.",
+        "Show or change the scheduler.  --pause stops new jobs from starting on one worker, or on "
+        "every worker (the default), so you can place runs by hand; running jobs carry on, and a "
+        "job you pin with `reschedule --to` waits until you unpause.  --placement chooses where "
+        "jobs go: pack fills busy GPUs first (keeps whole GPUs and machines free for big jobs); "
+        "spread puts each job on the least busy GPU.",
     )
+    pause = parser.add_mutually_exclusive_group()
+    pause.add_argument("--pause", nargs="?", const="all", metavar="WORKER|all",
+                       help="Start nothing new on WORKER, or anywhere (all, the default)")
+    pause.add_argument("--unpause", nargs="?", const="all", metavar="WORKER|all",
+                       help="Start scheduling again on WORKER, or lift every pause (all, the default)")
     parser.add_argument("--placement", choices=("pack", "spread"))
     parser.add_argument("--json", action="store_true", help="Print the scheduler settings as JSON")
     args = parser.parse_args(argv)
@@ -2335,11 +2997,27 @@ def scheduler_cmd(argv: list[str]) -> None:
     if args.placement:
         status, resp = _http_request("PATCH", _manager_url(manager, "/api/scheduler"), token,
                                      json_data={"placement": args.placement})
-    else:
-        status, resp = _http_request("GET", _manager_url(manager, "/api/scheduler"), token)
+        if status != 200:
+            _fail("set placement", status, resp)
+    target = args.pause or args.unpause
+    if target:
+        verb = "pause" if args.pause else "unpause"
+        body = {} if target == "all" else {"worker_id": target}
+        status, resp = _http_request("POST", _manager_url(manager, f"/api/scheduler/{verb}"), token,
+                                     json_data=body)
+        if status != 200:
+            _fail(verb, status, resp)
+    status, resp = _http_request("GET", _manager_url(manager, "/api/scheduler"), token)
     if status != 200 or not isinstance(resp, dict):
         _fail("scheduler", status, resp)
     if args.json:
         emit(resp)
         return
     sweep_print(f"  placement: {resp.get('placement')}")
+    paused_workers = resp.get("paused_workers") or []
+    if resp.get("paused"):
+        sweep_print(f"  scheduling: {_YELLOW}paused everywhere{_RESET} (running jobs carry on)")
+    else:
+        sweep_print(f"  scheduling: {'running' if not paused_workers else 'running, except on the paused workers'}")
+    if paused_workers:
+        sweep_print(f"  paused workers: {', '.join(paused_workers)}")

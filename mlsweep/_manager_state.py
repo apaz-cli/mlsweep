@@ -53,10 +53,12 @@ class InFlightRun:
     nodes: dict[str, list[int]] = field(default_factory=dict)  # worker_id → GPU ids
     log_end: int = 0  # training.log is stored up to this byte offset
     replay_requested: bool = False
+    sync_inflight: bool = False  # an artifact rsync for a mid-run sync is running
     last_progress: float = 0.0  # epoch seconds of the last log/metric/start event
     last_step: int | None = None  # newest metric step this session
     last_step_time: float = 0.0  # epoch seconds when last_step first arrived here
     step_seconds: float | None = None  # the logger's wall seconds per step, if it sent one
+    total_steps: int | None = None  # the step the run ends at, if its logger said
     first_step: int | None = None  # first metric step this session, and when it arrived
     first_step_time: float = 0.0
     metric_seen: bool = False  # it logged its sweep's METRIC_CHECK metric this session
@@ -65,14 +67,18 @@ class InFlightRun:
     ending: tuple[JobStatus, str] | None = None
     ending_since: float = 0.0
 
-    def note_step(self, step: int, step_seconds: float | None, now: float) -> None:
+    def note_step(self, step: int, step_seconds: float | None, now: float,
+                  total_steps: int | None = None) -> None:
         """Record a metric for *step* that arrived at *now*.
 
         Only a higher step restarts the clock, so several log() calls at one
-        step count once.  *step_seconds* is measured by the logger.
+        step count once.  *step_seconds* is measured by the logger, and
+        *total_steps* is what the script told its logger, if anything.
         """
         if step_seconds is not None:
             self.step_seconds = step_seconds
+        if total_steps is not None:
+            self.total_steps = total_steps
         if self.last_step is None or step > self.last_step:
             self.last_step = step
             self.last_step_time = now
@@ -85,6 +91,19 @@ class InFlightRun:
         if self.first_step is None or self.last_step is None or self.last_step <= self.first_step:
             return None
         return (self.last_step_time - self.first_step_time) / (self.last_step - self.first_step)
+
+    def eta_seconds(self, now: float) -> float | None:
+        """Seconds until the run reaches ``total_steps``, at its average pace so far.
+
+        None until the logger has said where the run ends and the step has
+        advanced (or the logger has timed one).  Counted from when the last
+        step arrived, so it keeps falling between steps, and never below 0.
+        """
+        per = self.avg_step_seconds or self.step_seconds
+        if self.total_steps is None or self.last_step is None or not per:
+            return None
+        left = max(0, self.total_steps - self.last_step) * per - (now - self.last_step_time)
+        return max(0.0, left)
 
     @classmethod
     def from_job(cls, job: JobRecord, primary: str, **kwargs: Any) -> InFlightRun:
@@ -146,6 +165,7 @@ class WorkerConn:
     ssh_key: str | None = None
     venv: str | None = None
     tunnel_proc: Any = None  # asyncio.subprocess.Process keeping the reverse tunnel alive
+    forward: Any = None  # PortForward the manager reaches the worker through, for a --tunnel worker
     tunnel_task: Any = None  # asyncio.Task of _tunnel_monitor_task, cancelled on retirement
 
     @property
@@ -191,15 +211,25 @@ class ManagerState:
         self.db_writer: DbWriter = cast(DbWriter, None)
         self.workers: dict[str, WorkerConn] = {}
         self.launching: set[str] = set()  # worker ids with a launch in progress
+        # Worker ids disconnected or forgotten this session.  A launch still in
+        # flight for one gives up instead of registering it (see
+        # ``connect_single_worker``); adding the worker again clears it.
+        self.retired: set[str] = set()
         # Worker ids refused at their hello for speaking an older protocol.
         # The System page offers to update them (see ``update_worker``).
         self.outdated: set[str] = set()
         self.runs: dict[RunKey, InFlightRun] = {}
         self.pins: dict[RunKey, Pin] = {}  # hand-chosen placements for pending jobs
         self.placement: Placement = DEFAULT_PLACEMENT
-        # Metric values of finished Bayesian runs, by (job_key, attempt).  See _manager_optimizer.
-        self.run_values: dict[tuple[int, int], float | None] = {}
-        self.pruned_points: dict[tuple[int, int], tuple[int, float | None]] = {}  # likewise, of pruned runs
+        # Scheduling pauses, saved in the settings table.  While ``paused`` is
+        # set nothing starts anywhere; a worker in ``paused_workers`` starts
+        # nothing new, pinned jobs included.  Running jobs carry on either way.
+        self.paused: bool = False
+        self.paused_workers: set[str] = set()
+        # Metric values of finished Bayesian runs, keyed by
+        # (experiment_id, job_key, attempt, metric, goal).  See _manager_optimizer.
+        self.run_values: dict[tuple[str, int, int, str, str], float | None] = {}
+        self.pruned_points: dict[tuple[str, int, int, str, str], tuple[int, float | None]] = {}
         # Run controls of running and paused experiments, by experiment id, reloaded by
         # each scheduler pass, and the pruning state of those that prune.  See _manager_controls.
         self.controls: dict[str, dict[str, Any]] = {}

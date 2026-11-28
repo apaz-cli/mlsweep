@@ -26,10 +26,13 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .filter-chip .n { color: var(--text-muted); font-variant-numeric: tabular-nums; margin-left: 2px; }
 .filter-chip.active .n { color: inherit; }
 #exp-shown { font-size: 11px; color: var(--text-muted); }
-.notes-cell { white-space: nowrap; }
+.refs-cell { white-space: nowrap; }
+/* The notes and traces badges, one above the other. */
+.refs { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; }
 .note-ref { display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; font-size: 10px; font-weight: 600; font-family: system-ui, sans-serif; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 3px; text-decoration: none; vertical-align: middle; font-variant-numeric: tabular-nums; }
 .note-ref svg { width: 10px; height: 10px; }
-.note-ref:hover { background: var(--radio-checked-bg); border-color: var(--accent); }
+a.note-ref:hover { background: var(--radio-checked-bg); border-color: var(--accent); }
+.note-ref.zero { color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); border-color: color-mix(in srgb, var(--bad) 40%, transparent); cursor: default; }
 .campaign-tag { font-size: 10px; color: var(--text-dim); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; margin-left: 8px; }
 
 /* Status badges */
@@ -49,8 +52,13 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 .exp-toggle { cursor: pointer; font-size: 11px; color: var(--text-dim); user-select: none; margin-right: 6px; }
 .exp-name-cell { display: flex; align-items: center; }
 .exp-name { font-weight: 600; color: var(--text-strong); }
-.exp-note { font-size: 11px; color: var(--text-muted); font-style: italic; margin-left: 8px; }
+/* The description on hover: a fixed panel, large enough to read, that never
+   widens a row or gets clipped by the table's scroll box. */
+.exp-note-tip { position: fixed; z-index: 1200; pointer-events: none; max-width: min(34rem, calc(100vw - 16px)); padding: 10px 13px; border: 1px solid var(--border-input); border-radius: 6px; background: var(--surface); color: var(--text); box-shadow: 0 8px 28px rgba(0,0,0,.28); font-family: system-ui, -apple-system, sans-serif; font-size: 14px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
+.exp-note-tip[hidden] { display: none; }
 .exp-manager-note.paused { color: var(--warn); }
+.exp-no-desc { font: inherit; font-size: 10px; color: var(--text-muted); background: none; border: 1px dashed var(--border-input); border-radius: 3px; padding: 0 5px; margin-left: 8px; cursor: pointer; vertical-align: middle; }
+.exp-no-desc:hover { color: var(--text); border-color: var(--accent); }
 .exp-manager-note { font-size: 11px; color: var(--text-muted); margin-left: 8px; max-width: 48ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 /* Action cells stay table cells (the buttons flex inside a div), so they
    stretch to the row and its bottom border stays one line. */
@@ -98,6 +106,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
 </style>
 <script src="chrome.js"></script>
 <script src="dialog.js"></script>
+<script src="viewmenu.js"></script>
 <script src="campaign.js"></script>
 </head>
 <body>
@@ -122,7 +131,7 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
   <table class="exp-table" id="exp-table">
     <thead>
       <tr>
-        <th style="width:34%">Name</th>
+        <th style="width:35%">Name</th>
         <th style="width:8%">Status</th>
         <th style="width:6%;text-align:right">Done</th>
         <th style="width:6%;text-align:right">Failed</th>
@@ -130,8 +139,8 @@ h2 { font-size: 14px; font-weight: 700; color: var(--text-strong); }
         <th style="width:6%;text-align:right">Running</th>
         <th style="width:6%;text-align:right">Finished</th>
         <th style="width:11%">Submitted</th>
-        <th style="width:5%">Notes</th>
-        <th style="width:12%">Actions</th>
+        <th style="width:5%" title="Notes that mention it, and the agent traces that submitted it">Refs</th>
+        <th style="width:11%">Actions</th>
       </tr>
     </thead>
     <tbody id="exp-tbody"></tbody>

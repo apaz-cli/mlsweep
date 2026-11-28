@@ -6,13 +6,12 @@ import os
 import pickle
 import shlex
 import struct
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
 
 from campaign_helpers import shared_manager, uid
+from conftest import _api_status
 from mlsweep._inspect_model import InspectError, inspect_file
 
 torch = pytest.importorskip("torch")
@@ -164,12 +163,7 @@ def mgr(tmp_path_factory):
 
 
 def _get(mgr, path):
-    r = urllib.request.Request(mgr.url + path, headers={"Authorization": f"Bearer {mgr.token}"})
-    try:
-        with urllib.request.urlopen(r, timeout=15) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
+    return _api_status(mgr.url, mgr.token, "GET", path)
 
 
 def test_route(mgr):

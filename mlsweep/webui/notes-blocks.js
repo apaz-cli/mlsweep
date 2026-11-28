@@ -333,9 +333,12 @@ function nbTableBox(data) {
           else td.textContent = text;
           tr.append(td);
         } else {
-          tr.append(nbMetricCell(row.metrics ? row.metrics[c.key] : null, spec.agg));
+          const td = nbMetricCell(row.metrics ? row.metrics[c.key] : null, spec.agg);
+          td.dataset.metric = c.key;
+          tr.append(td);
         }
       }
+      tr.oncontextmenu = e => nbRunMenu(e, row, spec);
       tbody.append(tr);
     }
     for (const h of headers) {
@@ -366,6 +369,29 @@ function nbTableBox(data) {
   drawBody();
   wrap.append(table);
   return wrap;
+}
+
+// Right-click a table row: the run's pages, and on a metric cell, its value
+// or an evidence link a note can cite.
+function nbRunMenu(e, row, spec) {
+  if (mlNativeMenuWanted(e, null)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const items = [
+    ...MLViews.runItems(row.experiment, row.run),
+    "-",
+    { label: "Copy run ID", run: () => copyText(row.run) },
+  ];
+  const metric = e.target.closest("td[data-metric]")?.dataset.metric;
+  const summary = metric && row.metrics ? row.metrics[metric] : null;
+  const value = summary ? (summary.value != null ? summary.value : summary.final) : null;
+  if (value != null) {
+    const at = ["min", "max", "mean"].includes(spec.agg) ? spec.agg : "final";
+    items.push({ label: "Copy value", run: () => copyText(String(value)) },
+      { label: "Copy evidence link", hint: `@${at}`,
+        run: () => copyText(`[${nbNum(value)}](mlsweep:${row.experiment}/${row.run}/${metric}@${at})`) });
+  }
+  mlMenuAt(e.clientX, e.clientY, items);
 }
 
 // ── block wiring ─────────────────────────────────────────────────────────────
@@ -546,12 +572,16 @@ function nbBlock(pre, kind, raw, figState) {
     figure.append(card);
   }
 
+  let loadSeq = 0;
   async function load(force) {
+    const seq = ++loadSeq;
     if (force) NB_CACHE.delete(kind + "\n" + raw);
     body.innerHTML = "";
     body.append(el("div", "nb-loading", "Loading…"));
     try {
       const data = await nbFetchBlock(kind, raw);
+      // A refresh clicked while this fetch was out owns the block now.
+      if (seq !== loadSeq) return;
       body.innerHTML = "";
       body.append(nbRenderBody(kind, data));
       const spec = data.spec || {};
@@ -564,7 +594,7 @@ function nbBlock(pre, kind, raw, figState) {
           : codeHref(`code/${data.to.experiment || data.to.snapshot}${data.path ? "/" + data.path : ""}`);
       }
     } catch (e) {
-      nbError(body, e.message || String(e));
+      if (seq === loadSeq) nbError(body, e.message || String(e));
     }
   }
   load(false);
@@ -597,6 +627,7 @@ function nbEvidenceMark(a, ev) {
   a.dataset.evValue = String(ev.value);
   a.dataset.evStep = String(ev.step);
   a.href = pageHref("results.html", { experiment: ev.experiment, run: ev.run });
+  mlTagEntity(a, ev.experiment, ev.run);
   if (claimed == null || !Number.isFinite(got)) {
     a.classList.add("ev-unknown");
     mark.textContent = "?";
@@ -612,30 +643,40 @@ function nbEvidenceMark(a, ev) {
     : `${where} = ${nbNum(got)}, but the note says ${nbNum(claimed)}. Click for the experiment.`;
 }
 
-async function annotateEvidence(root) {
-  const anchors = [...root.querySelectorAll("a[data-ev-ref]")];
-  if (!anchors.length) return;
-  const refs = [...new Set(anchors.map(a => a.dataset.evRef))];
-  const missing = refs.filter(r => {
+// Resolve `mlsweep:` link refs the cache lacks (or has stale), in one request.
+async function evResolve(refs) {
+  const missing = [...new Set(refs)].filter(r => {
     const hit = EV_CACHE.get(r);
     return !hit || Date.now() - hit.at >= EV_CACHE_MS;
   });
-  if (missing.length) {
-    try {
-      const r = await apiFetch("/api/notes/evidence", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refs: missing }),
-      });
-      const body = await r.json();
-      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
-      for (const [ref, data] of Object.entries(body.results || {})) {
-        EV_CACHE.set(ref, { at: Date.now(), data });
-      }
-    } catch (e) {
-      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
-    }
+  if (!missing.length) return;
+  try {
+    const r = await apiFetch("/api/notes/evidence", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refs: missing }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
+    for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
+  } catch (e) {
+    for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
   }
+}
+
+// Every kind of `mlsweep:` link in *root*, resolved together, then marked.
+async function annotateLinks(root) {
+  const anchors = root.querySelectorAll("a[data-ev-ref], a[data-code-ref], a[data-trace-ref]");
+  if (!anchors.length) return;
+  await evResolve([...anchors].map(a => a.dataset.evRef || a.dataset.codeRef || a.dataset.traceRef));
+  annotateEvidence(root);
+  annotateCode(root);
+  annotateTraces(root);
+}
+
+async function annotateEvidence(root) {
+  const anchors = [...root.querySelectorAll("a[data-ev-ref]")];
+  if (!anchors.length) return;
+  await evResolve(anchors.map(a => a.dataset.evRef));
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.evRef);
     nbEvidenceMark(a, hit && hit.data);
@@ -648,24 +689,7 @@ async function annotateEvidence(root) {
 async function annotateCode(root) {
   const anchors = [...root.querySelectorAll("a[data-code-ref]")];
   if (!anchors.length) return;
-  const refs = [...new Set(anchors.map(a => a.dataset.codeRef))];
-  const missing = refs.filter(r => {
-    const hit = EV_CACHE.get(r);
-    return !hit || Date.now() - hit.at >= EV_CACHE_MS;
-  });
-  if (missing.length) {
-    try {
-      const r = await apiFetch("/api/notes/evidence", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refs: missing }),
-      });
-      const body = await r.json();
-      if (!r.ok) throw new Error((body && body.error) || `HTTP ${r.status}`);
-      for (const [ref, data] of Object.entries(body.results || {})) EV_CACHE.set(ref, { at: Date.now(), data });
-    } catch (e) {
-      for (const ref of missing) EV_CACHE.set(ref, { at: Date.now(), data: { ok: false, error: e.message } });
-    }
-  }
+  await evResolve(anchors.map(a => a.dataset.codeRef));
   for (const a of anchors) {
     const hit = EV_CACHE.get(a.dataset.codeRef);
     const res = hit && hit.data;
@@ -682,6 +706,40 @@ async function annotateCode(root) {
     const what = res.kind === "tree" ? `the code (${res.files} files)` : res.kind === "dir" ? `${res.path}/` : res.path + lines;
     a.title = `${what} as ${res.experiment || "snapshot"} ran it · ${res.short}`
       + (res.versions > 1 ? ` (latest of ${res.versions} code versions)` : "");
+  }
+}
+
+// ── trace links ──────────────────────────────────────────────────────────────
+
+// Says which session a trace link opens; marks it ⚠ when the trace is gone or a
+// short id matches more than one.
+async function annotateTraces(root) {
+  const anchors = [...root.querySelectorAll("a[data-trace-ref]")];
+  if (!anchors.length) return;
+  await evResolve(anchors.map(a => a.dataset.traceRef));
+  for (const a of anchors) {
+    const hit = EV_CACHE.get(a.dataset.traceRef);
+    const res = hit && hit.data;
+    a.querySelectorAll(".ev-mark").forEach(m => m.remove());
+    a.classList.remove("trace-ok", "trace-bad");
+    if (!res || !res.ok) {
+      a.classList.add("trace-bad");
+      a.append(el("span", "ev-mark", "⚠"));
+      a.title = (res && res.error) || "could not check this trace link";
+      continue;
+    }
+    a.classList.add("trace-ok");
+    // A short id opens the full one, so the Traces tab's URL names the trace.
+    if (res.session_id) a.href = traceHref(a.dataset.traceRef, res.session_id);
+    const exps = res.experiments || [];
+    const trace = `${res.agent} trace${res.title ? `: ${res.title}` : ""}`;
+    const ev = res.event;
+    a.title = ev
+      ? `${ev.kind === "tool" ? ev.name || "tool" : ev.kind} event ${ev.seq} of ${trace}`
+        + (ev.text ? `\n${ev.text}` : "")
+      : `${trace} · ${res.event_count ?? 0} events`
+        + (exps.length ? ` · ${exps.length} experiment${exps.length === 1 ? "" : "s"}` : "")
+        + (res.kind ? ` · showing ${res.kind} only` : "");
   }
 }
 

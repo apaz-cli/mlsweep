@@ -169,12 +169,22 @@ def _status(argv: list[str]) -> None:
 # ── lint ───────────────────────────────────────────────────────────────────────
 
 
+def _why_not(status: int, data: Any) -> str:
+    """What a failed manager request said: its status and error message, or that nothing answered."""
+    if not status:
+        return "no response (unreachable, or it took longer than the timeout)"
+    if status == 404:
+        return "HTTP 404: this manager is older and has no such endpoint"
+    msg = data.get("error") if isinstance(data, dict) else None
+    return f"HTTP {status}" + (f": {msg}" if msg else "")
+
+
 def _fetch_known(manager: str, token: str) -> set[str]:
     """Experiment IDs on the manager; OSError if it won't say."""
     path = "/api/notes/experiment-ids"
     status, data = _http_request("GET", _manager_url(manager, path), token, timeout=60, quiet=True)
     if status != 200 or not isinstance(data, dict):
-        raise OSError(f"HTTP {status}" if status else "no response")
+        raise OSError(_why_not(status, data))
     return set(data.get("known", []))
 
 
@@ -183,7 +193,7 @@ def _fetch_run_map(manager: str, token: str) -> dict[str, list[str]]:
     path = "/api/notes/run-ids"
     status, data = _http_request("GET", _manager_url(manager, path), token, timeout=60, quiet=True)
     if status != 200 or not isinstance(data, dict):
-        raise OSError(f"HTTP {status}" if status else "no response")
+        raise OSError(_why_not(status, data))
     runs = data.get("runs")
     return runs if isinstance(runs, dict) else {}
 
@@ -194,7 +204,7 @@ def _fetch_evidence(manager: str, token: str, refs: list[str]) -> dict[str, dict
     status, data = _http_request("POST", _manager_url(manager, path), token,
                                  json_data={"refs": refs}, timeout=60, quiet=True)
     if status != 200 or not isinstance(data, dict):
-        raise OSError(f"HTTP {status}" if status else "no response")
+        raise OSError(_why_not(status, data))
     results = data.get("results")
     return results if isinstance(results, dict) else {}
 
@@ -238,12 +248,12 @@ def _lint(argv: list[str]) -> None:
         try:
             known = _fetch_known(args.manager, token)
         except OSError as exc:
-            note = f"experiment and run IDs not checked: manager {args.manager} unreachable ({exc})"
+            note = f"experiment and run IDs not checked: manager {args.manager} answered {exc}"
         else:
             try:
                 known_runs = _fetch_run_map(args.manager, token)
-            except OSError:
-                note = "run IDs not checked: this manager does not report them"
+            except OSError as exc:
+                note = f"run IDs not checked: {exc}"
 
     if known is not None:
         index = _notes.build_index(root, known)
@@ -251,8 +261,8 @@ def _lint(argv: list[str]) -> None:
         if refs:
             try:
                 evidence = _fetch_evidence(args.manager, token, refs)
-            except OSError:
-                msg = "evidence numbers not checked: this manager does not report them"
+            except OSError as exc:
+                msg = f"evidence numbers not checked: asking the manager for {len(refs)} link(s) failed, {exc}"
                 note = f"{note} {msg}".strip() if note else msg
 
     result = _notes_lint.lint(root, known_experiments=known, known_runs=known_runs,
@@ -265,7 +275,8 @@ def _lint(argv: list[str]) -> None:
         result = _notes_lint.lint(root, known_experiments=known, known_runs=known_runs,
                                   evidence=evidence, index=index)
     if args.json:
-        emit(result)
+        # What lint could not check, so a script doesn't read silence as a pass.
+        emit({**result, "note": note} if note else result)
         return
     if args.review_prompt:
         print(_notes_lint.review_prompt(root, result, time.strftime("%Y-%m-%d")))
